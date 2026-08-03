@@ -17,6 +17,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development",
 ]
+
 dependencies = [
     "nooa==0.0.8",
     "nooa-cli==0.0.8",
@@ -30,6 +31,13 @@ dependencies = [
     "rich>=13.0.0",
     "textual>=1.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/skundu42/noah-code"
+Documentation = "https://github.com/skundu42/noah-code#readme"
+Repository = "https://github.com/skundu42/noah-code.git"
+Issues = "https://github.com/skundu42/noah-code/issues"
+Releases = "https://github.com/skundu42/noah-code/releases"
 
 [project.optional-dependencies]
 dev = [
