@@ -33,8 +33,10 @@ Before the first release, configure a PyPI Trusted Publisher for package `noah-c
 `skundu42`, repository `noah-code`, workflow `release.yml`, and GitHub environment `pypi`. The
 GitHub environment permits deployments only from tags matching `v*`.
 
-For every release, update the version in `pyproject.toml` and `src/noah_code/__init__.py`, commit
-and push the change, then push a matching annotated tag. For example:
+For every release, update the version in `pyproject.toml`, `src/noah_code/__init__.py`, and
+`uv.lock`. Add curated notes at `docs/releases/vX.Y.Z.md`; the release workflow uses that file
+when it exists and otherwise falls back to generated notes. Commit and push the change, then push
+a matching annotated tag. For example:
 
 ```bash
 git tag -a v0.2.0 -m "Noah Code v0.2.0"

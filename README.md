@@ -106,6 +106,7 @@ details or `F3` for paginated conversation history.
 - [Generated-code security](docs/security.md)
 - [Custom commands, skills, MCP, and tracing](docs/extensions.md)
 - [Development, CI, and releases](docs/development.md)
+- [Release notes](docs/releases/)
 
 ## Updates
 

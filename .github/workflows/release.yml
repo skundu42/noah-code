@@ -105,6 +105,11 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Check out tagged release notes
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Download release distributions
         uses: actions/download-artifact@v6
         with:
@@ -125,4 +130,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "$RELEASE_TAG"
+        run: |
+          notes_file="docs/releases/${RELEASE_TAG}.md"
+          if [ -f "$notes_file" ]; then
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --notes-file "$notes_file" --title "$RELEASE_TAG"
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "$RELEASE_TAG"
+          fi
