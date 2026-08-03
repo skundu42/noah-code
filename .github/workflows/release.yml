@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verify distributions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+          python-version: "3.13"
+
+      - name: Verify tag and package versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          tag_version = os.environ["RELEASE_TAG"].removeprefix("v")
+          project_version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          namespace = {}
+          exec(pathlib.Path("src/noah_code/__init__.py").read_text(), namespace)
+          package_version = namespace["__version__"]
+          if tag_version != project_version or tag_version != package_version:
+              raise SystemExit(
+                  f"version mismatch: tag={tag_version}, project={project_version}, package={package_version}"
+              )
+          PY
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run release checks
+        run: |
+          uv run ruff check src tests
+          uv run pytest tests
+          uv lock --check
+
+      - name: Build wheel and source distribution
+        run: uv build
+
+      - name: Validate package metadata
+        run: uvx twine check dist/*
+
+      - name: Verify binary-only public installation
+        env:
+          UV_TOOL_DIR: ${{ runner.temp }}/noah-tools
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/noah-bin
+        run: |
+          uv tool install --managed-python --python 3.12 --no-build --with 'nooa[mcp,tracing]==0.0.8' dist/*.whl
+          "${UV_TOOL_BIN_DIR}/noah" --version
+
+      - name: Upload release distributions
+        uses: actions/upload-artifact@v5
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/noah-code
+    permissions:
+      id-token: write
+    steps:
+      - name: Download release distributions
+        uses: actions/download-artifact@v6
+        with:
+          name: python-package-distributions
+          path: dist
+
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Create GitHub release
+    needs:
+      - build
+      - publish-pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download release distributions
+        uses: actions/download-artifact@v6
+        with:
+          name: python-package-distributions
+          path: dist
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "$RELEASE_TAG"

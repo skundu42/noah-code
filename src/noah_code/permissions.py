@@ -1,0 +1,400 @@
+"""Deterministic allow/ask/deny permission engine."""
+
+from __future__ import annotations
+
+import fnmatch
+import re
+import shlex
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+from typing import Literal
+
+from noah_code.config import PermissionRule
+
+PermissionAction = Literal["allow", "ask", "deny"]
+
+
+class PermissionCategory(StrEnum):
+    READ = "read"
+    EDIT = "edit"
+    BASH = "bash"
+    EXTERNAL_DIRECTORY = "external_directory"
+    TASK = "task"
+    SKILL = "skill"
+    MCP = "mcp"
+    LSP = "lsp"
+
+
+# Patterns that are always denied regardless of mode / auto.
+_ALWAYS_DENY_BASH = (
+    re.compile(r"\brm\s+(-[^\s]*\s+)*-?[rR]?[fF]?[rR]?[fF]?\s+(/|\.|~|\*)"),
+    re.compile(r"\brm\s+.*\s+(-[^\s]*r|-rf|-fr)\b"),
+    re.compile(r"\b(mkfs|dd\s+if=|/dev/sd|/dev/disk|shred\b|wipefs\b)\b"),
+    re.compile(r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;:"),  # fork bomb
+    re.compile(r"\bgit\s+push\b"),
+    re.compile(r"\bgit\s+clean\b"),
+    re.compile(r"\bgit\s+reset\s+--hard\b"),
+    re.compile(r"\bgit\s+filter-branch\b"),
+    re.compile(r"\bprintenv\b"),
+    re.compile(r"\benv\b(?!\s+\w+=)"),
+    re.compile(r"\bexport\s+-p\b"),
+    re.compile(r"\bcat\s+.*\.pem\b"),
+    re.compile(r"\bcat\s+.*id_rsa\b"),
+    re.compile(r"\bchmod\s+-R\s+777\b"),
+    re.compile(r"\bcurl\b.*\|\s*(ba)?sh\b"),
+    re.compile(r"\bwget\b.*\|\s*(ba)?sh\b"),
+    re.compile(r"\bsudo\b"),
+    re.compile(r"\bchmod\b.+\s+/"),
+    re.compile(r"\bchown\b.+\s+/"),
+)
+
+# Mutating patterns that always require ask (even if a broad allow matched earlier
+# via auto) unless already an explicit session allow - handled by forcing ask
+# when compound/uncertain; these bump deny-adjacent risk to ask minimum.
+_ALWAYS_ASK_BASH = (
+    re.compile(r"\brm\b"),
+    re.compile(r"\bmv\b"),
+    re.compile(r"\bchmod\b"),
+    re.compile(r"\bchown\b"),
+    re.compile(r"\bkill\b"),
+    re.compile(r"\bpkill\b"),
+    re.compile(r"\bdocker\s+(rm|rmi|system\s+prune)\b"),
+    re.compile(r"\bnpm\s+(publish|unpublish)\b"),
+    re.compile(r"\bpip\s+install\b"),
+    re.compile(r"\buv\s+pip\s+install\b"),
+    re.compile(r"\bcurl\b"),
+    re.compile(r"\bwget\b"),
+)
+
+_MUTATING_GIT = re.compile(
+    r"\bgit\s+(commit|add|push|pull|fetch|rebase|merge|reset|clean|checkout|stash|tag|remote)\b"
+)
+_READ_ONLY_PREFIXES = (
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git branch",
+    "git rev-parse",
+    "rg ",
+    "grep ",
+    "egrep ",
+    "fgrep ",
+    "find ",
+    "ls ",
+    "pwd",
+    "head ",
+    "tail ",
+    "wc ",
+    "file ",
+    "stat ",
+    "test ",
+    "pytest --collect-only",
+    "python -m pytest --collect-only",
+)
+_READ_ONLY_GIT_SUBCOMMANDS = frozenset({"branch", "diff", "log", "rev-parse", "show", "status"})
+
+_SECRET_BASENAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    "credentials.json",
+    "service-account.json",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+}
+_SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
+_SECRET_ALLOW = {".env.example", ".env.sample", ".env.template"}
+
+
+@dataclass(frozen=True)
+class PermissionDecision:
+    category: str
+    target: str
+    action: PermissionAction
+    matching_rule: PermissionRule | None
+    reason: str
+    remember_pattern: str
+
+    @property
+    def allowed(self) -> bool:
+        return self.action == "allow"
+
+    @property
+    def denied(self) -> bool:
+        return self.action == "deny"
+
+    @property
+    def needs_ask(self) -> bool:
+        return self.action == "ask"
+
+
+def is_secret_path(path: str | Path) -> bool:
+    p = Path(path)
+    name = p.name
+    if name in _SECRET_ALLOW:
+        return False
+    if name in _SECRET_BASENAMES:
+        return True
+    if name.startswith(".env.") and name not in _SECRET_ALLOW:
+        return True
+    if any(name.endswith(suf) for suf in _SECRET_SUFFIXES):
+        return True
+    if "id_rsa" in name or "id_ed25519" in name:
+        return True
+    parts = p.parts
+    if ".git" in parts:
+        return True
+    return name.endswith(".db") and "noah-code" in str(p)
+
+
+def _match_rule(rule: PermissionRule, category: str, target: str) -> bool:
+    cat_ok = rule.category in {"*", category}
+    if not cat_ok:
+        return False
+    return fnmatch.fnmatch(target, rule.pattern) or fnmatch.fnmatch(Path(target).name, rule.pattern)
+
+
+class PermissionEngine:
+    """Ordered wildcard rules; last matching rule wins."""
+
+    def __init__(
+        self,
+        rules: list[PermissionRule] | None = None,
+        *,
+        mode: Literal["build", "plan"] = "build",
+        auto_approve: bool = False,
+    ) -> None:
+        self.rules: list[PermissionRule] = list(rules or [])
+        self.mode = mode
+        self.auto_approve = auto_approve
+        self._session_rules: list[PermissionRule] = []
+
+    def add_session_rule(self, rule: PermissionRule) -> None:
+        self._session_rules.append(rule)
+
+    def snapshot_session_rules(self) -> list[dict]:
+        return [r.model_dump() for r in self._session_rules]
+
+    def load_session_rules(self, raw: list[dict] | None) -> None:
+        self._session_rules = [PermissionRule.model_validate(r) for r in (raw or [])]
+
+    def decide(self, category: str, target: str) -> PermissionDecision:
+        normalized = target.strip() or "*"
+        # Hard denies for secrets on read/edit.
+        if (
+            category in {PermissionCategory.READ, PermissionCategory.EDIT}
+            and is_secret_path(normalized)
+            and Path(normalized).name not in _SECRET_ALLOW
+        ):
+            return PermissionDecision(
+                category=category,
+                target=normalized,
+                action="deny",
+                matching_rule=None,
+                reason="secret or credential path denied",
+                remember_pattern=normalized,
+            )
+
+        if category == PermissionCategory.BASH:
+            hard = self._hard_bash_deny(normalized)
+            if hard is not None:
+                return hard
+
+        if self.mode == "plan":
+            plan = self._plan_mode_gate(category, normalized)
+            if plan is not None:
+                return plan
+
+        matching: PermissionRule | None = None
+        for rule in [*self.rules, *self._session_rules]:
+            if _match_rule(rule, category, normalized):
+                matching = rule
+
+        if matching is None:
+            action: PermissionAction = "ask"
+            reason = "no matching rule; default ask"
+        else:
+            action = matching.action
+            reason = matching.reason or f"matched {matching.pattern}"
+
+        if category == PermissionCategory.BASH and action == "allow":
+            elevated = self._elevated_bash_ask(normalized)
+            if elevated is not None:
+                action = elevated.action
+                reason = elevated.reason
+                matching = elevated.matching_rule
+
+        if action == "ask" and self.auto_approve:
+            # --auto never overrides explicit deny; only ask → allow.
+            action = "allow"
+            reason = f"{reason} (auto-approved)"
+
+        return PermissionDecision(
+            category=category,
+            target=normalized,
+            action=action,
+            matching_rule=matching,
+            reason=reason,
+            remember_pattern=self._remember_pattern(category, normalized),
+        )
+
+    def _remember_pattern(self, category: str, target: str) -> str:
+        if category == PermissionCategory.BASH:
+            try:
+                parts = shlex.split(target)
+            except ValueError:
+                parts = target.split()
+            if parts:
+                return f"{parts[0]} *"
+            return "*"
+        return target
+
+    def _hard_bash_deny(self, command: str) -> PermissionDecision | None:
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = []
+
+        for index, token in enumerate(tokens):
+            if Path(token).name != "git":
+                continue
+            remaining = tokens[index + 1 :]
+            if any(part in {"push", "clean", "filter-branch"} for part in remaining) or (
+                "reset" in remaining and "--hard" in remaining
+            ):
+                return PermissionDecision(
+                    category=PermissionCategory.BASH,
+                    target=command,
+                    action="deny",
+                    matching_rule=None,
+                    reason="destructive git command denied",
+                    remember_pattern=command,
+                )
+            if self.auto_approve and not self.is_readonly_command(command):
+                return PermissionDecision(
+                    category=PermissionCategory.BASH,
+                    target=command,
+                    action="deny",
+                    matching_rule=None,
+                    reason="mutating or unrecognized git commands are not auto-approved",
+                    remember_pattern=command,
+                )
+
+        for pat in _ALWAYS_DENY_BASH:
+            if pat.search(command):
+                return PermissionDecision(
+                    category=PermissionCategory.BASH,
+                    target=command,
+                    action="deny",
+                    matching_rule=None,
+                    reason="destructive or secret-exposing command denied",
+                    remember_pattern=command,
+                )
+        lowered = command.lower()
+        if "aws_secret" in lowered or "private key" in lowered:
+            return PermissionDecision(
+                category=PermissionCategory.BASH,
+                target=command,
+                action="deny",
+                matching_rule=None,
+                reason="credential dump denied",
+                remember_pattern=command,
+            )
+        return None
+
+    def _elevated_bash_ask(self, command: str) -> PermissionDecision | None:
+        """Force ask for risky commands unless a session allow rule already matched."""
+        session_allowed = any(
+            r.action == "allow" and _match_rule(r, PermissionCategory.BASH, command)
+            for r in self._session_rules
+        )
+        if session_allowed:
+            return None
+        for pat in _ALWAYS_ASK_BASH:
+            if pat.search(command):
+                return PermissionDecision(
+                    category=PermissionCategory.BASH,
+                    target=command,
+                    action="ask",
+                    matching_rule=None,
+                    reason="elevated-risk shell command requires approval",
+                    remember_pattern=self._remember_pattern(PermissionCategory.BASH, command),
+                )
+        return None
+
+    def _plan_mode_gate(self, category: str, target: str) -> PermissionDecision | None:
+        if category == PermissionCategory.EDIT:
+            return PermissionDecision(
+                category=category,
+                target=target,
+                action="deny",
+                matching_rule=None,
+                reason="plan mode forbids file edits",
+                remember_pattern=target,
+            )
+        if category == PermissionCategory.BASH and not self.is_readonly_command(target):
+            return PermissionDecision(
+                category=category,
+                target=target,
+                action="deny",
+                matching_rule=None,
+                reason="plan mode forbids mutating shell commands",
+                remember_pattern=target,
+            )
+        return None
+
+    @staticmethod
+    def is_readonly_command(command: str) -> bool:
+        cmd = command.strip()
+        if not cmd:
+            return True
+        if _is_compound(cmd):
+            return False
+        lowered = cmd.lower()
+        if _MUTATING_GIT.search(lowered):
+            return False
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            return False
+        if not tokens:
+            return True
+        program = Path(tokens[0]).name.lower()
+        if program == "git":
+            return len(tokens) > 1 and tokens[1].lower() in _READ_ONLY_GIT_SUBCOMMANDS
+        if program == "pwd":
+            return len(tokens) == 1
+        return any(lowered == p.strip() or lowered.startswith(p) for p in _READ_ONLY_PREFIXES[6:])
+
+    @staticmethod
+    def is_uncertain_shell(command: str) -> bool:
+        return _is_compound(command)
+
+
+def _is_compound(command: str) -> bool:
+    """Detect pipes, chains, redirects, substitutions, heredocs."""
+    # Rough conservative scan - not a full shell parser.
+    specials = ("|", "&&", "||", ";", "`", "$(", "${", ">", "<", "<<", "\n")
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            for sp in specials:
+                if command.startswith(sp, i):
+                    return True
+        i += 1
+    try:
+        shlex.split(command)
+    except ValueError:
+        return True
+    return False

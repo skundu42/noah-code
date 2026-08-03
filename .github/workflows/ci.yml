@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Python ${{ matrix.python-version }} quality
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.12"
+          - "3.13"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Check lock file
+        run: uv lock --check
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Test
+        run: uv run pytest tests
+
+      - name: Build distributions
+        run: uv build --out-dir build-dist
+
+  platform:
+    name: ${{ matrix.name }} smoke test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+          - name: macOS arm64
+            runner: macos-15
+          - name: macOS x86_64
+            runner: macos-15-intel
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run tests
+        run: uv run pytest tests
+
+      - name: Verify command entry point
+        run: uv run noah --version
+
+      - name: Verify binary-only public installation
+        env:
+          UV_TOOL_DIR: ${{ runner.temp }}/noah-tools
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/noah-bin
+        run: |
+          uv build --out-dir smoke-dist
+          uv tool install --managed-python --python 3.12 --no-build --with 'nooa[mcp,tracing]==0.0.8' smoke-dist/*.whl
+          "${UV_TOOL_BIN_DIR}/noah" --version

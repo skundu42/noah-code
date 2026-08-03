@@ -1,0 +1,9 @@
+/* Optional reference stylesheet - App embeds CSS to avoid token clashes.
+   Do not use Textual reserved names ($panel, $primary, …) here. */
+
+$nc-bg: #14161a;
+$nc-surface: #1c1f26;
+$nc-border: #2a303a;
+$nc-fg: #e6e8eb;
+$nc-muted: #8b939e;
+$nc-accent: #5b9fd4;
