@@ -1,9 +1,244 @@
-/* Optional reference stylesheet - App embeds CSS to avoid token clashes.
-   Do not use Textual reserved names ($panel, $primary, …) here. */
+$nc-canvas: #282c34;
+$nc-surface: #21252b;
+$nc-raised: #2c313c;
+$nc-border: #3e4451;
+$nc-text: #abb2bf;
+$nc-muted: #7f848e;
+$nc-accent: #61afef;
+$nc-success: #98c379;
+$nc-warning: #e5c07b;
+$nc-error: #e06c75;
 
-$nc-bg: #14161a;
-$nc-surface: #1c1f26;
-$nc-border: #2a303a;
-$nc-fg: #e6e8eb;
-$nc-muted: #8b939e;
-$nc-accent: #5b9fd4;
+Screen {
+    background: $nc-canvas;
+    color: $nc-text;
+}
+
+#header {
+    dock: top;
+    height: 1;
+    padding: 0 1;
+    background: $nc-surface;
+    color: $nc-accent;
+    text-style: bold;
+}
+
+#workspace-layout {
+    height: 1fr;
+    background: $nc-canvas;
+}
+
+#primary-pane {
+    width: 1fr;
+    height: 1fr;
+}
+
+#conversation {
+    height: 1fr;
+    padding: 0 2 1 1;
+    background: $nc-canvas;
+    border: none;
+    scrollbar-color: $nc-border;
+    scrollbar-color-hover: $nc-muted;
+    scrollbar-color-active: $nc-accent;
+    scrollbar-background: $nc-canvas;
+    scrollbar-background-hover: $nc-canvas;
+    scrollbar-background-active: $nc-canvas;
+}
+
+#context-rail {
+    display: none;
+    width: 32;
+    height: 1fr;
+    padding: 1 1;
+    background: $nc-surface;
+    color: $nc-text;
+    border-left: solid $nc-border;
+}
+
+.wide #context-rail {
+    display: block;
+}
+
+#live-activity {
+    display: none;
+    height: 9;
+    min-height: 5;
+    max-height: 12;
+    margin: 0 1 1 1;
+    background: $nc-surface;
+    border-left: tall $nc-warning;
+}
+
+#activity-title {
+    height: 1;
+    padding: 0 1;
+    background: $nc-raised;
+}
+
+#activity-output {
+    height: 1fr;
+    padding: 0 1;
+    background: $nc-surface;
+    color: $nc-text;
+    border: none;
+    scrollbar-color: $nc-border;
+    scrollbar-background: $nc-surface;
+}
+
+#command-suggestions {
+    display: none;
+    height: auto;
+    max-height: 10;
+    padding: 0 2;
+    background: $nc-surface;
+    color: $nc-text;
+    border-left: tall $nc-accent;
+}
+
+#context-hint {
+    height: 1;
+    padding: 0 1;
+    background: $nc-surface;
+    color: $nc-muted;
+}
+
+#composer {
+    height: 4;
+    min-height: 3;
+    max-height: 8;
+    padding: 0 1;
+    background: $nc-surface;
+    color: $nc-text;
+    border: tall $nc-border;
+}
+
+#composer:focus {
+    border: tall $nc-accent;
+}
+
+.compact #conversation {
+    padding: 0 1;
+}
+
+.compact #context-hint {
+    display: none;
+}
+
+.compact #command-suggestions {
+    max-height: 6;
+}
+
+.compact #live-activity {
+    height: 5;
+}
+
+ApprovalModal,
+FilteredPicker,
+ActivityHistoryScreen,
+ConversationHistoryScreen {
+    align: center middle;
+    background: $nc-canvas 75%;
+}
+
+#approval-dialog,
+#picker-dialog,
+#detail-dialog,
+#history-dialog {
+    width: 76;
+    max-width: 94%;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    background: $nc-surface;
+    border: solid $nc-border;
+}
+
+#approval-dialog {
+    border: solid $nc-warning;
+}
+
+#approval-title,
+#picker-title,
+#detail-title {
+    height: 1;
+    margin-bottom: 1;
+    color: $nc-accent;
+    text-style: bold;
+}
+
+#approval-body {
+    height: auto;
+    max-height: 14;
+    margin-bottom: 1;
+}
+
+#approval-buttons {
+    height: auto;
+    align: center middle;
+}
+
+#approval-buttons Button {
+    margin: 0 1;
+}
+
+#picker-dialog {
+    height: 24;
+}
+
+#picker-filter {
+    margin-bottom: 1;
+    border: tall $nc-border;
+}
+
+#picker-filter:focus {
+    border: tall $nc-accent;
+}
+
+#picker-list,
+#activity-list {
+    height: 1fr;
+    background: $nc-canvas;
+    border: none;
+    scrollbar-color: $nc-border;
+    scrollbar-background: $nc-canvas;
+}
+
+#picker-hint,
+#detail-hint {
+    height: 1;
+    margin-top: 1;
+    color: $nc-muted;
+}
+
+#detail-dialog,
+#history-dialog {
+    width: 100;
+    height: 32;
+}
+
+#detail-body {
+    height: 1fr;
+}
+
+#activity-list {
+    width: 34;
+    border-right: solid $nc-border;
+}
+
+#activity-detail,
+#history-log {
+    width: 1fr;
+    height: 1fr;
+    padding: 0 1;
+    background: $nc-canvas;
+    border: none;
+    scrollbar-color: $nc-border;
+    scrollbar-background: $nc-canvas;
+}
+
+OptionList > .option-list--option-highlighted {
+    background: $nc-raised;
+    color: $nc-text;
+    text-style: bold;
+}

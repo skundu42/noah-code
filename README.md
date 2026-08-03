@@ -16,10 +16,6 @@ or system package setup is required.
 ```bash
 curl -LsSf https://raw.githubusercontent.com/skundu42/noah-code/main/install.sh | sh
 ```
-
-The bootstrapper validates macOS/Linux support, installs the standalone uv package manager, and
-downloads an isolated Python 3.12 runtime plus Noah Code. It does not modify a system Python.
-
 Open a new terminal, move into a repository, and run:
 
 ```bash
@@ -38,8 +34,11 @@ and seccomp support. You also need an LLM provider account such as OpenAI, Anthr
 - Switch between implementation-focused **build** mode and read-only **plan** mode.
 - Approve actions once or for a session with ordered `allow`, `ask`, and `deny` rules.
 - Undo and redo journaled file edits across process restarts.
-- Work in a full-screen TUI, a classic console, or one-shot non-interactive mode.
+- Work in an adaptive Atom One Dark cockpit, a classic console, or one-shot non-interactive mode.
+- Type `/` for a live-filtering command and configuration reference; press Enter to send.
+- Follow batched live tool output, then inspect compact execution records with `F2`.
 - Resume workspace-scoped sessions with todos and automatic context compaction.
+- Switch AI models between turns, with optional cross-repository defaults.
 - Extend workflows with slash commands, opt-in skills, MCP servers, model selection, and tracing.
 
 ## Quick start
@@ -90,6 +89,15 @@ noah update --check
 The package also installs `noah-code` and `nc` as equivalent entry points. Because `nc` commonly
 refers to netcat, `noah` or `noah-code` is recommended. Keep provider API keys in the environment
 or trusted NOOA user configuration, never in a repository or Noah Code session metadata.
+
+Inside a session, `/model MODEL` switches the active model immediately and remembers it when that
+session is resumed. It does not change other sessions. Use `/model --global MODEL` when the new
+model should also become the default for future sessions in every repository.
+
+The TUI keeps the conversation central and adds a session-and-plan rail on terminals at least
+110 columns wide. Tool output streams in a bounded activity panel and compacts after completion,
+keeping long runs responsive without deleting persisted session data. Press `F2` for activity
+details or `F3` for paginated conversation history.
 
 ## Documentation
 

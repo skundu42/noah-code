@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from typing import Any, Literal
 
 import click
 
 from noah_code import __version__
-from noah_code.config import config_sources, load_config
+from noah_code.config import (
+    NoahCodeConfig,
+    config_sources,
+    load_config,
+    save_user_default_model,
+    user_default_model,
+)
 from noah_code.host import AgentHost
 from noah_code.sessions import SessionError, SessionStore
 from noah_code.ui.console import ConsoleUI
@@ -41,8 +48,48 @@ def _common_options(fn):  # noqa: ANN001
     fn = click.option(
         "--auto", is_flag=True, help="Auto-approve ask decisions (never overrides deny)"
     )(fn)
-    fn = click.option("--model", "model", default=None, help="Override model alias")(fn)
+    fn = click.option(
+        "--model", "model", default=None, help="Override the model for this launch"
+    )(fn)
     return fn
+
+
+def _configure_first_run_model(model_override: str | None) -> str | None:
+    """Prompt once for a cross-repository default before an interactive launch."""
+
+    if user_default_model() is not None:
+        return model_override
+
+    if model_override is not None:
+        path = save_user_default_model(model_override)
+        click.echo(f"Saved {model_override} as the default model in {path}.", err=True)
+        return model_override
+
+    suggested = os.environ.get("NOAH_CODE_MODEL") or NoahCodeConfig().model
+    click.secho("Noah Code · first-run model setup", fg="bright_blue", bold=True, err=True)
+    click.echo(
+        "Choose the model Noah Code should use by default in every repository.",
+        err=True,
+    )
+    click.echo(
+        "Enter a LiteLLM model name or a configured NOOA model alias. "
+        "Repository config, environment variables, and --model can override it later.",
+        err=True,
+    )
+    click.echo(
+        "You can switch models between turns with /model MODEL, without starting a new session.",
+        err=True,
+    )
+
+    while True:
+        selected = click.prompt("Default model", default=suggested, show_default=True).strip()
+        try:
+            path = save_user_default_model(selected)
+        except ValueError as exc:
+            click.echo(f"Invalid model: {exc}", err=True)
+            continue
+        click.echo(f"Saved the global default in {path}.", err=True)
+        return selected
 
 
 @click.command("noah-code")
@@ -327,6 +374,15 @@ async def _interactive(
     use_console: bool,
     unsafe_inprocess_code_execution: bool,
 ) -> int:
+    try:
+        model = _configure_first_run_model(model)
+    except (OSError, ValueError) as exc:
+        click.echo(f"error: first-run model setup failed: {exc}", err=True)
+        return EXIT_CONFIG
+    except click.Abort:
+        click.echo("error: first-run model setup was cancelled", err=True)
+        return EXIT_CONFIG
+
     frontend: Literal["tui", "console"] | None = "console" if use_console else None
     prepared, code = await _prepare(
         path=path,
@@ -399,8 +455,6 @@ async def _run_once(
 
 def _launched_as_nc() -> bool:
     """Detect whether the process was launched as `nc` or `noah`."""
-    import os
-
     name = os.path.basename(sys.argv[0]) if sys.argv else ""
     return name in {"nc", "nc.exe", "noah", "noah.exe"}
 
@@ -408,8 +462,6 @@ def _launched_as_nc() -> bool:
 def main(argv: list[str] | None = None) -> None:
     """Dispatch: subcommands via group; otherwise interactive with optional PATH."""
     args = list(sys.argv[1:] if argv is None else argv)
-    import os
-
     base = os.path.basename(sys.argv[0]) if sys.argv else "noah-code"
     prog = base if base in {"nc", "noah", "noah-code"} else "noah-code"
     if args and args[0] in SUBCOMMANDS:

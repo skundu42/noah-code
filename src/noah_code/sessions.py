@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 from nooa.storage import SQLiteStorageManager
 
@@ -16,6 +18,16 @@ from noah_code.workspace import Workspace
 
 class SessionError(RuntimeError):
     """Session load/create failure."""
+
+
+@dataclass(frozen=True)
+class SessionEventRecord:
+    """Read-only event data used by lightweight history UIs."""
+
+    insertion_order: int
+    event_id: str
+    event_type: str
+    payload: dict[str, Any]
 
 
 @dataclass
@@ -155,3 +167,53 @@ class SessionStore:
             raise SessionError(
                 f"session {meta.session_id} belongs to {meta.workspace_path}, not {workspace.root}"
             )
+
+    def load_event_page(
+        self,
+        session_id: str,
+        *,
+        before: int | None = None,
+        limit: int = 50,
+    ) -> list[SessionEventRecord]:
+        """Read a chronological page without sharing the agent's SQLite connection."""
+
+        if not 1 <= limit <= 200:
+            raise ValueError("history page limit must be between 1 and 200")
+        db_path = self._db_path(session_id)
+        if not db_path.is_file():
+            return []
+
+        query = (
+            "SELECT insertion_order, event_id, event_type, data FROM events "
+            "WHERE insertion_order < ? AND json_valid(data) AND json_type(data) = 'object' "
+            "ORDER BY insertion_order DESC LIMIT ?"
+            if before is not None
+            else "SELECT insertion_order, event_id, event_type, data FROM events "
+            "WHERE json_valid(data) AND json_type(data) = 'object' "
+            "ORDER BY insertion_order DESC LIMIT ?"
+        )
+        params = (before, limit) if before is not None else (limit,)
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        try:
+            with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+                rows = connection.execute(query, params).fetchall()
+        except sqlite3.Error as exc:
+            raise SessionError(f"cannot read history for session {session_id}: {exc}") from exc
+
+        records: list[SessionEventRecord] = []
+        for insertion_order, event_id, event_type, raw_data in reversed(rows):
+            try:
+                payload = json.loads(raw_data)
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            records.append(
+                SessionEventRecord(
+                    insertion_order=int(insertion_order),
+                    event_id=str(event_id),
+                    event_type=str(event_type),
+                    payload=payload,
+                )
+            )
+        return records

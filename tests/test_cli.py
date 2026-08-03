@@ -6,7 +6,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from noah_code.cli import cli_group, interactive_cmd, main
+from noah_code.cli import _configure_first_run_model, cli_group, interactive_cmd, main
 
 
 def test_help() -> None:
@@ -62,3 +62,45 @@ def test_main_dispatches_subcommand(tmp_path: Path) -> None:
             main()
         except SystemExit as exc:
             assert exc.code in {0, None}
+
+
+def test_first_run_prompts_and_saves_global_model(monkeypatch, tmp_path: Path) -> None:
+    saved: list[str] = []
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setattr("noah_code.cli.user_default_model", lambda: None)
+    monkeypatch.setattr("noah_code.cli.click.prompt", lambda *args, **kwargs: "openai/gpt-5")
+    monkeypatch.setattr(
+        "noah_code.cli.save_user_default_model",
+        lambda model: saved.append(model) or config_path,
+    )
+
+    selected = _configure_first_run_model(None)
+
+    assert selected == "openai/gpt-5"
+    assert saved == ["openai/gpt-5"]
+
+
+def test_first_run_cli_override_becomes_global_default(monkeypatch, tmp_path: Path) -> None:
+    saved: list[str] = []
+    monkeypatch.setattr("noah_code.cli.user_default_model", lambda: None)
+    monkeypatch.setattr(
+        "noah_code.cli.save_user_default_model",
+        lambda model: saved.append(model) or tmp_path / "config.toml",
+    )
+
+    selected = _configure_first_run_model("anthropic/claude-sonnet-4-5")
+
+    assert selected == "anthropic/claude-sonnet-4-5"
+    assert saved == ["anthropic/claude-sonnet-4-5"]
+
+
+def test_existing_global_default_skips_first_run_prompt(monkeypatch) -> None:
+    monkeypatch.setattr("noah_code.cli.user_default_model", lambda: "global-model")
+
+    def unexpected_prompt(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("prompt should not be shown")
+
+    monkeypatch.setattr("noah_code.cli.click.prompt", unexpected_prompt)
+
+    assert _configure_first_run_model(None) is None
+    assert _configure_first_run_model("one-run-model") == "one-run-model"

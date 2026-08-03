@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from nooa.unifiedllm import FakeLLMClient
 
 from noah_code.approvals import ApprovalBroker, ApprovalChoice
+from noah_code.commands import help_text
 from noah_code.config import PermissionRule, load_config
 from noah_code.host import AgentHost
 from noah_code.permissions import PermissionEngine
@@ -111,3 +113,118 @@ async def test_resume_uses_persisted_model(tmp_path: Path, monkeypatch) -> None:
     await host.close()
 
     assert requested == ["resumed-model"]
+
+
+@pytest.mark.asyncio
+async def test_config_slash_command_shows_scoped_setting(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+
+    action = await host.handle_line("/config ui.theme")
+
+    assert action == "handled"
+    event = host.ui.render.call_args.args[0]
+    assert "ui.theme" in event.text
+    assert "atom-one-dark" in event.text
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_model_global_switches_session_and_saves_user_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+    switched: list[str] = []
+    saved: list[str] = []
+
+    async def switch_model(model: str) -> None:
+        switched.append(model)
+
+    monkeypatch.setattr(host, "_switch_model", switch_model)
+    monkeypatch.setattr(
+        "noah_code.host.save_user_default_model",
+        lambda model: saved.append(model) or tmp_path / "config.toml",
+    )
+
+    action = await host.handle_line("/model --global openai/gpt-5")
+
+    assert action == "handled"
+    assert switched == ["openai/gpt-5"]
+    assert saved == ["openai/gpt-5"]
+    assert host.config.model == "openai/gpt-5"
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_model_name_with_global_prefix_is_not_parsed_as_flag(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    switched: list[str] = []
+
+    async def switch_model(model: str) -> None:
+        switched.append(model)
+
+    monkeypatch.setattr(host, "_switch_model", switch_model)
+
+    action = await host.handle_line("/model --global-preview")
+
+    assert action == "handled"
+    assert switched == ["--global-preview"]
+    await host.close()
+
+
+def test_help_includes_global_model_command() -> None:
+    assert "/model --global MODEL" in help_text()
+
+
+@pytest.mark.asyncio
+async def test_model_switch_persists_for_current_session(tmp_path: Path, monkeypatch) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={
+            "model": "initial-model",
+            "session_dir": str(tmp_path / "sessions"),
+        },
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    requested: list[str] = []
+    switched_client = FakeLLMClient()
+
+    def get_client(model: str):  # noqa: ANN202
+        requested.append(model)
+        return switched_client
+
+    monkeypatch.setattr("nooa.unifiedllm.get_llm_client", get_client)
+
+    action = await host.handle_line("/model next-model")
+
+    assert action == "handled"
+    assert requested == ["next-model"]
+    assert host.agent._llm is switched_client
+    assert host.meta is not None
+    assert host.meta.model == "next-model"
+    assert host.store.load_meta(host.meta.session_id).model == "next-model"
+    assert host.config.model == "initial-model"
+    await host.close()

@@ -14,12 +14,12 @@ from nooa.tracing import enable_tracing, exporters, flush_traces, set_session
 
 from noah_code.agent import CodingAgent
 from noah_code.approvals import ApprovalChoice
-from noah_code.commands import help_text, parse_slash
-from noah_code.config import NoahCodeConfig
+from noah_code.commands import config_text, help_text, parse_slash
+from noah_code.config import NoahCodeConfig, save_user_default_model, user_default_model
 from noah_code.custom_commands import CustomCommand, discover_custom_commands
 from noah_code.event_bridge import install_event_bridge
 from noah_code.events import HostEvent, HostEventKind
-from noah_code.sessions import SessionMeta, SessionStore
+from noah_code.sessions import SessionEventRecord, SessionMeta, SessionStore
 from noah_code.ui.console import ConsoleUI
 from noah_code.ui.protocol import HostUI
 from noah_code.workspace import Workspace
@@ -277,6 +277,23 @@ class AgentHost:
     def list_session_metas(self) -> list[SessionMeta]:
         return self.store.list_sessions(self.workspace)
 
+    async def load_history_page(
+        self,
+        *,
+        before: int | None = None,
+        limit: int = 50,
+    ) -> list[SessionEventRecord]:
+        """Load persisted UI history without blocking the Textual event loop."""
+
+        if self.meta is None:
+            return []
+        return await asyncio.to_thread(
+            self.store.load_event_page,
+            self.meta.session_id,
+            before=before,
+            limit=limit,
+        )
+
     def cancel_active_turn(self) -> None:
         """Cancel the in-flight turn and pending approvals (Ctrl-C)."""
         self._cancel_turn = True
@@ -306,6 +323,19 @@ class AgentHost:
         if name == "help":
             self.ui.render(HostEvent(HostEventKind.MESSAGE, help_text(self._custom_commands)))
             return "handled"
+        if name == "config":
+            try:
+                text = config_text(self.config, args)
+            except KeyError:
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.ERROR,
+                        f"unknown configuration path {args.strip()!r}; use /config to list all",
+                    )
+                )
+            else:
+                self.ui.render(HostEvent(HostEventKind.MESSAGE, f"```text\n{text}\n```"))
+            return "handled"
         if name in self._custom_commands:
             return await self._run_custom_command(name, args)
         if name == "exit" or name == "quit":
@@ -330,8 +360,11 @@ class AgentHost:
             return "handled"
         if name == "mode":
             mode = args.strip().lower()
+            if not mode:
+                self.ui.render(HostEvent(HostEventKind.STATUS, f"mode={agent.mode}"))
+                return "handled"
             if mode not in {"build", "plan"}:
-                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /mode build|plan"))
+                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /mode [build|plan]"))
                 return "handled"
             agent.set_mode(mode)  # type: ignore[arg-type]
             if self.meta:
@@ -341,15 +374,35 @@ class AgentHost:
             self.ui.set_status(self.status_prompt())
             return "handled"
         if name == "model":
-            if not args.strip():
+            requested = args.strip()
+            if not requested:
+                default_model = user_default_model() or "(not configured)"
                 self.ui.render(
                     HostEvent(
                         HostEventKind.STATUS,
-                        f"model={self.meta.model if self.meta else self.config.model}",
+                        f"model={self.meta.model if self.meta else self.config.model} "
+                        f"global_default={default_model}",
                     )
                 )
                 return "handled"
-            await self._switch_model(args.strip())
+            if requested == "--global" or requested.startswith("--global "):
+                global_model = requested.removeprefix("--global").strip()
+                if not global_model:
+                    self.ui.render(
+                        HostEvent(HostEventKind.ERROR, "usage: /model --global MODEL")
+                    )
+                    return "handled"
+                await self._switch_model(global_model)
+                path = save_user_default_model(global_model)
+                self.config.model = global_model
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.STATUS,
+                        f"global default model set to {global_model} in {path}",
+                    )
+                )
+                return "handled"
+            await self._switch_model(requested)
             return "handled"
         if name == "session":
             self.ui.render(

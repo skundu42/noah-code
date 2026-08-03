@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
@@ -40,6 +43,7 @@ class SummarizationPolicy(BaseModel):
 
 
 class UIConfig(BaseModel):
+    theme: Literal["atom-one-dark"] = "atom-one-dark"
     show_reasoning: bool = False
     markdown: bool = True
     stream_shell: bool = True
@@ -166,6 +170,62 @@ DEFAULT_PERMISSION_RULES: list[PermissionRule] = [
 
 def _user_config_path() -> Path:
     return Path.home() / ".config" / "noah-code" / "config.toml"
+
+
+_TOP_LEVEL_MODEL_RE = re.compile(r"^(?P<indent>\s*)model\s*=.*$")
+
+
+def user_default_model() -> str | None:
+    """Return the explicitly configured cross-repository model, if any."""
+
+    value = _load_toml(_user_config_path()).get("model")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def save_user_default_model(model: str) -> Path:
+    """Persist a top-level model while preserving the rest of the user TOML file."""
+
+    selected = model.strip()
+    if not selected or any(character.isspace() for character in selected):
+        raise ValueError("model must be a non-empty name without whitespace")
+
+    path = _user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    existing = path.read_text() if path.is_file() else ""
+    lines = existing.splitlines(keepends=True)
+    encoded = json.dumps(selected, ensure_ascii=False)
+    replacement = f"model = {encoded}\n"
+
+    first_table = next(
+        (index for index, line in enumerate(lines) if line.lstrip().startswith("[")),
+        len(lines),
+    )
+    model_line = next(
+        (index for index, line in enumerate(lines[:first_table]) if _TOP_LEVEL_MODEL_RE.match(line)),
+        None,
+    )
+    if model_line is not None:
+        lines[model_line] = replacement
+    else:
+        if first_table and not lines[first_table - 1].endswith(("\n", "\r")):
+            lines[first_table - 1] += "\n"
+        insertion = [replacement]
+        if first_table < len(lines) and lines[first_table].lstrip().startswith("["):
+            insertion.append("\n")
+        lines[first_table:first_table] = insertion
+
+    content = "".join(lines) or replacement
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".config-", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(content)
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return path
 
 
 def _project_config_path(workspace: Path) -> Path:

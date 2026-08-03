@@ -10,6 +10,28 @@ Configuration is merged in this order, with later layers taking precedence:
 4. `NOAH_CODE_*` environment variables.
 5. CLI flags.
 
+### First-run model setup
+
+The first interactive `noah` launch asks for an AI model before starting the agent. Noah Code
+saves that choice as the top-level `model` in `~/.config/noah-code/config.toml`, making it the
+default for every repository. Enter a LiteLLM model name or an alias from the NOOA model registry.
+
+An explicit `noah --model MODEL` on the first launch is saved without prompting. Project config,
+`NOAH_CODE_MODEL`, and later `--model` flags still override the user default according to the
+precedence above. Non-interactive commands such as `noah run`, `doctor`, and `config show` never
+open the onboarding prompt.
+
+Inside an interactive session, switch only the current session or replace the global default:
+
+```text
+/model openai/MODEL_NAME
+/model --global anthropic/MODEL_NAME
+```
+
+Model switches take effect between turns and are stored in the current session metadata, so a
+resumed session continues with its most recently selected model. A session-only `/model MODEL`
+does not change the user configuration or affect new sessions.
+
 Example user configuration:
 
 ```toml
@@ -21,6 +43,7 @@ cell_timeout = 120
 command_timeout = 60
 
 [ui]
+theme = "atom-one-dark"
 frontend = "tui"       # "tui" or "console"
 markdown = true
 stream_shell = true
@@ -60,10 +83,18 @@ A user-configured `permission_rules` array replaces the default rule array. Copy
 default you still want before adding overrides. Hard secret, destructive-shell, and plan-mode
 gates remain enforced in code.
 
-Inspect the resolved configuration with:
+Inspect the resolved configuration from the CLI or inside an interactive session. `/config`
+lists every nested path, while an optional path scopes the output. Values whose names look like
+credentials are redacted.
 
 ```bash
 noah config show .
+```
+
+```text
+/config
+/config summarization
+/config updates.auto_install
 ```
 
 Model and provider configuration follows NOOA conventions, including its model registry,

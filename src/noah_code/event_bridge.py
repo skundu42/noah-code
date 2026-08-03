@@ -32,7 +32,18 @@ def install_event_bridge(agent: Any, emit: EmitFn) -> list[Unsubscribe]:
             text = f"execute_python{(': ' + preview) if preview else ''}"
         else:
             text = f"{name}({_brief_args(args)})"
-        emit(HostEvent(HostEventKind.TOOL_START, text, meta={"tool": name}))
+        activity_id = str(getattr(event, "tool_call_id", "") or getattr(event, "id", ""))
+        emit(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                text,
+                meta={
+                    "activity_id": activity_id,
+                    "tool": name,
+                    "state": "running",
+                },
+            )
+        )
 
     def on_python_output(event: Any) -> None:
         status = str(getattr(event, "execution_status", "") or "")
@@ -47,20 +58,18 @@ def install_event_bridge(agent: Any, emit: EmitFn) -> list[Unsubscribe]:
         elif stdout:
             line = stdout.splitlines()[0][:80]
             parts.append(line)
-        emit(
-            HostEvent(
-                HostEventKind.TOOL_FINISH,
-                " · ".join(p for p in parts if p),
-                meta={"kind": "python_output"},
-            )
-        )
+        activity_id = str(getattr(event, "tool_call_id", "") or getattr(event, "id", ""))
         # Stream truncated stdout/stderr as shell-like chunks when present.
         if stdout and len(stdout) > 0:
             emit(
                 HostEvent(
                     HostEventKind.SHELL_CHUNK,
                     _truncate(stdout, 4000),
-                    meta={"stream": "stdout", "source": "codeact"},
+                    meta={
+                        "activity_id": activity_id,
+                        "stream": "stdout",
+                        "source": "codeact",
+                    },
                 )
             )
         if stderr:
@@ -68,9 +77,27 @@ def install_event_bridge(agent: Any, emit: EmitFn) -> list[Unsubscribe]:
                 HostEvent(
                     HostEventKind.SHELL_CHUNK,
                     _truncate(stderr, 2000),
-                    meta={"stream": "stderr", "source": "codeact"},
+                    meta={
+                        "activity_id": activity_id,
+                        "stream": "stderr",
+                        "source": "codeact",
+                    },
                 )
             )
+        status_value = getattr(getattr(event, "execution_status", None), "value", status)
+        emit(
+            HostEvent(
+                HostEventKind.TOOL_FINISH,
+                " · ".join(p for p in parts if p),
+                meta={
+                    "activity_id": activity_id,
+                    "kind": "python_output",
+                    "tool": "execute_python",
+                    "state": "finished",
+                    "result_status": str(status_value).lower(),
+                },
+            )
+        )
 
     def on_error(event: Any) -> None:
         content = str(getattr(event, "content", event) or "")
