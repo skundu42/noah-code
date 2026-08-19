@@ -42,16 +42,17 @@ if TYPE_CHECKING:
 
 ATOM_ONE_DARK_TEXT_AREA = TextAreaTheme(
     name="atom-one-dark",
-    base_style=Style(color="#abb2bf", bgcolor="#21252b"),
-    cursor_style=Style(color="#282c34", bgcolor="#61afef"),
-    cursor_line_style=Style(bgcolor="#2c313c"),
-    bracket_matching_style=Style(color="#e5c07b", bold=True),
-    selection_style=Style(bgcolor="#3e4451"),
+    base_style=Style(color="#d1d1d6", bgcolor="#17171a"),
+    cursor_style=Style(color="#101012", bgcolor="#b8a9ff"),
+    cursor_line_style=Style(bgcolor="#222226"),
+    bracket_matching_style=Style(color="#e6b673", bold=True),
+    selection_style=Style(bgcolor="#303036"),
 )
 
 MAX_TRANSCRIPT_LINES = 10_000
 MAX_ACTIVITY_HISTORY = 100
 HISTORY_PAGE_SIZE = 50
+RECENT_HISTORY_SIZE = 24
 STREAM_FLUSH_SECONDS = 0.05
 WIDE_MIN_COLUMNS = 110
 COMPACT_MAX_ROWS = 25
@@ -118,19 +119,58 @@ class ActivityRecord:
 
 def _role_renderable(entry: TranscriptEntry) -> Group:
     colors = {
-        "YOU": "#98c379",
-        "NOAH": "#61afef",
-        "ACTIVITY": "#e5c07b",
-        "ERROR": "#e06c75",
-        "SUMMARY": "#c678dd",
-        "STATUS": "#7f848e",
+        "YOU": "#b8a9ff",
+        "NOAH": "#8bd5ca",
+        "COMMAND": "#a6da95",
+        "ACTIVITY": "#e6b673",
+        "ERROR": "#ed8796",
+        "SUMMARY": "#c6a0f6",
+        "STATUS": "#777781",
     }
-    label = Text(entry.role, style=f"bold {colors.get(entry.role, '#7f848e')}")
+    labels = {
+        "YOU": "▌ You",
+        "NOAH": "▌ Noah",
+        "COMMAND": "▌ Command output",
+        "ACTIVITY": "  Activity",
+        "ERROR": "▌ Error",
+        "SUMMARY": "▌ Summary",
+        "STATUS": "  ·",
+    }
+    label = Text(labels.get(entry.role, entry.role), style=f"bold {colors.get(entry.role, '#777781')}")
     if entry.markdown:
-        body: Any = Markdown(entry.text, code_theme="one-dark", hyperlinks=True)
+        body: Any = Markdown(entry.text, code_theme="monokai", hyperlinks=True)
     else:
-        body = Text(entry.text, style="#abb2bf")
-    return Group(Text(""), label, Padding(body, (0, 0, 0, 2)))
+        body = Text(entry.text, style="#d1d1d6")
+    return Group(label, Padding(body, (0, 0, 1, 2)))
+
+
+def _welcome_renderable(repository: str, *, starting: bool) -> Group:
+    """Focused empty state inspired by terminal-native coding tools."""
+
+    state = "Starting agent…" if starting else "Ready"
+    return Group(
+        Text("NOAH", style="bold #f1f1f3", justify="center"),
+        Text("CODE", style="bold #b8a9ff", justify="center"),
+        Text(""),
+        Text(repository, style="#777781", justify="center"),
+        Text(state, style="#8bd5ca" if not starting else "#e6b673", justify="center"),
+        Text(""),
+        Text(
+            "/  commands     tab  build/plan     ctrl+p  palette",
+            style="#777781",
+            justify="center",
+        ),
+    )
+
+
+def _command_insertion(invocation: str) -> str:
+    """Turn a display invocation into editable composer text."""
+
+    if invocation.startswith("/model --global"):
+        return "/model --global "
+    if " [" in invocation:
+        return invocation.split(" [", 1)[0] + " "
+    return invocation
 
 
 def _record_to_entries(record: SessionEventRecord) -> list[TranscriptEntry]:
@@ -189,10 +229,20 @@ class ComposerTextArea(TextArea):
             event.prevent_default()
             app.accept_suggestion()  # type: ignore[attr-defined]
             return
+        if suggestions_open and event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            app.accept_suggestion()  # type: ignore[attr-defined]
+            return
         if suggestions_open and event.key == "escape":
             event.stop()
             event.prevent_default()
             app.close_suggestions()  # type: ignore[attr-defined]
+            return
+        if event.key == "tab":
+            event.stop()
+            event.prevent_default()
+            app.action_toggle_mode()  # type: ignore[attr-defined]
             return
         if event.key == "enter":
             event.stop()
@@ -227,10 +277,10 @@ class ApprovalModal(ModalScreen[ApprovalChoice]):
             yield Label("PERMISSION REQUIRED", id="approval-title")
             yield Static(
                 Text.assemble(
-                    (f"{decision.category.upper()}\n", "bold #e5c07b"),
-                    (f"{decision.target}\n\n", "#abb2bf"),
-                    (f"{decision.reason}\n", "#7f848e"),
-                    (f"Remember as: {decision.remember_pattern}", "#7f848e"),
+                    (f"{decision.category.upper()}\n", "bold #e6b673"),
+                    (f"{decision.target}\n\n", "#d1d1d6"),
+                    (f"{decision.reason}\n", "#777781"),
+                    (f"Remember as: {decision.remember_pattern}", "#777781"),
                 ),
                 id="approval-body",
             )
@@ -293,21 +343,23 @@ class FilteredPicker(ModalScreen[str | None]):
         options = []
         for value, label, description in self._filtered:
             prompt = Text.assemble(
-                (label, "bold #61afef"),
-                (f"  {description}" if description else "", "#7f848e"),
+                (label, "bold #b8a9ff"),
+                (f"  {description}" if description else "", "#777781"),
             )
             options.append(Option(prompt, id=value))
         if options:
             option_list.add_options(options)
             option_list.highlighted = 0
         else:
-            option_list.add_option(Option(Text("No matches", style="#7f848e"), disabled=True))
+            option_list.add_option(Option(Text("No matches", style="#777781"), disabled=True))
 
     @on(Input.Changed, "#picker-filter")
     def _filter(self, event: Input.Changed) -> None:
-        query = event.value.strip().lower().lstrip("/")
+        query = event.value.strip().lower().lstrip("/$")
         if query:
-            starts = [row for row in self._rows if row[1].lower().lstrip("/").startswith(query)]
+            starts = [
+                row for row in self._rows if row[1].lower().lstrip("/$").startswith(query)
+            ]
             contains = [
                 row
                 for row in self._rows
@@ -358,6 +410,44 @@ class FilteredPicker(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class TextPromptModal(ModalScreen[str | None]):
+    """Small focused prompt used by the skill and MCP setup flows."""
+
+    BINDINGS = [Binding("escape", "cancel", "Close", show=True)]
+
+    def __init__(
+        self,
+        title: str,
+        placeholder: str,
+        hint: str,
+        *,
+        password: bool = False,
+    ) -> None:
+        super().__init__()
+        self.prompt_title = title
+        self.placeholder = placeholder
+        self.hint = hint
+        self.password = password
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="prompt-dialog"):
+            yield Label(self.prompt_title.upper(), id="prompt-title")
+            yield Input(placeholder=self.placeholder, password=self.password, id="prompt-input")
+            yield Static(self.hint, id="prompt-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt-input", Input).focus()
+
+    @on(Input.Submitted, "#prompt-input")
+    def _submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        if value:
+            self.dismiss(value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ActivityHistoryScreen(ModalScreen[None]):
     """Inspect bounded full output for recent execution activities."""
 
@@ -387,7 +477,7 @@ class ActivityHistoryScreen(ModalScreen[None]):
         options = []
         for record in self.records:
             icon = "✓" if record.state == "complete" else "×" if record.state == "error" else "◆"
-            prompt = Text(f"{icon} {record.tool}  {record.duration:.1f}s", style="#abb2bf")
+            prompt = Text(f"{icon} {record.tool}  {record.duration:.1f}s", style="#d1d1d6")
             options.append(Option(prompt, id=record.activity_id))
         option_list = self.query_one("#activity-list", OptionList)
         if options:
@@ -396,16 +486,16 @@ class ActivityHistoryScreen(ModalScreen[None]):
             self._show_record(self.records[0])
             option_list.focus()
         else:
-            option_list.add_option(Option(Text("No activity yet", style="#7f848e"), disabled=True))
+            option_list.add_option(Option(Text("No activity yet", style="#777781"), disabled=True))
 
     def _show_record(self, record: ActivityRecord) -> None:
         detail = self.query_one("#activity-detail", RichLog)
         detail.clear()
         detail.write(
             Text.assemble(
-                (f"{record.label}\n", "bold #61afef"),
-                (f"{record.state} · {record.duration:.2f}s · {record.line_count} lines\n\n", "#7f848e"),
-                (record.output or record.result or "No captured output", "#abb2bf"),
+                (f"{record.label}\n", "bold #b8a9ff"),
+                (f"{record.state} · {record.duration:.2f}s · {record.line_count} lines\n\n", "#777781"),
+                (record.output or record.result or "No captured output", "#d1d1d6"),
             )
         )
 
@@ -463,14 +553,14 @@ class ConversationHistoryScreen(ModalScreen[None]):
             entries = [entry for record in records for entry in _record_to_entries(record)]
             if not entries and self._before is None:
                 self.query_one("#history-log", RichLog).write(
-                    Text("No persisted conversation yet.", style="#7f848e")
+                    Text("No persisted conversation yet.", style="#777781")
                 )
             else:
                 self._entries = entries + self._entries
                 self._render_entries()
         except Exception as exc:  # noqa: BLE001
             self.query_one("#history-log", RichLog).write(
-                Text(f"History could not be loaded: {exc}", style="#e06c75")
+                Text(f"History could not be loaded: {exc}", style="#ed8796")
             )
         finally:
             self._loading = False
@@ -553,7 +643,7 @@ class TextualUI:
 
 
 class NoahCodeApp(App[None]):
-    """Adaptive quiet-cockpit coding interface."""
+    """Fast, keyboard-first coding interface."""
 
     TITLE = "Noah Code"
     CSS_PATH = "textual.css"
@@ -562,8 +652,10 @@ class NoahCodeApp(App[None]):
         Binding("ctrl+q", "quit_app", "Quit", show=True),
         Binding("ctrl+c", "cancel_or_quit", "Cancel", show=True),
         Binding("ctrl+p", "palette", "Commands", show=True),
+        Binding("ctrl+k", "skills", "Skills", show=True, priority=True),
         Binding("ctrl+o", "sessions", "Sessions", show=True),
         Binding("ctrl+n", "new_session", "New", show=True),
+        Binding("tab", "toggle_mode", "Build/Plan", show=True),
         Binding("f1", "show_help", "Help", show=True),
         Binding("f2", "activity_history", "Activity", show=True),
         Binding("f3", "conversation_history", "History", show=True),
@@ -576,6 +668,9 @@ class NoahCodeApp(App[None]):
         self.host = host
         self.ui = ui
         self._turn_task: asyncio.Task[None] | None = None
+        self._agent_ready = host._agent is not None
+        self._pending_submit: str | None = None
+        self._session_id = host.meta.session_id if host.meta else None
         self._interrupt_count = 0
         self._header_text = ""
         self._rail_text = ""
@@ -593,6 +688,7 @@ class NoahCodeApp(App[None]):
         self._follow_batch: bool | None = None
         self._suggestion_matches: list[CommandSuggestion] = []
         self._suggestion_index = 0
+        self._skip_suggestion_text: str | None = None
         self._base_commands = all_command_suggestions(host._custom_commands)
         self._config_commands: list[CommandSuggestion] | None = None
         self._composer_rows = 4
@@ -606,6 +702,13 @@ class NoahCodeApp(App[None]):
         yield Static("", id="header")
         with Horizontal(id="workspace-layout"):
             with Vertical(id="primary-pane"):
+                yield Static(
+                    _welcome_renderable(
+                        self.host.workspace.root.name or str(self.host.workspace.root),
+                        starting=not self._agent_ready,
+                    ),
+                    id="welcome",
+                )
                 yield RichLog(
                     id="conversation",
                     markup=False,
@@ -643,15 +746,52 @@ class NoahCodeApp(App[None]):
         composer.register_theme(ATOM_ONE_DARK_TEXT_AREA)
         composer.theme = self.host.config.ui.theme
         composer.focus()
-        self._spinner_timer = self.set_interval(0.25, self._tick_busy, pause=not self.ui.busy)
-        self._append_entry(
-            TranscriptEntry(
-                "STATUS",
-                "Ready. Describe a task, or type / to explore commands.",
-            )
+        self._spinner_timer = self.set_interval(
+            0.25,
+            self._tick_busy,
+            pause=not self.ui.busy and self._agent_ready,
         )
         self.update_chrome(force=True)
-        self._load_recent_history()
+        if self._agent_ready:
+            self._load_recent_history()
+        else:
+            self._phase = "starting"
+            self.ui.set_busy(True)
+            self._start_host()
+
+    @work(exclusive=True, group="startup")
+    async def _start_host(self) -> None:
+        """Warm the agent after the first frame instead of blocking launch."""
+
+        try:
+            await self.host.start()
+        except Exception as exc:  # noqa: BLE001
+            self._phase = "startup failed"
+            self._reveal_transcript()
+            self._append_entry(
+                TranscriptEntry(
+                    "ERROR",
+                    f"Agent could not start: {exc}\nType /model to configure a provider and retry.",
+                )
+            )
+        else:
+            self._agent_ready = True
+            self._phase = "ready"
+            self._base_commands = all_command_suggestions(self.host._custom_commands)
+            self.query_one("#welcome", Static).update(
+                _welcome_renderable(
+                    self.host.workspace.root.name or str(self.host.workspace.root),
+                    starting=False,
+                ),
+                layout=False,
+            )
+            if self._pending_submit:
+                pending = self._pending_submit
+                self._pending_submit = None
+                self._run_turn(pending)
+        finally:
+            self.ui.set_busy(False)
+            self.update_chrome(force=True)
 
     def on_resize(self, event: events.Resize) -> None:
         self._apply_layout(event.size.width, event.size.height)
@@ -676,9 +816,10 @@ class NoahCodeApp(App[None]):
         repository = self.host.workspace.root.name or str(self.host.workspace.root)
         state = self._phase
         if self.ui.busy:
-            state = f"working {'◐◓◑◒'[self._spinner_index]}"
-        unread = f" · {self._unread_count} new" if self._unread_count else ""
-        header = f" NOAH  {repository}  ·  {mode}  ·  {model}  ·  {session_id}  ·  {state}{unread} "
+            verb = "starting" if not self._agent_ready else "working"
+            state = f"{verb} {'◐◓◑◒'[self._spinner_index]}"
+        unread = f"  {self._unread_count} new" if self._unread_count else ""
+        header = f" noah   {repository}   {mode.upper()}   {model}   {session_id}   {state}{unread} "
         if force or header != self._header_text:
             self._header_text = header
             with contextlib.suppress(Exception):
@@ -698,15 +839,15 @@ class NoahCodeApp(App[None]):
     def _build_rail_text(self) -> Text:
         meta = self.host.meta
         text = Text()
-        text.append("SESSION\n", style="bold #61afef")
-        text.append(f"{meta.title if meta and meta.title != 'untitled' else 'Untitled session'}\n", style="#abb2bf")
+        text.append("SESSION\n", style="bold #b8a9ff")
+        text.append(f"{meta.title if meta and meta.title != 'untitled' else 'Untitled session'}\n", style="#d1d1d6")
         if meta:
-            text.append(f"{meta.session_id[:8]}\n", style="#7f848e")
-        text.append("\nCURRENT\n", style="bold #61afef")
+            text.append(f"{meta.session_id[:8]}\n", style="#777781")
+        text.append("\nCURRENT\n", style="bold #b8a9ff")
         if self._active_activity_id and self._active_activity_id in self._activities:
-            text.append(self._activities[self._active_activity_id].label[:34], style="#e5c07b")
+            text.append(self._activities[self._active_activity_id].label[:34], style="#e6b673")
         else:
-            text.append("Waiting for your next turn", style="#7f848e")
+            text.append("Waiting for your next turn", style="#777781")
 
         todos: list[Any] = []
         if self.host._agent is not None:
@@ -714,17 +855,17 @@ class NoahCodeApp(App[None]):
                 candidate = self.host.agent.todos.list_todos()
                 if isinstance(candidate, list):
                     todos = candidate
-        text.append("\n\nPLAN\n", style="bold #61afef")
+        text.append("\n\nPLAN\n", style="bold #b8a9ff")
         if not todos:
-            text.append("No active plan", style="#7f848e")
+            text.append("No active plan", style="#777781")
             return text
         done = sum(1 for todo in todos if getattr(todo, "status", "") == "done")
-        text.append(f"{done}/{len(todos)} complete\n", style="#7f848e")
+        text.append(f"{done}/{len(todos)} complete\n", style="#777781")
         visible = [todo for todo in todos if getattr(todo, "status", "") != "done"][:6]
         for todo in visible:
             status = getattr(todo, "status", "open")
             icon = "●" if status == "blocked" else "○"
-            color = "#e06c75" if status == "blocked" else "#abb2bf"
+            color = "#ed8796" if status == "blocked" else "#d1d1d6"
             text.append(f"{icon} {str(getattr(todo, 'title', 'Untitled'))[:28]}\n", style=color)
         return text
 
@@ -738,6 +879,7 @@ class NoahCodeApp(App[None]):
         at_end = self._follow_batch if self._follow_batch is not None else self._at_transcript_end()
         if entry.event_id:
             self._transcript_event_ids.add(entry.event_id)
+        self._reveal_transcript()
         self._transcript_entries.append(entry)
         if len(self._transcript_entries) > 500:
             self._transcript_entries = self._transcript_entries[-500:]
@@ -748,6 +890,13 @@ class NoahCodeApp(App[None]):
         if not at_end:
             self._unread_count += 1
             self.update_chrome()
+
+    def _reveal_transcript(self) -> None:
+        """Swap the centered launch state for the conversation exactly once."""
+
+        with contextlib.suppress(Exception):
+            self.query_one("#welcome", Static).styles.display = "none"
+            self.query_one("#conversation", RichLog).styles.display = "block"
 
     def _rerender_transcript(self) -> None:
         log = self.query_one("#conversation", RichLog)
@@ -762,12 +911,13 @@ class NoahCodeApp(App[None]):
         if loader is None:
             return
         try:
-            records = await loader(limit=HISTORY_PAGE_SIZE)
+            records = await loader(limit=RECENT_HISTORY_SIZE)
         except Exception:  # noqa: BLE001 - history is an optional enhancement
             return
         entries = [entry for record in records for entry in _record_to_entries(record)]
         if not entries:
             return
+        self._reveal_transcript()
         existing = list(self._transcript_entries)
         history = [entry for entry in entries if not entry.event_id or entry.event_id not in self._transcript_event_ids]
         if not history:
@@ -805,7 +955,16 @@ class NoahCodeApp(App[None]):
         text = event.text.rstrip()
         if event.kind == HostEventKind.MESSAGE:
             self._finish_orphan_activity()
-            self._append_entry(TranscriptEntry("NOAH", text, True))
+            plain_command = (
+                event.meta.get("source") == "command" or event.meta.get("format") == "plain"
+            )
+            self._append_entry(
+                TranscriptEntry(
+                    "COMMAND" if plain_command else "NOAH",
+                    text,
+                    markdown=not plain_command,
+                )
+            )
         elif event.kind == HostEventKind.REASONING and self.host.config.ui.show_reasoning:
             self._append_entry(TranscriptEntry("STATUS", f"Thinking: {text}"))
         elif event.kind == HostEventKind.TOOL_START:
@@ -826,6 +985,8 @@ class NoahCodeApp(App[None]):
                 self._phase = "thinking"
             elif kind == "llm_end":
                 self._finish_orphan_activity()
+                self._phase = "ready"
+            elif text.startswith("mode set to "):
                 self._phase = "ready"
             else:
                 self._append_entry(TranscriptEntry("STATUS", text))
@@ -853,7 +1014,7 @@ class NoahCodeApp(App[None]):
         self._active_activity_id = activity_id
         self._phase = record.tool
         self.query_one("#activity-title", Static).update(
-            Text.assemble(("◆ RUNNING  ", "bold #e5c07b"), (record.label, "#abb2bf")),
+            Text.assemble(("◆ RUNNING  ", "bold #e6b673"), (record.label, "#d1d1d6")),
             layout=False,
         )
         output = self.query_one("#activity-output", RichLog)
@@ -868,7 +1029,7 @@ class NoahCodeApp(App[None]):
             self._activities[activity_id] = record
             self._active_activity_id = activity_id
             self.query_one("#activity-title", Static).update(
-                Text("◆ RUNNING  shell output", style="bold #e5c07b"), layout=False
+                Text("◆ RUNNING  shell output", style="bold #e6b673"), layout=False
             )
             self.query_one("#live-activity", Vertical).styles.display = "block"
         stream = str(event.meta.get("stream", "stdout"))
@@ -890,7 +1051,7 @@ class NoahCodeApp(App[None]):
         self._stream_fragments.clear()
         log = self.query_one("#activity-output", RichLog)
         for stream, fragments in grouped:
-            color = "#e06c75" if stream == "stderr" else "#abb2bf"
+            color = "#ed8796" if stream == "stderr" else "#d1d1d6"
             log.write(Text("".join(fragments), style=color), scroll_end=True)
         if self._active_activity_id and self._active_activity_id in self._activities:
             lines = self._activities[self._active_activity_id].line_count
@@ -946,12 +1107,26 @@ class NoahCodeApp(App[None]):
         query = text.strip()
         if not query.startswith("/") or "\n" in text:
             return []
+        raw_lowered = text.lstrip().lower()
+        if raw_lowered.startswith("/mode "):
+            mode_query = raw_lowered.removeprefix("/mode ").strip()
+            mode_options = [
+                CommandSuggestion("/mode build", "Switch to build mode"),
+                CommandSuggestion("/mode plan", "Switch to plan mode"),
+            ]
+            if not mode_query:
+                return mode_options
+            return [
+                item
+                for item in mode_options
+                if item.invocation.rsplit(" ", 1)[-1].startswith(mode_query)
+            ]
         commands = list(self._base_commands)
-        if query.lower().startswith("/config"):
+        lowered = query.lower()
+        if lowered.startswith("/config"):
             if self._config_commands is None:
                 self._config_commands = config_command_suggestions(self.host.config)
             commands.extend(self._config_commands)
-        lowered = query.lower()
         prefix = [item for item in commands if item.invocation.lower().startswith(lowered)]
         if prefix or lowered == "/":
             return prefix
@@ -964,10 +1139,7 @@ class NoahCodeApp(App[None]):
 
     def _update_command_suggestions(self, text: str) -> None:
         self._suggestion_matches = self._matching_command_suggestions(text)
-        self._suggestion_index = min(
-            self._suggestion_index,
-            max(len(self._suggestion_matches) - 1, 0),
-        )
+        self._suggestion_index = 0
         self._render_suggestions()
 
     def _render_suggestions(self) -> None:
@@ -976,43 +1148,52 @@ class NoahCodeApp(App[None]):
             widget.update("")
             widget.styles.display = "none"
             self.query_one("#context-hint", Static).update(
-                "Enter send · Shift+Enter newline · / commands · F2 activity · F3 history",
+                "Enter send · Shift+Enter newline · Tab build/plan · / commands · F2 activity",
                 layout=False,
             )
             return
-        visible = self._suggestion_matches[:8]
-        lines = [Text.assemble(("COMMANDS", "bold #61afef"), (f"  {len(self._suggestion_matches)} matches", "#7f848e"))]
-        for index, item in enumerate(visible):
+        total = len(self._suggestion_matches)
+        window_size = 8
+        start = min(
+            max(self._suggestion_index - window_size + 1, 0),
+            max(total - window_size, 0),
+        )
+        visible = self._suggestion_matches[start : start + window_size]
+        end = start + len(visible)
+        count = f"{start + 1}–{end} of {total}" if total > window_size else f"{total} matches"
+        lines = [Text.assemble(("COMMANDS", "bold #b8a9ff"), (f"  {count}", "#777781"))]
+        for offset, item in enumerate(visible):
+            index = start + offset
             marker = "› " if index == self._suggestion_index else "  "
-            style = "bold #98c379" if index == self._suggestion_index else "#abb2bf"
+            style = "bold #8bd5ca" if index == self._suggestion_index else "#d1d1d6"
             lines.append(
-                Text.assemble((marker + item.invocation, style), (f"  {item.description}", "#7f848e"))
+                Text.assemble((marker + item.invocation, style), (f"  {item.description}", "#777781"))
             )
         widget.update(Group(*lines))
         widget.styles.display = "block"
         self.query_one("#context-hint", Static).update(
-            "↑/↓ select · Tab complete · Enter run · Esc close",
+            "↑/↓ choose · Enter/Tab select · Esc close",
             layout=False,
         )
 
     def move_suggestion(self, delta: int) -> None:
         if not self._suggestion_matches:
             return
-        visible_count = min(len(self._suggestion_matches), 8)
-        self._suggestion_index = (self._suggestion_index + delta) % visible_count
+        self._suggestion_index = (self._suggestion_index + delta) % len(
+            self._suggestion_matches
+        )
         self._render_suggestions()
 
     def accept_suggestion(self) -> None:
         if not self._suggestion_matches:
             return
         invocation = self._suggestion_matches[self._suggestion_index].invocation
-        if invocation.startswith("/model --global"):
-            insertion = "/model --global "
-        else:
-            insertion = invocation.split(" ", 1)[0] + " "
+        insertion = _command_insertion(invocation)
         composer = self.query_one("#composer", ComposerTextArea)
+        self._skip_suggestion_text = insertion
         composer.text = insertion
         composer.cursor_location = (0, len(insertion))
+        self.close_suggestions()
         composer.focus()
 
     def close_suggestions(self) -> None:
@@ -1032,8 +1213,13 @@ class NoahCodeApp(App[None]):
 
     @on(TextArea.Changed, "#composer")
     def _composer_changed(self, event: TextArea.Changed) -> None:
-        self._update_command_suggestions(event.text_area.text)
-        self._resize_composer(event.text_area.text)
+        text = event.text_area.text
+        if self._skip_suggestion_text == text:
+            self._skip_suggestion_text = None
+        else:
+            self._skip_suggestion_text = None
+            self._update_command_suggestions(text)
+        self._resize_composer(text)
 
     @on(ComposerTextArea.Submitted, "#composer")
     def _composer_submitted(self) -> None:
@@ -1050,10 +1236,7 @@ class NoahCodeApp(App[None]):
     async def action_palette(self) -> None:
         rows = []
         for command in self._base_commands:
-            if command.invocation.startswith("/model --global"):
-                insertion = "/model --global "
-            else:
-                insertion = command.invocation.split(" ", 1)[0] + " "
+            insertion = _command_insertion(command.invocation)
             rows.append((insertion, command.invocation, command.description))
         choice = await self.push_screen_wait(
             FilteredPicker("Commands", rows, "↑/↓ select · Enter insert · Esc close")
@@ -1064,8 +1247,331 @@ class NoahCodeApp(App[None]):
             composer.cursor_location = (0, len(choice))
             composer.focus()
 
+    @work(exclusive=True, group="skills")
+    async def action_skills(self) -> None:
+        """Open the dedicated searchable skill palette."""
+
+        if not self._agent_ready:
+            return
+        try:
+            infos = self.host.list_skill_infos()
+            rows = [
+                (
+                    "__add_skill__",
+                    "+ Add skill from folder",
+                    "Import a Codex/Claude SKILL.md directory",
+                )
+            ]
+            for info in infos:
+                label = f"${info.name}" if info.document_skill else info.name
+                state = "active" if info.active else "available"
+                rows.append(
+                    (
+                        f"skill:{info.registry_name}",
+                        label,
+                        f"{state} · {info.description} · {info.source}",
+                    )
+                )
+            choice = await self.push_screen_wait(
+                FilteredPicker(
+                    "Skills",
+                    rows,
+                    "Type to search · Enter use · Add imports scripts/assets too · Esc close",
+                )
+            )
+            if not choice:
+                return
+            if choice == "__add_skill__":
+                source = await self.push_screen_wait(
+                    TextPromptModal(
+                        "Add skill folder",
+                        "~/path/to/skill",
+                        "Folder must contain SKILL.md · copied to ~/.agents/skills",
+                    )
+                )
+                if not source:
+                    return
+                info = await asyncio.to_thread(self.host.add_skill_from_path, source)
+                self._append_entry(
+                    TranscriptEntry("STATUS", f"Added ${info.name} from {info.source}")
+                )
+            else:
+                registry_name = choice.removeprefix("skill:")
+                info = next(item for item in infos if item.registry_name == registry_name)
+                if not info.document_skill:
+                    self._append_entry(
+                        TranscriptEntry(
+                            "STATUS",
+                            f"{info.name} is {'active' if info.active else 'available'} as a tool skill",
+                        )
+                    )
+                    return
+            composer = self.query_one("#composer", ComposerTextArea)
+            composer.text = f"${info.name} "
+            composer.cursor_location = (0, len(composer.text))
+            composer.focus()
+        except Exception as exc:  # noqa: BLE001
+            self._append_entry(TranscriptEntry("ERROR", f"Could not add or use skill: {exc}"))
+
+    @work(exclusive=True, group="mcp")
+    async def action_mcp(self) -> None:
+        """Open the MCP palette and guided STDIO/HTTP connection flow."""
+
+        if not self._agent_ready:
+            return
+        try:
+            infos = self.host.list_mcp_infos()
+            rows = [
+                ("__add_stdio__", "+ Add STDIO server", "Local command or package runner"),
+                ("__add_http__", "+ Add HTTP server", "Streamable HTTP endpoint"),
+            ]
+            for info in infos:
+                state = "connected" if info.name in self.host._mcp_attached else "available"
+                rows.append(
+                    (
+                        f"mcp:{info.name}",
+                        info.name,
+                        f"{state} · {info.transport} · {info.target} · {info.source}",
+                    )
+                )
+            choice = await self.push_screen_wait(
+                FilteredPicker(
+                    "MCP servers",
+                    rows,
+                    "Type to search · Enter connect · Esc close",
+                )
+            )
+            if not choice:
+                return
+            if choice.startswith("mcp:"):
+                status = await self.host.connect_mcp_server(choice.removeprefix("mcp:"))
+            else:
+                kind = "stdio" if choice == "__add_stdio__" else "http"
+                name = await self.push_screen_wait(
+                    TextPromptModal(
+                        "Server name",
+                        "github",
+                        "Letters, numbers, dots, underscores, and hyphens",
+                    )
+                )
+                if not name:
+                    return
+                target = await self.push_screen_wait(
+                    TextPromptModal(
+                        "STDIO command" if kind == "stdio" else "HTTP endpoint",
+                        "npx -y @modelcontextprotocol/server-name"
+                        if kind == "stdio"
+                        else "https://example.com/mcp",
+                        "Arguments are parsed safely; use environment variables for secrets"
+                        if kind == "stdio"
+                        else "Streamable HTTP · use config files for auth headers",
+                    )
+                )
+                if not target:
+                    return
+                status = await self.host.add_mcp_server(kind, name, target)
+            role = "ERROR" if "failed:" in status else "STATUS"
+            self._append_entry(TranscriptEntry(role, status))
+        except Exception as exc:  # noqa: BLE001
+            self._append_entry(TranscriptEntry("ERROR", f"MCP setup failed: {exc}"))
+
+    @work(exclusive=True, group="providers")
+    async def action_providers(self) -> None:
+        """Open searchable, secret-free model-provider setup."""
+
+        try:
+            infos = self.host.list_provider_infos()
+            rows = []
+            ordered_infos = sorted(
+                infos,
+                key=lambda info: (not info.active, not info.configured, info.label.lower()),
+            )
+            for info in ordered_infos:
+                state = "active" if info.active else "ready" if info.configured else "key missing"
+                rows.append(
+                    (
+                        f"provider:{info.key}",
+                        info.label,
+                        f"{state} · {info.description} · {info.model_hint}",
+                    )
+                )
+            rows.append(
+                (
+                    "provider:custom",
+                    "+ Custom OpenAI-compatible",
+                    "Self-hosted gateway, proxy, vLLM, LM Studio, or another compatible API",
+                )
+            )
+            choice = await self.push_screen_wait(
+                FilteredPicker(
+                    "Model providers",
+                    rows,
+                    "Type to search · Enter configure · API keys stay in environment variables",
+                )
+            )
+            if not choice:
+                return
+            provider = choice.removeprefix("provider:")
+            if provider == "custom":
+                alias = await self.push_screen_wait(
+                    TextPromptModal(
+                        "Provider alias",
+                        "my-gateway",
+                        "A short name used with /model and --model",
+                    )
+                )
+                if not alias:
+                    return
+                model = await self.push_screen_wait(
+                    TextPromptModal(
+                        "Endpoint model id",
+                        "my-model",
+                        "Noah routes this through the OpenAI-compatible protocol",
+                    )
+                )
+                if not model:
+                    return
+                base_url = await self.push_screen_wait(
+                    TextPromptModal(
+                        "API base URL",
+                        "http://localhost:8000/v1",
+                        "Absolute http:// or https:// URL",
+                    )
+                )
+                if not base_url:
+                    return
+                api_key_env = await self.push_screen_wait(
+                    TextPromptModal(
+                        "API key environment variable",
+                        "MY_GATEWAY_API_KEY",
+                        "Enter - if the local endpoint does not require authentication",
+                    )
+                )
+                if not api_key_env:
+                    return
+                status = await self.host.configure_provider(
+                    "custom",
+                    model,
+                    alias=alias,
+                    base_url=base_url,
+                    api_key_env=None if api_key_env == "-" else api_key_env,
+                )
+            else:
+                info = next(item for item in infos if item.key == provider)
+                model = await self.push_screen_wait(
+                    TextPromptModal(
+                        f"{info.label} model",
+                        info.model_hint,
+                        f"Credentials: {info.credential_hint} · values are never stored",
+                    )
+                )
+                if not model:
+                    return
+                status = await self.host.configure_provider(provider, model)
+            self._append_entry(TranscriptEntry("STATUS", status))
+            self.update_chrome(force=True)
+            self._retry_startup_after_setup()
+        except Exception as exc:  # noqa: BLE001
+            self._append_entry(TranscriptEntry("ERROR", f"Provider setup failed: {exc}"))
+
+    @work(exclusive=True, group="model-setup")
+    async def action_model_setup(self) -> None:
+        """Configure a provider credential and model from the TUI."""
+
+        try:
+            from noah_code.providers import provider_preset
+
+            infos = self.host.list_provider_infos()
+            quick_infos = [
+                info
+                for info in infos
+                if info.key not in {"azure", "bedrock"}
+                and (provider_preset(info.key).api_key_env is not None or info.key == "ollama")
+            ]
+            ordered_infos = sorted(
+                quick_infos,
+                key=lambda info: (not info.active, not info.configured, info.label.lower()),
+            )
+            rows = []
+            for info in ordered_infos:
+                state = "active" if info.active else "ready" if info.configured else "key needed"
+                rows.append(
+                    (
+                        f"provider:{info.key}",
+                        info.label,
+                        f"{state} · {info.description}",
+                    )
+                )
+            rows.append(
+                (
+                    "__advanced__",
+                    "Advanced provider setup",
+                    "Azure, Bedrock, Ollama endpoints, and custom OpenAI-compatible APIs",
+                )
+            )
+            choice = await self.push_screen_wait(
+                FilteredPicker(
+                    "Model setup · 1 of 3 · Provider",
+                    rows,
+                    "Type to search · Enter select · Esc cancel",
+                )
+            )
+            if not choice:
+                return
+            if choice == "__advanced__":
+                self.action_providers()
+                return
+
+            provider = choice.removeprefix("provider:")
+            info = next(item for item in infos if item.key == provider)
+            preset = provider_preset(provider)
+            credential_result = None
+            if preset.api_key_env is not None:
+                api_key = await self.push_screen_wait(
+                    TextPromptModal(
+                        f"Model setup · 2 of 3 · {info.label} API key",
+                        f"Paste {preset.api_key_env}",
+                        "Masked while typing · saved to the OS credential store when available",
+                        password=True,
+                    )
+                )
+                if not api_key:
+                    return
+                credential_result = await self.host.set_provider_api_key(provider, api_key)
+
+            model = await self.push_screen_wait(
+                TextPromptModal(
+                    f"Model setup · {'3 of 3' if credential_result else '2 of 2'} · Model",
+                    info.model_hint,
+                    f"Choose the model ID for {info.label}",
+                )
+            )
+            if not model:
+                if credential_result:
+                    self._append_entry(TranscriptEntry("STATUS", credential_result.message))
+                return
+            status = await self.host.configure_provider(provider, model)
+            if credential_result:
+                status = f"{status}\n{credential_result.message}."
+            self._append_entry(TranscriptEntry("STATUS", status))
+            self.update_chrome(force=True)
+            self._retry_startup_after_setup()
+        except Exception as exc:  # noqa: BLE001
+            self._append_entry(TranscriptEntry("ERROR", f"Model setup failed: {exc}"))
+
+    def _retry_startup_after_setup(self) -> None:
+        """Retry startup after credentials are configured from a failed shell."""
+
+        if self._agent_ready or self._phase != "startup failed":
+            return
+        self._phase = "starting"
+        self.ui.set_busy(True)
+        self._start_host()
+
     @work(exclusive=True, group="sessions")
     async def action_sessions(self) -> None:
+        if not self._agent_ready:
+            return
         try:
             sessions = await asyncio.to_thread(self.host.list_session_metas)
             rows = [
@@ -1087,14 +1593,33 @@ class NoahCodeApp(App[None]):
 
     @work(exclusive=True, group="sessions")
     async def action_new_session(self) -> None:
+        if not self._agent_ready:
+            return
         await self.host.start_new_session()
 
     def _session_changed(self) -> None:
+        current_session_id = self.host.meta.session_id if self.host.meta else None
+        changed_session = self._session_id is not None and current_session_id != self._session_id
+        self._session_id = current_session_id
+        self._agent_ready = True
         self._config_commands = None
         self._base_commands = all_command_suggestions(self.host._custom_commands)
+        if not changed_session:
+            self._load_recent_history()
+            self.update_chrome(force=True)
+            return
         self._transcript_entries.clear()
         self._transcript_event_ids.clear()
         self.query_one("#conversation", RichLog).clear()
+        self.query_one("#conversation", RichLog).styles.display = "none"
+        self.query_one("#welcome", Static).styles.display = "block"
+        self.query_one("#welcome", Static).update(
+            _welcome_renderable(
+                self.host.workspace.root.name or str(self.host.workspace.root),
+                starting=False,
+            ),
+            layout=False,
+        )
         self._load_recent_history()
         self.update_chrome(force=True)
 
@@ -1125,15 +1650,58 @@ class NoahCodeApp(App[None]):
         else:
             self._append_entry(TranscriptEntry("STATUS", "Press Ctrl+C again to quit"))
 
+    def action_toggle_mode(self) -> None:
+        if not self._agent_ready or self.ui.busy:
+            return
+        target = "plan" if self.host.agent.mode == "build" else "build"
+        self._toggle_mode(target)
+
+    @work(exclusive=True, group="mode-switch")
+    async def _toggle_mode(self, target: str) -> None:
+        self.ui.set_busy(True)
+        try:
+            await self.host.handle_line(f"/mode {target}")
+        except Exception as exc:  # noqa: BLE001
+            self._append_entry(TranscriptEntry("ERROR", f"Could not switch mode: {exc}"))
+        finally:
+            self.ui.set_busy(False)
+            self.update_chrome(force=True)
+            self.query_one("#composer", ComposerTextArea).focus()
+
     def action_submit(self) -> None:
         composer = self.query_one("#composer", ComposerTextArea)
         text = composer.text.strip()
-        if not text or self.ui.busy:
+        if not text or (self.ui.busy and self._agent_ready) or self._pending_submit is not None:
+            return
+        if self._agent_ready and text == "/skills":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_skills()
+            return
+        if self._agent_ready and text == "/mcp":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_mcp()
+            return
+        if text == "/providers":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_providers()
+            return
+        if text == "/model":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_model_setup()
             return
         composer.text = ""
         self.close_suggestions()
         self._append_entry(TranscriptEntry("YOU", text))
         self._interrupt_count = 0
+        if not self._agent_ready:
+            self._pending_submit = text
+            self._phase = "queued"
+            self.update_chrome(force=True)
+            return
         self._run_turn(text)
 
     @work(exclusive=True, group="turn")

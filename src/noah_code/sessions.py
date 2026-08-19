@@ -9,11 +9,12 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
-
-from nooa.storage import SQLiteStorageManager
+from typing import TYPE_CHECKING, Any
 
 from noah_code.workspace import Workspace
+
+if TYPE_CHECKING:
+    from nooa.storage import SQLiteStorageManager
 
 
 class SessionError(RuntimeError):
@@ -113,6 +114,11 @@ class SessionStore:
         return meta
 
     def open_storage(self, session_id: str) -> SQLiteStorageManager:
+        # Importing NOOA eagerly pulls in LiteLLM and every provider adapter. Keep
+        # session discovery and CLI startup lightweight; the runtime is only
+        # needed once a session is actually opened.
+        from nooa.storage import SQLiteStorageManager
+
         db = self._db_path(session_id)
         db.parent.mkdir(parents=True, exist_ok=True)
         try:

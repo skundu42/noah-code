@@ -29,7 +29,7 @@ EXIT_CONFIG = 2
 EXIT_DENIED = 3
 EXIT_SIGINT = 130
 
-SUBCOMMANDS = frozenset({"run", "sessions", "doctor", "config", "update"})
+SUBCOMMANDS = frozenset({"run", "sessions", "doctor", "config", "providers", "update"})
 
 _AUTO_UPDATE_CHECKED = False
 
@@ -74,6 +74,11 @@ def _configure_first_run_model(model_override: str | None) -> str | None:
     click.echo(
         "Enter a LiteLLM model name or a configured NOOA model alias. "
         "Repository config, environment variables, and --model can override it later.",
+        err=True,
+    )
+    click.echo(
+        "Common formats: openai/MODEL, anthropic/MODEL, openrouter/PROVIDER/MODEL, "
+        "or gemini/MODEL. Run `noah providers list` for credential names and more options.",
         err=True,
     )
     click.echo(
@@ -230,10 +235,21 @@ def doctor(path: str | None) -> None:
     click.echo(f"user config: {sources['user'] or '(none)'}")
     click.echo(f"project config: {sources['project'] or '(none)'}")
     click.echo(f"model: {config.model}")
+    try:
+        from noah_code.providers import list_providers
+
+        active = next((info for info in list_providers(config.model) if info.active), None)
+        if active is not None:
+            state = "ready" if active.configured else f"missing ({active.credential_hint})"
+            click.echo(f"provider: {active.label} credentials={state}")
+        else:
+            click.echo("provider: registry alias or LiteLLM pass-through")
+    except Exception as exc:  # noqa: BLE001 - diagnostics should continue
+        click.echo(f"provider: diagnostics unavailable ({exc})")
     click.echo(f"session_dir: {config.session_dir}")
     click.echo(f"ui frontend: {config.ui.frontend}")
     try:
-        from nooa.unifiedllm import get_llm_client
+        from noah_code.llm import get_llm_client
 
         client = get_llm_client(config.model)
         click.echo(f"llm client: {type(client).__name__} model={getattr(client, 'model', '?')}")
@@ -269,6 +285,119 @@ def config_cmd(action: str, path: str | None, model: str | None, auto: bool) -> 
         overrides["auto_approve"] = True
     config = load_config(workspace.root, cli_overrides=overrides)
     click.echo(config.model_dump_json(indent=2))
+
+
+@cli_group.group("providers")
+def providers_group() -> None:
+    """Inspect and configure model providers without storing API keys."""
+
+
+@providers_group.command("list")
+def providers_list() -> None:
+    """Show popular providers and whether their credential environment is ready."""
+
+    from noah_code.providers import format_providers
+
+    click.echo(format_providers(user_default_model() or ""))
+
+
+@providers_group.command("add")
+@click.argument(
+    "provider",
+    type=click.Choice(
+        [
+            "openai",
+            "anthropic",
+            "openrouter",
+            "gemini",
+            "groq",
+            "mistral",
+            "xai",
+            "deepseek",
+            "together",
+            "perplexity",
+            "azure",
+            "bedrock",
+            "ollama",
+            "custom",
+        ]
+    ),
+)
+@click.option("--model", required=True, help="Provider model id or deployment name")
+@click.option("--alias", help="Alias for a custom OpenAI-compatible endpoint")
+@click.option("--base-url", help="Base URL for a custom OpenAI-compatible endpoint")
+@click.option("--api-key-env", help="Environment variable containing the custom API key")
+@click.option(
+    "--client-type",
+    type=click.Choice(["completion", "responses"]),
+    default="completion",
+    show_default=True,
+    help="API surface for a custom OpenAI-compatible endpoint",
+)
+@click.option("--set-default/--no-set-default", default=True, show_default=True)
+def providers_add(
+    provider: str,
+    model: str,
+    alias: str | None,
+    base_url: str | None,
+    api_key_env: str | None,
+    client_type: str,
+    set_default: bool,
+) -> None:
+    """Configure a provider using environment-based credentials."""
+
+    from noah_code.providers import (
+        provider_preset,
+        resolve_provider_model,
+        save_custom_openai_provider,
+    )
+
+    try:
+        if provider == "custom":
+            if not alias or not base_url:
+                raise ValueError("custom providers require --alias and --base-url")
+            path = save_custom_openai_provider(
+                alias,
+                model,
+                base_url,
+                api_key_env,
+                client_type=client_type,
+            )
+            selected_model = alias
+            click.echo(f"saved model alias {alias} in {path}")
+            if api_key_env:
+                state = "set" if os.environ.get(api_key_env) else "missing"
+                click.echo(f"credentials: {api_key_env} ({state}; value not read or stored)")
+            else:
+                click.echo("credentials: none configured (endpoint must allow unauthenticated use)")
+        else:
+            if alias or base_url or api_key_env:
+                raise ValueError(
+                    "--alias, --base-url, and --api-key-env are only for custom providers"
+                )
+            if client_type != "completion":
+                raise ValueError("--client-type is only configurable for custom providers")
+            preset = provider_preset(provider)
+            selected_model = resolve_provider_model(provider, model)
+            groups = [" + ".join(group) for group in preset.credential_groups]
+            ready = not groups or any(
+                all(os.environ.get(variable) for variable in group)
+                for group in preset.credential_groups
+            )
+            click.echo(f"provider: {preset.label}")
+            click.echo(f"model: {selected_model}")
+            click.echo(
+                "credentials: "
+                + ("ready" if ready else f"missing ({' or '.join(groups)})")
+                + "; values are never printed or stored"
+            )
+        if set_default:
+            path = save_user_default_model(selected_model)
+            click.echo(f"default model saved in {path}")
+        else:
+            click.echo(f"use once with: noah --model {selected_model} .")
+    except (FileExistsError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @cli_group.command("update")

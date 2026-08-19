@@ -6,7 +6,9 @@
 |-----|--------|
 | `Enter` | Send the current message |
 | `Shift+Enter` | Insert a newline without sending |
+| `Tab` | Toggle `build`/`plan` mode; accept the highlighted slash option while suggestions are open |
 | `Ctrl+P` | Open the command palette |
+| `Ctrl+K` | Open the searchable skills picker |
 | `Ctrl+O` | Open the session picker |
 | `Ctrl+N` | Start a new session |
 | `Ctrl+C` | Cancel the active turn; press twice while idle to quit |
@@ -25,9 +27,9 @@ todos. Narrow terminals retain the transcript, live activity, suggestions, and c
 the rail. Terminals 25 rows high or shorter use compact spacing.
 
 Type `/` in the composer to open the inline command list; the list remains visible and filters
-continuously. Use `Up`/`Down` to highlight a command, `Tab` to complete it, and `Esc` to close the
-list. `Enter` always sends the current command. Typing `/config` expands the list to every resolved
-configuration path and its current redacted value.
+continuously. Use `Up`/`Down` to highlight a command, `Enter` or `Tab` to complete it, and `Esc` to
+close the list. Press `Enter` again to run the completed command. Typing `/config` expands the list
+to every resolved configuration path and its current redacted value.
 
 Tool and shell output is batched into a live execution panel instead of forcing one full-screen
 redraw for every chunk. When the tool finishes, the panel becomes a compact transcript record with
@@ -41,14 +43,17 @@ the configured `max_output_chars` per activity.
 | `/help` | Show interactive help |
 | `/config [PATH]` | Show every resolved setting or one nested path |
 | `/mode` | Show or switch between `build` and `plan` |
-| `/model [MODEL]` | Show or switch the active session model |
+| `/model` | Search for a provider, enter a masked API key, then choose a model |
+| `/model MODEL` | Switch the active session model |
 | `/model --global MODEL` | Switch the active model and save it as the default for all repositories |
+| `/providers [use PROVIDER MODEL]` | Search and securely configure API providers |
 | `/session`, `/sessions`, `/new`, `/continue` | Inspect, switch, create, and resume sessions |
 | `/compact` | Summarize older conversation context |
 | `/todos` | Show the agent's current task list |
 | `/status`, `/diff` | Inspect the repository |
 | `/undo`, `/redo` | Restore or reapply journaled file edits |
-| `/skills` | Inspect discovered skills |
+| `/skills [add PATH]` | Search compatible Codex/Claude skills or import a skill folder |
+| `/mcp [connect|add]` | Search, connect, or add MCP servers |
 | `/trace` | Show the active tracing destination |
 | `/exit` | End the session |
 
@@ -60,9 +65,10 @@ Examples:
 /config ui.theme
 ```
 
-Use `/mode build|plan` and `/model MODEL` for settings that support live switching. Use
-`/model --global MODEL` to make that model the cross-repository default. Other settings are
-resolved at startup and should be changed in the user configuration file.
+Use `/mode build|plan` and `/model MODEL` for settings that support live switching. Bare `/model`
+opens guided provider and credential setup. Use `/model --global MODEL` to make that model the
+cross-repository default. Other settings are resolved at startup and should be changed in the user
+configuration file.
 
 `/model MODEL` takes effect before the next turn and persists in the current session, including
 after resuming it. Other sessions and repositories keep their existing defaults unless the

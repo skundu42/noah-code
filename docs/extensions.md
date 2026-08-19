@@ -24,11 +24,31 @@ through `$9`. Front matter may also select a mode or model.
 
 ## Skills
 
-Skills are discovered from:
+Open the dedicated searchable picker with `/skills` or `Ctrl+K`. Selecting a document skill
+inserts `$skill-name ` into the composer so you can add the task directly. Noah reads the standard
+`SKILL.md` directory format used by Codex and Claude, including companion `scripts/`, `references/`,
+and `assets/` folders.
 
-- `~/.config/noah-code/skills/`
+Project skills are discovered before user skills from:
+
+- `.agents/skills/`
+- `.claude/skills/`
 - `.noah-code/skills/`
 - `./skills/`
+- `~/.agents/skills/`
+- `~/.claude/skills/`
+- `~/.codex/skills/`
+- `~/.config/noah-code/skills/`
+
+Add an existing skill folder from the picker or the terminal:
+
+```text
+/skills add ~/path/to/my-skill
+```
+
+Noah validates the `SKILL.md` front matter, copies the whole directory to the shared
+`~/.agents/skills/` root, and will not overwrite an existing skill. Skills that depend on a
+vendor-specific runtime, binary, or remote tool still require that dependency to be installed.
 
 Discovery does not grant access. Activate trusted skills from user configuration with patterns
 such as:
@@ -37,7 +57,8 @@ such as:
 enabled_skills = ["cmd.*"]
 ```
 
-Use `/skills` to inspect the resulting registry. Project configuration cannot activate skills.
+Explicit `$skill-name TASK` invocation is also gated by the `skill` permission category. Project
+configuration cannot activate skills.
 
 ## MCP
 
@@ -47,9 +68,20 @@ MCP support is optional:
 uv sync --extra mcp
 ```
 
-Configure servers in trusted user configuration or a compatible `.mcp.json` or
-`.noah-code/mcp.json` file. Attaching a server is gated by the `mcp` permission category and asks
-by default.
+Open `/mcp` to search configured servers, connect one, or add a server through the guided STDIO
+and Streamable HTTP setup. Terminal equivalents are:
+
+```text
+/mcp add stdio filesystem npx -y @modelcontextprotocol/server-filesystem /path
+/mcp add http remote https://example.com/mcp
+/mcp connect filesystem
+```
+
+Noah reads the portable `{"mcpServers": {...}}` structure from `.mcp.json`,
+`.noah-code/mcp.json`, and `~/.config/noah-code/mcp.json`. The guided setup writes to the user
+file with mode `0600`; use environment variables or a manually edited config for secrets and auth
+headers. STDIO, SSE, Streamable HTTP, custom headers, and OAuth fields are passed through to the
+MCP runtime. Attaching every server is gated by the `mcp` permission category and asks by default.
 
 ## Tracing
 

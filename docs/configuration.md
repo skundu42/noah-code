@@ -24,13 +24,68 @@ open the onboarding prompt.
 Inside an interactive session, switch only the current session or replace the global default:
 
 ```text
+/model
 /model openai/MODEL_NAME
 /model --global anthropic/MODEL_NAME
 ```
 
+Bare `/model` opens a three-step TUI flow: search for a provider, enter its API key in a masked
+field, and enter the model ID. Noah attempts to save that key in the operating system credential
+store. If no secure backend is available, the key remains active only in the current Noah process
+and the TUI says so. Keys are never written to Noah configuration or session metadata.
+
 Model switches take effect between turns and are stored in the current session metadata, so a
 resumed session continues with its most recently selected model. A session-only `/model MODEL`
 does not change the user configuration or affect new sessions.
+
+### Bring your own API provider
+
+Enter `/model` for the common provider → API key → model flow. Run `noah providers list` or open
+`/providers` in the TUI for advanced, secret-free setup. Noah supports
+LiteLLM's provider routing and includes guided presets for OpenAI, Anthropic Claude, OpenRouter,
+Google Gemini, Groq, Mistral, xAI, DeepSeek, Together AI, Perplexity, Azure OpenAI, Amazon
+Bedrock, and local Ollama.
+
+For scripting, export credentials before starting Noah and select a provider/model:
+
+```bash
+# OpenAI
+export OPENAI_API_KEY="..."
+noah providers add openai --model MODEL_NAME
+
+# Anthropic Claude
+export ANTHROPIC_API_KEY="..."
+noah providers add anthropic --model MODEL_NAME
+
+# OpenRouter
+export OPENROUTER_API_KEY="..."
+noah providers add openrouter --model PROVIDER/MODEL
+
+# Google Gemini (GOOGLE_API_KEY is also accepted)
+export GEMINI_API_KEY="..."
+noah providers add gemini --model MODEL_NAME
+```
+
+Use `--no-set-default` to print a one-launch command without changing Noah's global default.
+Inside Noah, `/providers use openrouter PROVIDER/MODEL` switches the current session and saves the
+new global default.
+
+For vLLM, LM Studio, a company gateway, or another OpenAI-compatible API, create a secret-free
+NOOA model alias:
+
+```bash
+export COMPANY_LLM_API_KEY="..."
+noah providers add custom \
+  --alias company-llm \
+  --model MODEL_ID \
+  --base-url https://llm.example.com/v1 \
+  --api-key-env COMPANY_LLM_API_KEY
+```
+
+The alias is stored in `~/.config/nooa/llm_config.yaml` with mode `0600`. Only the environment
+variable's name is stored. For an unauthenticated local endpoint, omit `--api-key-env`. You can
+then use the alias anywhere a model is accepted: `noah --model company-llm .` or
+`/model company-llm`.
 
 Example user configuration:
 
@@ -98,7 +153,9 @@ noah config show .
 ```
 
 Model and provider configuration follows NOOA conventions, including its model registry,
-environment variables, and configuration under `~/.config/nooa/`.
+environment variables, and configuration under `~/.config/nooa/`. Provider strings not shown in
+the guided list still pass through to LiteLLM, so additional supported services can be selected
+with `--model PROVIDER/MODEL`.
 
 ## Modes and permissions
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from nooa.unifiedllm import FakeLLMClient
@@ -132,6 +132,66 @@ async def test_config_slash_command_shows_scoped_setting(tmp_path: Path) -> None
     event = host.ui.render.call_args.args[0]
     assert "ui.theme" in event.text
     assert "atom-one-dark" in event.text
+    assert event.meta == {"format": "plain", "source": "command"}
+    assert "```" not in event.text
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_skills_slash_command_renders_searchable_skill_metadata(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+
+    action = await host.handle_line("/skills")
+
+    assert action == "handled"
+    event = host.ui.render.call_args.args[0]
+    assert event.text.startswith("Skills\n")
+    assert "Search in the TUI with /skills" in event.text
+    assert "nemo.context" in event.text
+    assert "[available]" in event.text
+    assert event.meta == {"format": "plain", "source": "command"}
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_dollar_skill_invocation_activates_instructions_and_runs_task(tmp_path: Path) -> None:
+    skill_dir = tmp_path / ".agents" / "skills" / "host-explicit-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: host-explicit-skill\n"
+        "description: Apply an explicit test workflow\n"
+        "---\n"
+        "Always inspect the focused tests first.\n"
+    )
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+
+    async def approve(_request):  # noqa: ANN001, ANN202
+        return ApprovalChoice.ONCE
+
+    host.agent.approvals.set_handler(approve)
+    host._run_user_turn = AsyncMock()
+
+    action = await host.handle_line("$host-explicit-skill check the parser")
+
+    assert action == "continue"
+    assert "cmd.host-explicit-skill" in host.agent.skills.activated()
+    host._run_user_turn.assert_awaited_once_with(
+        "Use the $host-explicit-skill skill instructions for this task:\n\ncheck the parser"
+    )
     await host.close()
 
 
@@ -166,6 +226,56 @@ async def test_model_global_switches_session_and_saves_user_default(
     assert saved == ["openai/gpt-5"]
     assert host.config.model == "openai/gpt-5"
     await host.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_setup_switches_prefixed_model_and_saves_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host._switch_model = AsyncMock()
+    saved: list[str] = []
+    monkeypatch.setattr(
+        "noah_code.host.save_user_default_model",
+        lambda model: saved.append(model) or tmp_path / "config.toml",
+    )
+
+    status = await host.configure_provider("openrouter", "anthropic/example-model")
+
+    host._switch_model.assert_awaited_once_with("openrouter/anthropic/example-model")
+    assert saved == ["openrouter/anthropic/example-model"]
+    assert host.config.model == "openrouter/anthropic/example-model"
+    assert "OPENROUTER_API_KEY" in status
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_setup_can_configure_model_before_agent_starts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    host._switch_model = AsyncMock()
+    monkeypatch.setattr(
+        "noah_code.host.save_user_default_model",
+        lambda _model: tmp_path / "config.toml",
+    )
+
+    status = await host.configure_provider("openai", "example-model")
+
+    host._switch_model.assert_not_awaited()
+    assert host.config.model == "openai/example-model"
+    assert "openai/example-model" in status
 
 
 @pytest.mark.asyncio

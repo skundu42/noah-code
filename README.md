@@ -86,13 +86,32 @@ noah config show .
 noah update --check
 ```
 
-The package also installs `noah-code` and `nc` as equivalent entry points. Because `nc` commonly
-refers to netcat, `noah` or `noah-code` is recommended. Keep provider API keys in the environment
-or trusted NOOA user configuration, never in a repository or Noah Code session metadata.
+Bring your own API key from inside the TUI by entering `/model`: choose the provider, paste the
+key into the masked field, then choose the model. Noah saves the key to the operating system's
+credential store when one is available; otherwise it remains available only to that Noah process.
+API-key values are never written to Noah config, repository, or session files.
 
-Inside a session, `/model MODEL` switches the active model immediately and remembers it when that
-session is resumed. It does not change other sessions. Use `/model --global MODEL` when the new
-model should also become the default for future sessions in every repository.
+Environment variables and the CLI remain available for scripts and headless use:
+
+```bash
+export OPENAI_API_KEY="..."        # or ANTHROPIC_API_KEY / OPENROUTER_API_KEY
+noah providers list
+noah providers add openai --model MODEL_NAME
+noah .
+```
+
+Custom OpenAI-compatible gateways, vLLM, LM Studio, Ollama, Azure OpenAI, Bedrock, Gemini, Groq,
+Mistral, xAI, DeepSeek, Together AI, and Perplexity are also supported. See the
+[provider configuration guide](docs/configuration.md#bring-your-own-api-provider).
+
+The package also installs `noah-code` and `nc` as equivalent entry points. Because `nc` commonly
+refers to netcat, `noah` or `noah-code` is recommended. Keep provider API keys in the OS
+credential store or environment, never in a repository or Noah Code session metadata.
+
+Inside a session, bare `/model` opens guided provider, API-key, and model setup. `/model MODEL`
+switches the active model immediately and remembers it when that session is resumed. It does not
+change other sessions. Use `/model --global MODEL` when the new model should also become the
+default for future sessions in every repository.
 
 The TUI keeps the conversation central and adds a session-and-plan rail on terminals at least
 110 columns wide. Tool output streams in a bounded activity panel and compacts after completion,

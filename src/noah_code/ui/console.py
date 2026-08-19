@@ -31,10 +31,10 @@ class ConsoleUI:
 
     def render(self, event: HostEvent) -> None:
         if event.kind == HostEventKind.MESSAGE:
-            if self.markdown:
+            if self.markdown and event.meta.get("format", "markdown") == "markdown":
                 self.console.print(Markdown(event.text))
             else:
-                self.console.print(event.text)
+                self.console.print(event.text, markup=False, highlight=False)
         elif event.kind == HostEventKind.REASONING:
             self.console.print(f"[dim]thinking:[/dim] {event.text}")
         elif event.kind == HostEventKind.TOOL_START:

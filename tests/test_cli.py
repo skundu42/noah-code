@@ -104,3 +104,31 @@ def test_existing_global_default_skips_first_run_prompt(monkeypatch) -> None:
 
     assert _configure_first_run_model(None) is None
     assert _configure_first_run_model("one-run-model") == "one-run-model"
+
+
+def test_providers_list_reports_key_presence_without_printing_secret(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "never-print-this")
+    runner = CliRunner()
+
+    result = runner.invoke(cli_group, ["providers", "list"])
+
+    assert result.exit_code == 0
+    assert "OpenAI" in result.output
+    assert "[ready]" in result.output
+    assert "OPENAI_API_KEY" in result.output
+    assert "never-print-this" not in result.output
+
+
+def test_providers_add_saves_prefixed_default(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli_group,
+        ["providers", "add", "anthropic", "--model", "example-model"],
+    )
+
+    assert result.exit_code == 0
+    assert "anthropic/example-model" in result.output
+    assert 'model = "anthropic/example-model"' in config_path.read_text()

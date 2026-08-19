@@ -5,14 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from nooa.interactive import RespondReason, apply_model_limits
-from nooa.tracing import enable_tracing, exporters, flush_traces, set_session
-
-from noah_code.agent import CodingAgent
 from noah_code.approvals import ApprovalChoice
 from noah_code.commands import config_text, help_text, parse_slash
 from noah_code.config import NoahCodeConfig, save_user_default_model, user_default_model
@@ -24,7 +22,64 @@ from noah_code.ui.console import ConsoleUI
 from noah_code.ui.protocol import HostUI
 from noah_code.workspace import Workspace
 
+if TYPE_CHECKING:
+    from noah_code.agent import CodingAgent
+
 logger = logging.getLogger(__name__)
+
+
+def _command_output(text: str) -> HostEvent:
+    """Return exact, preformatted command output for every UI frontend."""
+
+    return HostEvent(
+        HostEventKind.MESSAGE,
+        text,
+        meta={"format": "plain", "source": "command"},
+    )
+
+
+def _format_skills_output(text: str) -> str:
+    """Convert NOOA's wide fixed-column status into a narrow, readable list."""
+
+    rendered: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if line.startswith("Active Skills"):
+            rendered.extend(
+                [
+                    "Active skills",
+                    "Use with self.<name>; deactivate with self.skills.deactivate(['name']).",
+                ]
+            )
+            continue
+        if line.startswith("Available Skills"):
+            if rendered and rendered[-1]:
+                rendered.append("")
+            rendered.extend(
+                [
+                    "Available skills",
+                    "Activate with self.skills.activate(['name']).",
+                ]
+            )
+            continue
+        match = re.fullmatch(r"\s{2}(\S+)(?:\s{2,}(.*))?", line)
+        if match:
+            name, description = match.groups()
+            rendered.append(f"\n  {name}")
+            if description:
+                rendered.append(f"    {description.strip()}")
+            continue
+        rendered.append(line)
+    return "\n".join(rendered).strip()
+
+
+def _load_agent_runtime() -> tuple[type[CodingAgent], Any]:
+    """Load the heavy NOOA/LiteLLM runtime away from the TUI event loop."""
+
+    from noah_code.agent import CodingAgent
+    from noah_code.llm import get_llm_client
+
+    return CodingAgent, get_llm_client
 
 
 def _json_safe(value: Any) -> Any:
@@ -84,6 +139,8 @@ class AgentHost:
         self._event_unsubs: list[Any] = []
         self._custom_commands: dict[str, CustomCommand] = {}
         self._last_turn_shell_bypass = False
+        self._mcp_attached: set[str] = set()
+        self._mcp_errors: dict[str, str] = {}
         self.on_session_changed: Any = None  # optional UI callback
 
     @property
@@ -95,6 +152,8 @@ class AgentHost:
     def _setup_tracing(self, session_id: str) -> None:
         if not self.config.tracing.enabled:
             return
+        from nooa.tracing import enable_tracing, exporters, set_session
+
         set_session(session_id)
         exps = []
         if self.config.tracing.jsonl_dir:
@@ -113,16 +172,19 @@ class AgentHost:
         else:
             self.store.verify_workspace(self.meta, self.workspace)
 
-        self._setup_tracing(self.meta.session_id)
-        self._storage = self.store.open_storage(self.meta.session_id)
+        # Python's first NOOA import initializes LiteLLM's provider registry and
+        # is by far the largest cold-start cost. Do it in a worker thread so the
+        # Textual shell can paint and remain responsive meanwhile.
+        agent_class, get_llm_client = await asyncio.to_thread(_load_agent_runtime)
 
         llm = self._llm
         if llm is None:
-            from nooa.unifiedllm import get_llm_client
+            llm = await asyncio.to_thread(get_llm_client, self.meta.model)
 
-            llm = get_llm_client(self.meta.model)
+        self._setup_tracing(self.meta.session_id)
+        self._storage = self.store.open_storage(self.meta.session_id)
 
-        agent = CodingAgent(
+        agent = agent_class(
             self.workspace,
             self.config,
             llm=llm,
@@ -157,14 +219,19 @@ class AgentHost:
         try:
             from noah_code.mcp_setup import install_mcp
 
-            mcp_status = await install_mcp(
+            mcp_result = await install_mcp(
                 agent,
                 self.workspace.root,
                 self.config,
                 engine=agent.engine,
                 approvals=agent.approvals,
             )
-            self.ui.render(HostEvent(HostEventKind.STATUS, mcp_status))
+            self._mcp_attached = set(mcp_result.attached)
+            self._mcp_errors = {
+                error.partition(":")[0]: error.partition(":")[2].strip()
+                for error in mcp_result.errors
+            }
+            self.ui.render(HostEvent(HostEventKind.STATUS, str(mcp_result)))
         except Exception as exc:  # noqa: BLE001
             logger.debug("mcp setup skipped: %s", exc)
 
@@ -228,10 +295,13 @@ class AgentHost:
             if self._storage is not None:
                 self._storage.close()
                 self._storage = None
-            try:
-                flush_traces()
-            except Exception:  # noqa: BLE001
-                logger.debug("trace flush failed", exc_info=True)
+            if self._agent is not None and self.config.tracing.enabled:
+                try:
+                    from nooa.tracing import flush_traces
+
+                    flush_traces()
+                except Exception:  # noqa: BLE001
+                    logger.debug("trace flush failed", exc_info=True)
 
     def status_prompt(self) -> str:
         sid = self.meta.session_id[:8] if self.meta else "?"
@@ -277,6 +347,148 @@ class AgentHost:
     def list_session_metas(self) -> list[SessionMeta]:
         return self.store.list_sessions(self.workspace)
 
+    def list_skill_infos(self) -> list[Any]:
+        """Return display metadata for all loaded and document skills."""
+
+        if self._agent is None or not hasattr(self.agent, "skills"):
+            return []
+        from noah_code.skills_setup import list_skills
+
+        return list_skills(self.agent.skills)
+
+    def add_skill_from_path(self, path: str) -> Any:
+        """Copy a compatible skill folder and discover it in this session."""
+
+        from noah_code.skills_setup import add_skill
+
+        return add_skill(path, registry=self.agent.skills)
+
+    def list_mcp_infos(self) -> list[Any]:
+        from noah_code.mcp_setup import list_mcp_servers
+
+        return list_mcp_servers(self.workspace.root, self.config)
+
+    def list_provider_infos(self) -> list[Any]:
+        from noah_code.providers import list_providers
+
+        model = self.meta.model if self.meta else self.config.model
+        return list_providers(model)
+
+    async def set_provider_api_key(self, provider: str, api_key: str) -> Any:
+        """Activate a provider key and persist it in the OS credential store."""
+
+        from noah_code.credentials import store_provider_api_key
+
+        return await asyncio.to_thread(store_provider_api_key, provider, api_key)
+
+    async def configure_provider(
+        self,
+        provider: str,
+        model: str,
+        *,
+        alias: str | None = None,
+        base_url: str | None = None,
+        api_key_env: str | None = None,
+        client_type: str = "completion",
+    ) -> str:
+        """Configure a provider, switch this session, and save the global default."""
+
+        from noah_code.providers import (
+            provider_preset,
+            resolve_provider_model,
+            save_custom_openai_provider,
+        )
+
+        if provider == "custom":
+            if not alias or not base_url:
+                raise ValueError("custom provider requires an alias and base URL")
+            config_path = await asyncio.to_thread(
+                save_custom_openai_provider,
+                alias,
+                model,
+                base_url,
+                api_key_env,
+                client_type=client_type,
+            )
+            from nooa.unifiedllm import reload_registry
+
+            await asyncio.to_thread(reload_registry)
+            selected_model = alias
+            credential_hint = api_key_env or "no API key"
+            provider_label = "Custom OpenAI-compatible"
+        else:
+            from noah_code.providers import list_providers
+
+            preset = provider_preset(provider)
+            selected_model = resolve_provider_model(provider, model)
+            credential_hint = " or ".join(
+                " + ".join(group) for group in preset.credential_groups
+            ) or "no API key"
+            provider_info = next(info for info in list_providers(selected_model) if info.key == provider)
+            credential_hint += " [ready]" if provider_info.configured else " [missing]"
+            provider_label = preset.label
+            config_path = None
+
+        if self._agent is not None:
+            await self._switch_model(selected_model)
+        elif self.meta is not None:
+            self.meta.model = selected_model
+            self.store.save_meta(self.meta)
+        default_path = save_user_default_model(selected_model)
+        self.config.model = selected_model
+        suffix = f"; alias saved in {config_path}" if config_path else ""
+        return (
+            f"Using {provider_label}: {selected_model}. Global default saved in {default_path}. "
+            f"Credentials: {credential_hint}{suffix}"
+        )
+
+    async def connect_mcp_server(self, name: str) -> str:
+        """Attach one configured MCP server to the live agent."""
+
+        if name in self._mcp_attached:
+            return f"MCP server {name} is already connected"
+        from noah_code.mcp_setup import attach_mcp_server, load_mcp_servers
+
+        servers, _sources = load_mcp_servers(self.workspace.root, self.config)
+        if name not in servers:
+            raise KeyError(f"unknown MCP server: {name}")
+        attr = await attach_mcp_server(
+            self.agent,
+            name,
+            servers[name],
+            engine=self.agent.engine,
+            approvals=self.agent.approvals,
+        )
+        self._mcp_attached.add(name)
+        self._mcp_errors.pop(name, None)
+        return f"Connected MCP server {name} as self.{attr}"
+
+    async def add_mcp_server(self, kind: str, name: str, target: str) -> str:
+        """Persist and connect a simple STDIO or Streamable HTTP server."""
+
+        from noah_code.mcp_setup import save_user_mcp_server
+
+        normalized_kind = kind.strip().lower()
+        if normalized_kind == "stdio":
+            command = shlex.split(target)
+            if not command:
+                raise ValueError("STDIO server command cannot be empty")
+            spec: dict[str, Any] = {
+                "command": command[0],
+                "args": command[1:],
+                "transport": "stdio",
+            }
+        elif normalized_kind in {"http", "streamable-http"}:
+            spec = {"url": target.strip(), "transport": "streamable-http"}
+        else:
+            raise ValueError("MCP transport must be stdio or http")
+        path = await asyncio.to_thread(save_user_mcp_server, name, spec)
+        try:
+            status = await self.connect_mcp_server(name)
+        except Exception as exc:
+            return f"Saved MCP server {name} in {path}, but connection failed: {exc}"
+        return f"Saved MCP server {name} in {path}. {status}"
+
     async def load_history_page(
         self,
         *,
@@ -307,6 +519,10 @@ class AgentHost:
         slash = parse_slash(line)
         if slash:
             return await self._handle_slash(slash[0], slash[1])
+        skill_prompt = await self._activate_explicit_skill(line)
+        if skill_prompt is None:
+            return "handled"
+        line = skill_prompt
         self._cancel_turn = False
         self.ui.set_busy(True)
         self._active_turn = asyncio.current_task()
@@ -318,10 +534,43 @@ class AgentHost:
             self.ui.set_busy(False)
             self.ui.set_status(self.status_prompt())
 
+    async def _activate_explicit_skill(self, line: str) -> str | None:
+        """Resolve ``$name task``, approve it, and expose its instructions."""
+
+        match = re.match(r"^\$([A-Za-z0-9][A-Za-z0-9._-]*)\s*(.*)$", line, re.DOTALL)
+        if not match or self._agent is None:
+            return line
+        requested, task = match.groups()
+        candidates = [
+            info
+            for info in self.list_skill_infos()
+            if info.document_skill and requested in {info.name, info.registry_name}
+        ]
+        if not candidates:
+            return line
+        if not task.strip():
+            self.ui.render(
+                HostEvent(HostEventKind.ERROR, f"Add a task after ${candidates[0].name}")
+            )
+            return None
+        info = candidates[0]
+        decision = self.agent.engine.decide("skill", info.registry_name)
+        try:
+            await self.agent.approvals.require(decision)
+            self.agent.skills.activate([info.registry_name])
+        except Exception as exc:  # noqa: BLE001
+            self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
+            return None
+        attr = getattr(self.agent.skills, "_attr_map", {}).get(info.registry_name)  # noqa: SLF001
+        approved = getattr(self.agent, "_sandbox_approved_roots", None)
+        if attr and isinstance(approved, set):
+            approved.add(attr)
+        return f"Use the ${info.name} skill instructions for this task:\n\n{task.strip()}"
+
     async def _handle_slash(self, name: str, args: str) -> Literal["continue", "exit", "handled"]:
         agent = self.agent
         if name == "help":
-            self.ui.render(HostEvent(HostEventKind.MESSAGE, help_text(self._custom_commands)))
+            self.ui.render(_command_output(help_text(self._custom_commands)))
             return "handled"
         if name == "config":
             try:
@@ -334,7 +583,7 @@ class AgentHost:
                     )
                 )
             else:
-                self.ui.render(HostEvent(HostEventKind.MESSAGE, f"```text\n{text}\n```"))
+                self.ui.render(_command_output(text))
             return "handled"
         if name in self._custom_commands:
             return await self._run_custom_command(name, args)
@@ -353,10 +602,50 @@ class AgentHost:
                 self.ui.render(HostEvent(HostEventKind.STATUS, "no skills registry"))
             else:
                 try:
-                    text = skills.status()
+                    if args.strip().lower().startswith("add "):
+                        source = args.strip()[4:].strip()
+                        info = await asyncio.to_thread(self.add_skill_from_path, source)
+                        text = f"Added ${info.name}\n{info.description}\n{info.source}"
+                    elif args.strip():
+                        text = "usage: /skills [add PATH]"
+                    else:
+                        from noah_code.skills_setup import format_skills
+
+                        text = format_skills(skills)
                 except Exception as exc:  # noqa: BLE001
                     text = f"skills error: {exc}"
-                self.ui.render(HostEvent(HostEventKind.MESSAGE, text or "(empty)"))
+                self.ui.render(_command_output(text if text else "(empty)"))
+            return "handled"
+        if name == "mcp":
+            try:
+                parts = shlex.split(args)
+                if not parts:
+                    rows = self.list_mcp_infos()
+                    text = "MCP servers"
+                    if rows:
+                        for row in rows:
+                            state = "connected" if row.name in self._mcp_attached else "available"
+                            text += (
+                                f"\n\n  {row.name}  [{state}]\n"
+                                f"    {row.transport} · {row.target}\n    {row.source}"
+                            )
+                    else:
+                        text += "\n\n  None configured"
+                    text += "\n\nAdd with: /mcp add stdio NAME COMMAND…\n          /mcp add http NAME URL"
+                elif parts[0] == "connect" and len(parts) == 2:
+                    text = await self.connect_mcp_server(parts[1])
+                elif parts[:2] == ["add", "stdio"] and len(parts) >= 4:
+                    text = await self.add_mcp_server("stdio", parts[2], shlex.join(parts[3:]))
+                elif parts[:2] == ["add", "http"] and len(parts) == 4:
+                    text = await self.add_mcp_server("http", parts[2], parts[3])
+                else:
+                    text = (
+                        "usage: /mcp [connect NAME | add stdio NAME COMMAND… | "
+                        "add http NAME URL]"
+                    )
+                self.ui.render(_command_output(text))
+            except Exception as exc:  # noqa: BLE001
+                self.ui.render(HostEvent(HostEventKind.ERROR, f"MCP error: {exc}"))
             return "handled"
         if name == "mode":
             mode = args.strip().lower()
@@ -404,13 +693,27 @@ class AgentHost:
                 return "handled"
             await self._switch_model(requested)
             return "handled"
+        if name == "providers":
+            try:
+                parts = shlex.split(args)
+                if not parts:
+                    from noah_code.providers import format_providers
+
+                    text = format_providers(self.meta.model if self.meta else self.config.model)
+                elif parts[0] == "use" and len(parts) == 3:
+                    text = await self.configure_provider(parts[1], parts[2])
+                else:
+                    text = "usage: /providers [use PROVIDER MODEL]"
+                self.ui.render(_command_output(text))
+            except Exception as exc:  # noqa: BLE001
+                self.ui.render(HostEvent(HostEventKind.ERROR, f"provider error: {exc}"))
+            return "handled"
         if name == "session":
             self.ui.render(
-                HostEvent(
-                    HostEventKind.MESSAGE,
+                _command_output(
                     f"id={self.meta.session_id}\ntitle={self.meta.title}\n"
                     f"mode={agent.mode}\nmodel={self.meta.model}\n"
-                    f"workspace={self.meta.workspace_path}",
+                    f"workspace={self.meta.workspace_path}"
                 )
             )
             return "handled"
@@ -433,10 +736,10 @@ class AgentHost:
                 or "(none)"
             )
             text += "\n\nSwitch with: /sessions SESSION_ID"
-            self.ui.render(HostEvent(HostEventKind.MESSAGE, text))
+            self.ui.render(_command_output(text))
             return "handled"
         if name == "todos":
-            self.ui.render(HostEvent(HostEventKind.MESSAGE, agent.todos.status() or "(no todos)"))
+            self.ui.render(_command_output(agent.todos.status() or "(no todos)"))
             return "handled"
         if name == "status":
             reversible = agent.journal.last_turn_reversible() if agent.journal.can_undo() else True
@@ -461,7 +764,7 @@ class AgentHost:
                 text = await agent.git.diff()
             except Exception as exc:  # noqa: BLE001
                 text = f"diff failed: {exc}"
-            self.ui.render(HostEvent(HostEventKind.MESSAGE, f"```\n{text}\n```"))
+            self.ui.render(_command_output(text))
             return "handled"
         if name == "undo":
             try:
@@ -552,9 +855,11 @@ class AgentHost:
         return "continue"
 
     async def _switch_model(self, model: str) -> None:
-        from nooa.unifiedllm import get_llm_client
+        from nooa.interactive import apply_model_limits
 
-        llm = get_llm_client(model)
+        from noah_code.llm import get_llm_client
+
+        llm = await asyncio.to_thread(get_llm_client, model)
         self.agent._llm = llm
         apply_model_limits(self.agent)
         if self.meta:
@@ -565,6 +870,8 @@ class AgentHost:
         self.ui.set_status(self.status_prompt())
 
     async def _run_user_turn(self, text: str) -> HostResult:
+        from nooa.interactive import RespondReason
+
         agent = self.agent
         agent.journal.begin_turn()
         agent._user_messages_in.put(text)
@@ -683,7 +990,6 @@ class AgentHost:
 
         ui = TextualUI()
         self.ui = ui
-        await self.start()
         app = NoahCodeApp(self, ui)
         try:
             await app.run_async()
