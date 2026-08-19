@@ -80,6 +80,24 @@ class UpdateConfig(BaseModel):
     check_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
 
 
+class LSPConfig(BaseModel):
+    """Lazy local language-server settings."""
+
+    enabled: bool = True
+    timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    max_symbols: int = Field(default=300, ge=20, le=5000)
+    servers: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class ProcessConfig(BaseModel):
+    """Bounds for background commands owned by one Noah session."""
+
+    max_jobs: int = Field(default=8, ge=1, le=32)
+    max_runtime_seconds: float = Field(default=3600.0, gt=1, le=86_400)
+    max_buffer_chars: int = Field(default=64_000, ge=4000, le=2_000_000)
+    stop_grace_seconds: float = Field(default=2.0, gt=0, le=30)
+
+
 class NoahCodeConfig(BaseModel):
     """Resolved configuration for a noah-code run."""
 
@@ -100,6 +118,8 @@ class NoahCodeConfig(BaseModel):
     mcp: dict[str, Any] = Field(default_factory=dict)
     ui: UIConfig = Field(default_factory=UIConfig)
     updates: UpdateConfig = Field(default_factory=UpdateConfig)
+    lsp: LSPConfig = Field(default_factory=LSPConfig)
+    processes: ProcessConfig = Field(default_factory=ProcessConfig)
     efficiency: EfficiencyConfig = Field(default_factory=EfficiencyConfig)
     mode: Literal["build", "plan"] = "build"
     max_file_bytes: int = 512_000
@@ -228,7 +248,11 @@ def save_user_default_model(model: str) -> Path:
         len(lines),
     )
     model_line = next(
-        (index for index, line in enumerate(lines[:first_table]) if _TOP_LEVEL_MODEL_RE.match(line)),
+        (
+            index
+            for index, line in enumerate(lines[:first_table])
+            if _TOP_LEVEL_MODEL_RE.match(line)
+        ),
         None,
     )
     if model_line is not None:
@@ -318,7 +342,9 @@ _USER_ONLY_CONFIG_KEYS = frozenset(
         "efficiency",
         "enabled_skills",
         "mcp",
+        "lsp",
         "permission_rules",
+        "processes",
         "session_dir",
         "tracing",
         "unsafe_inprocess_code_execution",
@@ -367,9 +393,7 @@ def _env_overrides() -> dict[str, Any]:
     if unsafe := os.environ.get("NOAH_CODE_UNSAFE_INPROCESS"):
         out["unsafe_inprocess_code_execution"] = unsafe.lower() in {"1", "true", "yes", "on"}
     if auto_update := os.environ.get("NOAH_CODE_AUTO_UPDATE"):
-        out["updates"] = {
-            "auto_install": auto_update.lower() in {"1", "true", "yes", "on"}
-        }
+        out["updates"] = {"auto_install": auto_update.lower() in {"1", "true", "yes", "on"}}
     if efficiency_profile := os.environ.get("NOAH_CODE_EFFICIENCY"):
         out["efficiency"] = {"profile": efficiency_profile.lower()}
     return out

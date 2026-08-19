@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import difflib
+import os
+import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated, Any
@@ -40,6 +44,7 @@ class WorkspaceTools(Skill):
         max_file_results: int = 500,
         output_retention_hours: int = 24,
         default_timeout: float = 60.0,
+        lsp: Any = None,
     ) -> None:
         super().__init__()
         self._workspace = workspace
@@ -54,6 +59,11 @@ class WorkspaceTools(Skill):
         self._output_store = ToolOutputStore(retention_hours=output_retention_hours)
         self._default_timeout = default_timeout
         self._on_shell_chunk: Any = None
+        self._lsp = lsp
+
+    def set_lsp(self, lsp: Any) -> None:
+        """Attach diagnostics after both services have been constructed."""
+        self._lsp = lsp
 
     def set_efficiency_profile(self, profile: str) -> None:
         """Adjust model-facing output limits for the current session."""
@@ -202,9 +212,7 @@ class WorkspaceTools(Skill):
             elif isinstance(result, ShellResult):
                 sections.append(result.stdout or result.stderr or "(no matches)")
             elif isinstance(result, Match):
-                sections.append(
-                    f"{result.path}:{result.start}-{result.end}\n{result.text}"
-                )
+                sections.append(f"{result.path}:{result.start}-{result.end}\n{result.text}")
             else:
                 sections.append(str(result))
         return self._bound("\n\n".join(sections))
@@ -272,6 +280,191 @@ class WorkspaceTools(Skill):
         """Create or overwrite a file; compatibility alias for write_file()."""
 
         return await self.write_file(path, content)
+
+    async def apply_patch(
+        self,
+        changes: Annotated[
+            list[dict[str, str | None]],
+            spec(
+                description=(
+                    "Atomic file changes: path plus exact old text and new text; "
+                    "old=null creates, new=null deletes"
+                )
+            ),
+        ],
+    ) -> str:
+        """Apply one exact, transactional multi-file patch and report diagnostics.
+
+        Each update replaces one unique ``old`` preimage. A create uses
+        ``old=None``; a delete uses ``new=None`` and requires ``old`` to equal
+        the entire current file. Every target is authorized and preflighted
+        before any file changes. A failed commit rolls the whole batch back.
+        """
+        if not changes:
+            raise ValueError("patch requires at least one change")
+        if len(changes) > 50:
+            raise ValueError("patch accepts at most 50 files")
+
+        prepared: list[dict[str, Any]] = []
+        seen: set[Path] = set()
+        # Resolve and authorize the entire batch before reading preimages.
+        for raw in changes:
+            path = str(raw.get("path") or "").strip()
+            if not path:
+                raise ValueError("every patch change requires path")
+            resolved = await self._authorize_path(path, PermissionCategory.EDIT)
+            if resolved in seen:
+                raise ValueError(f"patch target repeated: {path}")
+            seen.add(resolved)
+            prepared.append(
+                {
+                    "path": path,
+                    "resolved": resolved,
+                    "old": raw.get("old"),
+                    "new": raw.get("new"),
+                }
+            )
+
+        for item in prepared:
+            path: Path = item["resolved"]
+            old = item["old"]
+            new = item["new"]
+            exists = path.is_file()
+            if path.exists() and not exists:
+                raise ValueError(f"patch target is not a file: {item['path']}")
+            before_bytes = path.read_bytes() if exists else None
+            if before_bytes is not None and len(before_bytes) > self._journal.blob_limit:
+                raise ValueError(
+                    f"patch target exceeds atomic rollback limit ({self._journal.blob_limit} bytes): "
+                    f"{item['path']}"
+                )
+            if before_bytes is not None and b"\0" in before_bytes:
+                raise ValueError(f"binary patch targets are not supported: {item['path']}")
+            before = before_bytes.decode("utf-8") if before_bytes is not None else None
+            if old is None:
+                if exists:
+                    raise ValueError(f"create preimage failed; file already exists: {item['path']}")
+                if new is None:
+                    raise ValueError(f"create requires new content: {item['path']}")
+                after = new
+                operation = "add"
+            elif not exists:
+                raise ValueError(f"update preimage failed; file does not exist: {item['path']}")
+            elif new is None:
+                if old != before:
+                    raise ValueError(
+                        f"delete preimage mismatch; old must equal the full file: {item['path']}"
+                    )
+                after = None
+                operation = "delete"
+            else:
+                occurrences = before.count(old)
+                if occurrences != 1:
+                    raise ValueError(
+                        f"update preimage must match exactly once in {item['path']} "
+                        f"(found {occurrences})"
+                    )
+                after = before.replace(old, new, 1)
+                operation = "update"
+            item.update(
+                before=before,
+                before_bytes=before_bytes,
+                after=after,
+                after_bytes=after.encode() if after is not None else None,
+                operation=operation,
+                mode=path.stat().st_mode if exists else None,
+            )
+
+        temporary: dict[Path, Path] = {}
+        mutations = []
+        committed: list[dict[str, Any]] = []
+        created_dirs: list[Path] = []
+        try:
+            # Stage every write on the target filesystem before committing.
+            for item in prepared:
+                path: Path = item["resolved"]
+                after_bytes: bytes | None = item["after_bytes"]
+                if after_bytes is None:
+                    continue
+                missing: list[Path] = []
+                parent = path.parent
+                probe = parent
+                while not probe.exists() and probe.is_relative_to(self._workspace.root):
+                    missing.append(probe)
+                    probe = probe.parent
+                parent.mkdir(parents=True, exist_ok=True)
+                created_dirs.extend(reversed(missing))
+                descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.noah-", dir=parent)
+                temp_path = Path(temp_name)
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(after_bytes)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if item["mode"] is not None:
+                    temp_path.chmod(item["mode"])
+                temporary[path] = temp_path
+
+            # Close the TOCTOU window: every file must still match its preflight bytes.
+            for item in prepared:
+                path: Path = item["resolved"]
+                current = path.read_bytes() if path.exists() else None
+                if current != item["before_bytes"]:
+                    raise RuntimeError(f"concurrent modification detected: {item['path']}")
+
+            for item in prepared:
+                mutations.append(self._journal.record_preimage(item["resolved"]))
+            for item in prepared:
+                path: Path = item["resolved"]
+                if item["after_bytes"] is None:
+                    path.unlink()
+                else:
+                    os.replace(temporary.pop(path), path)
+                committed.append(item)
+            for mutation, item in zip(mutations, prepared, strict=True):
+                self._journal.record_postimage(mutation, item["resolved"])
+        except Exception as exc:
+            rollback_error: Exception | None = None
+            try:
+                for item in reversed(committed):
+                    SnapshotJournal._write_state(
+                        item["resolved"], item["before_bytes"], item["mode"]
+                    )
+            except Exception as rollback_exc:  # noqa: BLE001
+                rollback_error = rollback_exc
+            for mutation in mutations:
+                self._journal.discard_mutation(mutation)
+            for directory in reversed(created_dirs):
+                with contextlib.suppress(OSError):
+                    directory.rmdir()
+            if rollback_error is not None:
+                raise RuntimeError(
+                    f"atomic patch failed and rollback also failed: {exc}; {rollback_error}"
+                ) from exc
+            raise RuntimeError(f"atomic patch failed; all changes rolled back: {exc}") from exc
+        finally:
+            for temp_path in temporary.values():
+                with contextlib.suppress(FileNotFoundError):
+                    temp_path.unlink()
+
+        rows = ["Applied atomic patch:"]
+        changed_paths: list[str] = []
+        for item in prepared:
+            before_lines = (item["before"] or "").splitlines()
+            after_lines = (item["after"] or "").splitlines()
+            delta = list(difflib.ndiff(before_lines, after_lines))
+            additions = sum(line.startswith("+ ") for line in delta)
+            deletions = sum(line.startswith("- ") for line in delta)
+            marker = {"add": "A", "update": "M", "delete": "D"}[item["operation"]]
+            rows.append(f"  {marker} {item['path']}  +{additions} -{deletions}")
+            if item["after"] is not None:
+                changed_paths.append(item["path"])
+        if self._lsp is not None and changed_paths:
+            diagnostics = await self._lsp.diagnostics_for_paths(changed_paths)
+            rows.append("Diagnostics:")
+            for path, result in diagnostics.items():
+                first = result.splitlines()[0] if result else "unavailable"
+                rows.append(f"  {path}: {first}")
+        return "\n".join(rows)
 
     async def run(
         self,

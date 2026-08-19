@@ -39,9 +39,7 @@ def _friendly_agent_error(exc: Exception, profile: str) -> str:
     """Turn framework/provider failures into bounded, actionable UI copy."""
 
     raw = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(exc)).strip()
-    iteration = re.search(
-        r"Generation failed after (\d+) iterations \(max_iterations=(\d+)\)", raw
-    )
+    iteration = re.search(r"Generation failed after (\d+) iterations \(max_iterations=(\d+)\)", raw)
     if iteration:
         used, limit = iteration.groups()
         suggestion = (
@@ -281,6 +279,7 @@ class AgentHost:
         agent._approvals.set_handler(self.ui.ask_approval)
         agent._render_message = self._on_agent_message
         agent.ws.set_shell_chunk_handler(self._on_shell_chunk)
+        agent.processes.set_lifecycle_handler(self._on_process_lifecycle)
 
         self._teardown_event_bridge()
         self._event_unsubs = install_event_bridge(agent, self.ui.render, self._usage)
@@ -343,6 +342,17 @@ class AgentHost:
     def _on_shell_chunk(self, stream: str, text: str) -> None:
         self.ui.render(HostEvent(HostEventKind.SHELL_CHUNK, text, meta={"stream": stream}))
 
+    def _on_process_lifecycle(self, job_id: str, name: str, message: str) -> None:
+        """Push lifecycle changes to the UI without streaming logs into model context."""
+
+        self.ui.render(
+            HostEvent(
+                HostEventKind.STATUS,
+                f"background job {job_id} · {name} · {message}",
+                meta={"kind": "background_job", "job_id": job_id},
+            )
+        )
+
     def _on_agent_message(self, text: str, **_kwargs: Any) -> None:
         self.ui.render(HostEvent(HostEventKind.MESSAGE, text))
 
@@ -368,7 +378,7 @@ class AgentHost:
             self._teardown_event_bridge()
             if self._agent is not None:
                 try:
-                    await self._agent.ws.close()
+                    await self._agent.close_tools()
                 except Exception:  # noqa: BLE001
                     logger.debug("shell close failed", exc_info=True)
             if self._storage is not None:
@@ -396,13 +406,51 @@ class AgentHost:
     def usage_snapshot(self) -> UsageSnapshot:
         return self._usage.snapshot()
 
+    async def diff_review(self) -> Any:
+        """Build a Git review model and enrich changed files with diagnostics."""
+
+        review = await self.agent.git.review()
+        paths = list(dict.fromkeys(item.path for item in review.files))
+        diagnostics = await self.agent.lsp.diagnostics_for_paths(paths)
+        for item in review.files:
+            raw = diagnostics.get(item.path, "unavailable")
+            if raw.startswith("ok —"):
+                item.diagnostics = "clean"
+            elif raw.startswith("unavailable") or raw == "not supported":
+                item.diagnostics = raw
+            else:
+                issues = len([line for line in raw.splitlines() if line.strip()])
+                item.diagnostics = f"{issues} issue{'s' if issues != 1 else ''}"
+        return review
+
+    async def revert_diff_file(self, path: str, scope: str) -> str:
+        """Revert an explicitly confirmed review item as its own journal turn."""
+
+        self.agent.journal.begin_turn()
+        try:
+            result = await self.agent.git.revert(path, scope)
+        finally:
+            self.agent.journal.end_turn()
+            self._persist()
+        return result
+
+    def undo_last_turn(self) -> str:
+        """Undo the latest reversible checkpoint and persist it."""
+
+        turn = self.agent.journal._turns[-1] if self.agent.journal.can_undo() else None
+        if turn:
+            self.agent.journal.capture_post_bytes_before_undo(turn)
+        undone = self.agent.journal.undo()
+        self._persist()
+        return f"undid turn {undone.turn_id[:8]} ({len(undone.mutations)} files)"
+
     async def start_new_session(self) -> SessionMeta:
         """Persist current session and open a fresh one in-process."""
         self._persist()
         self._teardown_event_bridge()
         if self._agent is not None:
             with contextlib.suppress(Exception):
-                await self._agent.ws.close()
+                await self._agent.close_tools()
         if self._storage is not None:
             self._storage.close()
             self._storage = None
@@ -418,7 +466,7 @@ class AgentHost:
         self._teardown_event_bridge()
         if self._agent is not None:
             with contextlib.suppress(Exception):
-                await self._agent.ws.close()
+                await self._agent.close_tools()
         if self._storage is not None:
             self._storage.close()
             self._storage = None
@@ -508,10 +556,12 @@ class AgentHost:
 
             preset = provider_preset(provider)
             selected_model = resolve_provider_model(provider, model)
-            credential_hint = " or ".join(
-                " + ".join(group) for group in preset.credential_groups
-            ) or "no API key"
-            provider_info = next(info for info in list_providers(selected_model) if info.key == provider)
+            credential_hint = (
+                " or ".join(" + ".join(group) for group in preset.credential_groups) or "no API key"
+            )
+            provider_info = next(
+                info for info in list_providers(selected_model) if info.key == provider
+            )
             credential_hint += " [ready]" if provider_info.configured else " [missing]"
             provider_label = preset.label
             config_path = None
@@ -737,8 +787,7 @@ class AgentHost:
                     text = await self.add_mcp_server("http", parts[2], parts[3])
                 else:
                     text = (
-                        "usage: /mcp [connect NAME | add stdio NAME COMMAND… | "
-                        "add http NAME URL]"
+                        "usage: /mcp [connect NAME | add stdio NAME COMMAND… | add http NAME URL]"
                     )
                 self.ui.render(_command_output(text))
             except Exception as exc:  # noqa: BLE001
@@ -774,9 +823,7 @@ class AgentHost:
             if requested == "--global" or requested.startswith("--global "):
                 global_model = requested.removeprefix("--global").strip()
                 if not global_model:
-                    self.ui.render(
-                        HostEvent(HostEventKind.ERROR, "usage: /model --global MODEL")
-                    )
+                    self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /model --global MODEL"))
                     return "handled"
                 await self._switch_model(global_model)
                 path = save_user_default_model(global_model)
@@ -800,8 +847,7 @@ class AgentHost:
                 self.ui.render(
                     HostEvent(
                         HostEventKind.STATUS,
-                        f"reasoning_effort={effort} "
-                        "(default lets the provider/model decide)",
+                        f"reasoning_effort={effort} (default lets the provider/model decide)",
                     )
                 )
                 return "handled"
@@ -809,8 +855,7 @@ class AgentHost:
                 self.ui.render(
                     HostEvent(
                         HostEventKind.ERROR,
-                        "usage: /reasoning [--global] "
-                        "[default|none|minimal|low|medium|high|xhigh]",
+                        "usage: /reasoning [--global] [default|none|minimal|low|medium|high|xhigh]",
                     )
                 )
                 return "handled"
@@ -918,23 +963,27 @@ class AgentHost:
             return "handled"
         if name == "diff":
             try:
-                text = await agent.git.diff()
+                review = await self.diff_review()
+                if review.files:
+                    lines = [
+                        f"Changes · {len(review.files)} views · +{review.additions} -{review.deletions}"
+                    ]
+                    lines.extend(
+                        f"  {item.scope[0].upper()} {item.path} +{item.additions} -{item.deletions} "
+                        f"· {item.diagnostics}"
+                        for item in review.files
+                    )
+                    text = "\n".join(lines)
+                else:
+                    text = "No staged or unstaged changes"
             except Exception as exc:  # noqa: BLE001
-                text = f"diff failed: {exc}"
-            self.ui.render(_command_output(text))
+                self.ui.render(HostEvent(HostEventKind.ERROR, f"diff failed: {exc}"))
+                return "handled"
+            self.ui.render(HostEvent(HostEventKind.DIFF_REVIEW, text, meta={"review": review}))
             return "handled"
         if name == "undo":
             try:
-                turn = agent.journal._turns[-1] if agent.journal.can_undo() else None
-                if turn:
-                    agent.journal.capture_post_bytes_before_undo(turn)
-                undone = agent.journal.undo()
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.STATUS,
-                        f"undid turn {undone.turn_id[:8]} ({len(undone.mutations)} files)",
-                    )
-                )
+                self.ui.render(HostEvent(HostEventKind.STATUS, self.undo_last_turn()))
             except Exception as exc:  # noqa: BLE001
                 self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
             return "handled"
@@ -1060,6 +1109,14 @@ class AgentHost:
             self.ui.render(HostEvent(HostEventKind.STOP, _stop_text(kind, explanation)))
             if kind == RespondReason.NEED_INPUT:
                 exit_code = 0
+            if kind == RespondReason.WAIT and not agent.processes.has_running():
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.ERROR,
+                        "Agent returned WAIT without a running background job; "
+                        "start one with self.processes.start() or finish with DONE.",
+                    )
+                )
         except PermissionError as exc:
             exit_code = 3
             explanation = str(exc)

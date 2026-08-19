@@ -58,7 +58,7 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
         "efficiency [fast|balanced|deep]",
         True,
     ),
-    CommandSpec("diff", "Show git diff", host_only=True),
+    CommandSpec("diff", "Review staged and unstaged changes", host_only=True),
     CommandSpec("undo", "Undo last WorkspaceTools turn", host_only=True),
     CommandSpec("redo", "Redo last undone turn", host_only=True),
     CommandSpec("skills", "Search skills or add a compatible skill folder", "skills [add PATH]", True),

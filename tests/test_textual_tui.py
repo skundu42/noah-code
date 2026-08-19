@@ -21,6 +21,7 @@ from noah_code.ui.textual_app import (
     ActivityHistoryScreen,
     ApprovalModal,
     ConversationHistoryScreen,
+    DiffReviewScreen,
     FilteredPicker,
     NoahCodeApp,
     TextualUI,
@@ -117,6 +118,39 @@ async def test_tui_renders_host_events_and_header(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_diff_event_opens_change_ledger_with_validation_and_patch(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host.agent.lsp.document_symbols = AsyncMock(return_value="a.py:1  function changed")
+    review = SimpleNamespace(
+        files=[
+            SimpleNamespace(
+                key="unstaged:a.py",
+                path="a.py",
+                scope="unstaged",
+                status="modified",
+                additions=1,
+                deletions=1,
+                diagnostics="clean",
+                patch="--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+new\n",
+            )
+        ],
+        additions=1,
+        deletions=1,
+    )
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test(size=(120, 40)) as pilot:
+        ui.render(HostEvent(HostEventKind.DIFF_REVIEW, "changes", meta={"review": review}))
+        await pilot.pause()
+
+        assert isinstance(app.screen, DiffReviewScreen)
+        assert "a.py" in _rendered_text(app.screen.query_one("#diff-file-header").content)
+        assert "+new" in _log_text(app.screen.query_one("#diff-patch"))
+        assert "clean" in _rendered_text(app.screen.query_one("#diff-validation").content)
+        assert "changed" in _rendered_text(app.screen.query_one("#diff-validation").content)
+
+
+@pytest.mark.asyncio
 async def test_active_context_rail_shows_semantic_tool_state_not_code(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
     ui = TextualUI()
@@ -168,8 +202,9 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
         banner = app.query_one("#working-banner")
         assert banner.styles.display == "block"
         banner_text = _rendered_text(banner.content)
-        assert "NOAH IS WORKING" in banner_text
+        assert "WORKING" in banner_text
         assert "Inspecting repository" in banner_text
+        assert banner.styles.height.value == 1
         assert app.query_one("#live-activity").styles.display == "none"
 
         ui.render(

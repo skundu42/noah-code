@@ -142,6 +142,83 @@ async def test_compatibility_edit_alias_respects_plan_mode(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_atomic_patch_updates_multiple_files_and_undoes_as_one_turn(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("value = 1\n")
+    (tmp_path / "b.py").write_text("name = 'old'\n")
+    ws = _make_ws(tmp_path, auto=True)
+
+    result = await ws.apply_patch(
+        [
+            {"path": "a.py", "old": "value = 1", "new": "value = 2"},
+            {"path": "b.py", "old": "name = 'old'", "new": "name = 'new'"},
+            {"path": "new.py", "old": None, "new": "created = True\n"},
+        ]
+    )
+
+    assert "Applied atomic patch" in result
+    assert "M a.py" in result and "A new.py" in result
+    assert (tmp_path / "a.py").read_text() == "value = 2\n"
+    assert (tmp_path / "b.py").read_text() == "name = 'new'\n"
+    ws._journal.end_turn()
+    ws._journal.undo()
+    assert (tmp_path / "a.py").read_text() == "value = 1\n"
+    assert (tmp_path / "b.py").read_text() == "name = 'old'\n"
+    assert not (tmp_path / "new.py").exists()
+    await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_atomic_patch_preflights_whole_batch_before_writing(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("value = 1\n")
+    (tmp_path / "b.py").write_text("value = 2\n")
+    ws = _make_ws(tmp_path, auto=True)
+
+    with pytest.raises(ValueError, match="found 0"):
+        await ws.apply_patch(
+            [
+                {"path": "a.py", "old": "value = 1", "new": "changed = 1"},
+                {"path": "b.py", "old": "missing", "new": "changed = 2"},
+            ]
+        )
+
+    assert (tmp_path / "a.py").read_text() == "value = 1\n"
+    assert (tmp_path / "b.py").read_text() == "value = 2\n"
+    await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_atomic_patch_rolls_back_commit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("a = 1\n")
+    (tmp_path / "b.py").write_text("b = 1\n")
+    ws = _make_ws(tmp_path, auto=True)
+    real_replace = __import__("os").replace
+    commits = 0
+
+    def fail_second_commit(source, destination):  # noqa: ANN001, ANN202
+        nonlocal commits
+        if ".noah-" in str(source):
+            commits += 1
+            if commits == 2:
+                raise OSError("fixture commit failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr("noah_code.tools.workspace_tools.os.replace", fail_second_commit)
+    with pytest.raises(RuntimeError, match="all changes rolled back"):
+        await ws.apply_patch(
+            [
+                {"path": "a.py", "old": "a = 1", "new": "a = 2"},
+                {"path": "b.py", "old": "b = 1", "new": "b = 2"},
+            ]
+        )
+
+    assert (tmp_path / "a.py").read_text() == "a = 1\n"
+    assert (tmp_path / "b.py").read_text() == "b = 1\n"
+    await ws.close()
+
+
+@pytest.mark.asyncio
 async def test_oversized_read_is_not_an_editable_match(tmp_path: Path) -> None:
     (tmp_path / "large.txt").write_text("".join(f"line {line}\n" for line in range(500)))
     workspace = Workspace(root=tmp_path.resolve())

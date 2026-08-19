@@ -214,6 +214,25 @@ def _command_insertion(invocation: str) -> str:
     return invocation
 
 
+def _diff_renderable(patch: str) -> Group:
+    """Render a readable unified diff without interpreting arbitrary markup."""
+
+    lines: list[Text] = []
+    for raw in (patch or "(no textual diff)").splitlines():
+        if raw.startswith("@@"):
+            style = "bold #b8a9ff"
+        elif raw.startswith("+++") or raw.startswith("---") or raw.startswith("diff "):
+            style = "bold #7dc4e4"
+        elif raw.startswith("+"):
+            style = "#8bd5ca"
+        elif raw.startswith("-"):
+            style = "#ed8796"
+        else:
+            style = "#d1d1d6"
+        lines.append(Text(raw, style=style, no_wrap=False))
+    return Group(*lines)
+
+
 def _record_to_entries(record: SessionEventRecord) -> list[TranscriptEntry]:
     payload = record.payload
     event_type = record.event_type
@@ -243,11 +262,7 @@ def _record_to_entries(record: SessionEventRecord) -> list[TranscriptEntry]:
                 label,
                 failed="error" in status or "fail" in status,
             )
-            return (
-                [TranscriptEntry("ACTIVITY", text, event_id=record.event_id)]
-                if text
-                else []
-            )
+            return [TranscriptEntry("ACTIVITY", text, event_id=record.event_id)] if text else []
         display_tool = tool.replace("_", " ").strip().capitalize() or "Tool"
         return [
             TranscriptEntry(
@@ -412,9 +427,7 @@ class FilteredPicker(ModalScreen[str | None]):
     def _filter(self, event: Input.Changed) -> None:
         query = event.value.strip().lower().lstrip("/$")
         if query:
-            starts = [
-                row for row in self._rows if row[1].lower().lstrip("/$").startswith(query)
-            ]
+            starts = [row for row in self._rows if row[1].lower().lstrip("/$").startswith(query)]
             contains = [
                 row
                 for row in self._rows
@@ -549,7 +562,10 @@ class ActivityHistoryScreen(ModalScreen[None]):
         detail.write(
             Text.assemble(
                 (f"{record.label}\n", "bold #b8a9ff"),
-                (f"{record.state} · {record.duration:.2f}s · {record.line_count} lines\n\n", "#777781"),
+                (
+                    f"{record.state} · {record.duration:.2f}s · {record.line_count} lines\n\n",
+                    "#777781",
+                ),
                 (record.output or record.result or "No captured output", "#d1d1d6"),
             )
         )
@@ -601,7 +617,9 @@ class ConversationHistoryScreen(ModalScreen[None]):
             return
         self._loading = True
         try:
-            records = await self.host.load_history_page(before=self._before, limit=HISTORY_PAGE_SIZE)
+            records = await self.host.load_history_page(
+                before=self._before, limit=HISTORY_PAGE_SIZE
+            )
             self._has_more = len(records) == HISTORY_PAGE_SIZE
             if records:
                 self._before = min(record.insertion_order for record in records)
@@ -629,6 +647,216 @@ class ConversationHistoryScreen(ModalScreen[None]):
 
     def action_load_older(self) -> None:
         self._load_page()
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class DiffReviewScreen(ModalScreen[None]):
+    """Keyboard-first change ledger with per-file patch and validation state."""
+
+    BINDINGS = [
+        Binding("j,down,n", "next_file", "Next file", show=True),
+        Binding("k,up,p", "previous_file", "Previous file", show=True),
+        Binding("r", "revert", "Revert file", show=True),
+        Binding("u", "undo", "Undo checkpoint", show=True),
+        Binding("escape,q", "close", "Close", show=True),
+    ]
+
+    def __init__(self, host: AgentHost, review: Any) -> None:
+        super().__init__()
+        self.host = host
+        self.review = review
+        self._by_option: dict[str, Any] = {}
+        self._symbols: dict[str, str] = {}
+        self._selected_key: str | None = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="diff-dialog"):
+            yield Static("CHANGE LEDGER", id="diff-title")
+            yield Static("", id="diff-summary")
+            with Horizontal(id="diff-body"):
+                yield OptionList(id="diff-files", compact=True)
+                with Vertical(id="diff-inspector"):
+                    yield Static("", id="diff-file-header")
+                    yield RichLog(
+                        id="diff-patch",
+                        markup=False,
+                        highlight=False,
+                        wrap=False,
+                        min_width=0,
+                        max_lines=5_000,
+                    )
+                    yield Static("", id="diff-validation")
+            yield Static("", id="diff-status")
+            yield Static(
+                "J/K or ↑/↓ next file · R revert · U undo checkpoint · Esc close",
+                id="diff-hint",
+            )
+
+    def on_mount(self) -> None:
+        self._render_review()
+
+    def _render_review(self) -> None:
+        files = list(self.review.files)
+        summary = self.query_one("#diff-summary", Static)
+        summary.update(
+            Text.assemble(
+                (f"{len(files)} change view{'s' if len(files) != 1 else ''}", "bold #d1d1d6"),
+                (f"   +{self.review.additions}", "#8bd5ca"),
+                (f"  -{self.review.deletions}", "#ed8796"),
+                ("   staged and worktree are reviewed separately", "#777781"),
+            ),
+            layout=False,
+        )
+        option_list = self.query_one("#diff-files", OptionList)
+        option_list.clear_options()
+        self._by_option.clear()
+        options: list[Option] = []
+        for index, item in enumerate(files):
+            option_id = f"change-{index}"
+            self._by_option[option_id] = item
+            stage = "S" if item.scope == "staged" else "U"
+            diagnostic_style = (
+                "#8bd5ca"
+                if item.diagnostics == "clean"
+                else "#e6b673"
+                if "issue" in item.diagnostics
+                else "#777781"
+            )
+            prompt = Text()
+            prompt.append(f"{stage} ", style="bold #b8a9ff" if stage == "S" else "bold #7dc4e4")
+            prompt.append(f"{item.path}\n", style="#d1d1d6")
+            prompt.append(f"   {item.status}  ", style="#777781")
+            prompt.append(f"+{item.additions}", style="#8bd5ca")
+            prompt.append(f" -{item.deletions}  ", style="#ed8796")
+            prompt.append(item.diagnostics, style=diagnostic_style)
+            options.append(Option(prompt, id=option_id))
+        if options:
+            option_list.add_options(options)
+            option_list.highlighted = 0
+            option_list.focus()
+            self._show_item(files[0])
+        else:
+            option_list.add_option(
+                Option(Text("No staged or unstaged changes", style="#777781"), disabled=True)
+            )
+            self.query_one("#diff-file-header", Static).update("Working tree clean")
+            self.query_one("#diff-patch", RichLog).clear()
+            self.query_one("#diff-validation", Static).update("")
+
+    @on(OptionList.OptionHighlighted, "#diff-files")
+    def _highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option.id and event.option.id in self._by_option:
+            self._show_item(self._by_option[event.option.id])
+
+    def _show_item(self, item: Any) -> None:
+        self._selected_key = item.key
+        self.query_one("#diff-file-header", Static).update(
+            Text.assemble(
+                (item.path, "bold #f1f1f3"),
+                (f"   {item.scope} · {item.status}", "#777781"),
+            ),
+            layout=False,
+        )
+        patch = self.query_one("#diff-patch", RichLog)
+        patch.clear()
+        patch.write(_diff_renderable(item.patch), scroll_end=False)
+        patch.scroll_home(animate=False)
+        cached = self._symbols.get(item.path)
+        self.query_one("#diff-validation", Static).update(
+            self._validation_text(item, cached or "Loading changed-file symbols…"),
+            layout=False,
+        )
+        if cached is None:
+            self._load_symbols(item)
+
+    @work(exclusive=True, group="diff-symbols")
+    async def _load_symbols(self, item: Any) -> None:
+        try:
+            symbols = await self.host.agent.lsp.document_symbols(item.path)
+        except Exception as exc:  # noqa: BLE001
+            symbols = f"unavailable — {exc}"
+        compact = " · ".join(
+            line.split("  ", 1)[-1] for line in symbols.splitlines()[:4] if line.strip()
+        )
+        if len(symbols.splitlines()) > 4:
+            compact += " · …"
+        self._symbols[item.path] = compact or "no declarations"
+        if self._selected_key == item.key:
+            self.query_one("#diff-validation", Static).update(
+                self._validation_text(item, self._symbols[item.path]),
+                layout=False,
+            )
+
+    @staticmethod
+    def _validation_text(item: Any, symbols: str) -> Text:
+        text = Text()
+        validation_style = (
+            "#8bd5ca"
+            if item.diagnostics == "clean"
+            else "#e6b673"
+            if "issue" in item.diagnostics
+            else "#777781"
+        )
+        text.append("VALIDATION  ", style="bold #b8a9ff")
+        text.append(item.diagnostics, style=validation_style)
+        text.append("\nSYMBOLS     ", style="bold #b8a9ff")
+        text.append(symbols, style="#d1d1d6")
+        return text
+
+    def _move(self, delta: int) -> None:
+        option_list = self.query_one("#diff-files", OptionList)
+        count = len(self._by_option)
+        if not count:
+            return
+        current = option_list.highlighted or 0
+        option_list.highlighted = (current + delta) % count
+
+    def action_next_file(self) -> None:
+        self._move(1)
+
+    def action_previous_file(self) -> None:
+        self._move(-1)
+
+    @work(exclusive=True, group="diff-mutation")
+    async def action_revert(self) -> None:
+        item = next((item for item in self.review.files if item.key == self._selected_key), None)
+        if item is None:
+            return
+        confirmation = await self.app.push_screen_wait(
+            TextPromptModal(
+                f"Revert {item.path}?",
+                "Type REVERT",
+                "This discards the selected file changes. Staged reverts also change the Git index.",
+            )
+        )
+        if confirmation != "REVERT":
+            self.query_one("#diff-status", Static).update("Revert cancelled")
+            return
+        try:
+            status = await self.host.revert_diff_file(item.path, item.scope)
+            self.review = await self.host.diff_review()
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#diff-status", Static).update(
+                Text(f"Revert failed: {exc}", style="#ed8796")
+            )
+            return
+        self.query_one("#diff-status", Static).update(Text(status, style="#8bd5ca"))
+        self._render_review()
+
+    @work(exclusive=True, group="diff-mutation")
+    async def action_undo(self) -> None:
+        try:
+            status = self.host.undo_last_turn()
+            self.review = await self.host.diff_review()
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#diff-status", Static).update(
+                Text(f"Undo unavailable: {exc}", style="#ed8796")
+            )
+            return
+        self.query_one("#diff-status", Static).update(Text(status, style="#8bd5ca"))
+        self._render_review()
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -856,7 +1084,9 @@ class NoahCodeApp(App[None]):
         with contextlib.suppress(Exception):
             self.screen.set_class(width >= WIDE_MIN_COLUMNS, "wide")
             self.screen.set_class(height <= COMPACT_MAX_ROWS, "compact")
-        self._resize_composer(self.query_one("#composer", ComposerTextArea).text if self.is_mounted else "")
+        self._resize_composer(
+            self.query_one("#composer", ComposerTextArea).text if self.is_mounted else ""
+        )
 
     def _tick_busy(self) -> None:
         if not self.ui.busy:
@@ -881,8 +1111,8 @@ class NoahCodeApp(App[None]):
             frame = "◐◓◑◒"[self._spinner_index]
             banner.update(
                 Text.assemble(
-                    (f"{frame}  NOAH IS WORKING", "bold #e6b673"),
-                    (f"   {label}", "#d1d1d6"),
+                    (f"{frame}  WORKING", "bold #e6b673"),
+                    (f"  ·  {label}", "#d1d1d6"),
                 ),
                 layout=False,
             )
@@ -928,7 +1158,10 @@ class NoahCodeApp(App[None]):
         meta = self.host.meta
         text = Text()
         text.append("SESSION\n", style="bold #b8a9ff")
-        text.append(f"{meta.title if meta and meta.title != 'untitled' else 'Untitled session'}\n", style="#d1d1d6")
+        text.append(
+            f"{meta.title if meta and meta.title != 'untitled' else 'Untitled session'}\n",
+            style="#d1d1d6",
+        )
         if meta:
             text.append(f"{meta.session_id[:8]}\n", style="#777781")
         text.append("\nCURRENT\n", style="bold #b8a9ff")
@@ -1021,7 +1254,11 @@ class NoahCodeApp(App[None]):
             return
         self._reveal_transcript()
         existing = list(self._transcript_entries)
-        history = [entry for entry in entries if not entry.event_id or entry.event_id not in self._transcript_event_ids]
+        history = [
+            entry
+            for entry in entries
+            if not entry.event_id or entry.event_id not in self._transcript_event_ids
+        ]
         if not history:
             return
         for entry in history:
@@ -1096,6 +1333,10 @@ class NoahCodeApp(App[None]):
             self._finish_orphan_activity()
             self._phase = "ready"
             self._append_entry(TranscriptEntry("STATUS", text))
+        elif event.kind == HostEventKind.DIFF_REVIEW:
+            review = event.meta.get("review")
+            if review is not None:
+                self.push_screen(DiffReviewScreen(self.host, review))
 
     def _activity_id(self, event: HostEvent) -> str:
         activity_id = str(event.meta.get("activity_id", "") or "")
@@ -1167,7 +1408,9 @@ class NoahCodeApp(App[None]):
                 tool=str(event.meta.get("tool", "tool")),
             )
         result_status = str(event.meta.get("result_status", "complete")).lower()
-        record.state = "error" if "error" in result_status or "fail" in result_status else "complete"
+        record.state = (
+            "error" if "error" in result_status or "fail" in result_status else "complete"
+        )
         record.result = event.text
         record.finished_at = time.monotonic()
         self._activity_history.append(record)
@@ -1238,9 +1481,7 @@ class NoahCodeApp(App[None]):
             return prefix
         token = lowered.lstrip("/")
         return [
-            item
-            for item in commands
-            if token in f"{item.invocation} {item.description}".lower()
+            item for item in commands if token in f"{item.invocation} {item.description}".lower()
         ]
 
     def _update_command_suggestions(self, text: str) -> None:
@@ -1273,7 +1514,9 @@ class NoahCodeApp(App[None]):
             marker = "› " if index == self._suggestion_index else "  "
             style = "bold #8bd5ca" if index == self._suggestion_index else "#d1d1d6"
             lines.append(
-                Text.assemble((marker + item.invocation, style), (f"  {item.description}", "#777781"))
+                Text.assemble(
+                    (marker + item.invocation, style), (f"  {item.description}", "#777781")
+                )
             )
         widget.update(Group(*lines))
         widget.styles.display = "block"
@@ -1285,9 +1528,7 @@ class NoahCodeApp(App[None]):
     def move_suggestion(self, delta: int) -> None:
         if not self._suggestion_matches:
             return
-        self._suggestion_index = (self._suggestion_index + delta) % len(
-            self._suggestion_matches
-        )
+        self._suggestion_index = (self._suggestion_index + delta) % len(self._suggestion_matches)
         self._render_suggestions()
 
     def accept_suggestion(self) -> None:
@@ -1336,7 +1577,9 @@ class NoahCodeApp(App[None]):
         return result if result is not None else ApprovalChoice.REJECT
 
     def action_show_help(self) -> None:
-        self._append_entry(TranscriptEntry("NOAH", f"```text\n{help_text(self.host._custom_commands)}\n```", True))
+        self._append_entry(
+            TranscriptEntry("NOAH", f"```text\n{help_text(self.host._custom_commands)}\n```", True)
+        )
 
     @work(exclusive=True, group="palette")
     async def action_palette(self) -> None:

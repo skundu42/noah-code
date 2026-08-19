@@ -28,8 +28,12 @@ and seccomp support. You also need an LLM provider account such as OpenAI, Anthr
 ## Features
 
 - Read files, search with ripgrep, and inspect Git status, diffs, and history.
-- Edit files with anchored replacements, full rewrites, and concurrent-change detection.
-- Run permission-gated shell commands with timeouts and streamed output.
+- Navigate definitions, implementations, references, symbols, hover types, and diagnostics through
+  lazily launched language servers plus an mtime-cached repository map.
+- Edit files with anchored replacements or atomic multi-file patches with exact preimages,
+  rollback, immediate diagnostics, and concurrent-change detection.
+- Run permission-gated shell commands with timeouts and streamed output, or own long-running
+  servers and watchers as bounded background jobs with cursor-based logs.
 - Follow repository instructions from `AGENTS.md`, `CLAUDE.md`, and `.noah-code/instructions.md`.
 - Switch between implementation-focused **build** mode and read-only **plan** mode.
 - Approve actions once or for a session with ordered `allow`, `ask`, and `deny` rules.
@@ -37,6 +41,8 @@ and seccomp support. You also need an LLM provider account such as OpenAI, Anthr
 - Work in an adaptive Atom One Dark cockpit, a classic console, or one-shot non-interactive mode.
 - Type `/` for a live-filtering command and configuration reference; press Enter to send.
 - Follow batched live tool output, then inspect compact execution records with `F2`.
+- Review `/diff` in a keyboard-driven staged/worktree ledger with per-file patches, line deltas,
+  validation state, changed symbols, explicit revert, and checkpoint undo.
 - Resume workspace-scoped sessions with todos and automatic context compaction.
 - Keep full oversized tool results privately while sending the model a focused, reopenable preview.
 - Inspect token, prompt-cache, model-wait, and tool-output usage with `/tokens`; switch live

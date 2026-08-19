@@ -53,6 +53,8 @@ class ConsoleUI:
             self.console.print(f"[dim]{event.text}[/dim]")
         elif event.kind == HostEventKind.STOP:
             self.console.print(f"[bold]stop:[/bold] {event.text}")
+        elif event.kind == HostEventKind.DIFF_REVIEW:
+            self.console.print(event.text or "(no changes)", markup=False, highlight=False)
         else:
             self.console.print(event.text)
 

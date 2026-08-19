@@ -54,7 +54,8 @@ the configured `max_output_chars` per activity.
 | `/tokens` | Show tokens, cache hits, cost, model wait, and tool-output volume |
 | `/efficiency [fast|balanced|deep]` | Show or switch live iteration and output budgets |
 | `/todos` | Show the agent's current task list |
-| `/status`, `/diff` | Inspect the repository |
+| `/status` | Inspect the current session and repository state |
+| `/diff` | Review staged and unstaged files, patches, diagnostics, and changed symbols |
 | `/undo`, `/redo` | Restore or reapply journaled file edits |
 | `/skills [add PATH]` | Search compatible Codex/Claude skills or import a skill folder |
 | `/mcp [connect|add]` | Search, connect, or add MCP servers |
@@ -109,3 +110,23 @@ File edits made through workspace tools record pre-images and post-images with c
 - `/redo` survives process restarts.
 - A turn that ran a mutating shell command is marked as not fully reversible because the command
   may have changed files outside the journal.
+
+### Change ledger
+
+`/diff` opens staged and worktree changes as separate review entries. Use `J`/`K`, arrow keys, or
+`N`/`P` to move between files. Each row shows status, additions/deletions, and LSP validation;
+the inspector shows the unified patch and a compact declaration summary. Press `R` and type
+`REVERT` to discard the selected file view, `U` to undo the latest reversible checkpoint, or
+`Esc` to close. Staged reverts also modify the Git index and are marked as not fully reversible.
+
+### Semantic navigation and background jobs
+
+The agent can use `self.lsp.definition`, `implementation`, `references`, `document_symbols`,
+`workspace_symbols`, `hover`, `diagnostics`, `rename_preview`, `changed_symbols`, and
+`repository_map`. A language server starts only when a semantic operation needs it; the local
+declaration map remains available when no server is installed. Rename is preview-only.
+
+Long-running commands use `self.processes.start`, `logs`, `status`, `input`, and `stop`. Jobs are
+owned by the current session, run in separate process groups, have bounded runtime and retained
+output, and are terminated when Noah closes. `logs` accepts a cursor and returns only new output.
+Lifecycle updates appear in the TUI without copying continuous logs into model context.

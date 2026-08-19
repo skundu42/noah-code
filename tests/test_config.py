@@ -54,6 +54,11 @@ def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> N
         "session_dir = '/tmp/repository-controlled-sessions'\n"
         "[efficiency]\n"
         "lazy_mcp = false\n"
+        "[lsp]\n"
+        "enabled = false\n"
+        "servers.python = ['repository-command']\n"
+        "[processes]\n"
+        "max_jobs = 32\n"
         "[updates]\n"
         "auto_install = false\n"
     )
@@ -62,6 +67,9 @@ def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> N
     assert cfg.unsafe_inprocess_code_execution is False
     assert str(cfg.session_dir) != "/tmp/repository-controlled-sessions"
     assert cfg.efficiency.lazy_mcp is True
+    assert cfg.lsp.enabled is True
+    assert cfg.lsp.servers == {}
+    assert cfg.processes.max_jobs == 8
     assert cfg.updates.auto_install is True
 
 

@@ -29,6 +29,8 @@ from noah_code.macos_sandbox import build_macos_profile, macos_worker_main
 from noah_code.permissions import PermissionEngine
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tools.git_tools import GitTools
+from noah_code.tools.lsp_tools import LSPTools
+from noah_code.tools.process_tools import ProcessTools
 from noah_code.tools.workspace_tools import WorkspaceTools
 from noah_code.workspace import Workspace
 
@@ -93,6 +95,7 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("workspace_root",),
             ("ws", "edit"),
             ("ws", "inspect"),
+            ("ws", "apply_patch"),
             ("ws", "list"),
             ("ws", "list_files"),
             ("ws", "read"),
@@ -102,6 +105,21 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("ws", "search"),
             ("ws", "write"),
             ("ws", "write_file"),
+            ("lsp", "changed_symbols"),
+            ("lsp", "definition"),
+            ("lsp", "diagnostics"),
+            ("lsp", "document_symbols"),
+            ("lsp", "hover"),
+            ("lsp", "implementation"),
+            ("lsp", "references"),
+            ("lsp", "rename_preview"),
+            ("lsp", "repository_map"),
+            ("lsp", "workspace_symbols"),
+            ("processes", "input"),
+            ("processes", "logs"),
+            ("processes", "start"),
+            ("processes", "status"),
+            ("processes", "stop"),
         }
     )
     _SAFE_SUBTREES = frozenset({("todos",), ("v",)})
@@ -220,9 +238,7 @@ class _LeanPermissionCodeActStrategy(_PermissionCodeActStrategy):
         truncation = runtime.agent._truncation
         runtime.agent.render_config = original.model_copy(
             update={
-                "block_formatter": PlainCodeActBlockFormatter(
-                    event_format=truncation.event_format
-                )
+                "block_formatter": PlainCodeActBlockFormatter(event_format=truncation.event_format)
             }
         )
         try:
@@ -288,6 +304,17 @@ class CodingAgent(InteractiveAgent):
         self._approvals = approvals or ApprovalBroker(self._engine)
         self._journal = journal or SnapshotJournal(blob_limit=config.undo_blob_limit)
 
+        self.lsp = LSPTools(
+            workspace,
+            self._engine,
+            self._approvals,
+            enabled=config.lsp.enabled,
+            timeout=config.lsp.timeout_seconds,
+            server_overrides=config.lsp.servers,
+            max_symbols=config.lsp.max_symbols,
+            max_file_bytes=config.max_file_bytes,
+        )
+
         shell = ShellTools(cwd=str(workspace.root))
         self._shell: Annotated[ShellTools, hidden] = shell
 
@@ -303,6 +330,14 @@ class CodingAgent(InteractiveAgent):
             max_file_results=config.efficiency.max_file_results,
             output_retention_hours=config.efficiency.tool_output_retention_hours,
             default_timeout=config.command_timeout,
+            lsp=self.lsp,
+        )
+        self.processes = ProcessTools(
+            self.ws,
+            max_jobs=config.processes.max_jobs,
+            max_runtime_seconds=config.processes.max_runtime_seconds,
+            max_buffer_chars=config.processes.max_buffer_chars,
+            stop_grace_seconds=config.processes.stop_grace_seconds,
         )
         self.todos = TodoManager()
         self.git = GitTools(self.ws)
@@ -319,6 +354,7 @@ class CodingAgent(InteractiveAgent):
         self.context["todos"] = Context(expr="self.todos.status()")
         self._git_summary_value = self._git_summary()
         self.context["git"] = Context(expr="self._git_summary_value")
+        self.context["background_jobs"] = Context(expr="self.processes.summary()")
 
         if config.summarization.policy != "none":
             from nooa.config.summarizer_config import TokenBudgetConfig
@@ -501,6 +537,13 @@ class CodingAgent(InteractiveAgent):
           editable Match; ``await self.ws.replace(match, "replacement")`` edits it.
         - ``await self.ws.edit("path.py", "unique old text", "new text")`` is the
           simple string-edit form. ``await self.ws.write("new.py", content)`` creates files.
+        - Prefer ``await self.ws.apply_patch(changes)`` for coherent edits. Each change is
+          ``{"path": ..., "old": exact_text_or_None, "new": replacement_or_None}``;
+          one call validates and atomically commits the full batch.
+        - Use ``self.lsp`` for definitions, implementations, references, symbols, hover,
+          diagnostics, rename previews, and compact repository maps before broad searches.
+        - Use ``self.processes.start/logs/status/input/stop`` for servers, watchers, and
+          long-running commands. Consume logs by cursor; do not poll without new work.
         - ``result = await self.ws.run("pytest -q")`` runs validation; inspect
           ``result.returncode``, ``result.stdout``, and ``result.stderr``.
 
@@ -508,7 +551,7 @@ class CodingAgent(InteractiveAgent):
         - Inspect relevant repository instructions and nearby code first.
         - Prefer ``self.ws.search`` / focused ``self.ws.read`` over dumping large files.
         - Use ``self.todos`` for genuinely multi-step tasks; keep todos current.
-        - Make the smallest coherent change with Match-based ``self.ws.replace``.
+        - Make the smallest coherent change, preferring one atomic ``self.ws.apply_patch``.
         - Preserve unrelated user modifications.
         - Run validation proportional to risk (focused tests, not entire suites).
         - Never claim a command or test passed unless its successful result was observed.
@@ -524,3 +567,14 @@ class CodingAgent(InteractiveAgent):
         - WAIT - a registered background job is still running
         """
         ...
+
+    @hidden
+    async def close_tools(self) -> None:
+        """Close every owned shell, LSP server, and background process."""
+
+        await asyncio.gather(
+            self.processes.close(),
+            self.lsp.close(),
+            self.ws.close(),
+            return_exceptions=True,
+        )

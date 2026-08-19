@@ -109,6 +109,19 @@ max_search_results = 100
 max_file_results = 500
 tool_output_retention_hours = 24
 
+[lsp]
+enabled = true
+timeout_seconds = 5
+max_symbols = 300
+# Trusted user config may override a language server command:
+# servers.python = ["basedpyright-langserver", "--stdio"]
+
+[processes]
+max_jobs = 8
+max_runtime_seconds = 3600
+max_buffer_chars = 64000
+stop_grace_seconds = 2
+
 [ui]
 theme = "atom-one-dark"
 frontend = "tui"       # "tui" or "console"
@@ -145,9 +158,10 @@ Supported environment overrides include:
 - `NOAH_CODE_AUTO_UPDATE`
 
 Repository-controlled configuration cannot weaken the host trust boundary. Project config is
-ignored for `auto_approve`, `efficiency`, `enabled_skills`, `mcp`, `permission_rules`,
-`session_dir`, `tracing`, `updates`, and `unsafe_inprocess_code_execution`. Put those settings in
-trusted user config, the environment, or an explicit CLI flag.
+ignored for `auto_approve`, `efficiency`, `enabled_skills`, `lsp`, `mcp`, `permission_rules`,
+`processes`, `session_dir`, `tracing`, `updates`, and `unsafe_inprocess_code_execution`. Put those
+settings in trusted user config, the environment, or an explicit CLI flag. Language-server
+overrides are user-only because they launch local executables.
 
 A user-configured `permission_rules` array replaces the default rule array. Copy forward every
 default you still want before adding overrides. Hard secret, destructive-shell, and plan-mode

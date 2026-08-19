@@ -18,6 +18,7 @@ class HostEventKind(StrEnum):
     APPROVAL = "approval"
     STATUS = "status"
     STOP = "stop"
+    DIFF_REVIEW = "diff_review"
 
 
 @dataclass
