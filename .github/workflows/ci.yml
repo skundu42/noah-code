@@ -88,5 +88,5 @@ jobs:
           UV_TOOL_BIN_DIR: ${{ runner.temp }}/noah-bin
         run: |
           uv build --out-dir smoke-dist
-          uv tool install --managed-python --python 3.12 --no-build --with 'nooa[mcp,tracing]==0.0.8' smoke-dist/*.whl
+          uv tool install --managed-python --python 3.12 --no-build --with 'nooa[mcp,tracing]' smoke-dist/*.whl
           "${UV_TOOL_BIN_DIR}/noah" --version

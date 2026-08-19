@@ -113,14 +113,17 @@ class ProcessTools(Skill):
             process=process,
         )
         self._jobs[job_id] = job
-        job.tasks = [
+        readers = (
             asyncio.create_task(
                 self._read(job, "stdout", process.stdout), name=f"noah-job-{job_id}-out"
             ),
             asyncio.create_task(
                 self._read(job, "stderr", process.stderr), name=f"noah-job-{job_id}-err"
             ),
-            asyncio.create_task(self._wait(job), name=f"noah-job-{job_id}-wait"),
+        )
+        job.tasks = [
+            *readers,
+            asyncio.create_task(self._wait(job, readers), name=f"noah-job-{job_id}-wait"),
             asyncio.create_task(self._expire(job, runtime), name=f"noah-job-{job_id}-timeout"),
         ]
         self._emit(job, f"started pid={process.pid}")
@@ -192,6 +195,10 @@ class ProcessTools(Skill):
             return self._status_line(job)
         job.state = "stopping"
         await self._terminate(job)
+        await asyncio.gather(
+            *(task for task in job.tasks if task.get_name().endswith("-wait")),
+            return_exceptions=True,
+        )
         return self._status_line(job)
 
     def summary(self) -> str:
@@ -233,8 +240,14 @@ class ProcessTools(Skill):
             removed = job.events.popleft()
             job.event_chars -= len(removed.text)
 
-    async def _wait(self, job: BackgroundJob) -> None:
+    async def _wait(
+        self,
+        job: BackgroundJob,
+        readers: tuple[asyncio.Task[Any], asyncio.Task[Any]],
+    ) -> None:
         returncode = await job.process.wait()
+        await self._close_stdin(job)
+        await asyncio.gather(*readers, return_exceptions=True)
         if job.state == "running":
             job.state = "completed" if returncode == 0 else "failed"
         elif job.state == "stopping":
@@ -253,6 +266,7 @@ class ProcessTools(Skill):
             pass
 
     async def _terminate(self, job: BackgroundJob) -> None:
+        await self._close_stdin(job)
         if job.process.returncode is not None:
             return
         with contextlib.suppress(ProcessLookupError):
@@ -269,6 +283,15 @@ class ProcessTools(Skill):
                 else:
                     job.process.kill()
             await job.process.wait()
+
+    @staticmethod
+    async def _close_stdin(job: BackgroundJob) -> None:
+        writer = job.process.stdin
+        if writer is None or writer.is_closing():
+            return
+        writer.close()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            await writer.wait_closed()
 
     def _emit(self, job: BackgroundJob, message: str) -> None:
         if self._on_lifecycle is not None:
@@ -293,7 +316,7 @@ class ProcessTools(Skill):
         current = asyncio.current_task()
         for job in self._jobs.values():
             for task in job.tasks:
-                if task is not current and not task.done():
+                if task is not current and not task.done() and task.get_name().endswith("-timeout"):
                     task.cancel()
         await asyncio.gather(
             *(task for job in self._jobs.values() for task in job.tasks if task is not current),
