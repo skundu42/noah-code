@@ -11,10 +11,36 @@ from nooa.unifiedllm import FakeLLMClient
 from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.commands import help_text
 from noah_code.config import PermissionRule, load_config
-from noah_code.host import AgentHost
+from noah_code.host import AgentHost, _friendly_agent_error, _stop_text
 from noah_code.permissions import PermissionEngine
 from noah_code.sessions import SessionStore
 from noah_code.workspace import Workspace
+
+
+def test_agent_protocol_status_is_plain_language() -> None:
+    assert _stop_text("DONE", "task complete") == "Completed · task complete"
+    assert _stop_text("NEED_INPUT", "choose one") == "Waiting for input · choose one"
+
+
+def test_iteration_limit_error_recommends_recovery() -> None:
+    error = RuntimeError(
+        "Generation failed after 12 iterations (max_iterations=12). "
+        "Unable to complete `handle`."
+    )
+
+    text = _friendly_agent_error(error, "fast")
+
+    assert text == (
+        "Reached the fast profile limit (12/12 turns). "
+        "Continue with /efficiency balanced for more tool turns."
+    )
+
+
+def test_generic_agent_error_is_single_line_and_bounded() -> None:
+    text = _friendly_agent_error(RuntimeError("provider\n" + "x" * 1000), "fast")
+
+    assert "\n" not in text
+    assert len(text) <= 700
 
 
 @pytest.mark.asyncio
@@ -235,7 +261,10 @@ async def test_provider_setup_switches_prefixed_model_and_saves_default(
     workspace = Workspace(root=tmp_path.resolve())
     config = load_config(
         workspace.root,
-        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+        cli_overrides={
+            "session_dir": str(tmp_path / "sessions"),
+            "reasoning_effort": "default",
+        },
     )
     host = AgentHost(workspace, config, llm=FakeLLMClient())
     await host.start()
@@ -316,6 +345,7 @@ async def test_model_switch_persists_for_current_session(tmp_path: Path, monkeyp
         workspace.root,
         cli_overrides={
             "model": "initial-model",
+            "reasoning_effort": "default",
             "session_dir": str(tmp_path / "sessions"),
         },
     )
@@ -347,7 +377,10 @@ async def test_model_switch_updates_implicit_lightweight_model(tmp_path: Path, m
     workspace = Workspace(root=tmp_path.resolve())
     config = load_config(
         workspace.root,
-        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+        cli_overrides={
+            "session_dir": str(tmp_path / "sessions"),
+            "reasoning_effort": "default",
+        },
     )
     host = AgentHost(workspace, config, llm=FakeLLMClient())
     await host.start()

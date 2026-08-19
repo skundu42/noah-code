@@ -24,6 +24,8 @@ from noah_code.ui.textual_app import (
     FilteredPicker,
     NoahCodeApp,
     TextualUI,
+    _normalize_markdown,
+    _record_to_entries,
 )
 
 
@@ -60,6 +62,46 @@ def _log_text(log) -> str:  # noqa: ANN001
     return "\n".join(strip.text for strip in log.lines)
 
 
+def test_markdown_normalization_repairs_indented_model_output() -> None:
+    raw = (
+        "# Noah Code\n\n"
+        "        **Noah Code** is a coding agent.\n\n"
+        "        ### Capabilities\n\n"
+        "        - **Inspect** repositories"
+    )
+
+    assert _normalize_markdown(raw) == (
+        "# Noah Code\n\n"
+        "**Noah Code** is a coding agent.\n\n"
+        "### Capabilities\n\n"
+        "- **Inspect** repositories"
+    )
+
+
+def test_markdown_normalization_unwraps_redundant_markdown_fence() -> None:
+    assert _normalize_markdown("```markdown\n## Result\n\n**Passed**\n```") == (
+        "## Result\n\n**Passed**"
+    )
+
+
+def test_persisted_python_activity_uses_human_label() -> None:
+    record = SessionEventRecord(
+        1,
+        "event-1",
+        "ToolCallEvent",
+        {
+            "name": "execute_python",
+            "arguments": {"code": 'await self.ws.run("pytest -q")'},
+            "result": {"result_status": "complete"},
+        },
+    )
+
+    entries = _record_to_entries(record)
+
+    assert [entry.text for entry in entries] == ["✓ Ran tests"]
+    assert "execute_python" not in entries[0].text
+
+
 @pytest.mark.asyncio
 async def test_tui_renders_host_events_and_header(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
@@ -72,6 +114,80 @@ async def test_tui_renders_host_events_and_header(tmp_path: Path) -> None:
         assert "hello from agent" in _log_text(app.query_one("#conversation"))
         assert "fake-model" in _rendered_text(app.query_one("#header").content)
         assert app.query_one("#conversation").max_lines == MAX_TRANSCRIPT_LINES
+
+
+@pytest.mark.asyncio
+async def test_active_context_rail_shows_semantic_tool_state_not_code(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test(size=(120, 30)) as pilot:
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                "Running tests",
+                meta={"activity_id": "tool-1", "tool": "execute_python"},
+            )
+        )
+        await pilot.pause()
+
+        rail = _rendered_text(app.query_one("#context-rail").content)
+        assert "Running\nRunning tests" in rail
+        assert "result = await" not in rail
+
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_FINISH,
+                "code cell success",
+                meta={"activity_id": "tool-1", "result_status": "success"},
+            )
+        )
+        ui.render(HostEvent(HostEventKind.STOP, "Completed · tests passed"))
+        await pilot.pause()
+        assert "ready" in _rendered_text(app.query_one("#header").content)
+
+
+@pytest.mark.asyncio
+async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
+    tmp_path: Path,
+) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test(size=(120, 30)) as pilot:
+        ui.set_busy(True)
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                "Inspecting repository",
+                meta={"activity_id": "tool-1", "tool": "execute_python"},
+            )
+        )
+        await pilot.pause()
+
+        banner = app.query_one("#working-banner")
+        assert banner.styles.display == "block"
+        banner_text = _rendered_text(banner.content)
+        assert "NOAH IS WORKING" in banner_text
+        assert "Inspecting repository" in banner_text
+        assert app.query_one("#live-activity").styles.display == "none"
+
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_FINISH,
+                "complete",
+                meta={"activity_id": "tool-1", "result_status": "complete"},
+            )
+        )
+        await pilot.pause()
+        transcript = _log_text(app.query_one("#conversation"))
+        assert "✓ Inspected repository" in transcript
+        assert "execute_python" not in transcript
+        assert "Activity" not in transcript
+
+        ui.set_busy(False)
+        await pilot.pause()
+        assert banner.styles.display == "none"
 
 
 @pytest.mark.asyncio
@@ -578,7 +694,7 @@ async def test_activity_streams_live_then_compacts(tmp_path: Path) -> None:
         ui.render(
             HostEvent(
                 HostEventKind.TOOL_START,
-                "execute_python: run tests",
+                "Running tests",
                 meta={"activity_id": "tool-1", "tool": "execute_python"},
             )
         )
@@ -602,8 +718,9 @@ async def test_activity_streams_live_then_compacts(tmp_path: Path) -> None:
         assert len(app._activity_history) == 1
         assert app._activity_history[0].output == "one\ntwo\n"
         transcript = _log_text(app.query_one("#conversation"))
-        assert "execute_python: run tests" in transcript
-        assert "2 lines" in transcript
+        assert "✓ Ran tests" in transcript
+        assert "execute_python" not in transcript
+        assert "2 lines" not in transcript
 
         await pilot.press("f2")
         await pilot.pause()

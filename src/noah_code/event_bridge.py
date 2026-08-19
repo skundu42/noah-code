@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -9,6 +10,32 @@ from noah_code.events import HostEvent, HostEventKind
 
 Unsubscribe = Callable[[], None]
 EmitFn = Callable[[HostEvent], None]
+
+
+def _describe_code_activity(code: str) -> str:
+    """Describe generated tool code using user-facing coding verbs."""
+
+    lowered = code.lower()
+    if re.search(r"self\.ws\.(?:run|run_stream)\s*\(", lowered):
+        if re.search(r"(?:pytest|unittest|tox|vitest|jest|go test|cargo test|npm test)", lowered):
+            return "Running tests"
+        if re.search(r"(?:ruff|mypy|pyright|lint|check)", lowered):
+            return "Running checks"
+        if "build" in lowered:
+            return "Building project"
+        return "Running command"
+    if re.search(r"self\.ws\.(?:edit|replace|write|write_file)\s*\(", lowered):
+        return "Editing files"
+    if re.search(
+        r"self\.(?:ws\.(?:inspect|list|list_files|read|read_output|search)|git\.)",
+        lowered,
+    ):
+        return "Inspecting repository"
+    if "self.message(" in lowered or "return_result(" in lowered:
+        return "Preparing response"
+    if "inspecting inputs" in lowered:
+        return "Preparing"
+    return "Working"
 
 
 def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> list[Unsubscribe]:
@@ -25,13 +52,12 @@ def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> 
             return
         name = getattr(event, "name", "tool")
         args = getattr(event, "arguments", {}) or {}
-        preview = ""
         if name == "execute_python":
             code = str(args.get("code", ""))
-            preview = code.strip().splitlines()[0][:80] if code.strip() else ""
-            text = f"execute_python{(': ' + preview) if preview else ''}"
+            text = _describe_code_activity(code)
         else:
-            text = f"{name}({_brief_args(args)})"
+            cleaned = name.replace("_", " ").strip().capitalize() or "Working"
+            text = f"{cleaned}{(' · ' + _brief_args(args)) if args else ''}"
         activity_id = str(getattr(event, "tool_call_id", "") or getattr(event, "id", ""))
         emit(
             HostEvent(
@@ -49,10 +75,11 @@ def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> 
         if usage is not None:
             usage.tool_output(event)
         status = str(getattr(event, "execution_status", "") or "")
+        status_value = getattr(getattr(event, "execution_status", None), "value", status)
         err = (getattr(event, "error", "") or "").strip()
         stdout = (getattr(event, "stdout", "") or "").strip()
         stderr = (getattr(event, "stderr", "") or "").strip()
-        parts = [f"code cell {status}".strip()]
+        parts = [str(status_value or "complete")]
         if err:
             parts.append(err[:200])
         elif stderr:
@@ -86,7 +113,6 @@ def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> 
                     },
                 )
             )
-        status_value = getattr(getattr(event, "execution_status", None), "value", status)
         emit(
             HostEvent(
                 HostEventKind.TOOL_FINISH,
@@ -104,7 +130,7 @@ def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> 
     def on_error(event: Any) -> None:
         content = str(getattr(event, "content", event) or "")
         if content:
-            emit(HostEvent(HostEventKind.ERROR, content))
+            emit(HostEvent(HostEventKind.ERROR, _truncate(content, 1200)))
 
     def on_llm_start(event: Any) -> None:
         if usage is not None:

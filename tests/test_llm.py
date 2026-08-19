@@ -14,6 +14,18 @@ def test_reasoning_overrides_omits_provider_default() -> None:
         reasoning_overrides("unlimited")
 
 
+def test_client_construction_suppresses_litellm_debug_banners(monkeypatch) -> None:
+    import litellm
+
+    downstream = MagicMock(return_value="client")
+    monkeypatch.setattr(litellm, "suppress_debug_info", False)
+    monkeypatch.setattr("nooa.unifiedllm.get_registry_config", lambda _name: {})
+    monkeypatch.setattr("nooa.unifiedllm.get_llm_client", downstream)
+
+    assert get_llm_client("openrouter/example/model") == "client"
+    assert litellm.suppress_debug_info is True
+
+
 def test_custom_alias_fails_closed_when_named_credential_is_missing(monkeypatch) -> None:
     monkeypatch.delenv("COMPANY_LLM_API_KEY", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-fall-back")

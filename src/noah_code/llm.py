@@ -33,6 +33,14 @@ def get_llm_client(name: str, **overrides: Any) -> Any:
 
     hydrate_provider_credentials_for_model(name)
 
+    # LiteLLM prints a red provider-documentation banner directly to stderr
+    # during some successful OpenRouter capability probes. Keep real
+    # exceptions intact while preventing that debug-only output from corrupting
+    # Noah's console and Textual renderers.
+    import litellm
+
+    litellm.suppress_debug_info = True
+
     from nooa.unifiedllm import get_llm_client as nooa_get_llm_client
     from nooa.unifiedllm import get_registry_config
 

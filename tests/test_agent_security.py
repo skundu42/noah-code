@@ -39,6 +39,9 @@ def test_inprocess_execution_requires_explicit_unsafe_setting(tmp_path: Path) ->
 
 def test_sandbox_broker_exposes_only_permission_gated_capabilities() -> None:
     assert _PermissionSandboxedExecutor._path_allowed(("ws", "read"))
+    assert _PermissionSandboxedExecutor._path_allowed(("ws", "list"))
+    assert _PermissionSandboxedExecutor._path_allowed(("ws", "edit"))
+    assert _PermissionSandboxedExecutor._path_allowed(("ws", "write"))
     assert _PermissionSandboxedExecutor._path_allowed(("git", "status"))
     assert not _PermissionSandboxedExecutor._path_allowed(("runtime", "execute_code"))
     assert not _PermissionSandboxedExecutor._path_allowed(("_shell", "run"))

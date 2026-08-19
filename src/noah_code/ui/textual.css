@@ -65,6 +65,17 @@ Screen {
     border-left: solid #242428;
 }
 
+#working-banner {
+    display: none;
+    height: 3;
+    margin: 0 2 1 2;
+    padding: 0 1;
+    content-align: left middle;
+    background: #211e18;
+    border-left: thick $nc-warning;
+    color: $nc-text;
+}
+
 .wide #context-rail {
     display: block;
 }
@@ -146,6 +157,11 @@ Screen {
 
 .compact #live-activity {
     height: 5;
+}
+
+.compact #working-banner {
+    height: 2;
+    margin-bottom: 0;
 }
 
 ApprovalModal,

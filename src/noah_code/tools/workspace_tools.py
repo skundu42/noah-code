@@ -20,8 +20,9 @@ class WorkspaceTools(Skill):
     """Read, search, edit, and run commands inside the active workspace.
 
     All mutating operations go through the permission engine. Prefer
-    Match-based ``replace`` over rewriting whole files. Paths are
-    canonicalized and must remain inside the workspace unless
+    Match-based ``replace`` over rewriting whole files. Familiar ``list``,
+    ``edit``, and ``write`` aliases are available for model compatibility.
+    Paths are canonicalized and must remain inside the workspace unless
     ``external_directory`` is approved.
     """
 
@@ -103,7 +104,7 @@ class WorkspaceTools(Skill):
         pattern: Annotated[str, spec(description="Regex or fixed pattern for ripgrep")],
         path: Annotated[str, spec(description="Subdirectory or file to search")] = ".",
     ) -> ShellResult:
-        """Search the workspace with ripgrep; results may include Match anchors."""
+        """Return bounded ripgrep text; call read() on a result to get an edit anchor."""
         resolved = await self._authorize_path(path, PermissionCategory.READ)
         import shlex
 
@@ -129,6 +130,15 @@ class WorkspaceTools(Skill):
                 f"...[{len(matches) - self._max_file_results} more]"
             ]
         return matches
+
+    async def list(
+        self,
+        pattern: Annotated[str, spec(description="Glob pattern")] = "**/*",
+        path: Annotated[str, spec(description="Subdirectory")] = ".",
+    ) -> list[str]:
+        """Compatibility alias for list_files()."""
+
+        return await self.list_files(pattern=pattern, path=path)
 
     async def read_output(
         self,
@@ -228,6 +238,16 @@ class WorkspaceTools(Skill):
             return result
         raise TypeError("replace expects a Match or path string")
 
+    async def edit(
+        self,
+        path: Annotated[str, spec(description="File path relative to workspace")],
+        old: Annotated[str, spec(description="Unique text to replace")],
+        new: Annotated[str, spec(description="Replacement text")],
+    ) -> Any:
+        """Replace one unique string in a file; compatibility alias for replace()."""
+
+        return await self.replace(path, old, new)
+
     async def write_file(
         self,
         path: Annotated[str, spec(description="File path relative to workspace")],
@@ -243,6 +263,15 @@ class WorkspaceTools(Skill):
             raise
         self._journal.record_postimage(mut, resolved)
         return result
+
+    async def write(
+        self,
+        path: Annotated[str, spec(description="File path relative to workspace")],
+        content: Annotated[str, spec(description="Full file content")],
+    ) -> Any:
+        """Create or overwrite a file; compatibility alias for write_file()."""
+
+        return await self.write_file(path, content)
 
     async def run(
         self,

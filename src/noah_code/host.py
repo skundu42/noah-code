@@ -35,6 +35,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _friendly_agent_error(exc: Exception, profile: str) -> str:
+    """Turn framework/provider failures into bounded, actionable UI copy."""
+
+    raw = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(exc)).strip()
+    iteration = re.search(
+        r"Generation failed after (\d+) iterations \(max_iterations=(\d+)\)", raw
+    )
+    if iteration:
+        used, limit = iteration.groups()
+        suggestion = (
+            "Continue with /efficiency balanced for more tool turns."
+            if profile == "fast"
+            else "Continue with a narrower follow-up, or use /efficiency deep."
+        )
+        return f"Reached the {profile} profile limit ({used}/{limit} turns). {suggestion}"
+    retries = re.search(r"Generation failed after (\d+) errors", raw)
+    if retries:
+        return (
+            f"The model produced invalid tool code {retries.group(1)} times. "
+            "Try again; if it repeats, switch models with /model."
+        )
+    compact = " ".join(raw.split())
+    if len(compact) > 700:
+        compact = compact[:697].rstrip() + "…"
+    return compact or type(exc).__name__
+
+
+def _stop_text(kind: Any, explanation: str) -> str:
+    """Render the agent protocol as human language instead of enum syntax."""
+
+    value = str(getattr(kind, "value", kind) or "").upper()
+    label = {
+        "DONE": "Completed",
+        "NEED_INPUT": "Waiting for input",
+        "GET_USER_INPUT": "Waiting for input",
+        "WAIT": "Waiting for background work",
+    }.get(value, value.replace("_", " ").title() or "Stopped")
+    detail = " ".join((explanation or "").split())
+    return f"{label} · {detail}" if detail else label
+
+
 def _command_output(text: str) -> HostEvent:
     """Return exact, preformatted command output for every UI frontend."""
 
@@ -1016,7 +1057,7 @@ class AgentHost:
             explanation = getattr(result, "explanation", "") or ""
             kind = getattr(result, "kind", None)
             self._last_stop = explanation
-            self.ui.render(HostEvent(HostEventKind.STOP, f"{kind}: {explanation}"))
+            self.ui.render(HostEvent(HostEventKind.STOP, _stop_text(kind, explanation)))
             if kind == RespondReason.NEED_INPUT:
                 exit_code = 0
         except PermissionError as exc:
@@ -1030,9 +1071,9 @@ class AgentHost:
             raise
         except Exception as exc:
             exit_code = 1
-            explanation = f"agent failure: {exc}"
+            explanation = _friendly_agent_error(exc, self.config.efficiency.profile)
             self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
-            logger.exception("handle() failed")
+            logger.debug("handle() failed", exc_info=True)
         finally:
             agent.journal.end_turn()
             self._last_turn_shell_bypass = bool(

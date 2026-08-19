@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import threading
 import time
 from collections import deque
@@ -33,6 +34,7 @@ from noah_code.commands import (
     config_command_suggestions,
     help_text,
 )
+from noah_code.event_bridge import _describe_code_activity
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.sessions import SessionEventRecord
 
@@ -136,12 +138,51 @@ def _role_renderable(entry: TranscriptEntry) -> Group:
         "SUMMARY": "▌ Summary",
         "STATUS": "  ·",
     }
-    label = Text(labels.get(entry.role, entry.role), style=f"bold {colors.get(entry.role, '#777781')}")
+    if entry.role == "ACTIVITY":
+        return Group(Padding(Text(entry.text, style=colors["ACTIVITY"]), (0, 0, 1, 2)))
+    label = Text(
+        labels.get(entry.role, entry.role),
+        style=f"bold {colors.get(entry.role, '#777781')}",
+    )
     if entry.markdown:
-        body: Any = Markdown(entry.text, code_theme="monokai", hyperlinks=True)
+        body: Any = Markdown(
+            _normalize_markdown(entry.text),
+            code_theme="monokai",
+            hyperlinks=True,
+        )
     else:
         body = Text(entry.text, style="#d1d1d6")
     return Group(label, Padding(body, (0, 0, 1, 2)))
+
+
+def _normalize_markdown(text: str) -> str:
+    """Repair model-authored indentation and redundant outer Markdown fences."""
+
+    cleaned = inspect.cleandoc(text)
+    lines = cleaned.splitlines()
+    if (
+        len(lines) >= 2
+        and lines[0].strip().lower() in {"```markdown", "```md"}
+        and lines[-1].strip() == "```"
+    ):
+        cleaned = inspect.cleandoc("\n".join(lines[1:-1]))
+    return cleaned
+
+
+def _completed_activity_label(label: str, *, failed: bool) -> str | None:
+    """Collapse internal activity into one concise transcript line."""
+
+    if label in {"Preparing", "Preparing response", "Working"}:
+        return None
+    completed = {
+        "Inspecting repository": "Inspected repository",
+        "Editing files": "Edited files",
+        "Running tests": "Ran tests",
+        "Running checks": "Ran checks",
+        "Building project": "Built project",
+        "Running command": "Ran command",
+    }.get(label, label)
+    return f"× {completed} failed" if failed else f"✓ {completed}"
 
 
 def _welcome_renderable(repository: str, *, starting: bool) -> Group:
@@ -194,10 +235,24 @@ def _record_to_entries(record: SessionEventRecord) -> list[TranscriptEntry]:
         status = "recorded"
         if isinstance(result, dict):
             status = str(result.get("result_status", "complete") or "complete").lower()
+        if tool == "execute_python":
+            arguments = payload.get("arguments")
+            code = str(arguments.get("code", "")) if isinstance(arguments, dict) else ""
+            label = _describe_code_activity(code)
+            text = _completed_activity_label(
+                label,
+                failed="error" in status or "fail" in status,
+            )
+            return (
+                [TranscriptEntry("ACTIVITY", text, event_id=record.event_id)]
+                if text
+                else []
+            )
+        display_tool = tool.replace("_", " ").strip().capitalize() or "Tool"
         return [
             TranscriptEntry(
                 "ACTIVITY",
-                f"{tool} · {status}",
+                f"{display_tool} · {status}",
                 event_id=record.event_id,
             )
         ]
@@ -477,7 +532,7 @@ class ActivityHistoryScreen(ModalScreen[None]):
         options = []
         for record in self.records:
             icon = "✓" if record.state == "complete" else "×" if record.state == "error" else "◆"
-            prompt = Text(f"{icon} {record.tool}  {record.duration:.1f}s", style="#d1d1d6")
+            prompt = Text(f"{icon} {record.label}  {record.duration:.1f}s", style="#d1d1d6")
             options.append(Option(prompt, id=record.activity_id))
         option_list = self.query_one("#activity-list", OptionList)
         if options:
@@ -718,6 +773,7 @@ class NoahCodeApp(App[None]):
                     min_width=0,
                     max_lines=MAX_TRANSCRIPT_LINES,
                 )
+                yield Static("", id="working-banner")
                 with Vertical(id="live-activity"):
                     yield Static("", id="activity-title")
                     yield RichLog(
@@ -806,7 +862,31 @@ class NoahCodeApp(App[None]):
         if not self.ui.busy:
             return
         self._spinner_index = (self._spinner_index + 1) % 4
+        self._update_working_banner()
         self.update_chrome()
+
+    def _update_working_banner(self) -> None:
+        """Keep an obvious animated turn indicator visible between tool calls."""
+
+        with contextlib.suppress(Exception):
+            banner = self.query_one("#working-banner", Static)
+            if not self.ui.busy:
+                banner.styles.display = "none"
+                return
+            label = "Thinking"
+            if self._active_activity_id and self._active_activity_id in self._activities:
+                label = self._activities[self._active_activity_id].label
+            elif self._phase not in {"ready", "thinking"}:
+                label = self._phase.replace("_", " ").strip().capitalize()
+            frame = "◐◓◑◒"[self._spinner_index]
+            banner.update(
+                Text.assemble(
+                    (f"{frame}  NOAH IS WORKING", "bold #e6b673"),
+                    (f"   {label}", "#d1d1d6"),
+                ),
+                layout=False,
+            )
+            banner.styles.display = "block"
 
     def update_chrome(self, *, force: bool = False) -> None:
         meta = self.host.meta
@@ -837,6 +917,7 @@ class NoahCodeApp(App[None]):
             self._rail_text = rail
             with contextlib.suppress(Exception):
                 self.query_one("#context-rail", Static).update(rail, layout=False)
+        self._update_working_banner()
 
     def update_status_bar(self) -> None:
         """Compatibility shim for callers of the original TUI API."""
@@ -852,7 +933,9 @@ class NoahCodeApp(App[None]):
             text.append(f"{meta.session_id[:8]}\n", style="#777781")
         text.append("\nCURRENT\n", style="bold #b8a9ff")
         if self._active_activity_id and self._active_activity_id in self._activities:
-            text.append(self._activities[self._active_activity_id].label[:34], style="#e6b673")
+            record = self._activities[self._active_activity_id]
+            text.append("Running\n", style="#e6b673")
+            text.append(record.label[:28], style="#d1d1d6")
         else:
             text.append("Waiting for your next turn", style="#777781")
 
@@ -1011,7 +1094,7 @@ class NoahCodeApp(App[None]):
                 self._append_entry(TranscriptEntry("STATUS", text))
         elif event.kind == HostEventKind.STOP:
             self._finish_orphan_activity()
-            self._phase = "stopped"
+            self._phase = "ready"
             self._append_entry(TranscriptEntry("STATUS", text))
 
     def _activity_id(self, event: HostEvent) -> str:
@@ -1031,14 +1114,11 @@ class NoahCodeApp(App[None]):
         )
         self._activities[activity_id] = record
         self._active_activity_id = activity_id
-        self._phase = record.tool
-        self.query_one("#activity-title", Static).update(
-            Text.assemble(("◆ RUNNING  ", "bold #e6b673"), (record.label, "#d1d1d6")),
-            layout=False,
-        )
+        self._phase = record.label
         output = self.query_one("#activity-output", RichLog)
         output.clear()
-        self.query_one("#live-activity", Vertical).styles.display = "block"
+        self.query_one("#live-activity", Vertical).styles.display = "none"
+        self._update_working_banner()
 
     def _queue_activity_output(self, event: HostEvent) -> None:
         activity_id = self._activity_id(event)
@@ -1047,10 +1127,11 @@ class NoahCodeApp(App[None]):
             record = ActivityRecord(activity_id=activity_id, label="shell output", tool="shell")
             self._activities[activity_id] = record
             self._active_activity_id = activity_id
-            self.query_one("#activity-title", Static).update(
-                Text("◆ RUNNING  shell output", style="bold #e6b673"), layout=False
-            )
-            self.query_one("#live-activity", Vertical).styles.display = "block"
+        self.query_one("#activity-title", Static).update(
+            Text.assemble(("OUTPUT  ", "bold #e6b673"), (record.label, "#d1d1d6")),
+            layout=False,
+        )
+        self.query_one("#live-activity", Vertical).styles.display = "block"
         stream = str(event.meta.get("stream", "stdout"))
         record.append(event.text, self.host.config.max_output_chars)
         self._stream_fragments.append((stream, event.text))
@@ -1092,15 +1173,21 @@ class NoahCodeApp(App[None]):
         self._activity_history.append(record)
         if self._active_activity_id == activity_id:
             self._active_activity_id = None
-        icon = "✓" if record.state == "complete" else "×"
-        self._append_entry(
-            TranscriptEntry(
-                "ACTIVITY",
-                f"{icon} {record.label} · {record.duration:.1f}s · {record.line_count} lines",
-            )
+        completion = _completed_activity_label(
+            record.label,
+            failed=record.state == "error",
         )
+        duplicate = bool(
+            completion
+            and self._transcript_entries
+            and self._transcript_entries[-1].role == "ACTIVITY"
+            and self._transcript_entries[-1].text == completion
+        )
+        if completion and not duplicate:
+            self._append_entry(TranscriptEntry("ACTIVITY", completion))
         self.query_one("#live-activity", Vertical).styles.display = "none"
         self._phase = "ready"
+        self._update_working_banner()
 
     def _finish_orphan_activity(self, *, state: str = "complete") -> None:
         activity_id = self._active_activity_id

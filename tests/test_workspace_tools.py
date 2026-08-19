@@ -118,6 +118,30 @@ async def test_match_replace(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_compatibility_aliases_are_permission_gated_and_functional(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "a.py").write_text("value = 1\n")
+    ws = _make_ws(tmp_path, auto=True)
+
+    assert await ws.list("*.py") == ["a.py"]
+    await ws.edit("a.py", "value = 1", "value = 2")
+    await ws.write("b.py", "result = 3\n")
+
+    assert (tmp_path / "a.py").read_text() == "value = 2\n"
+    assert (tmp_path / "b.py").read_text() == "result = 3\n"
+
+
+@pytest.mark.asyncio
+async def test_compatibility_edit_alias_respects_plan_mode(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("value = 1\n")
+    ws = _make_ws(tmp_path, mode="plan", auto=True)
+
+    with pytest.raises(PermissionError):
+        await ws.edit("a.py", "1", "2")
+
+
+@pytest.mark.asyncio
 async def test_oversized_read_is_not_an_editable_match(tmp_path: Path) -> None:
     (tmp_path / "large.txt").write_text("".join(f"line {line}\n" for line in range(500)))
     workspace = Workspace(root=tmp_path.resolve())

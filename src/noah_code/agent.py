@@ -91,13 +91,16 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("message",),
             ("mode",),
             ("workspace_root",),
+            ("ws", "edit"),
             ("ws", "inspect"),
+            ("ws", "list"),
             ("ws", "list_files"),
             ("ws", "read"),
             ("ws", "read_output"),
             ("ws", "replace"),
             ("ws", "run"),
             ("ws", "search"),
+            ("ws", "write"),
             ("ws", "write_file"),
         }
     )
@@ -490,6 +493,16 @@ class CodingAgent(InteractiveAgent):
 
         Read all user messages, slash-command results, and system messages
         in the notification. Understand the requested end state before editing.
+
+        Minimal tool cookbook:
+        - ``await self.ws.list("**/*.py")`` lists files.
+        - ``await self.ws.search("symbol")`` returns locations as text.
+        - ``match = await self.ws.read("path.py", lines=(10, 30))`` returns an
+          editable Match; ``await self.ws.replace(match, "replacement")`` edits it.
+        - ``await self.ws.edit("path.py", "unique old text", "new text")`` is the
+          simple string-edit form. ``await self.ws.write("new.py", content)`` creates files.
+        - ``result = await self.ws.run("pytest -q")`` runs validation; inspect
+          ``result.returncode``, ``result.stdout``, and ``result.stderr``.
 
         Workflow:
         - Inspect relevant repository instructions and nearby code first.
