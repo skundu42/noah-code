@@ -33,6 +33,12 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("mode", "Show or switch the active mode", "mode [build|plan]", True),
     CommandSpec("model", "Configure a provider or switch this session's model", "model [MODEL]", True),
     CommandSpec(
+        "reasoning",
+        "Show or set reasoning effort for compatible models",
+        "reasoning [default|none|minimal|low|medium|high|xhigh]",
+        True,
+    ),
+    CommandSpec(
         "providers",
         "Search and configure API providers",
         "providers [use PROVIDER MODEL]",
@@ -45,6 +51,13 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("compact", "Trigger history summarization", host_only=True),
     CommandSpec("todos", "Show todo list", host_only=True),
     CommandSpec("status", "Show mode/model/session/context", host_only=True),
+    CommandSpec("tokens", "Show token, cache, cost, and latency usage", host_only=True),
+    CommandSpec(
+        "efficiency",
+        "Show or switch the token/latency profile",
+        "efficiency [fast|balanced|deep]",
+        True,
+    ),
     CommandSpec("diff", "Show git diff", host_only=True),
     CommandSpec("undo", "Undo last WorkspaceTools turn", host_only=True),
     CommandSpec("redo", "Redo last undone turn", host_only=True),
@@ -127,6 +140,12 @@ def all_command_suggestions(
     suggestions.append(
         CommandSuggestion("/model --global MODEL", "Set the default model for every repository")
     )
+    suggestions.append(
+        CommandSuggestion(
+            "/reasoning --global EFFORT",
+            "Set the reasoning effort default for every repository",
+        )
+    )
     if custom:
         suggestions.extend(
             CommandSuggestion(f"/{name} [ARGS]", command.description)
@@ -148,6 +167,9 @@ def help_text(custom: dict[str, CustomCommand] | None = None) -> str:
     for cmd in BUILTIN_COMMANDS:
         lines.append(f"  {cmd.invocation:<28} {cmd.description}")
     lines.append(f"  {'/model --global MODEL':<28} Set the default model for every repository")
+    lines.append(
+        f"  {'/reasoning --global EFFORT':<28} Set the global reasoning effort default"
+    )
     if custom:
         lines.append("")
         lines.append("Custom commands:")

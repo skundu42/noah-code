@@ -248,7 +248,9 @@ async def test_provider_setup_switches_prefixed_model_and_saves_default(
 
     status = await host.configure_provider("openrouter", "anthropic/example-model")
 
-    host._switch_model.assert_awaited_once_with("openrouter/anthropic/example-model")
+    host._switch_model.assert_awaited_once_with(
+        "openrouter/anthropic/example-model", reasoning_effort="default"
+    )
     assert saved == ["openrouter/anthropic/example-model"]
     assert host.config.model == "openrouter/anthropic/example-model"
     assert "OPENROUTER_API_KEY" in status
@@ -337,4 +339,93 @@ async def test_model_switch_persists_for_current_session(tmp_path: Path, monkeyp
     assert host.meta.model == "next-model"
     assert host.store.load_meta(host.meta.session_id).model == "next-model"
     assert host.config.model == "initial-model"
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_model_switch_updates_implicit_lightweight_model(tmp_path: Path, monkeypatch) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    switched_client = FakeLLMClient()
+    monkeypatch.setattr("noah_code.llm.get_llm_client", lambda _model: switched_client)
+
+    await host._switch_model("next-model")
+
+    assert host.agent._llm is switched_client
+    assert host.agent._lightweight_llm is switched_client
+    assert all(summarizer._llm is switched_client for summarizer in host.agent._summarizers)
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_lazy_mcp_skips_eager_install(tmp_path: Path, monkeypatch) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    install = AsyncMock()
+    monkeypatch.setattr("noah_code.mcp_setup.install_mcp", install)
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+
+    await host.start()
+
+    install.assert_not_awaited()
+    assert host._mcp_attached == set()
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_tokens_and_efficiency_commands(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+
+    assert await host.handle_line("/tokens") == "handled"
+    assert "Token and latency usage" in host.ui.render.call_args.args[0].text
+
+    assert await host.handle_line("/efficiency balanced") == "handled"
+    assert config.efficiency.profile == "balanced"
+    assert "efficiency set to balanced" in host.ui.render.call_args.args[0].text
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_command_rebuilds_client_and_persists_session(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+    calls: list[tuple[str, dict[str, str]]] = []
+    replacement = FakeLLMClient()
+
+    def get_client(model: str, **kwargs):  # noqa: ANN003, ANN202
+        calls.append((model, kwargs))
+        return replacement
+
+    monkeypatch.setattr("noah_code.llm.get_llm_client", get_client)
+
+    action = await host.handle_line("/reasoning high")
+
+    assert action == "handled"
+    assert calls == [(host.meta.model, {"reasoning_effort": "high"})]
+    assert host.agent._llm is replacement
+    assert host.meta.reasoning_effort == "high"
+    assert host.store.load_meta(host.meta.session_id).reasoning_effort == "high"
     await host.close()

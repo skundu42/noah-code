@@ -81,7 +81,11 @@ Noah reads the portable `{"mcpServers": {...}}` structure from `.mcp.json`,
 `.noah-code/mcp.json`, and `~/.config/noah-code/mcp.json`. The guided setup writes to the user
 file with mode `0600`; use environment variables or a manually edited config for secrets and auth
 headers. STDIO, SSE, Streamable HTTP, custom headers, and OAuth fields are passed through to the
-MCP runtime. Attaching every server is gated by the `mcp` permission category and asks by default.
+MCP runtime. Under the default `lazy_mcp` setting, servers are cataloged but not connected at
+startup, keeping unused schemas and connection latency out of the session. Select a server in
+`/mcp` or run `/mcp connect NAME` to attach it to the live agent. Attachment is gated by the `mcp`
+permission category and asks by default. Set `efficiency.lazy_mcp = false` in trusted user
+configuration only when eager attachment is desired.
 
 ## Tracing
 

@@ -11,6 +11,7 @@ from noah_code.config import (
     NoahCodeConfig,
     load_config,
     save_user_default_model,
+    save_user_reasoning_effort,
     user_default_model,
 )
 
@@ -51,6 +52,8 @@ def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> N
         "auto_approve = true\n"
         "unsafe_inprocess_code_execution = true\n"
         "session_dir = '/tmp/repository-controlled-sessions'\n"
+        "[efficiency]\n"
+        "lazy_mcp = false\n"
         "[updates]\n"
         "auto_install = false\n"
     )
@@ -58,6 +61,7 @@ def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> N
     assert cfg.auto_approve is False
     assert cfg.unsafe_inprocess_code_execution is False
     assert str(cfg.session_dir) != "/tmp/repository-controlled-sessions"
+    assert cfg.efficiency.lazy_mcp is True
     assert cfg.updates.auto_install is True
 
 
@@ -119,3 +123,22 @@ def test_save_user_default_model_rejects_whitespace(tmp_path: Path, monkeypatch)
         save_user_default_model("not a model")
 
     assert not config_path.exists()
+
+
+def test_save_user_reasoning_effort_preserves_sections(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('model = "openai/gpt-5"\n\n[ui]\nmarkdown = false\n')
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    save_user_reasoning_effort("high")
+
+    loaded = load_config(tmp_path)
+    assert loaded.reasoning_effort == "high"
+    assert loaded.model == "openai/gpt-5"
+    assert loaded.ui.markdown is False
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_reasoning_effort_environment_override(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("NOAH_CODE_REASONING_EFFORT", "LOW")
+    assert load_config(tmp_path).reasoning_effort == "low"

@@ -15,6 +15,7 @@ from noah_code.config import (
     config_sources,
     load_config,
     save_user_default_model,
+    save_user_reasoning_effort,
     user_default_model,
 )
 from noah_code.host import AgentHost
@@ -29,7 +30,9 @@ EXIT_CONFIG = 2
 EXIT_DENIED = 3
 EXIT_SIGINT = 130
 
-SUBCOMMANDS = frozenset({"run", "sessions", "doctor", "config", "providers", "update"})
+SUBCOMMANDS = frozenset(
+    {"run", "sessions", "doctor", "config", "providers", "update", "benchmark"}
+)
 
 _AUTO_UPDATE_CHECKED = False
 
@@ -50,6 +53,12 @@ def _common_options(fn):  # noqa: ANN001
     )(fn)
     fn = click.option(
         "--model", "model", default=None, help="Override the model for this launch"
+    )(fn)
+    fn = click.option(
+        "--reasoning-effort",
+        type=click.Choice(["default", "none", "minimal", "low", "medium", "high", "xhigh"]),
+        default=None,
+        help="Reasoning effort for compatible models; default lets the provider decide",
     )(fn)
     return fn
 
@@ -112,6 +121,7 @@ def _configure_first_run_model(model_override: str | None) -> str | None:
 def interactive_cmd(
     path: str | None,
     model: str | None,
+    reasoning_effort: str | None,
     auto: bool,
     mode: str | None,
     continue_session: bool,
@@ -127,6 +137,7 @@ def interactive_cmd(
         _interactive(
             path=path,
             model=model,
+            reasoning_effort=reasoning_effort,
             auto=auto,
             continue_session=continue_session,
             session_id=session_id,
@@ -153,6 +164,7 @@ def run_cmd(
     prompt: str,
     path: str | None,
     model: str | None,
+    reasoning_effort: str | None,
     auto: bool,
     mode: str | None,
     session_id: str | None,
@@ -164,6 +176,7 @@ def run_cmd(
             prompt=prompt,
             path=path,
             model=model,
+            reasoning_effort=reasoning_effort,
             auto=auto,
             mode=mode,
             session_id=session_id,
@@ -220,6 +233,29 @@ def sessions_delete(session_id: str) -> None:
         raise SystemExit(EXIT_CONFIG) from exc
 
 
+@cli_group.command("benchmark")
+@click.argument("path", required=False, type=click.Path())
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
+def benchmark_cmd(path: str | None, as_json: bool) -> None:
+    """Run deterministic token-efficiency fixtures without making API calls."""
+
+    try:
+        workspace = open_workspace(path)
+        config = load_config(workspace.root)
+        from noah_code.benchmark import run_efficiency_benchmark
+
+        result = run_efficiency_benchmark(config)
+    except (WorkspaceError, ValueError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    if as_json:
+        import json
+
+        click.echo(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    else:
+        click.echo(result.format())
+
+
 @cli_group.command("doctor")
 @click.argument("path", required=False, type=click.Path())
 def doctor(path: str | None) -> None:
@@ -235,6 +271,7 @@ def doctor(path: str | None) -> None:
     click.echo(f"user config: {sources['user'] or '(none)'}")
     click.echo(f"project config: {sources['project'] or '(none)'}")
     click.echo(f"model: {config.model}")
+    click.echo(f"reasoning effort: {config.reasoning_effort}")
     try:
         from noah_code.providers import list_providers
 
@@ -328,6 +365,12 @@ def providers_list() -> None:
 @click.option("--base-url", help="Base URL for a custom OpenAI-compatible endpoint")
 @click.option("--api-key-env", help="Environment variable containing the custom API key")
 @click.option(
+    "--reasoning-effort",
+    type=click.Choice(["default", "none", "minimal", "low", "medium", "high", "xhigh"]),
+    default=None,
+    help="Save the reasoning effort with the global model default",
+)
+@click.option(
     "--client-type",
     type=click.Choice(["completion", "responses"]),
     default="completion",
@@ -341,6 +384,7 @@ def providers_add(
     alias: str | None,
     base_url: str | None,
     api_key_env: str | None,
+    reasoning_effort: str | None,
     client_type: str,
     set_default: bool,
 ) -> None:
@@ -393,9 +437,16 @@ def providers_add(
             )
         if set_default:
             path = save_user_default_model(selected_model)
+            if reasoning_effort is not None:
+                save_user_reasoning_effort(reasoning_effort)
             click.echo(f"default model saved in {path}")
+            if reasoning_effort is not None:
+                click.echo(f"reasoning effort: {reasoning_effort}")
         else:
-            click.echo(f"use once with: noah --model {selected_model} .")
+            suffix = (
+                f" --reasoning-effort {reasoning_effort}" if reasoning_effort is not None else ""
+            )
+            click.echo(f"use once with: noah --model {selected_model}{suffix} .")
     except (FileExistsError, OSError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -443,6 +494,7 @@ async def _prepare(
     *,
     path: str | None,
     model: str | None,
+    reasoning_effort: str | None,
     auto: bool,
     mode: str | None,
     continue_session: bool = False,
@@ -459,6 +511,8 @@ async def _prepare(
     overrides: dict[str, Any] = {}
     if model:
         overrides["model"] = model
+    if reasoning_effort:
+        overrides["reasoning_effort"] = reasoning_effort
     if auto:
         overrides["auto_approve"] = True
     if mode:
@@ -482,8 +536,11 @@ async def _prepare(
             if meta is None:
                 click.echo("error: no prior session for this workspace", err=True)
                 return None, EXIT_CONFIG
-        if meta is not None and model is not None:
-            meta.model = config.model
+        if meta is not None and (model is not None or reasoning_effort is not None):
+            if model is not None:
+                meta.model = config.model
+            if reasoning_effort is not None:
+                meta.reasoning_effort = config.reasoning_effort
             store.save_meta(meta)
     except SessionError as exc:
         click.echo(f"error: {exc}", err=True)
@@ -496,6 +553,7 @@ async def _interactive(
     *,
     path: str | None,
     model: str | None,
+    reasoning_effort: str | None,
     auto: bool,
     continue_session: bool,
     session_id: str | None,
@@ -516,6 +574,7 @@ async def _interactive(
     prepared, code = await _prepare(
         path=path,
         model=model,
+        reasoning_effort=reasoning_effort,
         auto=auto,
         mode=mode,
         continue_session=continue_session,
@@ -554,6 +613,7 @@ async def _run_once(
     prompt: str,
     path: str | None,
     model: str | None,
+    reasoning_effort: str | None,
     auto: bool,
     mode: str | None,
     session_id: str | None,
@@ -562,6 +622,7 @@ async def _run_once(
     prepared, code = await _prepare(
         path=path,
         model=model,
+        reasoning_effort=reasoning_effort,
         auto=auto,
         mode=mode,
         session_id=session_id,

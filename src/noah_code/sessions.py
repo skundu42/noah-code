@@ -39,6 +39,7 @@ class SessionMeta:
     title: str = "untitled"
     mode: str = "build"
     model: str = "gpt-4o-mini"
+    reasoning_effort: str = "default"
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     permission_rules: list[dict] = field(default_factory=list)
@@ -75,7 +76,14 @@ class SessionStore:
     def _db_path(self, session_id: str) -> Path:
         return self._session_path(session_id) / "session.db"
 
-    def create(self, workspace: Workspace, *, model: str, mode: str = "build") -> SessionMeta:
+    def create(
+        self,
+        workspace: Workspace,
+        *,
+        model: str,
+        mode: str = "build",
+        reasoning_effort: str = "default",
+    ) -> SessionMeta:
         session_id = uuid.uuid4().hex[:12]
         path = self._session_path(session_id)
         path.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -85,6 +93,7 @@ class SessionStore:
             workspace_identity=workspace.identity,
             model=model,
             mode=mode,
+            reasoning_effort=reasoning_effort,
         )
         self.save_meta(meta)
         return meta

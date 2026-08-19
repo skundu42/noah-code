@@ -12,19 +12,8 @@ from nooa.tools.shell_tools import Match, ShellResult, ShellTools, StreamDone, S
 from noah_code.approvals import ApprovalBroker
 from noah_code.permissions import PermissionCategory, PermissionDecision, PermissionEngine
 from noah_code.snapshots import SnapshotJournal
+from noah_code.tool_output import ToolOutputStore
 from noah_code.workspace import Workspace, WorkspaceError
-
-
-def _truncate(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    head = limit // 2
-    tail = limit - head - 40
-    return (
-        text[:head]
-        + f"\n...[{len(text) - head - max(tail, 0)} chars truncated]...\n"
-        + text[-max(tail, 0) :]
-    )
 
 
 class WorkspaceTools(Skill):
@@ -44,7 +33,11 @@ class WorkspaceTools(Skill):
         approvals: ApprovalBroker,
         journal: SnapshotJournal,
         *,
-        max_output_chars: int = 80_000,
+        max_output_chars: int = 16_000,
+        max_output_lines: int = 250,
+        max_search_results: int = 100,
+        max_file_results: int = 500,
+        output_retention_hours: int = 24,
         default_timeout: float = 60.0,
     ) -> None:
         super().__init__()
@@ -54,8 +47,27 @@ class WorkspaceTools(Skill):
         self._approvals = approvals
         self._journal = journal
         self._max_output = max_output_chars
+        self._max_output_lines = max_output_lines
+        self._max_search_results = max_search_results
+        self._max_file_results = max_file_results
+        self._output_store = ToolOutputStore(retention_hours=output_retention_hours)
         self._default_timeout = default_timeout
         self._on_shell_chunk: Any = None
+
+    def set_efficiency_profile(self, profile: str) -> None:
+        """Adjust model-facing output limits for the current session."""
+
+        if profile == "fast":
+            self._max_output = 16_000
+            self._max_output_lines = 250
+        elif profile == "balanced":
+            self._max_output = 24_000
+            self._max_output_lines = 400
+        elif profile == "deep":
+            self._max_output = 80_000
+            self._max_output_lines = 2_000
+        else:
+            raise ValueError("profile must be fast, balanced, or deep")
 
     def set_shell_chunk_handler(self, handler: Any) -> None:
         """Optional callback(stream: str, text: str) for UI streaming."""
@@ -74,14 +86,16 @@ class WorkspaceTools(Skill):
             tuple[int, int] | None,
             spec(description="Optional (start, end) 1-indexed inclusive range"),
         ] = None,
-    ) -> Match:
-        """Read a file (or line range) and return a Match anchor for editing."""
+    ) -> Match | str:
+        """Read a file range; oversized reads return a managed preview, not an edit anchor."""
         resolved = await self._authorize_path(path, PermissionCategory.READ)
         rel = self._workspace.relpath(resolved)
         result = await self._shell.read(rel, lines=lines)
-        if len(result.text) > self._max_output:
-            truncated = _truncate(result.text, self._max_output)
-            return Match(result.path, result.start, result.end, truncated)
+        bounded = self._bound(result.text)
+        if bounded != result.text:
+            # A head/tail preview is not contiguous file content and therefore
+            # must never masquerade as an editable Match anchor.
+            return f"{result.path}:{result.start}-{result.end}\n{bounded}"
         return result
 
     async def search(
@@ -110,9 +124,80 @@ class WorkspaceTools(Skill):
         matches = sorted(
             str(p.relative_to(self._workspace.root)) for p in root.glob(pattern) if p.is_file()
         )
-        if len(matches) > 2000:
-            return matches[:2000] + [f"...[{len(matches) - 2000} more]"]
+        if len(matches) > self._max_file_results:
+            return matches[: self._max_file_results] + [
+                f"...[{len(matches) - self._max_file_results} more]"
+            ]
         return matches
+
+    async def read_output(
+        self,
+        output_id: Annotated[str, spec(description="Managed output id from a truncated result")],
+        lines: Annotated[
+            tuple[int, int],
+            spec(description="1-indexed inclusive line range to retrieve"),
+        ],
+    ) -> str:
+        """Read a focused slice of a previously truncated full tool result."""
+
+        text = self._output_store.read(output_id, lines)
+        return self._bound(text)
+
+    async def inspect(
+        self,
+        searches: Annotated[
+            list[str] | None,
+            spec(description="Regex/fixed searches to run concurrently"),
+        ] = None,
+        files: Annotated[
+            list[str] | None,
+            spec(description="Workspace files to read concurrently"),
+        ] = None,
+        symbols: Annotated[
+            bool,
+            spec(description="Also return class/function/type declarations"),
+        ] = False,
+    ) -> str:
+        """Batch focused repository searches and reads into one compact result."""
+
+        queries = list(dict.fromkeys(searches or []))
+        paths = list(dict.fromkeys(files or []))
+        if len(queries) > 8 or len(paths) > 8:
+            raise ValueError("inspect accepts at most 8 searches and 8 files")
+        if not queries and not paths and not symbols:
+            raise ValueError("inspect requires searches, files, or symbols=True")
+
+        import asyncio
+
+        labels: list[tuple[str, str]] = []
+        operations = []
+        for query in queries:
+            labels.append(("search", query))
+            operations.append(self.search(query))
+        for path in paths:
+            labels.append(("file", path))
+            operations.append(self.read(path, lines=(1, 300)))
+        if symbols:
+            labels.append(("symbols", "definitions"))
+            operations.append(
+                self.search(r"^(?:class|def|async def|interface|type|enum|struct)\s+", ".")
+            )
+
+        results = await asyncio.gather(*operations, return_exceptions=True)
+        sections: list[str] = []
+        for (kind, label), result in zip(labels, results, strict=True):
+            sections.append(f"## {kind}: {label}")
+            if isinstance(result, Exception):
+                sections.append(f"error: {type(result).__name__}: {result}")
+            elif isinstance(result, ShellResult):
+                sections.append(result.stdout or result.stderr or "(no matches)")
+            elif isinstance(result, Match):
+                sections.append(
+                    f"{result.path}:{result.start}-{result.end}\n{result.text}"
+                )
+            else:
+                sections.append(str(result))
+        return self._bound("\n\n".join(sections))
 
     async def replace(
         self,
@@ -234,16 +319,27 @@ class WorkspaceTools(Skill):
         return self._cap_shell_result(result)
 
     def _cap_shell_result(self, result: ShellResult) -> ShellResult:
-        stdout = _truncate(result.stdout, self._max_output)
-        stderr = _truncate(result.stderr, self._max_output)
-        if stdout is result.stdout and stderr is result.stderr:
+        stdout = self._bound(result.stdout)
+        stderr = self._bound(result.stderr)
+        matches = result.matches
+        if matches and len(matches) > self._max_search_results:
+            matches = matches[: self._max_search_results]
+        if stdout == result.stdout and stderr == result.stderr and matches is result.matches:
             return result
         return ShellResult(
             stdout=stdout,
             stderr=stderr,
             returncode=result.returncode,
-            matches=result.matches,
+            matches=matches,
+            timed_out=result.timed_out,
         )
+
+    def _bound(self, text: str) -> str:
+        return self._output_store.bound(
+            text,
+            max_chars=self._max_output,
+            max_lines=self._max_output_lines,
+        ).text
 
     async def _authorize_path(self, path: str, category: str) -> Path:
         try:

@@ -29,8 +29,8 @@ Inside an interactive session, switch only the current session or replace the gl
 /model --global anthropic/MODEL_NAME
 ```
 
-Bare `/model` opens a three-step TUI flow: search for a provider, enter its API key in a masked
-field, and enter the model ID. Noah attempts to save that key in the operating system credential
+Bare `/model` opens a guided TUI flow: search for a provider, enter its API key in a masked
+field, enter the model ID, and select reasoning effort. Noah attempts to save that key in the operating system credential
 store. If no secure backend is available, the key remains active only in the current Noah process
 and the TUI says so. Keys are never written to Noah configuration or session metadata.
 
@@ -91,11 +91,23 @@ Example user configuration:
 
 ```toml
 model = "gpt-4o-mini"
+reasoning_effort = "default" # default, none, minimal, low, medium, high, or xhigh
 lightweight_model = "gpt-4o-mini"
 mode = "build"
 max_iterations = 40
 cell_timeout = 120
 command_timeout = 60
+max_output_chars = 16000
+
+[efficiency]
+profile = "fast"          # "fast", "balanced", or "deep"
+strategy = "lean"         # "standard" is the comparison fallback
+deterministic_titles = true
+lazy_mcp = true
+max_output_lines = 250
+max_search_results = 100
+max_file_results = 500
+tool_output_retention_hours = 24
 
 [ui]
 theme = "atom-one-dark"
@@ -106,8 +118,9 @@ show_reasoning = false
 
 [summarization]
 policy = "token_budget" # or "none"
-preserve_recent = 10
-target_chars = 4000
+trigger_ratio = 0.35
+preserve_recent = 6
+target_chars = 2500
 
 [tracing]
 enabled = true
@@ -123,16 +136,18 @@ Supported environment overrides include:
 
 - `NOAH_CODE_MODEL`
 - `NOAH_CODE_LIGHTWEIGHT_MODEL`
+- `NOAH_CODE_REASONING_EFFORT`
 - `NOAH_CODE_AUTO`
 - `NOAH_CODE_SESSION_DIR`
 - `NOAH_CODE_MODE`
+- `NOAH_CODE_EFFICIENCY`
 - `NOAH_CODE_UNSAFE_INPROCESS`
 - `NOAH_CODE_AUTO_UPDATE`
 
 Repository-controlled configuration cannot weaken the host trust boundary. Project config is
-ignored for `auto_approve`, `enabled_skills`, `mcp`, `permission_rules`, `session_dir`, `tracing`,
-`updates`, and `unsafe_inprocess_code_execution`. Put those settings in trusted user config, the
-environment, or an explicit CLI flag.
+ignored for `auto_approve`, `efficiency`, `enabled_skills`, `mcp`, `permission_rules`,
+`session_dir`, `tracing`, `updates`, and `unsafe_inprocess_code_execution`. Put those settings in
+trusted user config, the environment, or an explicit CLI flag.
 
 A user-configured `permission_rules` array replaces the default rule array. Copy forward every
 default you still want before adding overrides. Hard secret, destructive-shell, and plan-mode
@@ -156,6 +171,42 @@ Model and provider configuration follows NOOA conventions, including its model r
 environment variables, and configuration under `~/.config/nooa/`. Provider strings not shown in
 the guided list still pass through to LiteLLM, so additional supported services can be selected
 with `--model PROVIDER/MODEL`.
+
+Reasoning effort is passed through NOOA to LiteLLM only when it is not `default`. Supported values
+are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`, but each provider/model may support
+only a subset. Change the current session or the cross-repository default with:
+
+```text
+/reasoning
+/reasoning high
+/reasoning --global low
+```
+
+For headless launches use `--reasoning-effort high`, or add
+`--reasoning-effort high` to `noah providers add ...` when saving a global model default.
+
+### Efficiency and model routing
+
+`fast` is the default: at most 12 CodeAct iterations, 16,000 characters and 250 lines per
+model-facing tool result, and lazy MCP attachment. `balanced` raises the live cap to 24 iterations
+and its preview to 24,000 characters/400 lines. `deep` permits the configured `max_iterations` and
+legacy-sized 80,000-character previews. Switch without restarting:
+
+```text
+/efficiency
+/efficiency balanced
+/efficiency deep
+```
+
+Oversized results are not discarded. Noah writes the exact output to a private cache file for the
+configured retention period, returns a bounded head/tail preview, and gives the agent an output ID
+for focused line-range retrieval. A truncated file preview is never returned as an editable Match
+anchor.
+
+Set `lightweight_model` to route compaction to a faster or cheaper model. If it is omitted, that
+route follows live `/model` switches. Compaction starts at 35% of the active main model's context
+window by default, preserves the six newest events, and writes a coding checkpoint covering the
+objective, decisions, files, validation, blockers, and next steps.
 
 ## Modes and permissions
 

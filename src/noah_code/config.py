@@ -18,6 +18,16 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 PermissionAction = Literal["allow", "ask", "deny"]
+ReasoningEffort = Literal["default", "none", "minimal", "low", "medium", "high", "xhigh"]
+REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
+    "default",
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+)
 
 
 class PermissionRule(BaseModel):
@@ -38,8 +48,22 @@ class TracingConfig(BaseModel):
 class SummarizationPolicy(BaseModel):
     policy: Literal["token_budget", "none"] = "token_budget"
     max_tokens: int | None = None
-    preserve_recent: int = 10
-    target_chars: int = 4000
+    trigger_ratio: float = Field(default=0.35, gt=0.05, lt=0.95)
+    preserve_recent: int = Field(default=6, ge=2, le=50)
+    target_chars: int = Field(default=2500, ge=500, le=20_000)
+
+
+class EfficiencyConfig(BaseModel):
+    """Token and latency controls for the coding harness."""
+
+    profile: Literal["fast", "balanced", "deep"] = "fast"
+    strategy: Literal["lean", "standard"] = "lean"
+    deterministic_titles: bool = True
+    lazy_mcp: bool = True
+    max_output_lines: int = Field(default=250, ge=20, le=5000)
+    max_search_results: int = Field(default=100, ge=10, le=1000)
+    max_file_results: int = Field(default=500, ge=50, le=5000)
+    tool_output_retention_hours: int = Field(default=24, ge=1, le=24 * 30)
 
 
 class UIConfig(BaseModel):
@@ -60,6 +84,7 @@ class NoahCodeConfig(BaseModel):
     """Resolved configuration for a noah-code run."""
 
     model: str = "gpt-4o-mini"
+    reasoning_effort: ReasoningEffort = "default"
     lightweight_model: str | None = None
     max_iterations: int = 40
     cell_timeout: float = 120.0
@@ -75,9 +100,10 @@ class NoahCodeConfig(BaseModel):
     mcp: dict[str, Any] = Field(default_factory=dict)
     ui: UIConfig = Field(default_factory=UIConfig)
     updates: UpdateConfig = Field(default_factory=UpdateConfig)
+    efficiency: EfficiencyConfig = Field(default_factory=EfficiencyConfig)
     mode: Literal["build", "plan"] = "build"
     max_file_bytes: int = 512_000
-    max_output_chars: int = 80_000
+    max_output_chars: int = Field(default=16_000, ge=1000, le=1_000_000)
     undo_blob_limit: int = 2_000_000
     unsafe_inprocess_code_execution: bool = False
 
@@ -173,6 +199,7 @@ def _user_config_path() -> Path:
 
 
 _TOP_LEVEL_MODEL_RE = re.compile(r"^(?P<indent>\s*)model\s*=.*$")
+_TOP_LEVEL_REASONING_RE = re.compile(r"^(?P<indent>\s*)reasoning_effort\s*=.*$")
 
 
 def user_default_model() -> str | None:
@@ -228,6 +255,56 @@ def save_user_default_model(model: str) -> Path:
     return path
 
 
+def save_user_reasoning_effort(effort: str) -> Path:
+    """Persist the cross-repository reasoning effort without disturbing other settings."""
+
+    selected = effort.strip().lower()
+    if selected not in REASONING_EFFORTS:
+        raise ValueError(
+            "reasoning effort must be default, none, minimal, low, medium, high, or xhigh"
+        )
+
+    path = _user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    existing = path.read_text() if path.is_file() else ""
+    lines = existing.splitlines(keepends=True)
+    replacement = f"reasoning_effort = {json.dumps(selected)}\n"
+    first_table = next(
+        (index for index, line in enumerate(lines) if line.lstrip().startswith("[")),
+        len(lines),
+    )
+    effort_line = next(
+        (
+            index
+            for index, line in enumerate(lines[:first_table])
+            if _TOP_LEVEL_REASONING_RE.match(line)
+        ),
+        None,
+    )
+    if effort_line is not None:
+        lines[effort_line] = replacement
+    else:
+        if first_table and not lines[first_table - 1].endswith(("\n", "\r")):
+            lines[first_table - 1] += "\n"
+        insertion = [replacement]
+        if first_table < len(lines) and lines[first_table].lstrip().startswith("["):
+            insertion.append("\n")
+        lines[first_table:first_table] = insertion
+
+    content = "".join(lines) or replacement
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".config-", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(content)
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return path
+
+
 def _project_config_path(workspace: Path) -> Path:
     return workspace / ".noah-code" / "config.toml"
 
@@ -238,6 +315,7 @@ def _project_config_path(workspace: Path) -> Path:
 _USER_ONLY_CONFIG_KEYS = frozenset(
     {
         "auto_approve",
+        "efficiency",
         "enabled_skills",
         "mcp",
         "permission_rules",
@@ -278,6 +356,8 @@ def _env_overrides() -> dict[str, Any]:
         out["model"] = model
     if light := os.environ.get("NOAH_CODE_LIGHTWEIGHT_MODEL"):
         out["lightweight_model"] = light
+    if reasoning_effort := os.environ.get("NOAH_CODE_REASONING_EFFORT"):
+        out["reasoning_effort"] = reasoning_effort.lower()
     if auto := os.environ.get("NOAH_CODE_AUTO"):
         out["auto_approve"] = auto.lower() in {"1", "true", "yes", "on"}
     if session_dir := os.environ.get("NOAH_CODE_SESSION_DIR"):
@@ -290,6 +370,8 @@ def _env_overrides() -> dict[str, Any]:
         out["updates"] = {
             "auto_install": auto_update.lower() in {"1", "true", "yes", "on"}
         }
+    if efficiency_profile := os.environ.get("NOAH_CODE_EFFICIENCY"):
+        out["efficiency"] = {"profile": efficiency_profile.lower()}
     return out
 
 
@@ -308,6 +390,8 @@ def _normalize_raw(raw: dict[str, Any]) -> dict[str, Any]:
         data["ui"] = UIConfig.model_validate(data["ui"])
     if "updates" in data and isinstance(data["updates"], dict):
         data["updates"] = UpdateConfig.model_validate(data["updates"])
+    if "efficiency" in data and isinstance(data["efficiency"], dict):
+        data["efficiency"] = EfficiencyConfig.model_validate(data["efficiency"])
     return data
 
 

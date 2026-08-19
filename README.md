@@ -38,6 +38,9 @@ and seccomp support. You also need an LLM provider account such as OpenAI, Anthr
 - Type `/` for a live-filtering command and configuration reference; press Enter to send.
 - Follow batched live tool output, then inspect compact execution records with `F2`.
 - Resume workspace-scoped sessions with todos and automatic context compaction.
+- Keep full oversized tool results privately while sending the model a focused, reopenable preview.
+- Inspect token, prompt-cache, model-wait, and tool-output usage with `/tokens`; switch live
+  `fast`, `balanced`, and `deep` budgets with `/efficiency`.
 - Switch AI models between turns, with optional cross-repository defaults.
 - Extend workflows with slash commands, opt-in skills, MCP servers, model selection, and tracing.
 
@@ -84,10 +87,11 @@ noah --version
 noah doctor .
 noah config show .
 noah update --check
+noah benchmark .
 ```
 
 Bring your own API key from inside the TUI by entering `/model`: choose the provider, paste the
-key into the masked field, then choose the model. Noah saves the key to the operating system's
+key into the masked field, choose the model, then select its reasoning effort. Noah saves the key to the operating system's
 credential store when one is available; otherwise it remains available only to that Noah process.
 API-key values are never written to Noah config, repository, or session files.
 
@@ -100,6 +104,14 @@ noah providers add openai --model MODEL_NAME
 noah .
 ```
 
+For reasoning models, choose `default`, `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
+Provider and model support varies; `default` omits the parameter. You can set it in the guided
+`/model` flow, switch it live with `/reasoning high`, or launch with:
+
+```bash
+uv run noah --model openai/MODEL --reasoning-effort high .
+```
+
 Custom OpenAI-compatible gateways, vLLM, LM Studio, Ollama, Azure OpenAI, Bedrock, Gemini, Groq,
 Mistral, xAI, DeepSeek, Together AI, and Perplexity are also supported. See the
 [provider configuration guide](docs/configuration.md#bring-your-own-api-provider).
@@ -108,7 +120,7 @@ The package also installs `noah-code` and `nc` as equivalent entry points. Becau
 refers to netcat, `noah` or `noah-code` is recommended. Keep provider API keys in the OS
 credential store or environment, never in a repository or Noah Code session metadata.
 
-Inside a session, bare `/model` opens guided provider, API-key, and model setup. `/model MODEL`
+Inside a session, bare `/model` opens guided provider, API-key, model, and reasoning setup. `/model MODEL`
 switches the active model immediately and remembers it when that session is resumed. It does not
 change other sessions. Use `/model --global MODEL` when the new model should also become the
 default for future sessions in every repository.
@@ -117,6 +129,12 @@ The TUI keeps the conversation central and adds a session-and-plan rail on termi
 110 columns wide. Tool output streams in a bounded activity panel and compacts after completion,
 keeping long runs responsive without deleting persisted session data. Press `F2` for activity
 details or `F3` for paginated conversation history.
+
+The default `fast` profile uses compact NOOA trajectory rendering, bounded tool results, batched
+repository inspection, cache-friendly turn-boundary context refresh, and lazy MCP connections. A
+configured `lightweight_model` handles coding-session compaction; deterministic titles avoid an
+otherwise unnecessary model request. Run `noah benchmark .` for the deterministic offline fixture
+and `/tokens` for real provider-reported usage in the current run.
 
 ## Documentation
 
@@ -140,7 +158,7 @@ noah update
 ## Development
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra mcp --extra tracing
 uv run ruff check src tests
 uv run pytest tests
 uv build

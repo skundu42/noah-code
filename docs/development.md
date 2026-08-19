@@ -5,13 +5,24 @@
 Install the development environment and run the local checks:
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra mcp --extra tracing
 uv run ruff check src tests
 uv run pytest tests
 uv build
 ```
 
 The default test suite is hermetic and does not require network access or provider keys.
+
+Run the deterministic efficiency fixture without making provider calls:
+
+```bash
+uv run noah benchmark .
+uv run noah benchmark . --json
+```
+
+It compares standard and lean NOOA trajectory rendering, then measures the configured managed
+preview against a fixed high-volume tool result. The report uses a transparent four-characters-
+per-token estimate; use `/tokens` during a real session for provider-reported usage.
 
 ## CI
 

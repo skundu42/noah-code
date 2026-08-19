@@ -899,10 +899,10 @@ requires-dist = [
     { name = "click", specifier = ">=8.1.0" },
     { name = "keyring", specifier = ">=25.0.0" },
     { name = "litellm", specifier = ">=1.84.0,<1.92.0" },
-    { name = "nooa", specifier = "==0.0.8" },
-    { name = "nooa", extras = ["mcp"], marker = "extra == 'mcp'", specifier = "==0.0.8" },
-    { name = "nooa", extras = ["tracing"], marker = "extra == 'tracing'", specifier = "==0.0.8" },
-    { name = "nooa-cli", specifier = "==0.0.8" },
+    { name = "nooa", specifier = "==0.0.9" },
+    { name = "nooa", extras = ["mcp"], marker = "extra == 'mcp'", specifier = "==0.0.9" },
+    { name = "nooa", extras = ["tracing"], marker = "extra == 'tracing'", specifier = "==0.0.9" },
+    { name = "nooa-cli", specifier = "==0.0.9" },
     { name = "packaging", specifier = ">=24.0" },
     { name = "pydantic", specifier = ">=2.5.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
@@ -918,7 +918,7 @@ provides-extras = ["dev", "tui", "mcp", "tracing"]
 
 [[package]]
 name = "nooa"
-version = "0.0.8"
+version = "0.0.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -926,9 +926,9 @@ dependencies = [
     { name = "openinference-instrumentation-litellm" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/35/33/a0aa8ed5b3fbf78b72bddc8c3b184ea5cf2e2d9c03128e8375dbd74df9a2/nooa-0.0.8.tar.gz", hash = "sha256:59e36e150fe8ac96122f6d129cc60b68ba82355f568ea409624102ec9150613f", size = 2825643, upload-time = "2026-07-30T07:32:12.441Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/34/6f/c4e3ea70b373f72f98c12d23fd61f8525462bcecb4a969b58fbb67092699/nooa-0.0.9.tar.gz", hash = "sha256:c7a90ffb5b54094180efcb845e74a00c4182766745245f4258e613f9c12cb522", size = 3315964, upload-time = "2026-08-18T15:00:15.26Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cd/3b/921df5aa96d79f1bed2defda8e09f2768c62cdeeb7e14026d43a36093aa9/nooa-0.0.8-py3-none-any.whl", hash = "sha256:c4a4a458acf524ccbbbf4b649aabdf0281973f6767140ac92d3e144b13414c99", size = 1085740, upload-time = "2026-07-30T07:32:14.117Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/27/11b2754bc31994244418d0a55447f20bc0efbd9d2573802db13c7ca367b5/nooa-0.0.9-py3-none-any.whl", hash = "sha256:60b64663f34a47aec206137035d62e816c1147484bb74a8a4700a47d1a10b60c", size = 1104654, upload-time = "2026-08-18T15:00:13.588Z" },
 ]
 
 [package.optional-dependencies]
@@ -945,16 +945,16 @@ tracing = [
 
 [[package]]
 name = "nooa-cli"
-version = "0.0.8"
+version = "0.0.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "nooa" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/61/db/3102e89788ca0e2e7c494a7c4c6c8c3004213416bb3f9d11f1da908aafff/nooa_cli-0.0.8.tar.gz", hash = "sha256:4c80a31815ddd0472d4c422324eb3a4b542e3e1901d1f17c7b3d0ef3f287f81e", size = 51263, upload-time = "2026-07-30T07:32:20.358Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/41/0b/ab13465d13cfa6b29e1521e672ea44e02a70ebd4977df7c2b4ed34f0d038/nooa_cli-0.0.9.tar.gz", hash = "sha256:5bc45f6328fd4cb02531278db1779f51a83f3b8e631cba818caf133f3631e4c8", size = 68335, upload-time = "2026-08-18T14:59:30.3Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1e/66/cf679e4774ff54d0d5cc71dcbd7ef86de4eb93fa3cc55e711d94e1d52a79/nooa_cli-0.0.8-py3-none-any.whl", hash = "sha256:5b9280dc3c80598df18753336ee810c687083974b348ba8986ed4afa9dcd5c67", size = 59160, upload-time = "2026-07-30T07:32:19.248Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/34/9acdbac505979b0f765288db9272b10205674240689a9a3901d535412d38/nooa_cli-0.0.9-py3-none-any.whl", hash = "sha256:e8fad7b7a1601c9d7206c8d92c3cabeca2539af96c7e75923261b096a3616b09", size = 72613, upload-time = "2026-08-18T14:59:29.324Z" },
 ]
 
 [[package]]

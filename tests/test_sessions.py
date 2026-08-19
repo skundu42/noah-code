@@ -26,6 +26,7 @@ async def test_session_meta_and_resume_fields(tmp_path: Path) -> None:
     store = SessionStore(config.session_dir)
     host = AgentHost(workspace, config, llm=FakeLLMClient(), store=store)
     meta = await host.start()
+    meta.reasoning_effort = "high"
     host.agent.set_mode("plan")
     host.agent.v.model = "fake-model"
     t = host.agent.todos.add("step one")
@@ -40,6 +41,7 @@ async def test_session_meta_and_resume_fields(tmp_path: Path) -> None:
 
     meta2 = store.load_meta(meta.session_id)
     assert meta2.mode == "plan"
+    assert meta2.reasoning_effort == "high"
     assert meta2.todos
     assert meta2.permission_rules
 

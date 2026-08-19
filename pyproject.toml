@@ -19,8 +19,8 @@ classifiers = [
 ]
 
 dependencies = [
-    "nooa==0.0.8",
-    "nooa-cli==0.0.8",
+    "nooa==0.0.9",
+    "nooa-cli==0.0.9",
     # Newer LiteLLM releases currently omit macOS wheels and require a Rust
     # build. Keep the public installer binary-only until upstream restores them.
     "litellm>=1.84.0,<1.92.0",
@@ -51,10 +51,10 @@ tui = [
     "textual>=1.0.0",
 ]
 mcp = [
-    "nooa[mcp]==0.0.8",
+    "nooa[mcp]==0.0.9",
 ]
 tracing = [
-    "nooa[tracing]==0.0.8",
+    "nooa[tracing]==0.0.9",
 ]
 
 [project.scripts]

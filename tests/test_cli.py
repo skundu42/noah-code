@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -43,6 +44,16 @@ def test_config_show(tmp_path: Path) -> None:
     result = runner.invoke(cli_group, ["config", "show", str(tmp_path)])
     assert result.exit_code == 0
     assert "model" in result.output
+
+
+def test_benchmark_is_offline_and_machine_readable(tmp_path: Path) -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli_group, ["benchmark", str(tmp_path), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["profile"] == "fast"
+    assert payload["bounded_tool_output_chars"] < payload["raw_tool_output_chars"]
 
 
 def test_doctor(tmp_path: Path) -> None:
@@ -126,9 +137,19 @@ def test_providers_add_saves_prefixed_default(monkeypatch, tmp_path: Path) -> No
 
     result = runner.invoke(
         cli_group,
-        ["providers", "add", "anthropic", "--model", "example-model"],
+        [
+            "providers",
+            "add",
+            "anthropic",
+            "--model",
+            "example-model",
+            "--reasoning-effort",
+            "high",
+        ],
     )
 
     assert result.exit_code == 0
     assert "anthropic/example-model" in result.output
+    assert "reasoning effort: high" in result.output
     assert 'model = "anthropic/example-model"' in config_path.read_text()
+    assert 'reasoning_effort = "high"' in config_path.read_text()

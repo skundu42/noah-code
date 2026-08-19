@@ -4,7 +4,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from noah_code.llm import get_llm_client
+from noah_code.llm import get_llm_client, reasoning_overrides
+
+
+def test_reasoning_overrides_omits_provider_default() -> None:
+    assert reasoning_overrides("default") == {}
+    assert reasoning_overrides("high") == {"reasoning_effort": "high"}
+    with pytest.raises(ValueError, match="reasoning effort"):
+        reasoning_overrides("unlimited")
 
 
 def test_custom_alias_fails_closed_when_named_credential_is_missing(monkeypatch) -> None:

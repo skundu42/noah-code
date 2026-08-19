@@ -118,6 +118,45 @@ async def test_match_replace(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_oversized_read_is_not_an_editable_match(tmp_path: Path) -> None:
+    (tmp_path / "large.txt").write_text("".join(f"line {line}\n" for line in range(500)))
+    workspace = Workspace(root=tmp_path.resolve())
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="build", auto_approve=True)
+    approvals = ApprovalBroker(engine, handler=_always_once)
+    journal = SnapshotJournal()
+    shell = ShellTools(cwd=str(workspace.root))
+    ws = WorkspaceTools(
+        workspace,
+        shell,
+        engine,
+        approvals,
+        journal,
+        max_output_chars=500,
+        max_output_lines=30,
+    )
+
+    result = await ws.read("large.txt")
+
+    assert isinstance(result, str)
+    assert "full output id=" in result
+    assert "self.ws.read_output" in result
+    await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_batched_inspect_returns_search_and_file_sections(tmp_path: Path) -> None:
+    (tmp_path / "parser.py").write_text("def parse(value):\n    return value\n")
+    ws = _make_ws(tmp_path)
+
+    result = await ws.inspect(searches=["parse"], files=["parser.py"], symbols=True)
+
+    assert "## search: parse" in result
+    assert "## file: parser.py" in result
+    assert "## symbols: definitions" in result
+    await ws.close()
+
+
+@pytest.mark.asyncio
 async def test_nonzero_preserves_stderr(tmp_path: Path) -> None:
     ws = _make_ws(tmp_path, auto=False)
     # Force ask→allow via auto for a simple failing command.

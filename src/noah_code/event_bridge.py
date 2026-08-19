@@ -11,7 +11,7 @@ Unsubscribe = Callable[[], None]
 EmitFn = Callable[[HostEvent], None]
 
 
-def install_event_bridge(agent: Any, emit: EmitFn) -> list[Unsubscribe]:
+def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> list[Unsubscribe]:
     """Subscribe to agent.event_manager and forward useful events to the UI.
 
     Returns unsubscribe callables (call all on host close / session switch).
@@ -46,6 +46,8 @@ def install_event_bridge(agent: Any, emit: EmitFn) -> list[Unsubscribe]:
         )
 
     def on_python_output(event: Any) -> None:
+        if usage is not None:
+            usage.tool_output(event)
         status = str(getattr(event, "execution_status", "") or "")
         err = (getattr(event, "error", "") or "").strip()
         stdout = (getattr(event, "stdout", "") or "").strip()
@@ -105,6 +107,8 @@ def install_event_bridge(agent: Any, emit: EmitFn) -> list[Unsubscribe]:
             emit(HostEvent(HostEventKind.ERROR, content))
 
     def on_llm_start(event: Any) -> None:
+        if usage is not None:
+            usage.llm_start(event)
         method = getattr(event, "method_name", "")
         turn = getattr(event, "turn_number", "")
         emit(
@@ -116,6 +120,8 @@ def install_event_bridge(agent: Any, emit: EmitFn) -> list[Unsubscribe]:
         )
 
     def on_llm_end(event: Any) -> None:
+        if usage is not None:
+            usage.llm_end(event)
         ok = getattr(event, "success", True)
         emit(
             HostEvent(
@@ -124,6 +130,10 @@ def install_event_bridge(agent: Any, emit: EmitFn) -> list[Unsubscribe]:
                 meta={"kind": "llm_end"},
             )
         )
+
+    def on_llm_complete(event: Any) -> None:
+        if usage is not None:
+            usage.llm_complete(event)
 
     def on_summary(event: Any) -> None:
         text = str(getattr(event, "content", "") or getattr(event, "summary", "") or "")
@@ -136,6 +146,7 @@ def install_event_bridge(agent: Any, emit: EmitFn) -> list[Unsubscribe]:
         ("Error", on_error),
         ("LLMCallStart", on_llm_start),
         ("LLMCallEnd", on_llm_end),
+        ("LLMComplete", on_llm_complete),
         ("Summary", on_summary),
     ):
         try:

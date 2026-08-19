@@ -5,6 +5,19 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from noah_code.config import REASONING_EFFORTS
+
+
+def reasoning_overrides(effort: str | None) -> dict[str, str]:
+    """Translate Noah's provider-default sentinel into NOOA/LiteLLM kwargs."""
+
+    normalized = (effort or "default").strip().lower()
+    if normalized not in REASONING_EFFORTS:
+        raise ValueError(
+            "reasoning effort must be default, none, minimal, low, medium, high, or xhigh"
+        )
+    return {} if normalized == "default" else {"reasoning_effort": normalized}
+
 
 def get_llm_client(name: str, **overrides: Any) -> Any:
     """Build a client while preventing custom-endpoint credential fallback.

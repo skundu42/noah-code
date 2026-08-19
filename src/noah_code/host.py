@@ -13,13 +13,20 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from noah_code.approvals import ApprovalChoice
 from noah_code.commands import config_text, help_text, parse_slash
-from noah_code.config import NoahCodeConfig, save_user_default_model, user_default_model
+from noah_code.config import (
+    REASONING_EFFORTS,
+    NoahCodeConfig,
+    save_user_default_model,
+    save_user_reasoning_effort,
+    user_default_model,
+)
 from noah_code.custom_commands import CustomCommand, discover_custom_commands
 from noah_code.event_bridge import install_event_bridge
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.sessions import SessionEventRecord, SessionMeta, SessionStore
 from noah_code.ui.console import ConsoleUI
 from noah_code.ui.protocol import HostUI
+from noah_code.usage import UsageSnapshot, UsageTracker
 from noah_code.workspace import Workspace
 
 if TYPE_CHECKING:
@@ -71,6 +78,15 @@ def _format_skills_output(text: str) -> str:
             continue
         rendered.append(line)
     return "\n".join(rendered).strip()
+
+
+def _deterministic_title(text: str) -> str:
+    """Create a useful title without spending an additional model call."""
+
+    cleaned = re.sub(r"[`*_#>\[\]()]", " ", text)
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9._/-]*", cleaned)
+    title = " ".join(words[:5]).strip(" ._-/")
+    return title[:60] or "Coding task"
 
 
 def _load_agent_runtime() -> tuple[type[CodingAgent], Any]:
@@ -141,6 +157,7 @@ class AgentHost:
         self._last_turn_shell_bypass = False
         self._mcp_attached: set[str] = set()
         self._mcp_errors: dict[str, str] = {}
+        self._usage = UsageTracker()
         self.on_session_changed: Any = None  # optional UI callback
 
     @property
@@ -167,7 +184,10 @@ class AgentHost:
     async def start(self) -> SessionMeta:
         if self.meta is None:
             self.meta = self.store.create(
-                self.workspace, model=self.config.model, mode=self.config.mode
+                self.workspace,
+                model=self.config.model,
+                mode=self.config.mode,
+                reasoning_effort=self.config.reasoning_effort,
             )
         else:
             self.store.verify_workspace(self.meta, self.workspace)
@@ -179,7 +199,19 @@ class AgentHost:
 
         llm = self._llm
         if llm is None:
-            llm = await asyncio.to_thread(get_llm_client, self.meta.model)
+            from noah_code.llm import reasoning_overrides
+
+            llm = await asyncio.to_thread(
+                get_llm_client,
+                self.meta.model,
+                **reasoning_overrides(self.meta.reasoning_effort),
+            )
+        lightweight_llm = llm
+        if self.config.lightweight_model and self.config.lightweight_model != self.meta.model:
+            lightweight_llm = await asyncio.to_thread(
+                get_llm_client,
+                self.config.lightweight_model,
+            )
 
         self._setup_tracing(self.meta.session_id)
         self._storage = self.store.open_storage(self.meta.session_id)
@@ -188,6 +220,7 @@ class AgentHost:
             self.workspace,
             self.config,
             llm=llm,
+            lightweight_llm=lightweight_llm,
             storage=self._storage,
         )
         # Restore snapshot if present.
@@ -209,31 +242,36 @@ class AgentHost:
         agent.ws.set_shell_chunk_handler(self._on_shell_chunk)
 
         self._teardown_event_bridge()
-        self._event_unsubs = install_event_bridge(agent, self.ui.render)
+        self._event_unsubs = install_event_bridge(agent, self.ui.render, self._usage)
 
         self._custom_commands = discover_custom_commands(self.workspace.root)
 
         self._agent = agent
 
-        # Optional MCP (best-effort; never blocks startup on missing extra).
-        try:
-            from noah_code.mcp_setup import install_mcp
+        self._mcp_attached = set()
+        self._mcp_errors = {}
 
-            mcp_result = await install_mcp(
-                agent,
-                self.workspace.root,
-                self.config,
-                engine=agent.engine,
-                approvals=agent.approvals,
-            )
-            self._mcp_attached = set(mcp_result.attached)
-            self._mcp_errors = {
-                error.partition(":")[0]: error.partition(":")[2].strip()
-                for error in mcp_result.errors
-            }
-            self.ui.render(HostEvent(HostEventKind.STATUS, str(mcp_result)))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("mcp setup skipped: %s", exc)
+        # Keep MCP catalogs out of the prompt and critical startup path until
+        # explicitly connected. Deep/legacy profiles may opt back into eager attach.
+        if not self.config.efficiency.lazy_mcp:
+            try:
+                from noah_code.mcp_setup import install_mcp
+
+                mcp_result = await install_mcp(
+                    agent,
+                    self.workspace.root,
+                    self.config,
+                    engine=agent.engine,
+                    approvals=agent.approvals,
+                )
+                self._mcp_attached = set(mcp_result.attached)
+                self._mcp_errors = {
+                    error.partition(":")[0]: error.partition(":")[2].strip()
+                    for error in mcp_result.errors
+                }
+                self.ui.render(HostEvent(HostEventKind.STATUS, str(mcp_result)))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("mcp setup skipped: %s", exc)
 
         skills_status = getattr(agent, "_skills_status", "")
         if skills_status:
@@ -310,7 +348,12 @@ class AgentHost:
         title = ""
         if self.meta and self.meta.title and self.meta.title != "untitled":
             title = f"|{self.meta.title[:20]}"
-        return f"noah [{mode}|{model}|{sid}{title}]"
+        effort = self.meta.reasoning_effort if self.meta else self.config.reasoning_effort
+        effort_label = "auto" if effort == "default" else effort
+        return f"noah [{mode}|{model}|r:{effort_label}|{sid}{title}]"
+
+    def usage_snapshot(self) -> UsageSnapshot:
+        return self._usage.snapshot()
 
     async def start_new_session(self) -> SessionMeta:
         """Persist current session and open a fresh one in-process."""
@@ -323,6 +366,7 @@ class AgentHost:
             self._storage.close()
             self._storage = None
         self._agent = None
+        self._usage = UsageTracker()
         self.meta = None
         self._exit_requested = False
         return await self.start()
@@ -338,6 +382,7 @@ class AgentHost:
             self._storage.close()
             self._storage = None
         self._agent = None
+        self._usage = UsageTracker()
         meta = self.store.load_meta(session_id)
         self.store.verify_workspace(meta, self.workspace)
         self.meta = meta
@@ -390,6 +435,7 @@ class AgentHost:
         base_url: str | None = None,
         api_key_env: str | None = None,
         client_type: str = "completion",
+        reasoning_effort: str | None = None,
     ) -> str:
         """Configure a provider, switch this session, and save the global default."""
 
@@ -429,16 +475,26 @@ class AgentHost:
             provider_label = preset.label
             config_path = None
 
+        selected_effort = reasoning_effort or self.config.reasoning_effort
+        if selected_effort not in REASONING_EFFORTS:
+            raise ValueError(
+                "reasoning effort must be default, none, minimal, low, medium, high, or xhigh"
+            )
         if self._agent is not None:
-            await self._switch_model(selected_model)
+            await self._switch_model(selected_model, reasoning_effort=selected_effort)
         elif self.meta is not None:
             self.meta.model = selected_model
+            self.meta.reasoning_effort = selected_effort
             self.store.save_meta(self.meta)
         default_path = save_user_default_model(selected_model)
+        if reasoning_effort is not None:
+            save_user_reasoning_effort(selected_effort)
         self.config.model = selected_model
+        self.config.reasoning_effort = selected_effort  # type: ignore[assignment]
         suffix = f"; alias saved in {config_path}" if config_path else ""
         return (
-            f"Using {provider_label}: {selected_model}. Global default saved in {default_path}. "
+            f"Using {provider_label}: {selected_model} (reasoning={selected_effort}). "
+            f"Global default saved in {default_path}. "
             f"Credentials: {credential_hint}{suffix}"
         )
 
@@ -693,6 +749,42 @@ class AgentHost:
                 return "handled"
             await self._switch_model(requested)
             return "handled"
+        if name == "reasoning":
+            requested = args.strip().lower()
+            make_global = requested == "--global" or requested.startswith("--global ")
+            if make_global:
+                requested = requested.removeprefix("--global").strip()
+            if not requested:
+                effort = self.meta.reasoning_effort if self.meta else self.config.reasoning_effort
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.STATUS,
+                        f"reasoning_effort={effort} "
+                        "(default lets the provider/model decide)",
+                    )
+                )
+                return "handled"
+            if requested not in REASONING_EFFORTS:
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.ERROR,
+                        "usage: /reasoning [--global] "
+                        "[default|none|minimal|low|medium|high|xhigh]",
+                    )
+                )
+                return "handled"
+            model = self.meta.model if self.meta else self.config.model
+            await self._switch_model(model, reasoning_effort=requested)
+            if make_global:
+                path = save_user_reasoning_effort(requested)
+                self.config.reasoning_effort = requested  # type: ignore[assignment]
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.STATUS,
+                        f"global reasoning effort set to {requested} in {path}",
+                    )
+                )
+            return "handled"
         if name == "providers":
             try:
                 parts = shlex.split(args)
@@ -713,6 +805,7 @@ class AgentHost:
                 _command_output(
                     f"id={self.meta.session_id}\ntitle={self.meta.title}\n"
                     f"mode={agent.mode}\nmodel={self.meta.model}\n"
+                    f"reasoning_effort={self.meta.reasoning_effort}\n"
                     f"workspace={self.meta.workspace_path}"
                 )
             )
@@ -752,12 +845,35 @@ class AgentHost:
                 HostEvent(
                     HostEventKind.STATUS,
                     f"mode={agent.mode} model={self.meta.model if self.meta else '?'} "
+                    f"reasoning={self.meta.reasoning_effort if self.meta else '?'} "
                     f"session={self.meta.session_id if self.meta else '?'} "
                     f"title={self.meta.title if self.meta else '?'} "
                     f"undo={'yes' if agent.journal.can_undo() else 'no'} "
                     f"reversible={reversible}{warn}",
                 )
             )
+            return "handled"
+        if name == "tokens":
+            self.ui.render(_command_output(self.usage_snapshot().format()))
+            return "handled"
+        if name == "efficiency":
+            profile = args.strip().lower()
+            if not profile:
+                profile = self.config.efficiency.profile
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.STATUS,
+                        f"efficiency={profile} strategy={self.config.efficiency.strategy}",
+                    )
+                )
+                return "handled"
+            try:
+                agent.set_efficiency_profile(profile)
+            except ValueError as exc:
+                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
+            else:
+                self.config.efficiency.profile = profile  # type: ignore[assignment]
+                self.ui.render(HostEvent(HostEventKind.STATUS, f"efficiency set to {profile}"))
             return "handled"
         if name == "diff":
             try:
@@ -797,13 +913,13 @@ class AgentHost:
             self.ui.render(HostEvent(HostEventKind.STATUS, f"trace: {self._trace_info}"))
             return "handled"
         if name == "compact":
-            for summarizer in getattr(agent, "_summarizers", []):
-                try:
-                    await summarizer.summarize()  # type: ignore[attr-defined]
-                except Exception as exc:  # noqa: BLE001
-                    self.ui.render(HostEvent(HostEventKind.ERROR, f"compact failed: {exc}"))
-                    return "handled"
-            self.ui.render(HostEvent(HostEventKind.STATUS, "compaction requested"))
+            try:
+                compacted = await agent.compact_history()
+            except Exception as exc:  # noqa: BLE001
+                self.ui.render(HostEvent(HostEventKind.ERROR, f"compact failed: {exc}"))
+                return "handled"
+            status = "history compacted" if compacted else "nothing eligible to compact"
+            self.ui.render(HostEvent(HostEventKind.STATUS, status))
             return "handled"
         if name in {"continue"}:
             latest = self.store.latest_for_workspace(self.workspace)
@@ -854,30 +970,40 @@ class AgentHost:
             self.ui.set_status(self.status_prompt())
         return "continue"
 
-    async def _switch_model(self, model: str) -> None:
-        from nooa.interactive import apply_model_limits
+    async def _switch_model(self, model: str, *, reasoning_effort: str | None = None) -> None:
+        from noah_code.llm import get_llm_client, reasoning_overrides
 
-        from noah_code.llm import get_llm_client
-
-        llm = await asyncio.to_thread(get_llm_client, model)
-        self.agent._llm = llm
-        apply_model_limits(self.agent)
+        effort = reasoning_effort or (
+            self.meta.reasoning_effort if self.meta else self.config.reasoning_effort
+        )
+        llm = await asyncio.to_thread(get_llm_client, model, **reasoning_overrides(effort))
+        self.agent.set_main_llm(
+            llm,
+            lightweight_follows_main=not bool(self.config.lightweight_model),
+        )
         if self.meta:
             self.meta.model = model
+            self.meta.reasoning_effort = effort
             self.agent.v.model = model
             self.store.save_meta(self.meta)
-        self.ui.render(HostEvent(HostEventKind.STATUS, f"model set to {model}"))
+        self.ui.render(
+            HostEvent(HostEventKind.STATUS, f"model set to {model} · reasoning={effort}")
+        )
         self.ui.set_status(self.status_prompt())
 
     async def _run_user_turn(self, text: str) -> HostResult:
         from nooa.interactive import RespondReason
 
         agent = self.agent
+        agent.refresh_context_sources()
         agent.journal.begin_turn()
         agent._user_messages_in.put(text)
 
         if self.meta and self.meta.title == "untitled":
-            asyncio.create_task(self._maybe_title(text))
+            if self.config.efficiency.deterministic_titles:
+                self._set_session_title(_deterministic_title(text))
+            else:
+                asyncio.create_task(self._maybe_title(text))
 
         exit_code = 0
         explanation = ""
@@ -931,12 +1057,16 @@ class AgentHost:
         try:
             title = await self.agent.name_session(text)
             title = (title or "").strip().strip('"')[:60]
-            if title and self.meta:
-                self.meta.title = title
-                self.agent.v.title = title
-                self.store.save_meta(self.meta)
+            self._set_session_title(title)
         except Exception:  # noqa: BLE001 - never fail the main task
             logger.debug("title generation failed", exc_info=True)
+
+    def _set_session_title(self, title: str) -> None:
+        selected = (title or "").strip().strip('"')[:60]
+        if selected and self.meta:
+            self.meta.title = selected
+            self.agent.v.title = selected
+            self.store.save_meta(self.meta)
 
     async def run_interactive(self) -> int:
         """Line-oriented console loop."""

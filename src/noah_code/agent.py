@@ -13,17 +13,13 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from nooa import Context, hidden, strategy
-from nooa.config import CodeActConfig
-from nooa.interactive import (
-    InteractiveAgent,
-    RespondResult,
-    SummarizationConfig,
-    install_summarizer,
-)
+from nooa.config import CodeActConfig, PredictConfig
+from nooa.interactive import InteractiveAgent, RespondResult
 from nooa.runtime.restrictions import RESTRICTED_MODULES, RestrictionsConfig
 from nooa.runtime.sandbox.config import FileRule, SandboxConfig, resolve_spec
 from nooa.runtime.sandbox.executor import SandboxedExecutor
-from nooa.strategies import CodeActStrategy
+from nooa.strategies import CodeActStrategy, PredictStrategy
+from nooa.strategies.codeact_lite import PlainCodeActBlockFormatter
 from nooa.tools import TodoManager
 from nooa.tools.shell_tools import ShellTools
 
@@ -62,9 +58,12 @@ def _interpreter_read_rules() -> tuple[FileRule, ...]:
 
 def _codeact_config(config: NoahCodeConfig) -> CodeActConfig:
     unsafe = config.unsafe_inprocess_code_execution
+    profile_cap = {"fast": 12, "balanced": 24, "deep": config.max_iterations}[
+        config.efficiency.profile
+    ]
     restricted_imports = RESTRICTED_MODULES | frozenset({"nooa", "nooa_cli", "noah_code"})
     return CodeActConfig(
-        max_iterations=config.max_iterations,
+        max_iterations=min(config.max_iterations, profile_cap),
         cell_timeout=config.cell_timeout,
         execution_backend="inprocess" if unsafe else "sandbox",
         restrictions=RestrictionsConfig(restricted_imports=restricted_imports),
@@ -92,8 +91,10 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("message",),
             ("mode",),
             ("workspace_root",),
+            ("ws", "inspect"),
             ("ws", "list_files"),
             ("ws", "read"),
+            ("ws", "read_output"),
             ("ws", "replace"),
             ("ws", "run"),
             ("ws", "search"),
@@ -132,7 +133,7 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
         framework_builtins: dict[str, Any] | None = None,
         restrictions: Any = None,
     ) -> None:
-        # NOOA 0.0.8 probes specifically for Linux Landlock/seccomp. Preserve
+        # NOOA probes specifically for Linux Landlock/seccomp. Preserve
         # its worker and broker implementation, but install equivalent native
         # macOS guards in the child before NOOA enters its execution loop.
         worker_config = config.model_copy(
@@ -204,6 +205,47 @@ class _PermissionCodeActStrategy(CodeActStrategy):
         )
 
 
+class _LeanPermissionCodeActStrategy(_PermissionCodeActStrategy):
+    """Compact NOOA event rendering while retaining cross-turn history."""
+
+    @property
+    def name(self) -> str:
+        return "NOAH_LEAN_CODEACT"
+
+    async def execute(self, runtime: Any, call: Any) -> Any:
+        original = runtime.agent.render_config
+        truncation = runtime.agent._truncation
+        runtime.agent.render_config = original.model_copy(
+            update={
+                "block_formatter": PlainCodeActBlockFormatter(
+                    event_format=truncation.event_format
+                )
+            }
+        )
+        try:
+            return await super().execute(runtime, call)
+        finally:
+            runtime.agent.render_config = original
+
+
+class _AdaptivePermissionCodeActStrategy(_PermissionCodeActStrategy):
+    """Resolve NOOA strategy limits from the live agent efficiency profile."""
+
+    @property
+    def name(self) -> str:
+        return "NOAH_ADAPTIVE_CODEACT"
+
+    async def execute(self, runtime: Any, call: Any) -> Any:
+        config = runtime.agent._config
+        strategy_type = (
+            _LeanPermissionCodeActStrategy
+            if config.efficiency.strategy == "lean"
+            else _PermissionCodeActStrategy
+        )
+        delegate = strategy_type(config=_codeact_config(config))
+        return await delegate.execute(runtime, call)
+
+
 class CodingAgent(InteractiveAgent):
     """Repository coding agent for noah-code.
 
@@ -221,6 +263,7 @@ class CodingAgent(InteractiveAgent):
         config: NoahCodeConfig,
         *,
         llm: Any = None,
+        lightweight_llm: Any = None,
         storage: Any = None,
         engine: PermissionEngine | None = None,
         approvals: ApprovalBroker | None = None,
@@ -228,6 +271,7 @@ class CodingAgent(InteractiveAgent):
         **kwargs: Any,
     ) -> None:
         super().__init__(llm=llm, storage=storage, **kwargs)
+        self._lightweight_llm = lightweight_llm or self._llm
         self.workspace_root = str(workspace.root)
         self.mode = config.mode
         self._config = config
@@ -251,6 +295,10 @@ class CodingAgent(InteractiveAgent):
             self._approvals,
             self._journal,
             max_output_chars=config.max_output_chars,
+            max_output_lines=config.efficiency.max_output_lines,
+            max_search_results=config.efficiency.max_search_results,
+            max_file_results=config.efficiency.max_file_results,
+            output_retention_hours=config.efficiency.tool_output_retention_hours,
             default_timeout=config.command_timeout,
         )
         self.todos = TodoManager()
@@ -261,35 +309,120 @@ class CodingAgent(InteractiveAgent):
 
         self._skills_status = install_skills(self, workspace.root, config)
 
-        # Apply instance CodeAct limits without mutating other agents' class attrs.
-        # CodeActConfig is frozen, so replace the strategy object on this method
-        # only when values differ from the class decorator defaults.
-        desired = _codeact_config(config)
-        current = getattr(type(self).handle, "_strategy_override", None)
-        if current is None or getattr(current, "config", None) != desired:
-            # Bound on the unbound function object - acceptable for a single-process CLI.
-            type(self).handle._strategy_override = _PermissionCodeActStrategy(config=desired)
-
         # Bounded live context - not full trees/diffs.
         self.context["workspace"] = Context(
             expr="f'workspace={self.workspace_root}\\nmode={self.mode}'"
         )
         self.context["todos"] = Context(expr="self.todos.status()")
-        self.context["git"] = Context(expr="self._git_summary()")
+        self._git_summary_value = self._git_summary()
+        self.context["git"] = Context(expr="self._git_summary_value")
 
         if config.summarization.policy != "none":
-            install_summarizer(
-                SummarizationConfig(
-                    policy=config.summarization.policy,
-                    max_tokens=config.summarization.max_tokens,
+            from nooa.config.summarizer_config import TokenBudgetConfig
+
+            from noah_code.summarization import CodingSessionSummarizer
+
+            max_tokens = config.summarization.max_tokens
+            context_window = getattr(self._llm, "context_window", None)
+            if max_tokens is None and context_window:
+                max_tokens = int(context_window * config.summarization.trigger_ratio)
+            CodingSessionSummarizer.install(
+                self,
+                llm=self._lightweight_llm,
+                config=TokenBudgetConfig(
+                    max_tokens=max_tokens or 100_000,
                     preserve_recent=config.summarization.preserve_recent,
                     target_chars=config.summarization.target_chars,
                 ),
-                self,
             )
 
         # Discover AGENTS.md / README hints without dumping trees.
-        self.context["repo_instructions"] = Context(expr="self._repo_instructions()")
+        self._repo_instructions_value = self._repo_instructions()
+        self.context["repo_instructions"] = Context(
+            self._repo_instructions_value,
+            prefix=True,
+        )
+
+    @hidden
+    def refresh_context_sources(self) -> None:
+        """Refresh cacheable instructions at a safe user-turn boundary."""
+
+        self._git_summary_value = self._git_summary()
+        current = self._repo_instructions()
+        if current != self._repo_instructions_value:
+            self._repo_instructions_value = current
+            self.context["repo_instructions"] = Context(current, prefix=True)
+
+    @hidden
+    def sync_model_limits(self) -> None:
+        """Keep the configured compaction ratio after a live model switch."""
+
+        from nooa.config.summarizer_config import TokenBudgetConfig
+
+        context_window = getattr(self._llm, "context_window", None)
+        maximum = self._config.summarization.max_tokens or (
+            int(context_window * self._config.summarization.trigger_ratio)
+            if context_window
+            else 100_000
+        )
+        for summarizer in getattr(self, "_summarizers", []):
+            current = summarizer.config
+            summarizer.config = TokenBudgetConfig(
+                max_tokens=maximum,
+                preserve_recent=current.preserve_recent,
+                target_chars=current.target_chars,
+            )
+
+    @hidden
+    def set_main_llm(self, llm: Any, *, lightweight_follows_main: bool) -> None:
+        """Switch the primary model and keep compaction routing coherent."""
+
+        self._llm = llm
+        if lightweight_follows_main:
+            self._lightweight_llm = llm
+            for summarizer in getattr(self, "_summarizers", []):
+                summarizer._llm = llm
+        self.sync_model_limits()
+
+    @hidden
+    def set_efficiency_profile(self, profile: str) -> None:
+        """Apply a live iteration and tool-output efficiency profile."""
+
+        if profile not in {"fast", "balanced", "deep"}:
+            raise ValueError("profile must be fast, balanced, or deep")
+        self._config.efficiency.profile = profile  # type: ignore[assignment]
+        self.ws.set_efficiency_profile(profile)
+
+    @hidden
+    async def compact_history(self) -> bool:
+        """Compact the oldest eligible history now, at an explicit turn boundary."""
+
+        compacted = False
+        for summarizer in getattr(self, "_summarizers", []):
+            tags = summarizer.target_event_manager.keys()
+            preserve = summarizer.config.preserve_recent
+            if summarizer._pending_task is not None or len(tags) <= preserve:
+                continue
+            summarizer._schedule_summarization(tags[0], tags[-(preserve + 1)])
+            if summarizer._pending_task is not None:
+                await summarizer._pending_task
+                had_summary = summarizer._pending_summary is not None
+                summarizer._apply_pending_summary()
+                compacted = compacted or had_summary
+        return compacted
+
+    @hidden
+    @strategy(
+        PredictStrategy(PredictConfig(output_serialization="tool_call")),
+        llm=lambda agent: agent._lightweight_llm,
+    )
+    async def name_session(self, user_message: str) -> str:
+        """Generate an ultra-short 2-5 word coding-session title.
+
+        Conversation starts with: {user_message}
+        """
+
+        ...
 
     @hidden
     def _git_summary(self) -> str:
@@ -348,7 +481,9 @@ class CodingAgent(InteractiveAgent):
 
     @hidden
     @strategy(
-        _PermissionCodeActStrategy(config=CodeActConfig(max_iterations=40, cell_timeout=120.0))
+        _AdaptivePermissionCodeActStrategy(
+            config=CodeActConfig(max_iterations=40, cell_timeout=120.0)
+        )
     )
     async def handle(self, notification: dict[str, list]) -> RespondResult:
         """Handle one conversational turn for a coding task.

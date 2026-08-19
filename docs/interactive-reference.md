@@ -43,12 +43,16 @@ the configured `max_output_chars` per activity.
 | `/help` | Show interactive help |
 | `/config [PATH]` | Show every resolved setting or one nested path |
 | `/mode` | Show or switch between `build` and `plan` |
-| `/model` | Search for a provider, enter a masked API key, then choose a model |
+| `/model` | Choose a provider, masked API key, model, and optional reasoning effort |
 | `/model MODEL` | Switch the active session model |
 | `/model --global MODEL` | Switch the active model and save it as the default for all repositories |
+| `/reasoning [EFFORT]` | Show or set default/none/minimal/low/medium/high/xhigh for this session |
+| `/reasoning --global EFFORT` | Set reasoning effort for this and future sessions |
 | `/providers [use PROVIDER MODEL]` | Search and securely configure API providers |
 | `/session`, `/sessions`, `/new`, `/continue` | Inspect, switch, create, and resume sessions |
-| `/compact` | Summarize older conversation context |
+| `/compact` | Apply a coding checkpoint to eligible older context |
+| `/tokens` | Show tokens, cache hits, cost, model wait, and tool-output volume |
+| `/efficiency [fast|balanced|deep]` | Show or switch live iteration and output budgets |
 | `/todos` | Show the agent's current task list |
 | `/status`, `/diff` | Inspect the repository |
 | `/undo`, `/redo` | Restore or reapply journaled file edits |
@@ -90,8 +94,13 @@ The latest 50 persisted user, agent, summary, error, and activity events are res
 TUI's first paint. `F3` loads older history in read-only pages of 50, so resuming a long session
 does not delay input or load the entire database into the transcript.
 
-Long conversations use token-budget summarization while preserving recent messages. Force
-compaction with `/compact`.
+Long conversations compact earlier than the provider limit and preserve a recent tail. The
+checkpoint retains the objective, decisions, changed files, validation results, blockers, and
+next actions. Force compaction with `/compact`; it reports when there is not yet enough history.
+
+Large model-facing tool results are bounded by characters and lines. The full result remains in
+Noah's private managed-output cache and can be fetched by output ID and line range, keeping
+context small without losing diagnostic data.
 
 File edits made through workspace tools record pre-images and post-images with content hashes:
 

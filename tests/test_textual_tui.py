@@ -380,12 +380,17 @@ async def test_providers_have_searchable_secret_free_setup(tmp_path: Path) -> No
         model_input = app.screen.query_one("#prompt-input")
         model_input.value = "example-model"
         await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, FilteredPicker)
+        await pilot.press("enter")
         for _ in range(20):
             if host.configure_provider.await_count:
                 break
             await pilot.pause()
 
-        host.configure_provider.assert_awaited_once_with("openai", "example-model")
+        host.configure_provider.assert_awaited_once_with(
+            "openai", "example-model", reasoning_effort="default"
+        )
 
 
 @pytest.mark.asyncio
@@ -416,7 +421,7 @@ async def test_exact_model_command_runs_masked_provider_key_model_setup(tmp_path
         await pilot.pause()
 
         assert isinstance(app.screen, FilteredPicker)
-        assert "1 OF 3" in app.screen.query_one("#picker-title").render().plain
+        assert "1 OF 4" in app.screen.query_one("#picker-title").render().plain
         await pilot.press("enter")
         await pilot.pause()
 
@@ -433,14 +438,47 @@ async def test_exact_model_command_runs_masked_provider_key_model_setup(tmp_path
         assert model_input.password is False
         model_input.value = "example-model"
         await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, FilteredPicker)
+        assert "REASONING" in app.screen.query_one("#picker-title").render().plain
+        for _ in range(5):
+            await pilot.press("down")
+        await pilot.press("enter")
         for _ in range(20):
             if host.configure_provider.await_count:
                 break
             await pilot.pause()
 
         host.set_provider_api_key.assert_awaited_once_with("openai", "never-render-this-key")
-        host.configure_provider.assert_awaited_once_with("openai", "example-model")
+        host.configure_provider.assert_awaited_once_with(
+            "openai", "example-model", reasoning_effort="high"
+        )
         assert "never-render-this-key" not in _log_text(app.query_one("#conversation"))
+
+
+@pytest.mark.asyncio
+async def test_exact_reasoning_command_opens_picker_and_switches_effort(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "/reasoning"
+        await pilot.pause()
+        app.close_suggestions()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, FilteredPicker)
+        for _ in range(3):
+            await pilot.press("down")
+        await pilot.press("enter")
+        for _ in range(20):
+            if host.handle_line.await_count:
+                break
+            await pilot.pause()
+
+        host.handle_line.assert_awaited_once_with("/reasoning low")
 
 
 @pytest.mark.asyncio
@@ -495,6 +533,8 @@ async def test_model_setup_recovers_a_missing_credential_startup_failure(tmp_pat
                 break
             await pilot.pause()
         app.screen.query_one("#prompt-input").value = "example-model"
+        await pilot.press("enter")
+        await pilot.pause()
         await pilot.press("enter")
 
         for _ in range(40):

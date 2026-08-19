@@ -812,6 +812,10 @@ class NoahCodeApp(App[None]):
         meta = self.host.meta
         mode = self.host.agent.mode if self.host._agent else self.host.config.mode
         model = meta.model if meta else self.host.config.model
+        effort = getattr(meta, "reasoning_effort", None) if meta else None
+        if not isinstance(effort, str):
+            effort = self.host.config.reasoning_effort
+        effort_label = "auto" if effort == "default" else effort
         session_id = meta.session_id[:8] if meta else "new"
         repository = self.host.workspace.root.name or str(self.host.workspace.root)
         state = self._phase
@@ -819,7 +823,10 @@ class NoahCodeApp(App[None]):
             verb = "starting" if not self._agent_ready else "working"
             state = f"{verb} {'◐◓◑◒'[self._spinner_index]}"
         unread = f"  {self._unread_count} new" if self._unread_count else ""
-        header = f" noah   {repository}   {mode.upper()}   {model}   {session_id}   {state}{unread} "
+        header = (
+            f" noah   {repository}   {mode.upper()}   {model} · r:{effort_label}   "
+            f"{session_id}   {state}{unread} "
+        )
         if force or header != self._header_text:
             self._header_text = header
             with contextlib.suppress(Exception):
@@ -848,6 +855,18 @@ class NoahCodeApp(App[None]):
             text.append(self._activities[self._active_activity_id].label[:34], style="#e6b673")
         else:
             text.append("Waiting for your next turn", style="#777781")
+
+        with contextlib.suppress(Exception):
+            usage = self.host.usage_snapshot()
+            text.append("\n\nTOKENS\n", style="bold #b8a9ff")
+            text.append(
+                f"{usage.uncached_tokens:,} uncached · {usage.cache_hit_ratio:.0%} cache\n",
+                style="#d1d1d6",
+            )
+            text.append(
+                f"{usage.calls} calls · {usage.llm_seconds:.1f}s model",
+                style="#777781",
+            )
 
         todos: list[Any] = []
         if self.host._agent is not None:
@@ -1449,12 +1468,16 @@ class NoahCodeApp(App[None]):
                 )
                 if not api_key_env:
                     return
+                reasoning_effort = await self._pick_reasoning_effort("Provider setup · Reasoning")
+                if reasoning_effort is None:
+                    return
                 status = await self.host.configure_provider(
                     "custom",
                     model,
                     alias=alias,
                     base_url=base_url,
                     api_key_env=None if api_key_env == "-" else api_key_env,
+                    reasoning_effort=reasoning_effort,
                 )
             else:
                 info = next(item for item in infos if item.key == provider)
@@ -1467,12 +1490,61 @@ class NoahCodeApp(App[None]):
                 )
                 if not model:
                     return
-                status = await self.host.configure_provider(provider, model)
+                reasoning_effort = await self._pick_reasoning_effort("Provider setup · Reasoning")
+                if reasoning_effort is None:
+                    return
+                status = await self.host.configure_provider(
+                    provider,
+                    model,
+                    reasoning_effort=reasoning_effort,
+                )
             self._append_entry(TranscriptEntry("STATUS", status))
             self.update_chrome(force=True)
             self._retry_startup_after_setup()
         except Exception as exc:  # noqa: BLE001
             self._append_entry(TranscriptEntry("ERROR", f"Provider setup failed: {exc}"))
+
+    async def _pick_reasoning_effort(self, title: str) -> str | None:
+        """Choose a portable LiteLLM reasoning effort or leave it provider-controlled."""
+
+        rows: list[tuple[str, str, str]] = [
+            (
+                "effort:default",
+                "Provider default",
+                "Recommended · omit the parameter and let the selected model decide",
+            ),
+            ("effort:none", "None", "Disable reasoning when the model supports it"),
+            ("effort:minimal", "Minimal", "Lowest non-zero reasoning budget"),
+            ("effort:low", "Low", "Faster and more token-efficient"),
+            ("effort:medium", "Medium", "Balanced reasoning budget"),
+            ("effort:high", "High", "More reasoning for difficult coding tasks"),
+            ("effort:xhigh", "Extra high", "Maximum effort on models that support xhigh"),
+        ]
+        current = getattr(self.host.meta, "reasoning_effort", None)
+        if not isinstance(current, str):
+            current = self.host.config.reasoning_effort
+        rows.sort(key=lambda row: row[0] != f"effort:{current}")
+        choice = await self.push_screen_wait(
+            FilteredPicker(
+                title,
+                rows,
+                "Type to search · support depends on the provider and model",
+            )
+        )
+        return choice.removeprefix("effort:") if choice else None
+
+    @work(exclusive=True, group="reasoning-setup")
+    async def action_reasoning_setup(self) -> None:
+        """Switch reasoning effort without repeating provider or credential setup."""
+
+        try:
+            effort = await self._pick_reasoning_effort("Reasoning effort")
+            if effort is None:
+                return
+            await self.host.handle_line(f"/reasoning {effort}")
+            self.update_chrome(force=True)
+        except Exception as exc:  # noqa: BLE001
+            self._append_entry(TranscriptEntry("ERROR", f"Reasoning setup failed: {exc}"))
 
     @work(exclusive=True, group="model-setup")
     async def action_model_setup(self) -> None:
@@ -1511,7 +1583,7 @@ class NoahCodeApp(App[None]):
             )
             choice = await self.push_screen_wait(
                 FilteredPicker(
-                    "Model setup · 1 of 3 · Provider",
+                    "Model setup · 1 of 4 · Provider",
                     rows,
                     "Type to search · Enter select · Esc cancel",
                 )
@@ -1529,7 +1601,7 @@ class NoahCodeApp(App[None]):
             if preset.api_key_env is not None:
                 api_key = await self.push_screen_wait(
                     TextPromptModal(
-                        f"Model setup · 2 of 3 · {info.label} API key",
+                        f"Model setup · 2 of 4 · {info.label} API key",
                         f"Paste {preset.api_key_env}",
                         "Masked while typing · saved to the OS credential store when available",
                         password=True,
@@ -1541,7 +1613,7 @@ class NoahCodeApp(App[None]):
 
             model = await self.push_screen_wait(
                 TextPromptModal(
-                    f"Model setup · {'3 of 3' if credential_result else '2 of 2'} · Model",
+                    f"Model setup · {'3 of 4' if credential_result else '2 of 3'} · Model",
                     info.model_hint,
                     f"Choose the model ID for {info.label}",
                 )
@@ -1550,7 +1622,16 @@ class NoahCodeApp(App[None]):
                 if credential_result:
                     self._append_entry(TranscriptEntry("STATUS", credential_result.message))
                 return
-            status = await self.host.configure_provider(provider, model)
+            reasoning_effort = await self._pick_reasoning_effort(
+                f"Model setup · {'4 of 4' if credential_result else '3 of 3'} · Reasoning"
+            )
+            if reasoning_effort is None:
+                return
+            status = await self.host.configure_provider(
+                provider,
+                model,
+                reasoning_effort=reasoning_effort,
+            )
             if credential_result:
                 status = f"{status}\n{credential_result.message}."
             self._append_entry(TranscriptEntry("STATUS", status))
@@ -1692,6 +1773,11 @@ class NoahCodeApp(App[None]):
             composer.text = ""
             self.close_suggestions()
             self.action_model_setup()
+            return
+        if self._agent_ready and text == "/reasoning":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_reasoning_setup()
             return
         composer.text = ""
         self.close_suggestions()

@@ -10,6 +10,7 @@ from nooa.unifiedllm import FakeLLMClient
 
 from noah_code.agent import CodingAgent
 from noah_code.config import load_config
+from noah_code.summarization import CodingSessionSummarizer
 from noah_code.workspace import Workspace
 
 
@@ -32,4 +33,5 @@ async def test_summarizer_install_with_small_budget(tmp_path: Path) -> None:
         agent,
     )
     assert getattr(agent, "_summarizers", None)
+    assert isinstance(agent._summarizers[0], CodingSessionSummarizer)
     assert agent._summarizers[0].config.max_tokens == 50
