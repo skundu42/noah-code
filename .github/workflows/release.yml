@@ -50,7 +50,7 @@ jobs:
       - name: Run release checks
         run: |
           uv run ruff check src tests
-          uv run pytest tests
+          uv run pytest tests -W error::pytest.PytestUnraisableExceptionWarning
           uv lock --check
 
       - name: Build wheel and source distribution
