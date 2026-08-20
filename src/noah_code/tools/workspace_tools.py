@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import difflib
+import gc
 import os
+import sys
 import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -596,4 +598,9 @@ class WorkspaceTools(Skill):
             if transport is not None:
                 with contextlib.suppress(Exception):
                     transport.close()
+            # NOOA's timeout recovery creates a short-lived helper subprocess
+            # that can remain in a transport/protocol cycle on CPython 3.12
+            # Linux. Collect it before pytest or the app closes this loop.
+            if sys.platform.startswith("linux") and sys.version_info < (3, 13):
+                gc.collect()
             await asyncio.sleep(0)
