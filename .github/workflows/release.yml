@@ -64,7 +64,7 @@ jobs:
           UV_TOOL_DIR: ${{ runner.temp }}/noah-tools
           UV_TOOL_BIN_DIR: ${{ runner.temp }}/noah-bin
         run: |
-          uv tool install --managed-python --python 3.12 --no-build --with 'nooa[mcp,tracing]==0.0.8' dist/*.whl
+          uv tool install --managed-python --python 3.12 --no-build --with 'nooa[mcp,tracing]' dist/*.whl
           "${UV_TOOL_BIN_DIR}/noah" --version
 
       - name: Upload release distributions
