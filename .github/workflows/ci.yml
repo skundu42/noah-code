@@ -40,19 +40,6 @@ jobs:
       - name: Lint
         run: uv run ruff check src tests
 
-      - name: Check subprocess-owning tests in isolation
-        if: matrix.python-version == '3.12'
-        run: |
-          for test_file in \
-            tests/test_git_tools.py \
-            tests/test_host.py \
-            tests/test_process_tools.py \
-            tests/test_run_exit.py \
-            tests/test_sessions.py \
-            tests/test_workspace_tools.py; do
-            uv run pytest "$test_file" -W error::pytest.PytestUnraisableExceptionWarning
-          done
-
       - name: Test
         run: uv run pytest tests -W error::pytest.PytestUnraisableExceptionWarning
 
