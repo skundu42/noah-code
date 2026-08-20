@@ -47,6 +47,12 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --all-extras --dev
 
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          rg --version
+
       - name: Run release checks
         run: |
           uv run ruff check src tests

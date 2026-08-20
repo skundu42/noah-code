@@ -34,6 +34,12 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --all-extras --dev
 
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          rg --version
+
       - name: Check lock file
         run: uv lock --check
 
@@ -75,6 +81,16 @@ jobs:
 
       - name: Install locked dependencies
         run: uv sync --locked --all-extras --dev
+
+      - name: Install ripgrep
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y ripgrep
+          else
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep
+          fi
+          rg --version
 
       - name: Run tests
         run: uv run pytest tests -W error::pytest.PytestUnraisableExceptionWarning

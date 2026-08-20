@@ -305,14 +305,16 @@ async def test_search_redacts_secret_file_matches(tmp_path: Path) -> None:
     (tmp_path / "credentials.json").write_text('{"key":"hunter2"}\n')
     (tmp_path / "app.py").write_text("visible = 'ok'\n")
     ws = _make_ws(tmp_path, auto=True)
-    secret_hits = await ws.search("hunter2")
-    public_hits = await ws.search("visible")
-    assert "hunter2" not in (secret_hits.stdout or "")
-    assert "visible" in (public_hits.stdout or "")
-    inspect = await ws.inspect(searches=["hunter2"])
-    assert "credentials.json" not in inspect
-    assert "(no matches)" in inspect
-    await ws.close()
+    try:
+        secret_hits = await ws.search("hunter2")
+        public_hits = await ws.search("visible")
+        assert "hunter2" not in (secret_hits.stdout or "")
+        assert "visible" in (public_hits.stdout or "")
+        inspect = await ws.inspect(searches=["hunter2"])
+        assert "credentials.json" not in inspect
+        assert "(no matches)" in inspect
+    finally:
+        await ws.close()
 
 
 @pytest.mark.asyncio
@@ -320,6 +322,8 @@ async def test_list_files_rejects_parent_glob(tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside-secret.txt"
     outside.write_text("nope\n")
     ws = _make_ws(tmp_path, auto=True)
-    with pytest.raises(ValueError, match="workspace"):
-        await ws.list_files("../*")
-    await ws.close()
+    try:
+        with pytest.raises(ValueError, match="workspace"):
+            await ws.list_files("../*")
+    finally:
+        await ws.close()
