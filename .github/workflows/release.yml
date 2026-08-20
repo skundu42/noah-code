@@ -68,7 +68,7 @@ jobs:
           "${UV_TOOL_BIN_DIR}/noah" --version
 
       - name: Upload release distributions
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-package-distributions
           path: dist/
