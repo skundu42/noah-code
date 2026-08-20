@@ -30,9 +30,11 @@ Inside an interactive session, switch only the current session or replace the gl
 ```
 
 Bare `/model` opens a guided TUI flow: search for a provider, enter its API key in a masked
-field, enter the model ID, and select reasoning effort. Noah attempts to save that key in the operating system credential
-store. If no secure backend is available, the key remains active only in the current Noah process
-and the TUI says so. Keys are never written to Noah configuration or session metadata.
+field, enter the model ID, and select reasoning effort. Noah saves the credential in
+`~/.local/share/noah-code/auth.json`, using the same provider-keyed record shape as OpenCode.
+The containing directory uses mode `0700` and the file uses mode `0600`. If the file cannot be
+written, the key remains active only in the current Noah process and the TUI says so. Keys are
+never written to Noah configuration or session metadata. `XDG_DATA_HOME` relocates the data root.
 
 Model switches take effect between turns and are stored in the current session metadata, so a
 resumed session continues with its most recently selected model. A session-only `/model MODEL`

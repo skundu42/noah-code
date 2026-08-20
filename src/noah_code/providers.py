@@ -178,7 +178,13 @@ def resolve_provider_model(provider: str, model: str) -> str:
 def _credentials_ready(preset: ProviderPreset) -> bool:
     if not preset.credential_groups:
         return True
-    return any(all(os.environ.get(name) for name in group) for group in preset.credential_groups)
+    if any(all(os.environ.get(name) for name in group) for group in preset.credential_groups):
+        return True
+    if preset.api_key_env is None:
+        return False
+    from noah_code.credentials import has_provider_auth
+
+    return has_provider_auth(preset.key)
 
 
 def _credential_hint(preset: ProviderPreset) -> str:
@@ -215,8 +221,8 @@ def list_providers(active_model: str = "") -> list[ProviderInfo]:
 def format_providers(active_model: str = "") -> str:
     lines = [
         "Model providers",
-        "API keys are read from the environment or OS credential store; values are never saved "
-        "in Noah config or session files.",
+        "API keys are read from the environment or ~/.local/share/noah-code/auth.json; values "
+        "are never saved in Noah config or session files.",
     ]
     for info in list_providers(active_model):
         state = "active" if info.active else "ready" if info.configured else "key missing"

@@ -509,7 +509,7 @@ class AgentHost:
         return list_providers(model)
 
     async def set_provider_api_key(self, provider: str, api_key: str) -> Any:
-        """Activate a provider key and persist it in the OS credential store."""
+        """Activate a provider key and persist it in Noah's private auth file."""
 
         from noah_code.credentials import store_provider_api_key
 

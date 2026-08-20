@@ -97,9 +97,10 @@ noah benchmark .
 ```
 
 Bring your own API key from inside the TUI by entering `/model`: choose the provider, paste the
-key into the masked field, choose the model, then select its reasoning effort. Noah saves the key to the operating system's
-credential store when one is available; otherwise it remains available only to that Noah process.
-API-key values are never written to Noah config, repository, or session files.
+key into the masked field, choose the model, then select its reasoning effort. Like OpenCode,
+Noah saves provider credentials in `~/.local/share/noah-code/auth.json`; the directory is
+owner-only and the file uses mode `0600`. API-key values are never written to Noah config,
+repository, or session files. Set `XDG_DATA_HOME` to relocate the data directory.
 
 Environment variables and the CLI remain available for scripts and headless use:
 
@@ -123,8 +124,8 @@ Mistral, xAI, DeepSeek, Together AI, and Perplexity are also supported. See the
 [provider configuration guide](docs/configuration.md#bring-your-own-api-provider).
 
 The package also installs `noah-code` and `nc` as equivalent entry points. Because `nc` commonly
-refers to netcat, `noah` or `noah-code` is recommended. Keep provider API keys in the OS
-credential store or environment, never in a repository or Noah Code session metadata.
+refers to netcat, `noah` or `noah-code` is recommended. Keep provider API keys in Noah's private
+auth file or environment, never in a repository or Noah Code session metadata.
 
 Inside a session, bare `/model` opens guided provider, API-key, model, and reasoning setup. `/model MODEL`
 switches the active model immediately and remembers it when that session is resumed. It does not

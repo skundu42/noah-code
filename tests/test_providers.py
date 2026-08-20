@@ -12,7 +12,10 @@ from noah_code.providers import (
 )
 
 
-def test_popular_provider_status_checks_presence_without_exposing_values(monkeypatch) -> None:
+def test_popular_provider_status_checks_presence_without_exposing_values(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("OPENAI_API_KEY", "super-secret-value")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
@@ -23,6 +26,18 @@ def test_popular_provider_status_checks_presence_without_exposing_values(monkeyp
     assert providers["openai"].active is True
     assert providers["anthropic"].configured is False
     assert "super-secret-value" not in repr(providers)
+
+
+def test_provider_status_recognizes_file_backed_credentials(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    from noah_code.credentials import store_provider_api_key
+
+    store_provider_api_key("openrouter", "stored-secret")
+
+    providers = {provider.key: provider for provider in list_providers()}
+    assert providers["openrouter"].configured is True
+    assert "stored-secret" not in repr(providers)
 
 
 @pytest.mark.parametrize(

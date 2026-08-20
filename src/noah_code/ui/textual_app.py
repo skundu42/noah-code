@@ -1933,7 +1933,7 @@ class NoahCodeApp(App[None]):
                     TextPromptModal(
                         f"Model setup · 2 of 4 · {info.label} API key",
                         f"Paste {preset.api_key_env}",
-                        "Masked while typing · saved to the OS credential store when available",
+                        "Masked while typing · saved to ~/.local/share/noah-code/auth.json",
                         password=True,
                     )
                 )

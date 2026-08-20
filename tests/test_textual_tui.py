@@ -559,7 +559,7 @@ async def test_exact_model_command_runs_masked_provider_key_model_setup(tmp_path
         )
     ]
     host.set_provider_api_key.return_value = SimpleNamespace(
-        message="OPENAI_API_KEY saved in the OS credential store"
+        message="OPENAI_API_KEY saved in ~/.local/share/noah-code/auth.json"
     )
     app = NoahCodeApp(host, TextualUI())
 
