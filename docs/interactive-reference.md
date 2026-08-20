@@ -54,6 +54,8 @@ the configured `max_output_chars` per activity.
 | `/tokens` | Show tokens, cache hits, cost, model wait, and tool-output volume |
 | `/efficiency [fast|balanced|deep]` | Show or switch live iteration and output budgets |
 | `/todos` | Show the agent's current task list |
+| `/agents` | List built-in and markdown subagents |
+| `/attach PATH` | Attach a workspace file or image to the next turn |
 | `/status` | Inspect the current session and repository state |
 | `/diff` | Review staged and unstaged files, patches, diagnostics, and changed symbols |
 | `/undo`, `/redo` | Restore or reapply journaled file edits |
@@ -130,3 +132,17 @@ Long-running commands use `self.processes.start`, `logs`, `status`, `input`, and
 owned by the current session, run in separate process groups, have bounded runtime and retained
 output, and are terminated when Noah closes. `logs` accepts a cursor and returns only new output.
 Lifecycle updates appear in the TUI without copying continuous logs into model context.
+
+### Subagents, web, questions, and attachments
+
+The parent agent can run isolated NOOA subagents with `self.task.run("explore", ...)` or
+`self.task.run("general", ...)`. Explore is read-only. General can edit but does not own todos.
+Custom agents are markdown files in `.noah-code/agents/` or `~/.config/noah-code/agents/`. List
+them with `/agents`. Plan mode can run read-only agents only.
+
+`self.web.fetch(url)` and `self.web.search(query)` ask before leaving the machine.
+`self.ask.question(header, prompt, options)` pauses the turn for a structured choice.
+
+Type `@path` in the composer to inline a workspace file or attach a PNG/JPEG/WebP/GIF as a NOOA
+`Image` for `show()`. `/attach PATH` does the same from a slash command. Pasting an image path
+into the composer also inserts an `@` mention.

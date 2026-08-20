@@ -239,10 +239,12 @@ Permission rules are evaluated in order, and the last matching rule wins. The de
 - Allows ordinary reads.
 - Denies likely secrets, including `.env` variants, private keys, `.git` internals, and session
   databases. `.env.example` remains readable.
-- Asks before workspace edits and shell commands.
+- Asks before workspace edits, shell commands, web fetches, web searches, and subagents.
+- Allows the question tool so the agent can pause for a structured choice.
 - Denies `git push`, `git clean`, and `git reset --hard`.
 - Keeps file tools inside the active workspace and asks before skill or MCP access.
-- Denies plan-mode mutations regardless of broader allow rules.
+- Denies plan-mode mutations regardless of broader allow rules. Plan mode may still run
+  read-only subagents.
 
 `--auto` changes ask decisions to allow but never overrides an explicit deny. Compound shell
 commands and mutating or unrecognized Git commands cannot be silently auto-approved.

@@ -24,8 +24,7 @@ def test_agent_protocol_status_is_plain_language() -> None:
 
 def test_iteration_limit_error_recommends_recovery() -> None:
     error = RuntimeError(
-        "Generation failed after 12 iterations (max_iterations=12). "
-        "Unable to complete `handle`."
+        "Generation failed after 12 iterations (max_iterations=12). Unable to complete `handle`."
     )
 
     text = _friendly_agent_error(error, "fast")
@@ -461,4 +460,24 @@ async def test_reasoning_command_rebuilds_client_and_persists_session(
     assert host.agent._llm is replacement
     assert host.meta.reasoning_effort == "high"
     assert host.store.load_meta(host.meta.session_id).reasoning_effort == "high"
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_agents_command_lists_builtins(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+
+    action = await host.handle_line("/agents")
+
+    assert action == "handled"
+    rendered = host.ui.render.call_args.args[0].text
+    assert "explore" in rendered
+    assert "general" in rendered
     await host.close()

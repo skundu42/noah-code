@@ -31,7 +31,9 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("help", "Show available commands", host_only=True),
     CommandSpec("config", "Show every resolved setting or one path", "config [PATH]", True),
     CommandSpec("mode", "Show or switch the active mode", "mode [build|plan]", True),
-    CommandSpec("model", "Configure a provider or switch this session's model", "model [MODEL]", True),
+    CommandSpec(
+        "model", "Configure a provider or switch this session's model", "model [MODEL]", True
+    ),
     CommandSpec(
         "reasoning",
         "Show or set reasoning effort for compatible models",
@@ -61,7 +63,13 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("diff", "Review staged and unstaged changes", host_only=True),
     CommandSpec("undo", "Undo last WorkspaceTools turn", host_only=True),
     CommandSpec("redo", "Redo last undone turn", host_only=True),
-    CommandSpec("skills", "Search skills or add a compatible skill folder", "skills [add PATH]", True),
+    CommandSpec("agents", "List built-in and markdown subagents", host_only=True),
+    CommandSpec(
+        "attach", "Attach a workspace file or image to the next turn", "attach [PATH]", True
+    ),
+    CommandSpec(
+        "skills", "Search skills or add a compatible skill folder", "skills [add PATH]", True
+    ),
     CommandSpec("mcp", "Search, connect, or add MCP servers", "mcp [connect|add]", True),
     CommandSpec("trace", "Show tracing destination", host_only=True),
     CommandSpec("exit", "Exit Noah Code", host_only=True),
@@ -127,7 +135,9 @@ def config_text(config: Any, path: str = "") -> str:
     if not rows:
         raise KeyError(path)
     width = max(len(key) for key, _value in rows)
-    title = f"Resolved configuration ({path.strip()}):" if path.strip() else "Resolved configuration:"
+    title = (
+        f"Resolved configuration ({path.strip()}):" if path.strip() else "Resolved configuration:"
+    )
     return "\n".join([title, "", *(f"  {key:<{width}}  {value}" for key, value in rows)])
 
 
@@ -167,9 +177,7 @@ def help_text(custom: dict[str, CustomCommand] | None = None) -> str:
     for cmd in BUILTIN_COMMANDS:
         lines.append(f"  {cmd.invocation:<28} {cmd.description}")
     lines.append(f"  {'/model --global MODEL':<28} Set the default model for every repository")
-    lines.append(
-        f"  {'/reasoning --global EFFORT':<28} Set the global reasoning effort default"
-    )
+    lines.append(f"  {'/reasoning --global EFFORT':<28} Set the global reasoning effort default")
     if custom:
         lines.append("")
         lines.append("Custom commands:")

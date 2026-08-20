@@ -30,7 +30,11 @@ from noah_code.permissions import PermissionEngine
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tools.git_tools import GitTools
 from noah_code.tools.lsp_tools import LSPTools
+from noah_code.tools.media_tools import MediaTools
 from noah_code.tools.process_tools import ProcessTools
+from noah_code.tools.question_tools import QuestionTools
+from noah_code.tools.task_tools import TaskTools
+from noah_code.tools.web_tools import WebTools
 from noah_code.tools.workspace_tools import WorkspaceTools
 from noah_code.workspace import Workspace
 
@@ -115,6 +119,13 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("lsp", "rename_preview"),
             ("lsp", "repository_map"),
             ("lsp", "workspace_symbols"),
+            ("media", "consume"),
+            ("media", "pending"),
+            ("ask", "question"),
+            ("web", "fetch"),
+            ("web", "search"),
+            ("task", "list"),
+            ("task", "run"),
             ("processes", "input"),
             ("processes", "logs"),
             ("processes", "start"),
@@ -287,6 +298,8 @@ class CodingAgent(InteractiveAgent):
         engine: PermissionEngine | None = None,
         approvals: ApprovalBroker | None = None,
         journal: SnapshotJournal | None = None,
+        nested: bool = False,
+        nested_prompt: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(llm=llm, storage=storage, **kwargs)
@@ -294,6 +307,7 @@ class CodingAgent(InteractiveAgent):
         self.workspace_root = str(workspace.root)
         self.mode = config.mode
         self._config = config
+        self._nested = nested
 
         self._engine = engine or PermissionEngine(
             config.permission_rules,
@@ -341,11 +355,21 @@ class CodingAgent(InteractiveAgent):
         )
         self.todos = TodoManager()
         self.git = GitTools(self.ws)
+        self.web = WebTools(self._engine, self._approvals)
+        self.ask = QuestionTools(self._engine, self._approvals)
+        self.media = MediaTools()
         self._sandbox_approved_roots: set[str] = set()
+        if not nested:
+            self.task = TaskTools(
+                workspace,
+                self._engine,
+                self._approvals,
+                parent=self,
+            )
 
         from noah_code.skills_setup import install_skills
 
-        self._skills_status = install_skills(self, workspace.root, config)
+        self._skills_status = "" if nested else install_skills(self, workspace.root, config)
 
         # Bounded live context - not full trees/diffs.
         self.context["workspace"] = Context(
@@ -355,6 +379,10 @@ class CodingAgent(InteractiveAgent):
         self._git_summary_value = self._git_summary()
         self.context["git"] = Context(expr="self._git_summary_value")
         self.context["background_jobs"] = Context(expr="self.processes.summary()")
+        if nested_prompt:
+            self.context["subagent"] = Context(nested_prompt, prefix=True)
+        if not nested:
+            self.context["agents"] = Context(expr="self.task.list()")
 
         if config.summarization.policy != "none":
             from nooa.config.summarizer_config import TokenBudgetConfig
@@ -546,10 +574,19 @@ class CodingAgent(InteractiveAgent):
           long-running commands. Consume logs by cursor; do not poll without new work.
         - ``result = await self.ws.run("pytest -q")`` runs validation; inspect
           ``result.returncode``, ``result.stdout``, and ``result.stderr``.
+        - ``await self.web.fetch(url)`` reads a page; ``await self.web.search(query)``
+          searches the public web. Both ask for approval by default.
+        - ``await self.ask.question(header, prompt, options)`` pauses for a user choice.
+        - ``await self.task.run("explore", "...")`` or ``"general"`` runs a nested
+          NOOA subagent with isolated history. ``self.task.list()`` shows markdown agents.
+        - If ``self.media.pending()`` is non-empty, ``show()`` each ``self.media.consume()``
+          image before reasoning. ``show`` is a CodeAct builtin; do not import ``nooa``.
 
         Workflow:
+        - If the user attached images, show them first.
         - Inspect relevant repository instructions and nearby code first.
         - Prefer ``self.ws.search`` / focused ``self.ws.read`` over dumping large files.
+        - Delegate bounded research or parallel units with ``self.task.run``.
         - Use ``self.todos`` for genuinely multi-step tasks; keep todos current.
         - Make the smallest coherent change, preferring one atomic ``self.ws.apply_patch``.
         - Preserve unrelated user modifications.

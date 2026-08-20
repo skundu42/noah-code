@@ -24,6 +24,9 @@ class PermissionCategory(StrEnum):
     SKILL = "skill"
     MCP = "mcp"
     LSP = "lsp"
+    WEBFETCH = "webfetch"
+    WEBSEARCH = "websearch"
+    QUESTION = "question"
 
 
 # Patterns that are always denied regardless of mode / auto.
@@ -454,7 +457,7 @@ def _is_compound(command: str) -> bool:
     try:
         shlex.split(command)
     except ValueError:
-            return True
+        return True
     return False
 
 

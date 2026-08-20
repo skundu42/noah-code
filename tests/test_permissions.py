@@ -126,6 +126,21 @@ def test_background_ampersand_is_uncertain_shell() -> None:
     assert engine.is_uncertain_shell("pwd") is False
 
 
+def test_web_and_question_defaults() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=False)
+    assert engine.decide("webfetch", "https://example.com").action == "ask"
+    assert engine.decide("websearch", "asyncio").action == "ask"
+    assert engine.decide("question", "Approach").action == "allow"
+    assert engine.decide("task", "explore").action == "ask"
+
+
+def test_plan_mode_allows_questions_and_web_asks() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=False)
+    assert engine.decide("question", "Approach").action == "allow"
+    assert engine.decide("webfetch", "https://example.com").action == "ask"
+    assert engine.decide("edit", "a.py").action == "deny"
+
+
 def test_permission_pattern_does_not_match_foreign_basenames() -> None:
     engine = PermissionEngine(
         [

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import re
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rich.console import Group
@@ -34,9 +36,11 @@ from noah_code.commands import (
     config_command_suggestions,
     help_text,
 )
+from noah_code.composer import mention_suggestions
 from noah_code.event_bridge import _describe_code_activity
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.sessions import SessionEventRecord
+from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt
 
 if TYPE_CHECKING:
     from noah_code.host import AgentHost
@@ -207,11 +211,25 @@ def _welcome_renderable(repository: str, *, starting: bool) -> Group:
 def _command_insertion(invocation: str) -> str:
     """Turn a display invocation into editable composer text."""
 
+    if invocation.startswith("@"):
+        return invocation if invocation.endswith(" ") else f"{invocation} "
     if invocation.startswith("/model --global"):
         return "/model --global "
     if " [" in invocation:
         return invocation.split(" [", 1)[0] + " "
     return invocation
+
+
+def _active_mention(text: str) -> str | None:
+    match = re.search(r"@[A-Za-z0-9_./-]*$", text.rstrip())
+    return match.group(0) if match else None
+
+
+def _replace_active_mention(text: str, insertion: str) -> str:
+    match = re.search(r"@[A-Za-z0-9_./-]*$", text.rstrip())
+    if match is None:
+        return f"{text.rstrip()} {insertion}".strip()
+    return text[: match.start()] + insertion
 
 
 def _diff_renderable(patch: str) -> Group:
@@ -326,6 +344,18 @@ class ComposerTextArea(TextArea):
             return
         await super()._on_key(event)
 
+    async def _on_paste(self, event: events.Paste) -> None:
+        pasted = (event.text or "").strip()
+        if pasted and "\n" not in pasted:
+            path = Path(pasted).expanduser()
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+                event.stop()
+                event.prevent_default()
+                mention = f"@{path.name}" if path.name else pasted
+                self.replace(f"{mention} ", *self.selection, maintain_selection_offset=False)
+                return
+        await super()._on_paste(event)
+
 
 class ApprovalModal(ModalScreen[ApprovalChoice]):
     """Safe-by-default permission decision card."""
@@ -382,6 +412,55 @@ class ApprovalModal(ModalScreen[ApprovalChoice]):
     @on(Button.Pressed, "#reject")
     def _reject(self) -> None:
         self.dismiss(ApprovalChoice.REJECT)
+
+
+class QuestionModal(ModalScreen[QuestionAnswer | None]):
+    """Keyboard-first multiple-choice card for the question tool."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+        Binding("enter", "accept", "Choose", show=True),
+        Binding("0", "other", "Other", show=False),
+    ]
+
+    def __init__(self, prompt: QuestionPrompt) -> None:
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="approval-dialog"):
+            yield Label(self.prompt.header.upper(), id="approval-title")
+            yield Static(self.prompt.prompt, id="approval-body")
+            yield OptionList(id="question-list", compact=True)
+            yield Static("↑/↓ choose · Enter select · 0 other · Esc cancel", id="picker-hint")
+
+    def on_mount(self) -> None:
+        option_list = self.query_one("#question-list", OptionList)
+        options = [
+            Option(Text(f"{index}. {option}"), id=f"opt-{index}")
+            for index, option in enumerate(self.prompt.options, start=1)
+        ]
+        option_list.add_options(options)
+        option_list.highlighted = 0
+        option_list.focus()
+
+    def action_accept(self) -> None:
+        option_list = self.query_one("#question-list", OptionList)
+        index = option_list.highlighted
+        if index is None or index < 0 or index >= len(self.prompt.options):
+            self.dismiss(None)
+            return
+        self.dismiss(QuestionAnswer(selections=[self.prompt.options[index]], custom=""))
+
+    def action_other(self) -> None:
+        self.dismiss(QuestionAnswer(selections=[], custom="other"))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(OptionList.OptionSelected, "#question-list")
+    def _selected(self) -> None:
+        self.action_accept()
 
 
 class FilteredPicker(ModalScreen[str | None]):
@@ -920,6 +999,11 @@ class TextualUI:
             return ApprovalChoice.REJECT
         return await self._app.request_approval(request)
 
+    async def ask_questions(self, prompts: list[QuestionPrompt]) -> QuestionAnswer:
+        if self._app is None:
+            return QuestionAnswer(selections=[], custom="")
+        return await self._app.request_questions(prompts)
+
     async def prompt(self, status: str) -> str | None:
         self.set_status(status)
         return None
@@ -1454,7 +1538,13 @@ class NoahCodeApp(App[None]):
 
     def _matching_command_suggestions(self, text: str) -> list[CommandSuggestion]:
         query = text.strip()
-        if not query.startswith("/") or "\n" in text:
+        if "\n" in text:
+            return []
+        mention = _active_mention(text)
+        if mention is not None:
+            matches = mention_suggestions(Path(self.host.workspace.root), mention)
+            return [CommandSuggestion(f"@{path}", "Attach workspace file") for path in matches]
+        if not query.startswith("/"):
             return []
         raw_lowered = text.lstrip().lower()
         if raw_lowered.startswith("/mode "):
@@ -1537,9 +1627,16 @@ class NoahCodeApp(App[None]):
         invocation = self._suggestion_matches[self._suggestion_index].invocation
         insertion = _command_insertion(invocation)
         composer = self.query_one("#composer", ComposerTextArea)
-        self._skip_suggestion_text = insertion
-        composer.text = insertion
-        composer.cursor_location = (0, len(insertion))
+        current = composer.text
+        if current.lstrip().startswith("/") and "\n" not in current:
+            self._skip_suggestion_text = insertion
+            composer.text = insertion
+            composer.cursor_location = (0, len(insertion))
+        else:
+            replaced = _replace_active_mention(current, insertion)
+            self._skip_suggestion_text = replaced
+            composer.text = replaced
+            composer.cursor_location = (0, len(replaced))
         self.close_suggestions()
         composer.focus()
 
@@ -1575,6 +1672,18 @@ class NoahCodeApp(App[None]):
     async def request_approval(self, request: ApprovalRequest) -> ApprovalChoice:
         result = await self.push_screen_wait(ApprovalModal(request))
         return result if result is not None else ApprovalChoice.REJECT
+
+    async def request_questions(self, prompts: list[QuestionPrompt]) -> QuestionAnswer:
+        selections: list[str] = []
+        custom_parts: list[str] = []
+        for prompt in prompts:
+            result = await self.push_screen_wait(QuestionModal(prompt))
+            if result is None:
+                continue
+            selections.extend(result.selections)
+            if result.custom:
+                custom_parts.append(result.custom)
+        return QuestionAnswer(selections=selections, custom=" ".join(custom_parts).strip())
 
     def action_show_help(self) -> None:
         self._append_entry(

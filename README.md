@@ -48,6 +48,9 @@ and seccomp support. You also need an LLM provider account such as OpenAI, Anthr
 - Inspect token, prompt-cache, model-wait, and tool-output usage with `/tokens`; switch live
   `fast`, `balanced`, and `deep` budgets with `/efficiency`.
 - Switch AI models between turns, with optional cross-repository defaults.
+- Delegate research to nested **explore** and **general** subagents, or markdown agents in
+  `.noah-code/agents/`.
+- Fetch pages and search the web, ask structured questions mid-turn, and attach `@files` or images.
 - Extend workflows with slash commands, opt-in skills, MCP servers, model selection, and tracing.
 
 ## Quick start

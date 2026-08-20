@@ -22,6 +22,25 @@ test.
 Invoke it as `/fix the parser`. Commands support `$ARGUMENTS` and positional placeholders `$1`
 through `$9`. Front matter may also select a mode or model.
 
+## Subagents
+
+The parent agent invokes nested NOOA agents with `self.task.run("explore", prompt)` or
+`self.task.run("general", prompt)`. Each child gets isolated in-memory session storage and the
+same permission broker. Add project or user markdown agents:
+
+- `~/.config/noah-code/agents/*.md`
+- `.noah-code/agents/*.md`
+
+```markdown
+---
+description: Review a diff without editing
+readonly: true
+---
+Review the assigned change. Cite files. Do not edit.
+```
+
+`/agents` lists discovered names. Project files override user files with the same stem.
+
 ## Skills
 
 Open the dedicated searchable picker with `/skills` or `Ctrl+K`. Selecting a document skill

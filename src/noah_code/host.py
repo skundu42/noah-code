@@ -277,6 +277,7 @@ class AgentHost:
             agent.v.model = self.meta.model
 
         agent._approvals.set_handler(self.ui.ask_approval)
+        agent.ask.set_handler(self.ui.ask_questions)
         agent._render_message = self._on_agent_message
         agent.ws.set_shell_chunk_handler(self._on_shell_chunk)
         agent.processes.set_lifecycle_handler(self._on_process_lifecycle)
@@ -921,6 +922,29 @@ class AgentHost:
         if name == "todos":
             self.ui.render(_command_output(agent.todos.status() or "(no todos)"))
             return "handled"
+        if name == "agents":
+            listing = (
+                agent.task.list() if getattr(agent, "task", None) is not None else "(no agents)"
+            )
+            self.ui.render(_command_output(listing))
+            return "handled"
+        if name == "attach":
+            raw = args.strip().strip("\"'")
+            if not raw:
+                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /attach PATH"))
+                return "handled"
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                path = self.workspace.root / path
+            self.ui.set_busy(True)
+            self._active_turn = asyncio.current_task()
+            try:
+                await self._run_user_turn("Please inspect the attached file.", attach_paths=[path])
+            finally:
+                self._active_turn = None
+                self.ui.set_busy(False)
+                self.ui.set_status(self.status_prompt())
+            return "continue"
         if name == "status":
             reversible = agent.journal.last_turn_reversible() if agent.journal.can_undo() else True
             warn = ""
@@ -1082,13 +1106,29 @@ class AgentHost:
         )
         self.ui.set_status(self.status_prompt())
 
-    async def _run_user_turn(self, text: str) -> HostResult:
+    async def _run_user_turn(
+        self,
+        text: str,
+        *,
+        attach_paths: list[Path] | None = None,
+    ) -> HostResult:
         from nooa.interactive import RespondReason
+
+        from noah_code.composer import expand_turn
 
         agent = self.agent
         agent.refresh_context_sources()
         agent.journal.begin_turn()
-        agent._user_messages_in.put(text)
+        expanded = expand_turn(text, self.workspace.root, attach_paths=attach_paths)
+        if expanded.images:
+            agent.media.queue(expanded.images)
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    f"attached {len(expanded.images)} image(s) for show()",
+                )
+            )
+        agent._user_messages_in.put(expanded.text)
 
         if self.meta and self.meta.title == "untitled":
             if self.config.efficiency.deterministic_titles:

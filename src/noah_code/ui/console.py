@@ -12,6 +12,7 @@ from rich.panel import Panel
 
 from noah_code.approvals import ApprovalChoice, ApprovalRequest
 from noah_code.events import HostEvent, HostEventKind
+from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt, console_question_handler
 
 
 class ConsoleUI:
@@ -82,6 +83,12 @@ class ConsoleUI:
             if choice in {"3", "reject", "r", "n", "no"}:
                 return ApprovalChoice.REJECT
             self.console.print("Enter 1/2/3")
+
+    async def ask_questions(self, prompts: list[QuestionPrompt]) -> QuestionAnswer:
+        return await console_question_handler(
+            prompts,
+            printer=lambda line: self.console.print(line, highlight=False),
+        )
 
     async def prompt(self, status: str) -> str | None:
         try:

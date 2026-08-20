@@ -353,6 +353,24 @@ async def test_tab_toggles_between_build_and_plan_modes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_at_mention_suggestions_complete_in_place(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "parser.py").write_text("x = 1\n")
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "Fix @src/par"
+        await pilot.pause()
+        rendered = _rendered_text(app.query_one("#command-suggestions").content)
+        assert "@src/parser.py" in rendered
+        await pilot.press("enter")
+        assert "Fix @src/parser.py" in composer.text
+        host.handle_line.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_slash_suggestions_filter_navigate_and_complete(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
     ui = TextualUI()

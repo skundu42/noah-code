@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from noah_code.approvals import ApprovalChoice, ApprovalRequest
 from noah_code.events import HostEvent
@@ -18,6 +18,10 @@ class HostUI(Protocol):
 
     async def ask_approval(self, request: ApprovalRequest) -> ApprovalChoice:
         """Prompt for an allow-once / session / reject decision."""
+        ...
+
+    async def ask_questions(self, prompts: list[Any]) -> Any:
+        """Collect structured answers for the question tool."""
         ...
 
     async def prompt(self, status: str) -> str | None:

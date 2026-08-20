@@ -211,6 +211,24 @@ DEFAULT_PERMISSION_RULES: list[PermissionRule] = [
     PermissionRule(category="skill", pattern="*", action="ask", reason="skills require approval"),
     PermissionRule(category="mcp", pattern="*", action="ask", reason="MCP requires approval"),
     PermissionRule(category="lsp", pattern="*", action="allow", reason="LSP read-only by default"),
+    PermissionRule(
+        category="webfetch",
+        pattern="*",
+        action="ask",
+        reason="web fetches require approval",
+    ),
+    PermissionRule(
+        category="websearch",
+        pattern="*",
+        action="ask",
+        reason="web searches require approval",
+    ),
+    PermissionRule(
+        category="question",
+        pattern="*",
+        action="allow",
+        reason="asking the user is allowed",
+    ),
 ]
 
 
