@@ -254,6 +254,7 @@ async def test_batched_inspect_returns_search_and_file_sections(tmp_path: Path) 
     assert "## search: parse" in result
     assert "## file: parser.py" in result
     assert "## symbols: definitions" in result
+    assert ws.raw_shell.session._start_count == 1
     await ws.close()
 
 

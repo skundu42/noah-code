@@ -63,6 +63,10 @@ class WorkspaceTools(Skill):
         self._default_timeout = default_timeout
         self._on_shell_chunk: Any = None
         self._lsp = lsp
+        # NOOA 0.0.9 starts BashSession lazily without guarding concurrent
+        # callers. Batched inspections can otherwise launch multiple shells
+        # and orphan every process except the last one assigned to the session.
+        self._shell_start_lock = asyncio.Lock()
 
     def set_lsp(self, lsp: Any) -> None:
         """Attach diagnostics after both services have been constructed."""
@@ -125,6 +129,7 @@ class WorkspaceTools(Skill):
         cmd = " ".join(
             shlex.quote(a) for a in ["rg", "-n", "--no-heading", "-S", "--", pattern, target]
         )
+        await self._ensure_shell_started()
         result = await self._shell.run(cmd, timeout=self._default_timeout)
         return self._cap_shell_result(result)
 
@@ -482,6 +487,7 @@ class WorkspaceTools(Skill):
             self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
             self._on_shell_chunk("status", f"$ {command}\n")
+        await self._ensure_shell_started()
         result = await self._shell.run(
             command,
             stdin=stdin,
@@ -507,6 +513,7 @@ class WorkspaceTools(Skill):
             self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
             self._on_shell_chunk("status", f"$ {command}\n")
+        await self._ensure_shell_started()
         async for event in self._shell.run_stream(
             command, timeout=timeout or self._default_timeout
         ):
@@ -540,8 +547,14 @@ class WorkspaceTools(Skill):
         """Run a host-constructed, strictly read-only command without a model approval."""
         if not self._engine.is_readonly_command(command):
             raise PermissionError(f"trusted command is not read-only: {command}")
+        await self._ensure_shell_started()
         result = await self._shell.run(command, timeout=self._default_timeout)
         return self._cap_shell_result(result)
+
+    async def _ensure_shell_started(self) -> None:
+        """Single-flight NOOA's lazy persistent-shell startup."""
+        async with self._shell_start_lock:
+            await self._shell.session.start()
 
     def _cap_shell_result(self, result: ShellResult) -> ShellResult:
         stdout = self._bound(result.stdout)
