@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal
 
 from nooa import Context, hidden, strategy
 from nooa.config import CodeActConfig, PredictConfig
-from nooa.interactive import InteractiveAgent, RespondResult
+from nooa.interactive import InteractiveAgent, RespondReason, RespondResult
 from nooa.runtime.restrictions import RESTRICTED_MODULES, RestrictionsConfig
 from nooa.runtime.sandbox.config import FileRule, SandboxConfig, resolve_spec
 from nooa.runtime.sandbox.executor import SandboxedExecutor
@@ -221,6 +221,13 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
 
 
 class _PermissionCodeActStrategy(CodeActStrategy):
+    def _build_builtins(self, runtime: Any, call: Any) -> dict[str, Any]:
+        builtins = super()._build_builtins(runtime, call)
+        # InteractiveAgent documents this exact inline return pattern. Keep the
+        # enum explicit in case module-context filtering changes upstream.
+        builtins["RespondReason"] = RespondReason
+        return builtins
+
     def _create_sandbox_executor(self, runtime: Any, call: Any, builtins: dict[str, Any]) -> Any:
         framework_builtins = {**builtins, "_call": call}
         executor_type = (
