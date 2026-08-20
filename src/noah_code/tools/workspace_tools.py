@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import difflib
 import os
@@ -584,4 +585,15 @@ class WorkspaceTools(Skill):
 
     @hidden
     async def close(self) -> None:
-        await self._shell.close()
+        # NOOA 0.0.9 waits for its persistent shell but can leave asyncio's
+        # subprocess transport open on Linux until after the test/app loop exits.
+        session = self._shell.session
+        process = getattr(session, "_process", None)
+        try:
+            await self._shell.close()
+        finally:
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                with contextlib.suppress(Exception):
+                    transport.close()
+            await asyncio.sleep(0)

@@ -53,6 +53,7 @@ async def test_background_logs_are_cursor_based_and_job_completes(tmp_path: Path
         assert "done" in output
         assert "next_cursor=" in output
         assert "[completed]" in output
+        assert manager._jobs[job_id].process._transport.is_closing()
     finally:
         await manager.close()
 
