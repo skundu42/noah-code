@@ -598,6 +598,14 @@ class WorkspaceTools(Skill):
             if transport is not None:
                 with contextlib.suppress(Exception):
                     transport.close()
+                # Closing a subprocess transport schedules each pipe's
+                # connection_lost callback, followed by the parent transport's
+                # finalizer. Give that callback chain time to complete while
+                # its event loop is still alive.
+                for _ in range(3):
+                    await asyncio.sleep(0)
+                    if getattr(transport, "_finished", True):
+                        break
             # NOOA's timeout recovery creates a short-lived helper subprocess
             # that can remain in a transport/protocol cycle on CPython 3.12
             # Linux. Collect it before pytest or the app closes this loop.
