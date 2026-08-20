@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import difflib
+import gc
 import os
+import sys
 import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -60,6 +63,10 @@ class WorkspaceTools(Skill):
         self._default_timeout = default_timeout
         self._on_shell_chunk: Any = None
         self._lsp = lsp
+        # NOOA 0.0.9 starts BashSession lazily without guarding concurrent
+        # callers. Batched inspections can otherwise launch multiple shells
+        # and orphan every process except the last one assigned to the session.
+        self._shell_start_lock = asyncio.Lock()
 
     def set_lsp(self, lsp: Any) -> None:
         """Attach diagnostics after both services have been constructed."""
@@ -122,6 +129,7 @@ class WorkspaceTools(Skill):
         cmd = " ".join(
             shlex.quote(a) for a in ["rg", "-n", "--no-heading", "-S", "--", pattern, target]
         )
+        await self._ensure_shell_started()
         result = await self._shell.run(cmd, timeout=self._default_timeout)
         return self._cap_shell_result(result)
 
@@ -479,6 +487,7 @@ class WorkspaceTools(Skill):
             self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
             self._on_shell_chunk("status", f"$ {command}\n")
+        await self._ensure_shell_started()
         result = await self._shell.run(
             command,
             stdin=stdin,
@@ -504,6 +513,7 @@ class WorkspaceTools(Skill):
             self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
             self._on_shell_chunk("status", f"$ {command}\n")
+        await self._ensure_shell_started()
         async for event in self._shell.run_stream(
             command, timeout=timeout or self._default_timeout
         ):
@@ -537,8 +547,14 @@ class WorkspaceTools(Skill):
         """Run a host-constructed, strictly read-only command without a model approval."""
         if not self._engine.is_readonly_command(command):
             raise PermissionError(f"trusted command is not read-only: {command}")
+        await self._ensure_shell_started()
         result = await self._shell.run(command, timeout=self._default_timeout)
         return self._cap_shell_result(result)
+
+    async def _ensure_shell_started(self) -> None:
+        """Single-flight NOOA's lazy persistent-shell startup."""
+        async with self._shell_start_lock:
+            await self._shell.session.start()
 
     def _cap_shell_result(self, result: ShellResult) -> ShellResult:
         stdout = self._bound(result.stdout)
@@ -584,4 +600,28 @@ class WorkspaceTools(Skill):
 
     @hidden
     async def close(self) -> None:
-        await self._shell.close()
+        # NOOA 0.0.9 waits for its persistent shell but can leave asyncio's
+        # subprocess transport open on Linux until after the test/app loop exits.
+        session = self._shell.session
+        process = getattr(session, "_process", None)
+        try:
+            await self._shell.close()
+        finally:
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                with contextlib.suppress(Exception):
+                    transport.close()
+                # Closing a subprocess transport schedules each pipe's
+                # connection_lost callback, followed by the parent transport's
+                # finalizer. Give that callback chain time to complete while
+                # its event loop is still alive.
+                for _ in range(3):
+                    await asyncio.sleep(0)
+                    if getattr(transport, "_finished", True):
+                        break
+            # NOOA's timeout recovery creates a short-lived helper subprocess
+            # that can remain in a transport/protocol cycle on CPython 3.12
+            # Linux. Collect it before pytest or the app closes this loop.
+            if sys.platform.startswith("linux") and sys.version_info < (3, 13):
+                gc.collect()
+            await asyncio.sleep(0)

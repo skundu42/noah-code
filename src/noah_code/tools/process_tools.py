@@ -255,6 +255,8 @@ class ProcessTools(Skill):
         job.returncode = returncode
         job.finished_at = time.monotonic()
         self._emit(job, f"{job.state} exit={returncode}")
+        self._close_transport(job.process)
+        await asyncio.sleep(0)
 
     async def _expire(self, job: BackgroundJob, timeout: float) -> None:
         try:
@@ -292,6 +294,16 @@ class ProcessTools(Skill):
         writer.close()
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             await writer.wait_closed()
+
+    @staticmethod
+    def _close_transport(process: asyncio.subprocess.Process) -> None:
+        # asyncio exposes no public Process.close(). Closing the private transport
+        # prevents its destructor from touching an event loop that pytest or the
+        # application has already shut down.
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            with contextlib.suppress(Exception):
+                transport.close()
 
     def _emit(self, job: BackgroundJob, message: str) -> None:
         if self._on_lifecycle is not None:

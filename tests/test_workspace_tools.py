@@ -254,28 +254,35 @@ async def test_batched_inspect_returns_search_and_file_sections(tmp_path: Path) 
     assert "## search: parse" in result
     assert "## file: parser.py" in result
     assert "## symbols: definitions" in result
+    assert ws.raw_shell.session._start_count == 1
     await ws.close()
 
 
 @pytest.mark.asyncio
 async def test_nonzero_preserves_stderr(tmp_path: Path) -> None:
     ws = _make_ws(tmp_path, auto=False)
-    # Force ask→allow via auto for a simple failing command.
-    # echo to stderr + false
-    result = await ws.run("sh -c 'echo failmsg 1>&2; exit 7'")
-    assert result.returncode == 7
-    assert "failmsg" in result.stderr
-    assert result.success is False
+    try:
+        # Force ask→allow via auto for a simple failing command.
+        # echo to stderr + false
+        result = await ws.run("sh -c 'echo failmsg 1>&2; exit 7'")
+        assert result.returncode == 7
+        assert "failmsg" in result.stderr
+        assert result.success is False
+    finally:
+        await ws.close()
 
 
 @pytest.mark.asyncio
 async def test_shell_timeout(tmp_path: Path) -> None:
     ws = _make_ws(tmp_path, auto=True)
-    started = time.monotonic()
-    result = await ws.run("sleep 5", timeout=0.2)
-    elapsed = time.monotonic() - started
-    assert result.returncode != 0 or "timeout" in (result.stderr or "").lower()
-    assert elapsed < 2
+    try:
+        started = time.monotonic()
+        result = await ws.run("sleep 5", timeout=0.2)
+        elapsed = time.monotonic() - started
+        assert result.returncode != 0 or "timeout" in (result.stderr or "").lower()
+        assert elapsed < 2
+    finally:
+        await ws.close()
 
 
 @pytest.mark.asyncio
