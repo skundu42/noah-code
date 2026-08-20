@@ -159,10 +159,13 @@ def add_skill(
     if destination.exists():
         raise FileExistsError(f"skill already exists: {destination}")
 
+    for path in source_dir.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(f"skill folder must not contain symlinks: {path}")
+
     temporary = destination_root / f".{skill_name}.tmp-{uuid.uuid4().hex}"
     try:
-        # Preserve companion scripts, references, assets, and symlinks exactly.
-        shutil.copytree(source_dir, temporary, symlinks=True)
+        shutil.copytree(source_dir, temporary, symlinks=False)
         temporary.rename(destination)
     except Exception:
         if temporary.exists():

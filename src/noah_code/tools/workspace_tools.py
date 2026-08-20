@@ -7,6 +7,7 @@ import contextlib
 import difflib
 import gc
 import os
+import shlex
 import sys
 import tempfile
 from collections.abc import AsyncIterator
@@ -17,7 +18,12 @@ from nooa import Skill, hidden, spec
 from nooa.tools.shell_tools import Match, ShellResult, ShellTools, StreamDone, StreamEvent
 
 from noah_code.approvals import ApprovalBroker
-from noah_code.permissions import PermissionCategory, PermissionDecision, PermissionEngine
+from noah_code.permissions import (
+    PermissionCategory,
+    PermissionDecision,
+    PermissionEngine,
+    is_secret_path,
+)
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tool_output import ToolOutputStore
 from noah_code.workspace import Workspace, WorkspaceError
@@ -123,15 +129,13 @@ class WorkspaceTools(Skill):
     ) -> ShellResult:
         """Return bounded ripgrep text; call read() on a result to get an edit anchor."""
         resolved = await self._authorize_path(path, PermissionCategory.READ)
-        import shlex
-
         target = self._workspace.relpath(resolved) or "."
         cmd = " ".join(
             shlex.quote(a) for a in ["rg", "-n", "--no-heading", "-S", "--", pattern, target]
         )
         await self._ensure_shell_started()
         result = await self._shell.run(cmd, timeout=self._default_timeout)
-        return self._cap_shell_result(result)
+        return self._cap_shell_result(self._redact_secret_search(result))
 
     async def list_files(
         self,
@@ -139,10 +143,19 @@ class WorkspaceTools(Skill):
         path: Annotated[str, spec(description="Subdirectory")] = ".",
     ) -> list[str]:
         """List files under path matching a glob (deterministic, no shell)."""
+        self._assert_internal_glob(pattern)
         root = await self._authorize_path(path, PermissionCategory.READ)
-        matches = sorted(
-            str(p.relative_to(self._workspace.root)) for p in root.glob(pattern) if p.is_file()
-        )
+        workspace_root = self._workspace.root.resolve()
+        matches = []
+        for candidate in root.glob(pattern):
+            if not candidate.is_file():
+                continue
+            try:
+                candidate.resolve().relative_to(workspace_root)
+                matches.append(str(candidate.relative_to(self._workspace.root)))
+            except ValueError:
+                continue
+        matches.sort()
         if len(matches) > self._max_file_results:
             return matches[: self._max_file_results] + [
                 f"...[{len(matches) - self._max_file_results} more]"
@@ -547,6 +560,12 @@ class WorkspaceTools(Skill):
         """Run a host-constructed, strictly read-only command without a model approval."""
         if not self._engine.is_readonly_command(command):
             raise PermissionError(f"trusted command is not read-only: {command}")
+        try:
+            tokens = shlex.split(command)
+        except ValueError as exc:
+            raise PermissionError(f"trusted command is not read-only: {command}") from exc
+        if any(is_secret_path(token) or is_secret_path(Path(token).name) for token in tokens):
+            raise PermissionError(f"trusted command targets a secret path: {command}")
         await self._ensure_shell_started()
         result = await self._shell.run(command, timeout=self._default_timeout)
         return self._cap_shell_result(result)
@@ -578,6 +597,35 @@ class WorkspaceTools(Skill):
             max_chars=self._max_output,
             max_lines=self._max_output_lines,
         ).text
+
+    @staticmethod
+    def _assert_internal_glob(pattern: str) -> None:
+        candidate = Path(pattern)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError("glob pattern must stay inside the workspace")
+
+    def _redact_secret_search(self, result: ShellResult) -> ShellResult:
+        stdout = "".join(
+            line
+            for line in (result.stdout or "").splitlines(keepends=True)
+            if not is_secret_path(_rg_hit_path(line) or "")
+        )
+        matches = result.matches
+        if matches:
+            matches = [
+                match
+                for match in matches
+                if not is_secret_path(str(getattr(match, "path", "") or ""))
+            ]
+        if stdout == (result.stdout or "") and matches is result.matches:
+            return result
+        return ShellResult(
+            stdout=stdout,
+            stderr=result.stderr,
+            returncode=result.returncode,
+            matches=matches,
+            timed_out=result.timed_out,
+        )
 
     async def _authorize_path(self, path: str, category: str) -> Path:
         try:
@@ -625,3 +673,13 @@ class WorkspaceTools(Skill):
             if sys.platform.startswith("linux") and sys.version_info < (3, 13):
                 gc.collect()
             await asyncio.sleep(0)
+
+
+def _rg_hit_path(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    parts = stripped.split(":", 2)
+    if len(parts) < 2:
+        return None
+    return parts[0]

@@ -10,7 +10,9 @@ from typing import Annotated
 
 from nooa import Skill, spec
 
+from noah_code.permissions import is_secret_path
 from noah_code.tools.workspace_tools import WorkspaceTools
+from noah_code.workspace import WorkspaceError
 
 
 @dataclass
@@ -58,14 +60,29 @@ class GitTools(Skill):
         path: Annotated[str | None, spec(description="Optional path limit")] = None,
     ) -> str:
         """Return ``git diff`` (unstaged + staged summary via --stat if no path)."""
-        if path:
-            import shlex
+        import shlex
 
+        if path:
+            blocked = self._review_path_error(path)
+            if blocked is not None:
+                return blocked
             cmd = f"git diff -- {shlex.quote(path)}"
-        else:
-            cmd = "git diff"
-        result = await self._ws.run_trusted_readonly(cmd)
-        return result.stdout or "(no diff)"
+            result = await self._ws.run_trusted_readonly(cmd)
+            return result.stdout or "(no diff)"
+        names = await self._ws.run_trusted_readonly("git diff --name-only")
+        chunks: list[str] = []
+        for file_path in names.stdout.splitlines():
+            file_path = file_path.strip()
+            if not file_path:
+                continue
+            blocked = self._review_path_error(file_path)
+            if blocked is not None:
+                chunks.append(blocked)
+                continue
+            piece = await self._ws.run_trusted_readonly(f"git diff -- {shlex.quote(file_path)}")
+            if piece.stdout:
+                chunks.append(piece.stdout)
+        return "\n".join(chunks) or "(no diff)"
 
     async def log(
         self,
@@ -147,8 +164,11 @@ class GitTools(Skill):
         return f"reverted staged and worktree changes in {path}"
 
     async def _patch(self, path: str, scope: str, status: str) -> str:
+        blocked = self._review_path_error(path)
+        if blocked is not None:
+            return blocked
         if status == "?":
-            target = self._ws._workspace.root / path
+            target = self._ws._workspace.resolve(path)
             try:
                 text = target.read_text(errors="replace")
             except OSError as exc:
@@ -165,11 +185,13 @@ class GitTools(Skill):
         return (result.stdout or result.stderr or "(no textual diff)")[:80_000]
 
     async def _counts(self, path: str, scope: str, status: str) -> tuple[int, int]:
+        if self._review_path_error(path) is not None:
+            return 0, 0
         if status == "?":
-            target = self._ws._workspace.root / path
+            target = self._ws._workspace.resolve(path)
             try:
                 return len(target.read_text(errors="replace").splitlines()), 0
-            except OSError:
+            except (OSError, WorkspaceError):
                 return 0, 0
         args = ["diff", "--numstat"]
         if scope == "staged":
@@ -196,6 +218,15 @@ class GitTools(Skill):
             )
 
         return await asyncio.to_thread(run)
+
+    def _review_path_error(self, path: str) -> str | None:
+        if is_secret_path(path):
+            return f"diff unavailable: secret path denied: {path}"
+        try:
+            self._ws._workspace.resolve(path)
+        except WorkspaceError as exc:
+            return f"diff unavailable: {exc}"
+        return None
 
     @staticmethod
     def _status_name(code: str) -> str:

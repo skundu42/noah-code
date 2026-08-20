@@ -27,26 +27,27 @@ class PermissionCategory(StrEnum):
 
 
 # Patterns that are always denied regardless of mode / auto.
-_ALWAYS_DENY_BASH = (
-    re.compile(r"\brm\s+(-[^\s]*\s+)*-?[rR]?[fF]?[rR]?[fF]?\s+(/|\.|~|\*)"),
-    re.compile(r"\brm\s+.*\s+(-[^\s]*r|-rf|-fr)\b"),
-    re.compile(r"\b(mkfs|dd\s+if=|/dev/sd|/dev/disk|shred\b|wipefs\b)\b"),
-    re.compile(r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;:"),  # fork bomb
-    re.compile(r"\bgit\s+push\b"),
-    re.compile(r"\bgit\s+clean\b"),
-    re.compile(r"\bgit\s+reset\s+--hard\b"),
-    re.compile(r"\bgit\s+filter-branch\b"),
-    re.compile(r"\bprintenv\b"),
-    re.compile(r"\benv\b(?!\s+\w+=)"),
-    re.compile(r"\bexport\s+-p\b"),
-    re.compile(r"\bcat\s+.*\.pem\b"),
-    re.compile(r"\bcat\s+.*id_rsa\b"),
-    re.compile(r"\bchmod\s+-R\s+777\b"),
-    re.compile(r"\bcurl\b.*\|\s*(ba)?sh\b"),
-    re.compile(r"\bwget\b.*\|\s*(ba)?sh\b"),
-    re.compile(r"\bsudo\b"),
-    re.compile(r"\bchmod\b.+\s+/"),
-    re.compile(r"\bchown\b.+\s+/"),
+_ALWAYS_DENY_BASH = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\brm\s+(-[^\s]*\s+)*-?[rR]?[fF]?[rR]?[fF]?\s+(/|\.|~|\*)",
+        r"\brm\s+.*\s+(-[^\s]*r|-rf|-fr)\b",
+        r"\b(mkfs|dd\s+if=|/dev/sd|/dev/disk|shred\b|wipefs\b)\b",
+        r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;:",  # fork bomb
+        r"\bgit\s+push\b",
+        r"\bgit\s+clean\b",
+        r"\bgit\s+reset\s+--hard\b",
+        r"\bgit\s+filter-branch\b",
+        r"\bexport\s+-p\b",
+        r"\bcat\s+.*\.pem\b",
+        r"\bcat\s+.*id_rsa\b",
+        r"\bchmod\s+-R\s+777\b",
+        r"\bcurl\b.*\|\s*(ba)?sh\b",
+        r"\bwget\b.*\|\s*(ba)?sh\b",
+        r"\bsudo\b",
+        r"\bchmod\b.+\s+/",
+        r"\bchown\b.+\s+/",
+    )
 )
 
 # Mutating patterns that always require ask (even if a broad allow matched earlier
@@ -94,6 +95,19 @@ _READ_ONLY_PREFIXES = (
     "python -m pytest --collect-only",
 )
 _READ_ONLY_GIT_SUBCOMMANDS = frozenset({"branch", "diff", "log", "rev-parse", "show", "status"})
+_FIND_MUTATING_FLAGS = frozenset(
+    {
+        "-delete",
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-fls",
+        "-fprint",
+        "-fprint0",
+        "-fprintf",
+    }
+)
 
 _SECRET_BASENAMES = {
     ".env",
@@ -155,7 +169,7 @@ def _match_rule(rule: PermissionRule, category: str, target: str) -> bool:
     cat_ok = rule.category in {"*", category}
     if not cat_ok:
         return False
-    return fnmatch.fnmatch(target, rule.pattern) or fnmatch.fnmatch(Path(target).name, rule.pattern)
+    return fnmatch.fnmatch(target, rule.pattern)
 
 
 class PermissionEngine:
@@ -243,14 +257,7 @@ class PermissionEngine:
         )
 
     def _remember_pattern(self, category: str, target: str) -> str:
-        if category == PermissionCategory.BASH:
-            try:
-                parts = shlex.split(target)
-            except ValueError:
-                parts = target.split()
-            if parts:
-                return f"{parts[0]} *"
-            return "*"
+        _ = category
         return target
 
     def _hard_bash_deny(self, command: str) -> PermissionDecision | None:
@@ -260,7 +267,35 @@ class PermissionEngine:
             tokens = []
 
         for index, token in enumerate(tokens):
-            if Path(token).name != "git":
+            if is_secret_path(token) or is_secret_path(Path(token).name):
+                return PermissionDecision(
+                    category=PermissionCategory.BASH,
+                    target=command,
+                    action="deny",
+                    matching_rule=None,
+                    reason="secret or credential path denied",
+                    remember_pattern=command,
+                )
+            program = Path(token).name.lower()
+            if program == "printenv":
+                return PermissionDecision(
+                    category=PermissionCategory.BASH,
+                    target=command,
+                    action="deny",
+                    matching_rule=None,
+                    reason="credential dump denied",
+                    remember_pattern=command,
+                )
+            if program == "env" and not any("=" in part for part in tokens[index + 1 :]):
+                return PermissionDecision(
+                    category=PermissionCategory.BASH,
+                    target=command,
+                    action="deny",
+                    matching_rule=None,
+                    reason="credential dump denied",
+                    remember_pattern=command,
+                )
+            if program != "git":
                 continue
             remaining = tokens[index + 1 :]
             if any(part in {"push", "clean", "filter-branch"} for part in remaining) or (
@@ -336,15 +371,25 @@ class PermissionEngine:
                 reason="plan mode forbids file edits",
                 remember_pattern=target,
             )
-        if category == PermissionCategory.BASH and not self.is_readonly_command(target):
-            return PermissionDecision(
-                category=category,
-                target=target,
-                action="deny",
-                matching_rule=None,
-                reason="plan mode forbids mutating shell commands",
-                remember_pattern=target,
-            )
+        if category == PermissionCategory.BASH:
+            if not self.is_readonly_command(target):
+                return PermissionDecision(
+                    category=category,
+                    target=target,
+                    action="deny",
+                    matching_rule=None,
+                    reason="plan mode forbids mutating shell commands",
+                    remember_pattern=target,
+                )
+            if _command_has_external_path(target):
+                return PermissionDecision(
+                    category=category,
+                    target=target,
+                    action="deny",
+                    matching_rule=None,
+                    reason="plan mode forbids filesystem access outside the workspace",
+                    remember_pattern=target,
+                )
         return None
 
     @staticmethod
@@ -368,17 +413,30 @@ class PermissionEngine:
             return len(tokens) > 1 and tokens[1].lower() in _READ_ONLY_GIT_SUBCOMMANDS
         if program == "pwd":
             return len(tokens) == 1
+        if program == "find":
+            return not any(_is_mutating_find_flag(token) for token in tokens[1:])
         return any(lowered == p.strip() or lowered.startswith(p) for p in _READ_ONLY_PREFIXES[6:])
 
     @staticmethod
     def is_uncertain_shell(command: str) -> bool:
-        return _is_compound(command)
+        if _is_compound(command):
+            return True
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return True
+        if not tokens:
+            return False
+        program = Path(tokens[0]).name.lower()
+        return program in {"sh", "bash", "zsh", "ksh", "dash"} and any(
+            token in {"-c", "-lc"} for token in tokens[1:]
+        )
 
 
 def _is_compound(command: str) -> bool:
     """Detect pipes, chains, redirects, substitutions, heredocs."""
     # Rough conservative scan - not a full shell parser.
-    specials = ("|", "&&", "||", ";", "`", "$(", "${", ">", "<", "<<", "\n")
+    specials = ("|", "&&", "||", ";", "&", "`", "$(", "${", ">", "<", "<<", "\n")
     in_single = False
     in_double = False
     i = 0
@@ -396,5 +454,27 @@ def _is_compound(command: str) -> bool:
     try:
         shlex.split(command)
     except ValueError:
+            return True
+    return False
+
+
+def _is_mutating_find_flag(token: str) -> bool:
+    name = token.split("=", 1)[0]
+    return name in _FIND_MUTATING_FLAGS or name.startswith(("-exec", "-ok", "-fprint", "-fprintf"))
+
+
+def _command_has_external_path(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
         return True
+    for token in tokens:
+        pieces = token.split("=", 1)[1:] if token.startswith("-") and "=" in token else [token]
+        if token.startswith("-") and "=" not in token:
+            continue
+        for piece in pieces:
+            if piece.startswith(("~", "/")) or piece == "..":
+                return True
+            if ".." in Path(piece).parts:
+                return True
     return False

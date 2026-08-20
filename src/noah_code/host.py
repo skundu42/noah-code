@@ -594,9 +594,9 @@ class AgentHost:
 
         if name in self._mcp_attached:
             return f"MCP server {name} is already connected"
-        from noah_code.mcp_setup import attach_mcp_server, load_mcp_servers
+        from noah_code.mcp_setup import attach_mcp_server, load_mcp_servers, mcp_source_is_trusted
 
-        servers, _sources = load_mcp_servers(self.workspace.root, self.config)
+        servers, sources = load_mcp_servers(self.workspace.root, self.config)
         if name not in servers:
             raise KeyError(f"unknown MCP server: {name}")
         attr = await attach_mcp_server(
@@ -605,6 +605,7 @@ class AgentHost:
             servers[name],
             engine=self.agent.engine,
             approvals=self.agent.approvals,
+            trusted=mcp_source_is_trusted(sources.get(name, "")),
         )
         self._mcp_attached.add(name)
         self._mcp_errors.pop(name, None)

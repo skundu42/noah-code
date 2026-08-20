@@ -16,6 +16,32 @@ from noah_code.approvals import ApprovalBroker
 from noah_code.config import NoahCodeConfig
 from noah_code.permissions import PermissionCategory, PermissionEngine
 
+_RESERVED_AGENT_ATTRS = frozenset(
+    {
+        "approvals",
+        "context",
+        "engine",
+        "git",
+        "journal",
+        "lsp",
+        "message",
+        "mode",
+        "processes",
+        "skills",
+        "todos",
+        "v",
+        "workspace_root",
+        "ws",
+        "_approvals",
+        "_config",
+        "_engine",
+        "_journal",
+        "_llm",
+        "_sandbox_approved_roots",
+        "_shell",
+    }
+)
+
 
 @dataclass(frozen=True)
 class MCPServerInfo:
@@ -46,6 +72,19 @@ def mcp_config_paths(workspace: Path, *, home: Path | None = None) -> list[Path]
         workspace / ".mcp.json",
         workspace / ".noah-code" / "mcp.json",
     ]
+
+
+def mcp_source_is_trusted(source: str, *, home: Path | None = None) -> bool:
+    """Return True when the MCP catalog entry came from user-owned configuration."""
+
+    if source == "user config.toml":
+        return True
+    user_home = (home or Path.home()).expanduser()
+    trusted = user_home / ".config" / "noah-code" / "mcp.json"
+    try:
+        return Path(source).expanduser().resolve() == trusted.resolve()
+    except OSError:
+        return False
 
 
 def _server_mapping(data: Any) -> dict[str, dict[str, Any]]:
@@ -194,10 +233,21 @@ async def attach_mcp_server(
     *,
     engine: PermissionEngine,
     approvals: ApprovalBroker,
+    trusted: bool = True,
 ) -> str:
     """Permission-check and attach a single configured MCP server."""
 
-    decision = engine.decide(PermissionCategory.MCP, name)
+    if trusted:
+        decision = engine.decide(PermissionCategory.MCP, name)
+    else:
+        saved = engine.auto_approve
+        engine.auto_approve = False
+        try:
+            decision = engine.decide(PermissionCategory.MCP, name)
+        finally:
+            engine.auto_approve = saved
+        if decision.action == "ask" and saved:
+            raise PermissionError(f"workspace MCP servers cannot be auto-approved: {name}")
     await approvals.require(decision)
     try:
         from nooa.mcp import MCPManager
@@ -227,7 +277,7 @@ async def install_mcp(
 ) -> MCPInstallResult:
     """Attach all configured servers without failing startup on one bad server."""
 
-    servers, _sources = load_mcp_servers(workspace, config)
+    servers, sources = load_mcp_servers(workspace, config)
     attached: list[str] = []
     errors: list[str] = []
     for name, spec in servers.items():
@@ -238,6 +288,7 @@ async def install_mcp(
                 spec,
                 engine=engine,
                 approvals=approvals,
+                trusted=mcp_source_is_trusted(sources.get(name, "")),
             )
             attached.append(name)
         except Exception as exc:  # noqa: BLE001
@@ -249,4 +300,9 @@ def re_attr(name: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", name)
     if cleaned and cleaned[0].isdigit():
         cleaned = f"mcp_{cleaned}"
-    return cleaned or "mcp_server"
+    if not cleaned:
+        return "mcp_server"
+    if cleaned in _RESERVED_AGENT_ATTRS or cleaned.startswith("_"):
+        trimmed = cleaned.lstrip("_") or "server"
+        cleaned = f"mcp_{trimmed}"
+    return cleaned

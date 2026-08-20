@@ -60,3 +60,10 @@ def test_add_skill_rejects_folder_without_skill_markdown(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="must contain SKILL.md"):
         add_skill(source, home=tmp_path / "home")
+
+
+def test_add_skill_rejects_symlinks(tmp_path: Path) -> None:
+    source = _make_skill(tmp_path)
+    (source / "secret-link").symlink_to("/etc/passwd")
+    with pytest.raises(ValueError, match="symlink"):
+        add_skill(source, home=tmp_path / "home")

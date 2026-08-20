@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -90,10 +91,25 @@ class ApprovalBroker:
             if self._handler is None:
                 # Non-interactive without --auto: treat ask as deny.
                 return ApprovalChoice.REJECT
-            choice = await self._handler(request)
-            if not fut.done():
-                fut.set_result(choice)
-            return choice
+
+            async def _resolve() -> None:
+                try:
+                    choice = await self._handler(request)
+                except Exception as exc:
+                    if not fut.done():
+                        fut.set_exception(exc)
+                    return
+                if not fut.done():
+                    fut.set_result(choice)
+
+            task = asyncio.create_task(_resolve())
+            try:
+                return await fut
+            finally:
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
         finally:
             async with self._lock:
                 self._pending.pop(req_id, None)
