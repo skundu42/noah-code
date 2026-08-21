@@ -5,14 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import difflib
-import fnmatch
 import gc
 import os
+import re
 import shlex
 import sys
 import tempfile
 from collections.abc import AsyncIterator
-from pathlib import Path, PurePath
+from pathlib import Path
 from typing import Annotated, Any
 
 from nooa import Skill, hidden, spec
@@ -28,7 +28,6 @@ from noah_code.permissions import (
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tool_output import ToolOutputStore
 from noah_code.workspace import Workspace, WorkspaceError
-
 
 _IGNORED_LIST_DIRS = frozenset(
     {
@@ -54,15 +53,42 @@ def _pattern_keeps_dir(pattern: str, name: str) -> bool:
     return name in pattern.replace("\\", "/").split("/")
 
 
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Translate a glob with ``**`` into a regex that works on Python 3.12+."""
+    parts: list[str] = []
+    index = 0
+    length = len(pattern)
+    while index < length:
+        if pattern.startswith("**", index):
+            rest = pattern[index + 2 :]
+            if rest.startswith("/"):
+                parts.append("(?:.*/)?")
+                index += 3
+            elif rest == "":
+                parts.append(".*")
+                index += 2
+            else:
+                parts.append("[^/]*[^/]*")
+                index += 2
+            continue
+        char = pattern[index]
+        if char == "*":
+            parts.append("[^/]*")
+        elif char == "?":
+            parts.append("[^/]")
+        else:
+            parts.append(re.escape(char))
+        index += 1
+    return re.compile("^" + "".join(parts) + "$")
+
+
 def _matches_glob(relative: str, pattern: str) -> bool:
     posix = relative.replace("\\", "/")
-    candidate = PurePath(posix)
+    normalized = pattern.replace("\\", "/").removeprefix("./")
     try:
-        if candidate.full_match(pattern) or candidate.full_match(pattern.lstrip("./")):
-            return True
-    except (TypeError, ValueError):
-        pass
-    return fnmatch.fnmatch(posix, pattern)
+        return _glob_to_regex(normalized).fullmatch(posix) is not None
+    except re.error:
+        return False
 
 
 class WorkspaceTools(Skill):

@@ -12,7 +12,7 @@ from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.config import DEFAULT_PERMISSION_RULES
 from noah_code.permissions import PermissionEngine
 from noah_code.snapshots import SnapshotJournal
-from noah_code.tools.workspace_tools import WorkspaceTools
+from noah_code.tools.workspace_tools import WorkspaceTools, _matches_glob
 from noah_code.workspace import Workspace, WorkspaceError, open_workspace
 
 
@@ -315,6 +315,16 @@ async def test_search_redacts_secret_file_matches(tmp_path: Path) -> None:
         assert "(no matches)" in inspect
     finally:
         await ws.close()
+
+
+def test_matches_glob_is_python_312_compatible() -> None:
+    assert _matches_glob("ok.py", "**/*")
+    assert _matches_glob("src/app.py", "**/*")
+    assert _matches_glob("src/app.py", "**/*.py")
+    assert _matches_glob("a.py", "*.py")
+    assert not _matches_glob("src/a.py", "*.py")
+    assert _matches_glob(".venv/lib/site.py", ".venv/**")
+    assert _matches_glob("src/app.py", "./**/*.py")
 
 
 @pytest.mark.asyncio

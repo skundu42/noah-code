@@ -11,7 +11,6 @@ from nooa.unifiedllm import FakeLLMClient
 from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.commands import help_text
 from noah_code.config import NoahCodeConfig, PermissionRule, load_config
-from noah_code.mcp_setup import MCPInstallResult
 from noah_code.host import (
     AgentHost,
     _friendly_agent_error,
@@ -19,6 +18,7 @@ from noah_code.host import (
     _is_context_overflow,
     _stop_text,
 )
+from noah_code.mcp_setup import MCPInstallResult
 from noah_code.permissions import PermissionEngine
 from noah_code.sessions import SessionStore
 from noah_code.workspace import Workspace
