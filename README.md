@@ -1,79 +1,83 @@
+<div align="center">
+
 # Noah Code
+
+**A terminal coding harness built on NVIDIA's NOAA framework**
 
 [![PyPI](https://img.shields.io/pypi/v/noah-code.svg)](https://pypi.org/project/noah-code/)
 [![CI](https://github.com/skundu42/noah-code/actions/workflows/ci.yml/badge.svg)](https://github.com/skundu42/noah-code/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/pypi/pyversions/noah-code.svg)](https://pypi.org/project/noah-code/)
 
-**Noah Code** (`noah-code`) is a terminal coding agent for understanding repositories, planning
-changes, editing files, running commands, and carrying work across persistent sessions. It is
-built on the [NVIDIA OO Agents (NOOA)](https://github.com/NVIDIA-NeMo/labs-OO-Agents) runtime.
+</div>
+
+![Noah Code handling a repository change in its terminal interface](docs/assets/noah-in-action.svg)
+
+<p align="center"><sub>The real Textual interface, captured from a deterministic Noah Code session.</sub></p>
+
+Noah keeps the conversation central while the context rail tracks the workspace, model, session,
+token usage, and current plan. Tool execution stays visible, completed work compacts into readable
+records, and every session remains scoped to its repository.
+
+Built on the [NVIDIA OO Agents (NOOA)](https://github.com/NVIDIA-NeMo/labs-OO-Agents) runtime.
 
 ## Install
 
-Install Noah Code and its managed Python runtime with one command. No existing Python, Homebrew,
-or system package setup is required.
+Install Noah Code and its managed Python runtime with one command:
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/skundu42/noah-code/main/install.sh | sh
 ```
-Open a new terminal, move into a repository, and run:
+
+Open a new terminal, move into a repository, and start Noah:
 
 ```bash
+cd your-project
 noah .
 ```
 
-Noah Code supports macOS on Apple Silicon and Intel, plus Linux on arm64 and x86_64 with Landlock
-and seccomp support. You also need an LLM provider account such as OpenAI, Anthropic, OpenRouter or NVIDIA.
+Noah is compatible with macOS on Apple Silicon and Intel, plus Linux on arm64 and x86_64.
 
-## Features
+On the first launch, the TUI walks through provider, API key, model, and reasoning setup. Keys are
+stored in Noah's private auth file with owner-only permissions; they are never written to project
+configuration or session history.
 
-- Read files, search with ripgrep, and inspect Git status, diffs, and history.
-- Navigate definitions, implementations, references, symbols, hover types, and diagnostics through
-  lazily launched language servers plus an mtime-cached repository map.
-- Edit files with anchored replacements or atomic multi-file patches with exact preimages,
-  rollback, immediate diagnostics, and concurrent-change detection.
-- Run permission-gated shell commands with timeouts and streamed output, or own long-running
-  servers and watchers as bounded background jobs with cursor-based logs.
-- Follow repository instructions from `AGENTS.md`, `CLAUDE.md`, and `.noah-code/instructions.md`.
-- Switch between implementation-focused **build** mode and read-only **plan** mode.
-- Approve actions once or for a session with ordered `allow`, `ask`, and `deny` rules.
-- Undo and redo journaled file edits across process restarts.
-- Work in an adaptive themed cockpit, a classic console, or one-shot non-interactive mode.
-- Type `/` for a live-filtering command and configuration reference; press Enter to send.
-- Follow batched live tool output, then inspect compact execution records with `F2`.
-- Review `/diff` in a keyboard-driven staged/worktree ledger with per-file patches, line deltas,
-  validation state, changed symbols, explicit revert, and checkpoint undo.
-- Resume workspace-scoped sessions with todos and automatic context compaction.
-- Keep full oversized tool results privately while sending the model a focused, reopenable preview.
-- Inspect token, prompt-cache, model-wait, and tool-output usage with `/tokens`; switch live
-  `fast`, `balanced`, and `deep` budgets with `/efficiency`.
-- Switch AI models between turns, with optional cross-repository defaults.
-- Delegate research to nested **explore** and **general** subagents, or markdown agents in
-  `.noah-code/agents/`.
-- Fetch pages and search the web, ask structured questions mid-turn, and attach `@files` or images.
-- Extend workflows with slash commands, opt-in skills, MCP servers, model selection, and tracing.
+## Why Noah
+
+- **Repository-aware exploration.** Search with ripgrep, inspect Git history and diffs, navigate
+  symbols through language servers, and use an mtime-cached repository map.
+- **Controlled edits.** Apply anchored replacements or atomic multi-file patches with exact
+  preimages, concurrent-change detection, immediate diagnostics, and rollback.
+- **Visible execution.** Stream bounded shell output while commands run, keep servers and watchers
+  as managed background jobs, and revisit activity details with `F2`.
+- **Recoverable work.** Review staged and unstaged changes in `/diff`, then undo or redo journaled
+  file edits even after restarting Noah.
+- **Persistent sessions.** Resume repository-scoped conversations, todos, model choices, and
+  automatically compacted context without losing the full underlying tool results.
+- **Explicit control.** Switch between implementation-focused **build** mode and read-only
+  **plan** mode, with ordered `allow`, `ask`, and `deny` permission rules.
+- **Extensible workflows.** Add slash commands, opt-in skills, MCP servers, or markdown subagents;
+  attach `@files` and images when the task needs more context.
+
+Noah follows repository instructions from `AGENTS.md`, `CLAUDE.md`, and
+`.noah-code/instructions.md`.
 
 ## Quick start
 
-Start the TUI in the current repository and describe the desired end state in plain language:
-
-```bash
-noah .
-```
+Describe the outcome you want rather than prescribing every edit:
 
 ```text
 Find the cause of the failing parser tests, implement the smallest safe fix, and run the
 focused test file.
 ```
 
-Common commands:
+Useful launch modes:
 
 ```bash
 # Open another workspace
 noah /path/to/repository
 
-# Use the line-oriented console
-noah --console .
+# Inspect and plan without editing
+noah --mode plan .
 
 # Run one task and exit
 noah run "Explain how authentication is wired" .
@@ -81,15 +85,15 @@ noah run "Explain how authentication is wired" .
 # Allow actions that would normally ask; explicit deny rules still apply
 noah run --auto "Fix the failing unit test" .
 
-# Inspect and plan without editing
-noah --mode plan .
-
-# Resume work
+# Resume previous work
 noah --continue .
 noah --session SESSION_ID .
+
+# Use the line-oriented interface
+noah --console .
 ```
 
-Check the installation or inspect resolved configuration with:
+Check the installation and resolved configuration with:
 
 ```bash
 noah --version
@@ -99,55 +103,70 @@ noah update --check
 noah benchmark .
 ```
 
-On the first TUI launch, Noah opens guided model setup automatically: choose the provider, paste
-the key into the masked field, choose the model, then select its reasoning effort. Reopen the same
-flow later with `/model`. Like OpenCode,
-Noah saves provider credentials in `~/.local/share/noah-code/auth.json`; the directory is
-owner-only and the file uses mode `0600`. API-key values are never written to Noah config,
-repository, or session files. Set `XDG_DATA_HOME` to relocate the data directory.
+The package also installs `noah-code` and `nc` as equivalent entry points. Because `nc` commonly
+means netcat, `noah` or `noah-code` is recommended.
 
-Environment variables and the CLI remain available for scripts and headless use:
+## Inside the TUI
+
+Type `/` to search the full command and configuration reference. The most common controls are:
+
+| Control | Action |
+| --- | --- |
+| `Enter` | Send the current prompt or accept a selected suggestion |
+| `Shift+Enter` | Insert a newline |
+| `Tab` | Switch between build and plan mode |
+| `F2` | Open execution activity |
+| `F3` | Open paginated conversation history |
+| `/model` | Configure a provider or switch the session model |
+| `/theme` | Choose Atom One Dark, Noah Ocean, Graphite, or High Contrast |
+| `/diff` | Review staged and unstaged changes |
+| `/undo` / `/redo` | Traverse the persistent edit journal |
+| `/tokens` | Inspect tokens, cache usage, model wait, and tool output |
+| `/efficiency` | Switch between `fast`, `balanced`, and `deep` budgets |
+
+On wide terminals, the side rail keeps the active workspace, session, model, tokens, update state,
+and plan in view. The main pane remains centered on the Noah mark until the first prompt, then
+becomes the conversation and execution timeline.
+
+## Models and providers
+
+Noah supports OpenAI, Anthropic, OpenRouter, NVIDIA, and custom OpenAI-compatible providers. It
+also works with vLLM, LM Studio, Ollama, Azure OpenAI, Bedrock, Gemini, Groq, Mistral, xAI,
+DeepSeek, Together AI, and Perplexity.
+
+The guided `/model` flow is the easiest way to configure a provider. Environment variables and
+the CLI remain available for scripts and headless environments:
 
 ```bash
-export OPENAI_API_KEY="..."        # or ANTHROPIC_API_KEY / OPENROUTER_API_KEY
+export OPENAI_API_KEY="..."  # or ANTHROPIC_API_KEY / OPENROUTER_API_KEY
 noah providers list
 noah providers add openai --model MODEL_NAME
 noah .
 ```
 
-For reasoning models, choose `default`, `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
-Provider and model support varies; `default` omits the parameter. You can set it in the guided
-`/model` flow, switch it live with `/reasoning high`, or launch with:
+`/model MODEL` changes only the current session and remembers that choice when resumed. Use
+`/model --global MODEL` to set the default for future sessions in every repository.
+
+For compatible reasoning models, choose `default`, `none`, `minimal`, `low`, `medium`, `high`, or
+`xhigh`. `default` omits the provider parameter:
 
 ```bash
-uv run noah --model openai/MODEL --reasoning-effort high .
+noah --model openai/MODEL --reasoning-effort high .
 ```
 
-Custom OpenAI-compatible gateways, vLLM, LM Studio, Ollama, Azure OpenAI, Bedrock, Gemini, Groq,
-Mistral, xAI, DeepSeek, Together AI, and Perplexity are also supported. See the
-[provider configuration guide](docs/configuration.md#bring-your-own-api-provider).
+See the [provider configuration guide](docs/configuration.md#bring-your-own-api-provider) for
+gateway-specific setup.
 
-The package also installs `noah-code` and `nc` as equivalent entry points. Because `nc` commonly
-refers to netcat, `noah` or `noah-code` is recommended. Keep provider API keys in Noah's private
-auth file or environment, never in a repository or Noah Code session metadata.
+## Updates
 
-Inside a session, bare `/model` opens guided provider, API-key, model, and reasoning setup. `/model MODEL`
-switches the active model immediately and remembers it when that session is resumed. It does not
-change other sessions. Use `/model --global MODEL` when the new model should also become the
-default for future sessions in every repository.
+Noah checks PyPI for new versions at most once every 24 hours. New TUI sessions show a temporary
+banner when an update is available and keep the version visible in the context rail. Installation
+remains explicit by default:
 
-The TUI keeps the conversation central and adds a session-and-plan rail on terminals at least
-110 columns wide. Tool output streams in a bounded activity panel and compacts after completion,
-keeping long runs responsive without deleting persisted session data. Press `F2` for activity
-details or `F3` for paginated conversation history. Switch among Atom One Dark, Noah Ocean,
-Graphite, and High Contrast with `/theme`.
-
-The default `fast` profile uses compact NOOA trajectory rendering, bounded tool results, batched
-repository inspection, cache-friendly turn-boundary context refresh, and MCP tools from trusted
-user-configured servers on the first turn. A
-configured `lightweight_model` handles coding-session compaction; deterministic titles avoid an
-otherwise unnecessary model request. Run `noah benchmark .` for the deterministic offline fixture
-and `/tokens` for real provider-reported usage in the current run.
+```bash
+noah update --check
+noah update
+```
 
 ## Documentation
 
@@ -157,17 +176,6 @@ and `/tokens` for real provider-reported usage in the current run.
 - [Custom commands, skills, MCP, and tracing](docs/extensions.md)
 - [Development, CI, and releases](docs/development.md)
 - [Release notes](docs/releases/)
-
-## Updates
-
-Noah Code checks PyPI for new versions at most once every 24 hours. New TUI sessions show a
-temporary banner when an update is available and retain the version in the context rail. Updates
-are explicit by default; to check or install immediately:
-
-```bash
-noah update --check
-noah update
-```
 
 ## Development
 
@@ -182,7 +190,7 @@ See the [development guide](docs/development.md) for platform checks and the rel
 
 ## License
 
-Apache-2.0, as declared in the project metadata. NOOA remains separately licensed by its upstream
+Apache-2.0. NOOA remains separately licensed by its upstream
 project.
 
 ## Credits
