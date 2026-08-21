@@ -35,11 +35,11 @@ def test_managed_output_rejects_invalid_ids(tmp_path: Path) -> None:
         store.read("../../secret")
 
 
-def test_efficiency_profiles_cap_codeact_iterations() -> None:
+def test_efficiency_profiles_do_not_cap_codeact_iterations() -> None:
     config = NoahCodeConfig(max_iterations=40)
-    assert _codeact_config(config).max_iterations == 12
+    assert _codeact_config(config).max_iterations == 40
     config.efficiency.profile = "balanced"
-    assert _codeact_config(config).max_iterations == 24
+    assert _codeact_config(config).max_iterations == 40
     config.efficiency.profile = "deep"
     assert _codeact_config(config).max_iterations == 40
 

@@ -142,8 +142,8 @@ def _role_renderable(entry: TranscriptEntry) -> Group:
         "SUMMARY": "▌ Summary",
         "STATUS": "  ·",
     }
-    if entry.role == "ACTIVITY":
-        return Group(Padding(Text(entry.text, style=colors["ACTIVITY"]), (0, 0, 1, 2)))
+    if entry.role in {"ACTIVITY", "STATUS"}:
+        return Group(Padding(Text(entry.text, style=colors[entry.role]), (0, 0, 1, 2)))
     label = Text(
         labels.get(entry.role, entry.role),
         style=f"bold {colors.get(entry.role, '#777781')}",
@@ -173,20 +173,91 @@ def _normalize_markdown(text: str) -> str:
     return cleaned
 
 
-def _completed_activity_label(label: str, *, failed: bool) -> str | None:
-    """Collapse internal activity into one concise transcript line."""
+_HIDDEN_ACTIVITY = frozenset(
+    {"Think", "Thinking", "Preparing", "Preparing response", "Working"}
+)
+_PROGRESSIVE_ACTIVITY = (
+    ("Reading ", "Read "),
+    ("Writing ", "Write "),
+    ("Editing ", "Edit "),
+    ("Listing ", "Glob "),
+    ("Searching ", "Grep "),
+    ("Running command", "Bash"),
+    ("Inspecting repository", "Inspect"),
+    ("Wrote ", "Write "),
+    ("Edited ", "Edit "),
+    ("Listed ", "Glob "),
+    ("Searched ", "Grep "),
+)
 
-    if label in {"Preparing", "Preparing response", "Working"}:
+
+def _completed_activity_label(label: str, *, failed: bool) -> str | None:
+    """Collapse internal activity into one OpenCode-style transcript line."""
+
+    if label in _HIDDEN_ACTIVITY:
         return None
-    completed = {
-        "Inspecting repository": "Inspected repository",
-        "Editing files": "Edited files",
-        "Running tests": "Ran tests",
-        "Running checks": "Ran checks",
-        "Building project": "Built project",
-        "Running command": "Ran command",
-    }.get(label, label)
+    completed = label
+    for prefix, replacement in _PROGRESSIVE_ACTIVITY:
+        if completed == prefix:
+            completed = replacement
+            continue
+        completed = completed.replace(prefix, replacement)
+    completed = completed.strip()
     return f"× {completed} failed" if failed else f"✓ {completed}"
+
+
+_DONE_FILE_ACTIVITY = re.compile(
+    r"^✓ (?P<verb>Read|Write|Wrote|Edit|Edited|Glob|Grep|List|Listed|Search|Searched) (?P<body>.+)$"
+)
+_FILE_PLUS = re.compile(r" \+(?P<extra>\d+)$")
+
+
+_VERB_ALIASES = {
+    "Wrote": "Write",
+    "Edited": "Edit",
+    "Listed": "Glob",
+    "List": "Glob",
+    "Searched": "Grep",
+    "Search": "Grep",
+}
+
+
+def _split_activity_files(body: str) -> tuple[list[str], int]:
+    extra = 0
+    match = _FILE_PLUS.search(body)
+    if match:
+        extra = int(match.group("extra"))
+        body = body[: match.start()]
+    paths = [part.strip() for part in body.split(",") if part.strip()]
+    return paths, extra
+
+
+def _format_activity_files(paths: list[str], extra: int = 0) -> str:
+    unique = list(dict.fromkeys(paths))
+    shown = unique[:2]
+    hidden = extra + max(len(unique) - len(shown), 0)
+    text = ", ".join(shown)
+    if hidden:
+        text = f"{text} +{hidden}"
+    return text
+
+
+def _coalesce_activity_text(previous: str, current: str) -> str | None:
+    """Merge consecutive same-verb file lines so the transcript stays compact."""
+
+    left = _DONE_FILE_ACTIVITY.fullmatch(previous)
+    right = _DONE_FILE_ACTIVITY.fullmatch(current)
+    if not left or not right:
+        return None
+    left_verb = _VERB_ALIASES.get(left.group("verb"), left.group("verb"))
+    right_verb = _VERB_ALIASES.get(right.group("verb"), right.group("verb"))
+    if left_verb != right_verb:
+        return None
+    if " · " in left.group("body") or " · " in right.group("body"):
+        return None
+    paths, extra = _split_activity_files(left.group("body"))
+    more, more_extra = _split_activity_files(right.group("body"))
+    return f"✓ {left_verb} {_format_activity_files(paths + more, extra + more_extra)}"
 
 
 def _welcome_renderable(repository: str, *, starting: bool) -> Group:
@@ -278,7 +349,7 @@ def _record_to_entries(record: SessionEventRecord) -> list[TranscriptEntry]:
             label = _describe_code_activity(code)
             text = _completed_activity_label(
                 label,
-                failed="error" in status or "fail" in status,
+                failed=status in {"error", "failed", "fail"},
             )
             return [TranscriptEntry("ACTIVITY", text, event_id=record.event_id)] if text else []
         display_tool = tool.replace("_", " ").strip().capitalize() or "Tool"
@@ -1188,19 +1259,35 @@ class NoahCodeApp(App[None]):
                 banner.styles.display = "none"
                 return
             label = "Thinking"
+            elapsed = ""
             if self._active_activity_id and self._active_activity_id in self._activities:
-                label = self._activities[self._active_activity_id].label
+                record = self._activities[self._active_activity_id]
+                label = record.label
+                seconds = int(record.duration)
+                if seconds >= 1:
+                    elapsed = f"  {seconds}s"
             elif self._phase not in {"ready", "thinking"}:
                 label = self._phase.replace("_", " ").strip().capitalize()
             frame = "◐◓◑◒"[self._spinner_index]
             banner.update(
                 Text.assemble(
-                    (f"{frame}  WORKING", "bold #e6b673"),
-                    (f"  ·  {label}", "#d1d1d6"),
+                    (f"{frame}  ", "bold #e6b673"),
+                    (label, "#d1d1d6"),
+                    (elapsed, "#777781"),
                 ),
                 layout=False,
             )
             banner.styles.display = "block"
+            with contextlib.suppress(Exception):
+                if self._active_activity_id and self._active_activity_id in self._activities:
+                    self.query_one("#activity-title", Static).update(
+                        Text.assemble(
+                            (f"{frame}  ", "bold #e6b673"),
+                            (label, "#d1d1d6"),
+                            (elapsed, "#777781"),
+                        ),
+                        layout=False,
+                    )
 
     def update_chrome(self, *, force: bool = False) -> None:
         meta = self.host.meta
@@ -1252,7 +1339,10 @@ class NoahCodeApp(App[None]):
         if self._active_activity_id and self._active_activity_id in self._activities:
             record = self._activities[self._active_activity_id]
             text.append("Running\n", style="#e6b673")
-            text.append(record.label[:28], style="#d1d1d6")
+            label = record.label
+            if len(label) > 28:
+                label = "…" + label[-27:]
+            text.append(label, style="#d1d1d6")
         else:
             text.append("Waiting for your next turn", style="#777781")
 
@@ -1299,6 +1389,22 @@ class NoahCodeApp(App[None]):
         if entry.event_id:
             self._transcript_event_ids.add(entry.event_id)
         self._reveal_transcript()
+        if (
+            entry.role == "ACTIVITY"
+            and self._transcript_entries
+            and self._transcript_entries[-1].role == "ACTIVITY"
+        ):
+            merged = _coalesce_activity_text(self._transcript_entries[-1].text, entry.text)
+            if merged:
+                previous = self._transcript_entries[-1]
+                self._transcript_entries[-1] = TranscriptEntry(
+                    previous.role,
+                    merged,
+                    previous.markdown,
+                    previous.event_id,
+                )
+                self._rerender_transcript()
+                return
         self._transcript_entries.append(entry)
         if len(self._transcript_entries) > 500:
             self._transcript_entries = self._transcript_entries[-500:]
@@ -1442,7 +1548,14 @@ class NoahCodeApp(App[None]):
         self._phase = record.label
         output = self.query_one("#activity-output", RichLog)
         output.clear()
-        self.query_one("#live-activity", Vertical).styles.display = "none"
+        frame = "◐◓◑◒"[self._spinner_index]
+        self.query_one("#activity-title", Static).update(
+            Text.assemble((f"{frame}  ", "bold #e6b673"), (record.label, "#d1d1d6")),
+            layout=False,
+        )
+        live = self.query_one("#live-activity", Vertical)
+        live.styles.display = "block"
+        live.styles.height = 3
         self._update_working_banner()
 
     def _queue_activity_output(self, event: HostEvent) -> None:
@@ -1452,8 +1565,9 @@ class NoahCodeApp(App[None]):
             record = ActivityRecord(activity_id=activity_id, label="shell output", tool="shell")
             self._activities[activity_id] = record
             self._active_activity_id = activity_id
+        frame = "◐◓◑◒"[self._spinner_index]
         self.query_one("#activity-title", Static).update(
-            Text.assemble(("OUTPUT  ", "bold #e6b673"), (record.label, "#d1d1d6")),
+            Text.assemble((f"{frame}  ", "bold #e6b673"), (record.label, "#d1d1d6")),
             layout=False,
         )
         self.query_one("#live-activity", Vertical).styles.display = "block"
@@ -1480,7 +1594,7 @@ class NoahCodeApp(App[None]):
             log.write(Text("".join(fragments), style=color), scroll_end=True)
         if self._active_activity_id and self._active_activity_id in self._activities:
             lines = self._activities[self._active_activity_id].line_count
-            self.query_one("#live-activity", Vertical).styles.height = min(max(lines + 2, 4), 9)
+            self.query_one("#live-activity", Vertical).styles.height = min(max(lines + 2, 4), 7)
 
     def _finish_activity(self, event: HostEvent) -> None:
         activity_id = self._activity_id(event)
@@ -1491,10 +1605,8 @@ class NoahCodeApp(App[None]):
                 label=event.text or "activity",
                 tool=str(event.meta.get("tool", "tool")),
             )
-        result_status = str(event.meta.get("result_status", "complete")).lower()
-        record.state = (
-            "error" if "error" in result_status or "fail" in result_status else "complete"
-        )
+        result_status = str(event.meta.get("result_status", "complete")).lower().strip()
+        record.state = "error" if result_status in {"error", "failed", "fail"} else "complete"
         record.result = event.text
         record.finished_at = time.monotonic()
         self._activity_history.append(record)

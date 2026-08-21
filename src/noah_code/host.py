@@ -38,16 +38,15 @@ logger = logging.getLogger(__name__)
 def _friendly_agent_error(exc: Exception, profile: str) -> str:
     """Turn framework/provider failures into bounded, actionable UI copy."""
 
+    _ = profile
     raw = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(exc)).strip()
     iteration = re.search(r"Generation failed after (\d+) iterations \(max_iterations=(\d+)\)", raw)
     if iteration:
         used, limit = iteration.groups()
-        suggestion = (
-            "Continue with /efficiency balanced for more tool turns."
-            if profile == "fast"
-            else "Continue with a narrower follow-up, or use /efficiency deep."
+        return (
+            f"Reached the iteration limit ({used}/{limit} turns). "
+            "Continue with a narrower follow-up."
         )
-        return f"Reached the {profile} profile limit ({used}/{limit} turns). {suggestion}"
     retries = re.search(r"Generation failed after (\d+) errors", raw)
     if retries:
         return (
@@ -58,6 +57,52 @@ def _friendly_agent_error(exc: Exception, profile: str) -> str:
     if len(compact) > 700:
         compact = compact[:697].rstrip() + "…"
     return compact or type(exc).__name__
+
+
+_OVERFLOW_MARKERS = (
+    "context length",
+    "context_length",
+    "context window",
+    "maximum context",
+    "prompt is too long",
+    "too many tokens",
+    "reduce the length",
+    "requested tokens exceed",
+    "input is too long",
+)
+
+
+def _is_context_overflow(exc: BaseException) -> bool:
+    """Return True when a provider error looks like a context-window overflow."""
+
+    text = str(exc).lower()
+    return any(marker in text for marker in _OVERFLOW_MARKERS)
+
+
+async def _handle_with_overflow_recovery(
+    agent: Any,
+    notification: dict[str, list],
+    *,
+    render: Any = None,
+) -> Any:
+    """Run handle(); on context overflow, compact once and retry the same step."""
+
+    try:
+        return await agent.handle(notification)
+    except Exception as exc:
+        if not _is_context_overflow(exc):
+            raise
+        compacted = await agent.compact_history()
+        if not compacted:
+            raise
+        if render is not None:
+            render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    "context overflow · compacted and retrying once",
+                )
+            )
+        return await agent.handle(notification)
 
 
 def _stop_text(kind: Any, explanation: str) -> str:
@@ -292,8 +337,8 @@ class AgentHost:
         self._mcp_attached = set()
         self._mcp_errors = {}
 
-        # Keep MCP catalogs out of the prompt and critical startup path until
-        # explicitly connected. Deep/legacy profiles may opt back into eager attach.
+        # Connect configured MCP servers so their tools are on the agent at
+        # the first turn. Workspace catalogs stay untrusted until `/mcp connect`.
         if not self.config.efficiency.lazy_mcp:
             try:
                 from noah_code.mcp_setup import install_mcp
@@ -304,6 +349,7 @@ class AgentHost:
                     self.config,
                     engine=agent.engine,
                     approvals=agent.approvals,
+                    startup=True,
                 )
                 self._mcp_attached = set(mcp_result.attached)
                 self._mcp_errors = {
@@ -1143,7 +1189,9 @@ class AgentHost:
             notification: dict[str, list] = {}
             for name, item in wins:
                 notification.setdefault(name, []).append(item)
-            result = await agent.handle(notification)
+            result = await _handle_with_overflow_recovery(
+                agent, notification, render=self.ui.render
+            )
             explanation = getattr(result, "explanation", "") or ""
             kind = getattr(result, "kind", None)
             self._last_stop = explanation

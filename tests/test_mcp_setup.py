@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
-from noah_code.approvals import ApprovalBroker
+from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.config import DEFAULT_PERMISSION_RULES, NoahCodeConfig
 from noah_code.mcp_setup import (
     attach_mcp_server,
+    install_mcp,
     load_mcp_servers,
     mcp_source_is_trusted,
     re_attr,
@@ -106,3 +110,91 @@ async def test_workspace_mcp_cannot_be_auto_approved() -> None:
             approvals=approvals,
             trusted=False,
         )
+
+
+def _stub_mcp_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = ModuleType("nooa.mcp")
+
+    class FakeManager:
+        @staticmethod
+        def create_from_server(name: str, **_spec: object) -> object:
+            return SimpleNamespace(server=name)
+
+    fake.MCPManager = FakeManager
+    monkeypatch.setitem(sys.modules, "nooa.mcp", fake)
+
+
+@pytest.mark.asyncio
+async def test_trusted_mcp_attaches_at_startup_without_ask(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_mcp_manager(monkeypatch)
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    approvals = ApprovalBroker(engine)
+    handler = AsyncMock(return_value=ApprovalChoice.ONCE)
+    approvals.set_handler(handler)
+    agent = SimpleNamespace(_sandbox_approved_roots=set())
+
+    attr = await attach_mcp_server(
+        agent,
+        "filesystem",
+        {"command": "true"},
+        engine=engine,
+        approvals=approvals,
+        trusted=True,
+        startup=True,
+    )
+
+    handler.assert_not_awaited()
+    assert attr == "filesystem"
+    assert hasattr(agent, "filesystem")
+    assert "filesystem" in agent._sandbox_approved_roots
+
+
+@pytest.mark.asyncio
+async def test_workspace_mcp_is_not_auto_connected_at_startup() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    approvals = ApprovalBroker(engine)
+    with pytest.raises(PermissionError, match="workspace MCP"):
+        await attach_mcp_server(
+            object(),
+            "planted",
+            {"command": "true"},
+            engine=engine,
+            approvals=approvals,
+            trusted=False,
+            startup=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_install_mcp_attaches_trusted_servers_at_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    user_mcp = home / ".config" / "noah-code" / "mcp.json"
+    user_mcp.parent.mkdir(parents=True)
+    user_mcp.write_text(
+        json.dumps({"mcpServers": {"filesystem": {"command": "true"}}})
+    )
+    (workspace / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"planted": {"command": "evil"}}})
+    )
+    attach = AsyncMock(side_effect=lambda _agent, name, *_args, **_kwargs: name)
+    monkeypatch.setattr("noah_code.mcp_setup.attach_mcp_server", attach)
+
+    result = await install_mcp(
+        SimpleNamespace(),
+        workspace,
+        NoahCodeConfig(),
+        engine=PermissionEngine(DEFAULT_PERMISSION_RULES),
+        approvals=ApprovalBroker(PermissionEngine(DEFAULT_PERMISSION_RULES)),
+        home=home,
+        startup=True,
+    )
+
+    assert result.attached == ("filesystem",)
+    assert any("planted" in error for error in result.errors)
+    attach.assert_awaited_once()
+    assert attach.await_args.kwargs["startup"] is True
+    assert attach.await_args.kwargs["trusted"] is True

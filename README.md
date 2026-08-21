@@ -141,7 +141,8 @@ keeping long runs responsive without deleting persisted session data. Press `F2`
 details or `F3` for paginated conversation history.
 
 The default `fast` profile uses compact NOOA trajectory rendering, bounded tool results, batched
-repository inspection, cache-friendly turn-boundary context refresh, and lazy MCP connections. A
+repository inspection, cache-friendly turn-boundary context refresh, and MCP tools from trusted
+user-configured servers on the first turn. A
 configured `lightweight_model` handles coding-session compaction; deterministic titles avoid an
 otherwise unnecessary model request. Run `noah benchmark .` for the deterministic offline fixture
 and `/tokens` for real provider-reported usage in the current run.

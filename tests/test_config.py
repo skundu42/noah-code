@@ -21,6 +21,7 @@ def test_defaults_and_cli_override(tmp_path: Path, monkeypatch) -> None:
     cfg = load_config(tmp_path, cli_overrides={"model": "claude-opus-4-8", "auto_approve": True})
     assert cfg.model == "claude-opus-4-8"
     assert cfg.auto_approve is True
+    assert NoahCodeConfig().efficiency.lazy_mcp is False
 
 
 def test_project_config_layer(tmp_path: Path, monkeypatch) -> None:
@@ -46,6 +47,10 @@ def test_env_overrides_project(tmp_path: Path, monkeypatch) -> None:
 def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("NOAH_CODE_AUTO", raising=False)
     monkeypatch.delenv("NOAH_CODE_AUTO_UPDATE", raising=False)
+    monkeypatch.setattr(
+        "noah_code.config._user_config_path",
+        lambda: tmp_path / "home" / ".config" / "noah-code" / "config.toml",
+    )
     conf = tmp_path / ".noah-code"
     conf.mkdir()
     (conf / "config.toml").write_text(
@@ -53,7 +58,7 @@ def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> N
         "unsafe_inprocess_code_execution = true\n"
         "session_dir = '/tmp/repository-controlled-sessions'\n"
         "[efficiency]\n"
-        "lazy_mcp = false\n"
+        "lazy_mcp = true\n"
         "[lsp]\n"
         "enabled = false\n"
         "servers.python = ['repository-command']\n"
@@ -66,7 +71,7 @@ def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> N
     assert cfg.auto_approve is False
     assert cfg.unsafe_inprocess_code_execution is False
     assert str(cfg.session_dir) != "/tmp/repository-controlled-sessions"
-    assert cfg.efficiency.lazy_mcp is True
+    assert cfg.efficiency.lazy_mcp is False
     assert cfg.lsp.enabled is True
     assert cfg.lsp.servers == {}
     assert cfg.processes.max_jobs == 8

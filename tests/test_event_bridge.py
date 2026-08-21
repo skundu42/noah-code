@@ -53,12 +53,54 @@ def test_event_bridge_correlates_tool_output_and_finish() -> None:
 
 
 def test_code_activity_labels_describe_intent_not_framework_internals() -> None:
-    assert (
-        _describe_code_activity('files = await self.ws.list("**/*.py")')
-        == "Inspecting repository"
-    )
-    assert (
-        _describe_code_activity('await self.ws.run("pytest -q")')
-        == "Running tests"
-    )
+    assert _describe_code_activity('files = await self.ws.list("**/*.py")') == "Glob **/*.py"
+    assert _describe_code_activity('await self.ws.run("pytest -q")') == "Bash pytest -q"
     assert _describe_code_activity('self.message("Done")') == "Preparing response"
+
+
+def test_code_activity_labels_include_read_and_write_paths() -> None:
+    assert (
+        _describe_code_activity('text = await self.ws.read("src/parser.py")')
+        == "Read src/parser.py"
+    )
+    assert (
+        _describe_code_activity('await self.ws.write("src/parser.py", text)')
+        == "Write src/parser.py"
+    )
+    assert (
+        _describe_code_activity(
+            'await self.ws.read("src/a.py")\nawait self.ws.read("src/b.py")\n'
+            'await self.ws.read("src/c.py")'
+        )
+        == "Read src/a.py, src/b.py +1"
+    )
+    assert (
+        _describe_code_activity(
+            'old = await self.ws.read("src/a.py")\nawait self.ws.write("src/b.py", old)'
+        )
+        == "Read src/a.py · Write src/b.py"
+    )
+    assert (
+        _describe_code_activity('await self.ws.replace("src/host.py", old, new)')
+        == "Edit src/host.py"
+    )
+
+
+def test_code_activity_labels_cover_git_web_task_and_shell() -> None:
+    assert _describe_code_activity("await self.git.status()") == "Git status"
+    assert (
+        _describe_code_activity('page = await self.web.fetch("https://docs.python.org/3/library/")')
+        == "Fetch docs.python.org/3/library"
+    )
+    assert (
+        _describe_code_activity('hits = await self.web.search("asyncio run")')
+        == "Search asyncio run"
+    )
+    assert (
+        _describe_code_activity('await self.task.run("explore", "find auth")')
+        == "Task explore"
+    )
+    assert (
+        _describe_code_activity('await self.filesystem.read_file({"path": "README.md"})')
+        == "MCP filesystem.read_file"
+    )

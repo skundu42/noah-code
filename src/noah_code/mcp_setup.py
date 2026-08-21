@@ -7,7 +7,7 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -234,11 +234,18 @@ async def attach_mcp_server(
     engine: PermissionEngine,
     approvals: ApprovalBroker,
     trusted: bool = True,
+    startup: bool = False,
 ) -> str:
     """Permission-check and attach a single configured MCP server."""
 
     if trusted:
         decision = engine.decide(PermissionCategory.MCP, name)
+        if startup and decision.action == "ask":
+            decision = replace(
+                decision,
+                action="allow",
+                reason=f"{decision.reason} (configured MCP)",
+            )
     else:
         saved = engine.auto_approve
         engine.auto_approve = False
@@ -246,7 +253,7 @@ async def attach_mcp_server(
             decision = engine.decide(PermissionCategory.MCP, name)
         finally:
             engine.auto_approve = saved
-        if decision.action == "ask" and saved:
+        if decision.action == "ask" and (saved or startup):
             raise PermissionError(f"workspace MCP servers cannot be auto-approved: {name}")
     await approvals.require(decision)
     try:
@@ -274,13 +281,19 @@ async def install_mcp(
     *,
     engine: PermissionEngine,
     approvals: ApprovalBroker,
+    home: Path | None = None,
+    startup: bool = False,
 ) -> MCPInstallResult:
     """Attach all configured servers without failing startup on one bad server."""
 
-    servers, sources = load_mcp_servers(workspace, config)
+    servers, sources = load_mcp_servers(workspace, config, home=home)
     attached: list[str] = []
     errors: list[str] = []
     for name, spec in servers.items():
+        trusted = mcp_source_is_trusted(sources.get(name, ""), home=home)
+        if startup and not trusted:
+            errors.append(f"{name}: workspace MCP servers cannot be auto-approved: {name}")
+            continue
         try:
             await attach_mcp_server(
                 agent,
@@ -288,7 +301,8 @@ async def install_mcp(
                 spec,
                 engine=engine,
                 approvals=approvals,
-                trusted=mcp_source_is_trusted(sources.get(name, "")),
+                trusted=trusted,
+                startup=startup,
             )
             attached.append(name)
         except Exception as exc:  # noqa: BLE001

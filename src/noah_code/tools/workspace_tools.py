@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import difflib
+import fnmatch
 import gc
 import os
 import shlex
 import sys
 import tempfile
 from collections.abc import AsyncIterator
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Annotated, Any
 
 from nooa import Skill, hidden, spec
@@ -27,6 +28,41 @@ from noah_code.permissions import (
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tool_output import ToolOutputStore
 from noah_code.workspace import Workspace, WorkspaceError
+
+
+_IGNORED_LIST_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "node_modules",
+        "dist",
+        "build",
+        "__pycache__",
+        ".tox",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+        ".cursor",
+    }
+)
+
+
+def _pattern_keeps_dir(pattern: str, name: str) -> bool:
+    return name in pattern.replace("\\", "/").split("/")
+
+
+def _matches_glob(relative: str, pattern: str) -> bool:
+    posix = relative.replace("\\", "/")
+    candidate = PurePath(posix)
+    try:
+        if candidate.full_match(pattern) or candidate.full_match(pattern.lstrip("./")):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return fnmatch.fnmatch(posix, pattern)
 
 
 class WorkspaceTools(Skill):
@@ -146,20 +182,45 @@ class WorkspaceTools(Skill):
         self._assert_internal_glob(pattern)
         root = await self._authorize_path(path, PermissionCategory.READ)
         workspace_root = self._workspace.root.resolve()
-        matches = []
-        for candidate in root.glob(pattern):
-            if not candidate.is_file():
-                continue
-            try:
-                candidate.resolve().relative_to(workspace_root)
-                matches.append(str(candidate.relative_to(self._workspace.root)))
-            except ValueError:
-                continue
+        matches: list[str] = []
+        truncated = False
+
+        for dirpath, dirnames, filenames in os.walk(
+            root,
+            onerror=lambda _error: None,
+            followlinks=False,
+        ):
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if _pattern_keeps_dir(pattern, name) or name not in _IGNORED_LIST_DIRS
+            )
+            directory = Path(dirpath)
+            for name in sorted(filenames):
+                candidate = directory / name
+                try:
+                    if candidate.is_symlink() or not candidate.is_file():
+                        continue
+                    resolved = candidate.resolve()
+                    glob_rel = candidate.relative_to(root).as_posix()
+                    workspace_rel = resolved.relative_to(workspace_root).as_posix()
+                except (OSError, ValueError):
+                    continue
+                if is_secret_path(workspace_rel):
+                    continue
+                if not _matches_glob(glob_rel, pattern):
+                    continue
+                matches.append(workspace_rel)
+                if len(matches) >= self._max_file_results:
+                    truncated = True
+                    dirnames.clear()
+                    break
+            if truncated:
+                break
+
         matches.sort()
-        if len(matches) > self._max_file_results:
-            return matches[: self._max_file_results] + [
-                f"...[{len(matches) - self._max_file_results} more]"
-            ]
+        if truncated:
+            matches.append(f"...[truncated at {self._max_file_results}]")
         return matches
 
     async def list(

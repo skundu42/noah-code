@@ -5,36 +5,201 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlparse
 
 from noah_code.events import HostEvent, HostEventKind
 
 Unsubscribe = Callable[[], None]
 EmitFn = Callable[[HostEvent], None]
 
+_STRING = r"(?P<q>['\"])(?P<val>(?:(?!(?P=q)).){0,240})(?P=q)"
+_PATH_CALL = re.compile(
+    rf"self\.ws\.(?P<method>read|inspect|write(?:_file)?|edit|replace|"
+    rf"list(?:_files)?|search)\s*\(\s*{_STRING}",
+    re.IGNORECASE,
+)
+_RUN_CALL = re.compile(
+    r"self\.ws\.(?:run|run_stream|run_trusted_readonly)\s*\(\s*"
+    r"(?:(?P<q>['\"])(?P<cmd>(?:(?!(?P=q)).){1,200})(?P=q)|(?P<var>[A-Za-z_][\w.]*))",
+    re.IGNORECASE,
+)
+_PATCH_PATH = re.compile(r"""['\"]path['\"]\s*:\s*['\"]([^'\"]+)['\"]""")
+_GIT_CALL = re.compile(
+    r"self\.git\.(?P<method>status|diff|log|review|revert)\s*\(\s*"
+    r"(?:(?P<q>['\"])(?P<path>(?:(?!(?P=q)).){1,160})(?P=q))?",
+    re.IGNORECASE,
+)
+_WEB_FETCH = re.compile(
+    r"self\.web\.fetch\s*\(\s*(?P<q>['\"])(?P<url>(?:(?!(?P=q)).){1,200})(?P=q)",
+    re.IGNORECASE,
+)
+_WEB_SEARCH = re.compile(
+    r"self\.web\.search\s*\(\s*(?P<q>['\"])(?P<query>(?:(?!(?P=q)).){1,160})(?P=q)",
+    re.IGNORECASE,
+)
+_TASK_CALL = re.compile(
+    r"self\.task\.run\s*\(\s*(?P<q>['\"])(?P<name>(?:(?!(?P=q)).){1,80})(?P=q)",
+    re.IGNORECASE,
+)
+_TODO_CALL = re.compile(r"self\.todos\.\w+", re.IGNORECASE)
+_LSP_CALL = re.compile(r"self\.lsp\.\w+", re.IGNORECASE)
+_PROCESS_CALL = re.compile(r"self\.processes\.\w+", re.IGNORECASE)
+_MCP_CALL = re.compile(
+    r"self\.(?!(?:ws|git|lsp|web|ask|media|task|todos|processes|skills|message|"
+    r"context|engine|v|approvals|journal)\.)(?P<server>[A-Za-z_][\w]*)\."
+    r"(?P<tool>[A-Za-z_]\w*)\s*\(",
+)
+_FILE_VERBS = {
+    "read": "Read",
+    "inspect": "Read",
+    "diff": "Read",
+    "write": "Write",
+    "write_file": "Write",
+    "edit": "Edit",
+    "replace": "Edit",
+    "list": "Glob",
+    "list_files": "Glob",
+    "search": "Grep",
+}
+_GROUPABLE = frozenset({"Read", "Write", "Edit", "Glob", "Grep"})
+_KNOWN_ROOTS = frozenset(
+    {
+        "ws",
+        "git",
+        "lsp",
+        "web",
+        "ask",
+        "media",
+        "task",
+        "todos",
+        "processes",
+        "skills",
+        "message",
+        "context",
+        "engine",
+        "v",
+        "approvals",
+        "journal",
+    }
+)
+
+
+def _shorten(text: str, limit: int = 72) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1].rstrip() + "…"
+
+
+def _format_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.netloc:
+        path = parsed.path.rstrip("/") or "/"
+        if len(path) > 36:
+            path = "…" + path[-35:]
+        return _shorten(f"{parsed.netloc}{path}", 64)
+    return _shorten(url, 64)
+
+
+def _format_path_group(verb: str, paths: list[str]) -> str:
+    if len(paths) == 1:
+        return f"{verb} {paths[0]}"
+    if len(paths) == 2:
+        return f"{verb} {paths[0]}, {paths[1]}"
+    return f"{verb} {paths[0]}, {paths[1]} +{len(paths) - 2}"
+
+
+def _collect_actions(code: str) -> list[tuple[int, str, str]]:
+    """Return (offset, verb, target) tuples in source order."""
+
+    found: list[tuple[int, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(start: int, verb: str, target: str = "") -> None:
+        key = (verb, target)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append((start, verb, target))
+
+    for match in _PATH_CALL.finditer(code):
+        verb = _FILE_VERBS.get(match.group("method").lower())
+        path = (match.group("val") or "").strip()
+        if verb and path:
+            add(match.start(), verb, path)
+    if re.search(r"self\.ws\.apply_patch\s*\(", code, re.IGNORECASE):
+        for path_match in _PATCH_PATH.finditer(code):
+            path = path_match.group(1).strip()
+            if path:
+                add(path_match.start(), "Edit", path)
+    for match in _RUN_CALL.finditer(code):
+        command = (match.group("cmd") or "").strip()
+        add(match.start(), "Bash", _shorten(command) if command else "")
+    for match in _GIT_CALL.finditer(code):
+        method = match.group("method").lower()
+        path = (match.group("path") or "").strip()
+        add(match.start(), "Git", _shorten(f"{method} {path}".strip()))
+    for match in _WEB_FETCH.finditer(code):
+        add(match.start(), "Fetch", _format_url(match.group("url")))
+    for match in _WEB_SEARCH.finditer(code):
+        add(match.start(), "Search", _shorten(match.group("query"), 56))
+    for match in _TASK_CALL.finditer(code):
+        add(match.start(), "Task", match.group("name").strip())
+    for match in _TODO_CALL.finditer(code):
+        add(match.start(), "Todos", "")
+        break
+    for match in _LSP_CALL.finditer(code):
+        add(match.start(), "LSP", "")
+        break
+    for match in _PROCESS_CALL.finditer(code):
+        add(match.start(), "Process", "")
+        break
+    for match in _MCP_CALL.finditer(code):
+        server = match.group("server")
+        if server.lower() in _KNOWN_ROOTS:
+            continue
+        add(match.start(), "MCP", f"{server}.{match.group('tool')}")
+    found.sort(key=lambda item: item[0])
+    return [(start, verb, target) for start, verb, target in found]
+
+
+def _compress_actions(actions: list[tuple[int, str, str]]) -> list[str]:
+    grouped: list[tuple[str, list[str]]] = []
+    for _start, verb, target in actions:
+        if grouped and grouped[-1][0] == verb and verb in _GROUPABLE and target:
+            grouped[-1][1].append(target)
+            continue
+        grouped.append((verb, [target] if target else []))
+    lines: list[str] = []
+    for verb, targets in grouped:
+        targets = [item for item in targets if item]
+        if not targets:
+            lines.append(verb)
+        elif verb in _GROUPABLE:
+            lines.append(_format_path_group(verb, targets))
+        elif len(targets) == 1:
+            lines.append(f"{verb} {targets[0]}")
+        else:
+            lines.append(f"{verb} {targets[0]} +{len(targets) - 1}")
+    if len(lines) > 4:
+        extra = len(lines) - 3
+        lines = [*lines[:3], f"+{extra}"]
+    return lines
+
 
 def _describe_code_activity(code: str) -> str:
-    """Describe generated tool code using user-facing coding verbs."""
+    """Describe generated tool code using OpenCode-style action labels."""
 
+    actions = _compress_actions(_collect_actions(code))
+    if actions:
+        return " · ".join(actions)
     lowered = code.lower()
-    if re.search(r"self\.ws\.(?:run|run_stream)\s*\(", lowered):
-        if re.search(r"(?:pytest|unittest|tox|vitest|jest|go test|cargo test|npm test)", lowered):
-            return "Running tests"
-        if re.search(r"(?:ruff|mypy|pyright|lint|check)", lowered):
-            return "Running checks"
-        if "build" in lowered:
-            return "Building project"
-        return "Running command"
-    if re.search(r"self\.ws\.(?:edit|replace|write|write_file)\s*\(", lowered):
-        return "Editing files"
-    if re.search(
-        r"self\.(?:ws\.(?:inspect|list|list_files|read|read_output|search)|git\.)",
-        lowered,
-    ):
-        return "Inspecting repository"
     if "self.message(" in lowered or "return_result(" in lowered:
         return "Preparing response"
     if "inspecting inputs" in lowered:
-        return "Preparing"
+        return "Think"
+    if re.search(r"self\.(?:ws|git|lsp)\.", lowered):
+        return "Inspect"
     return "Working"
 
 

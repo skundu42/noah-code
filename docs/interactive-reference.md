@@ -32,9 +32,11 @@ close the list. Press `Enter` again to run the completed command. Typing `/confi
 to every resolved configuration path and its current redacted value.
 
 Tool and shell output is batched into a live execution panel instead of forcing one full-screen
-redraw for every chunk. When the tool finishes, the panel becomes a compact transcript record with
-outcome, duration, and output-line count. `F2` retains the latest 100 activity records, bounded by
-the configured `max_output_chars` per activity.
+redraw for every chunk. While a turn is running, a spinner names the current action the way
+OpenCode does (`Read src/parser.py`, `Bash pytest -q`, `Git status`). When the tool finishes, the
+panel collapses to one transcript line such as `✓ Read src/parser.py`. Consecutive reads or writes
+merge into a single line (`✓ Read a.py, b.py +1`) so the chat stays compact. `F2` retains the
+latest 100 activity records, bounded by the configured `max_output_chars` per activity.
 
 ## Built-in slash commands
 
@@ -52,7 +54,7 @@ the configured `max_output_chars` per activity.
 | `/session`, `/sessions`, `/new`, `/continue` | Inspect, switch, create, and resume sessions |
 | `/compact` | Apply a coding checkpoint to eligible older context |
 | `/tokens` | Show tokens, cache hits, cost, model wait, and tool-output volume |
-| `/efficiency [fast|balanced|deep]` | Show or switch live iteration and output budgets |
+| `/efficiency [fast|balanced|deep]` | Show or switch live tool-output budgets |
 | `/todos` | Show the agent's current task list |
 | `/agents` | List built-in and markdown subagents |
 | `/attach PATH` | Attach a workspace file or image to the next turn |
@@ -60,7 +62,7 @@ the configured `max_output_chars` per activity.
 | `/diff` | Review staged and unstaged files, patches, diagnostics, and changed symbols |
 | `/undo`, `/redo` | Restore or reapply journaled file edits |
 | `/skills [add PATH]` | Search compatible Codex/Claude skills or import a skill folder |
-| `/mcp [connect|add]` | Search, connect, or add MCP servers |
+| `/mcp [connect|add]` | Search, connect, or add MCP servers. Trusted user servers connect at session start |
 | `/trace` | Show the active tracing destination |
 | `/exit` | End the session |
 

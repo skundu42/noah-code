@@ -105,7 +105,7 @@ max_output_chars = 16000
 profile = "fast"          # "fast", "balanced", or "deep"
 strategy = "lean"         # "standard" is the comparison fallback
 deterministic_titles = true
-lazy_mcp = true
+lazy_mcp = false         # true catalogs servers without attaching them at start
 max_output_lines = 250
 max_search_results = 100
 max_file_results = 500
@@ -203,10 +203,13 @@ For headless launches use `--reasoning-effort high`, or add
 
 ### Efficiency and model routing
 
-`fast` is the default: at most 12 CodeAct iterations, 16,000 characters and 250 lines per
-model-facing tool result, and lazy MCP attachment. `balanced` raises the live cap to 24 iterations
-and its preview to 24,000 characters/400 lines. `deep` permits the configured `max_iterations` and
-legacy-sized 80,000-character previews. Switch without restarting:
+`fast` is the default: 16,000 characters and 250 lines per model-facing tool result. Configured MCP
+servers from trusted user configuration attach at start so their tools are in the prompt; set
+`efficiency.lazy_mcp = true` to catalog them instead. The agent runs until it finishes; if a
+provider reports a context overflow, Noah compacts eligible history and retries that step once.
+`balanced` raises the preview to 24,000
+characters/400 lines. `deep` permits legacy-sized 80,000-character previews. `max_iterations` is a
+safety rail (default 40), not an efficiency-profile cap. Switch without restarting:
 
 ```text
 /efficiency

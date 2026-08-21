@@ -10,8 +10,15 @@ from nooa.unifiedllm import FakeLLMClient
 
 from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.commands import help_text
-from noah_code.config import PermissionRule, load_config
-from noah_code.host import AgentHost, _friendly_agent_error, _stop_text
+from noah_code.config import NoahCodeConfig, PermissionRule, load_config
+from noah_code.mcp_setup import MCPInstallResult
+from noah_code.host import (
+    AgentHost,
+    _friendly_agent_error,
+    _handle_with_overflow_recovery,
+    _is_context_overflow,
+    _stop_text,
+)
 from noah_code.permissions import PermissionEngine
 from noah_code.sessions import SessionStore
 from noah_code.workspace import Workspace
@@ -22,17 +29,87 @@ def test_agent_protocol_status_is_plain_language() -> None:
     assert _stop_text("NEED_INPUT", "choose one") == "Waiting for input · choose one"
 
 
-def test_iteration_limit_error_recommends_recovery() -> None:
+def test_iteration_limit_error_recommends_narrower_follow_up() -> None:
     error = RuntimeError(
-        "Generation failed after 12 iterations (max_iterations=12). Unable to complete `handle`."
+        "Generation failed after 40 iterations (max_iterations=40). Unable to complete `handle`."
     )
 
     text = _friendly_agent_error(error, "fast")
 
     assert text == (
-        "Reached the fast profile limit (12/12 turns). "
-        "Continue with /efficiency balanced for more tool turns."
+        "Reached the iteration limit (40/40 turns). "
+        "Continue with a narrower follow-up."
     )
+
+
+def test_context_overflow_is_detected_from_provider_errors() -> None:
+    assert _is_context_overflow(RuntimeError("This model's maximum context length was exceeded"))
+    assert _is_context_overflow(RuntimeError("prompt is too long for the context window"))
+    assert not _is_context_overflow(RuntimeError("rate limit exceeded"))
+
+
+@pytest.mark.asyncio
+async def test_overflow_compacts_and_retries_handle_once() -> None:
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+
+    async def handle(_notification):  # noqa: ANN001
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("maximum context length exceeded")
+        return SimpleNamespace(kind="DONE", explanation="ok")
+
+    async def compact_history() -> bool:
+        return True
+
+    rendered: list[str] = []
+    result = await _handle_with_overflow_recovery(
+        SimpleNamespace(handle=handle, compact_history=compact_history),
+        {},
+        render=lambda event: rendered.append(event.text),
+    )
+    assert calls["n"] == 2
+    assert result.explanation == "ok"
+    assert rendered == ["context overflow · compacted and retrying once"]
+
+
+@pytest.mark.asyncio
+async def test_overflow_does_not_retry_when_compaction_is_a_no_op() -> None:
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+
+    async def handle(_notification):  # noqa: ANN001
+        calls["n"] += 1
+        raise RuntimeError("prompt is too long")
+
+    async def compact_history() -> bool:
+        return False
+
+    with pytest.raises(RuntimeError, match="prompt is too long"):
+        await _handle_with_overflow_recovery(
+            SimpleNamespace(handle=handle, compact_history=compact_history),
+            {},
+        )
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_second_overflow_is_not_recovered() -> None:
+    from types import SimpleNamespace
+
+    async def handle(_notification):  # noqa: ANN001
+        raise RuntimeError("context window exceeded")
+
+    async def compact_history() -> bool:
+        return True
+
+    with pytest.raises(RuntimeError, match="context window exceeded"):
+        await _handle_with_overflow_recovery(
+            SimpleNamespace(handle=handle, compact_history=compact_history),
+            {},
+        )
 
 
 def test_generic_agent_error_is_single_line_and_bounded() -> None:
@@ -395,13 +472,30 @@ async def test_model_switch_updates_implicit_lightweight_model(tmp_path: Path, m
 
 
 @pytest.mark.asyncio
+async def test_eager_mcp_installs_at_start(tmp_path: Path, monkeypatch) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = NoahCodeConfig(session_dir=tmp_path / "sessions")
+    assert config.efficiency.lazy_mcp is False
+    install = AsyncMock(return_value=MCPInstallResult(attached=("filesystem",)))
+    monkeypatch.setattr("noah_code.mcp_setup.install_mcp", install)
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+
+    await host.start()
+
+    install.assert_awaited_once()
+    assert install.await_args.kwargs.get("startup") is True
+    assert host._mcp_attached == {"filesystem"}
+    await host.close()
+
+
+@pytest.mark.asyncio
 async def test_lazy_mcp_skips_eager_install(tmp_path: Path, monkeypatch) -> None:
     workspace = Workspace(root=tmp_path.resolve())
-    config = load_config(
-        workspace.root,
-        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    config = NoahCodeConfig(
+        session_dir=tmp_path / "sessions",
+        efficiency={"lazy_mcp": True},
     )
-    install = AsyncMock()
+    install = AsyncMock(return_value=MCPInstallResult())
     monkeypatch.setattr("noah_code.mcp_setup.install_mcp", install)
     host = AgentHost(workspace, config, llm=FakeLLMClient())
 

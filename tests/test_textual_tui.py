@@ -25,6 +25,8 @@ from noah_code.ui.textual_app import (
     FilteredPicker,
     NoahCodeApp,
     TextualUI,
+    _coalesce_activity_text,
+    _completed_activity_label,
     _normalize_markdown,
     _record_to_entries,
 )
@@ -99,7 +101,7 @@ def test_persisted_python_activity_uses_human_label() -> None:
 
     entries = _record_to_entries(record)
 
-    assert [entry.text for entry in entries] == ["✓ Ran tests"]
+    assert [entry.text for entry in entries] == ["✓ Bash pytest -q"]
     assert "execute_python" not in entries[0].text
 
 
@@ -159,14 +161,14 @@ async def test_active_context_rail_shows_semantic_tool_state_not_code(tmp_path: 
         ui.render(
             HostEvent(
                 HostEventKind.TOOL_START,
-                "Running tests",
+                "Bash pytest -q",
                 meta={"activity_id": "tool-1", "tool": "execute_python"},
             )
         )
         await pilot.pause()
 
         rail = _rendered_text(app.query_one("#context-rail").content)
-        assert "Running\nRunning tests" in rail
+        assert "Running\nBash pytest -q" in rail
         assert "result = await" not in rail
 
         ui.render(
@@ -179,6 +181,9 @@ async def test_active_context_rail_shows_semantic_tool_state_not_code(tmp_path: 
         ui.render(HostEvent(HostEventKind.STOP, "Completed · tests passed"))
         await pilot.pause()
         assert "ready" in _rendered_text(app.query_one("#header").content)
+        transcript = _log_text(app.query_one("#conversation"))
+        assert "Completed · tests passed" in transcript
+        assert "\n  ·\n" not in transcript
 
 
 @pytest.mark.asyncio
@@ -202,10 +207,14 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
         banner = app.query_one("#working-banner")
         assert banner.styles.display == "block"
         banner_text = _rendered_text(banner.content)
-        assert "WORKING" in banner_text
+        assert "WORKING" not in banner_text
         assert "Inspecting repository" in banner_text
+        assert any(frame in banner_text for frame in "◐◓◑◒")
         assert banner.styles.height.value == 1
-        assert app.query_one("#live-activity").styles.display == "none"
+        live = app.query_one("#live-activity")
+        assert live.styles.display == "block"
+        title = _rendered_text(app.query_one("#activity-title").content)
+        assert "Inspecting repository" in title
 
         ui.render(
             HostEvent(
@@ -216,7 +225,7 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
         )
         await pilot.pause()
         transcript = _log_text(app.query_one("#conversation"))
-        assert "✓ Inspected repository" in transcript
+        assert "✓ Inspect" in transcript
         assert "execute_python" not in transcript
         assert "Activity" not in transcript
 
@@ -738,6 +747,30 @@ async def test_adaptive_layout_breakpoints(
         assert app.query_one("#context-rail").styles.display == expected
 
 
+def test_completed_activity_label_keeps_file_paths() -> None:
+    assert _completed_activity_label("Read src/parser.py", failed=False) == "✓ Read src/parser.py"
+    assert _completed_activity_label("Reading src/parser.py", failed=False) == "✓ Read src/parser.py"
+    assert _completed_activity_label("Write src/parser.py", failed=False) == "✓ Write src/parser.py"
+    assert (
+        _completed_activity_label("Reading src/a.py · Writing src/b.py", failed=False)
+        == "✓ Read src/a.py · Write src/b.py"
+    )
+    assert _completed_activity_label("Inspecting repository", failed=False) == "✓ Inspect"
+    assert _completed_activity_label("Bash pytest -q", failed=False) == "✓ Bash pytest -q"
+    assert _completed_activity_label("Think", failed=False) is None
+    assert _completed_activity_label("Preparing", failed=False) is None
+
+
+def test_consecutive_file_activity_compacts_into_one_line() -> None:
+    assert _coalesce_activity_text("✓ Read src/a.py", "✓ Read src/b.py") == "✓ Read src/a.py, src/b.py"
+    assert (
+        _coalesce_activity_text("✓ Read src/a.py, src/b.py", "✓ Read src/c.py")
+        == "✓ Read src/a.py, src/b.py +1"
+    )
+    assert _coalesce_activity_text("✓ Read src/a.py", "✓ Write src/b.py") is None
+    assert _coalesce_activity_text("✓ Wrote src/a.py", "✓ Write src/b.py") == "✓ Write src/a.py, src/b.py"
+
+
 @pytest.mark.asyncio
 async def test_activity_streams_live_then_compacts(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
@@ -747,7 +780,7 @@ async def test_activity_streams_live_then_compacts(tmp_path: Path) -> None:
         ui.render(
             HostEvent(
                 HostEventKind.TOOL_START,
-                "Running tests",
+                "Bash pytest -q",
                 meta={"activity_id": "tool-1", "tool": "execute_python"},
             )
         )
@@ -771,7 +804,7 @@ async def test_activity_streams_live_then_compacts(tmp_path: Path) -> None:
         assert len(app._activity_history) == 1
         assert app._activity_history[0].output == "one\ntwo\n"
         transcript = _log_text(app.query_one("#conversation"))
-        assert "✓ Ran tests" in transcript
+        assert "✓ Bash pytest -q" in transcript
         assert "execute_python" not in transcript
         assert "2 lines" not in transcript
 
@@ -779,6 +812,53 @@ async def test_activity_streams_live_then_compacts(tmp_path: Path) -> None:
         await pilot.pause()
         assert isinstance(app.screen, ActivityHistoryScreen)
         assert "one" in _log_text(app.screen.query_one("#activity-detail"))
+
+
+@pytest.mark.asyncio
+async def test_file_activity_is_visible_live_then_compacts_together(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                "Reading src/a.py",
+                meta={"activity_id": "read-1", "tool": "execute_python"},
+            )
+        )
+        await pilot.pause()
+        live = app.query_one("#live-activity")
+        assert live.styles.display == "block"
+        assert "src/a.py" in _rendered_text(app.query_one("#activity-title").content)
+
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_FINISH,
+                "complete",
+                meta={"activity_id": "read-1", "result_status": "complete"},
+            )
+        )
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                "Reading src/b.py",
+                meta={"activity_id": "read-2", "tool": "execute_python"},
+            )
+        )
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_FINISH,
+                "complete",
+                meta={"activity_id": "read-2", "result_status": "complete"},
+            )
+        )
+        await pilot.pause()
+
+        transcript = _log_text(app.query_one("#conversation"))
+        assert "✓ Read src/a.py, src/b.py" in transcript
+        assert transcript.count("✓ Read") == 1
+        assert live.styles.display == "none"
 
 
 @pytest.mark.asyncio

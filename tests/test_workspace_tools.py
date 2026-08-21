@@ -327,3 +327,67 @@ async def test_list_files_rejects_parent_glob(tmp_path: Path) -> None:
             await ws.list_files("../*")
     finally:
         await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_list_files_skips_ignored_dirs_and_secrets(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("print(1)\n")
+    (tmp_path / ".env").write_text("SECRET=1\n")
+    venv = tmp_path / ".venv" / "lib"
+    venv.mkdir(parents=True)
+    (venv / "site.py").write_text("ignored\n")
+    git = tmp_path / ".git"
+    git.mkdir()
+    (git / "HEAD").write_text("ref: refs/heads/main\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        listed = await ws.list_files("**/*")
+        assert listed == ["src/app.py"]
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_list_files_can_target_ignored_directory(tmp_path: Path) -> None:
+    venv = tmp_path / ".venv" / "lib"
+    venv.mkdir(parents=True)
+    (venv / "site.py").write_text("ignored\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        listed = await ws.list_files(".venv/**")
+        assert "site.py" in " ".join(listed) or any(item.endswith("site.py") for item in listed)
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_list_files_skips_unreadable_directories(tmp_path: Path) -> None:
+    (tmp_path / "ok.py").write_text("ok\n")
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "hidden.py").write_text("nope\n")
+    blocked.chmod(0o000)
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        listed = await ws.list_files("**/*")
+        assert "ok.py" in listed
+        assert not any(item.endswith("hidden.py") for item in listed)
+    finally:
+        blocked.chmod(0o755)
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_list_files_caps_during_walk(tmp_path: Path) -> None:
+    for index in range(6):
+        (tmp_path / f"f{index}.py").write_text("x\n")
+    ws = _make_ws(tmp_path, auto=True)
+    ws._max_file_results = 2
+    try:
+        listed = await ws.list_files("**/*")
+        files = [item for item in listed if not item.startswith("...")]
+        assert len(files) == 2
+        assert any(item.startswith("...") for item in listed)
+    finally:
+        await ws.close()

@@ -64,12 +64,9 @@ def _interpreter_read_rules() -> tuple[FileRule, ...]:
 
 def _codeact_config(config: NoahCodeConfig) -> CodeActConfig:
     unsafe = config.unsafe_inprocess_code_execution
-    profile_cap = {"fast": 12, "balanced": 24, "deep": config.max_iterations}[
-        config.efficiency.profile
-    ]
     restricted_imports = RESTRICTED_MODULES | frozenset({"nooa", "nooa_cli", "noah_code"})
     return CodeActConfig(
-        max_iterations=min(config.max_iterations, profile_cap),
+        max_iterations=config.max_iterations,
         cell_timeout=config.cell_timeout,
         execution_backend="inprocess" if unsafe else "sandbox",
         restrictions=RestrictionsConfig(restricted_imports=restricted_imports),
@@ -460,7 +457,7 @@ class CodingAgent(InteractiveAgent):
 
     @hidden
     def set_efficiency_profile(self, profile: str) -> None:
-        """Apply a live iteration and tool-output efficiency profile."""
+        """Apply a live tool-output efficiency profile."""
 
         if profile not in {"fast", "balanced", "deep"}:
             raise ValueError("profile must be fast, balanced, or deep")
