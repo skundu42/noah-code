@@ -12,9 +12,11 @@ Configuration is merged in this order, with later layers taking precedence:
 
 ### First-run model setup
 
-The first interactive `noah` launch asks for an AI model before starting the agent. Noah Code
-saves that choice as the top-level `model` in `~/.config/noah-code/config.toml`, making it the
-default for every repository. Enter a LiteLLM model name or an alias from the NOOA model registry.
+The first TUI launch opens one guided provider → API key → model → reasoning flow before starting
+the agent. Noah Code saves the selected model as the top-level `model` in
+`~/.config/noah-code/config.toml`, making it the default for every repository, and stores provider
+credentials separately in its private auth file. The classic `--console` frontend retains a
+line-oriented model prompt for environments that cannot open the TUI.
 
 An explicit `noah --model MODEL` on the first launch is saved without prompting. Project config,
 `NOAH_CODE_MODEL`, and later `--model` flags still override the user default according to the
@@ -125,7 +127,7 @@ max_buffer_chars = 64000
 stop_grace_seconds = 2
 
 [ui]
-theme = "atom-one-dark"
+theme = "atom-one-dark" # atom-one-dark, noah-ocean, graphite, or high-contrast
 frontend = "tui"       # "tui" or "console"
 markdown = true
 stream_shell = true
@@ -143,7 +145,7 @@ viewer = true
 # jsonl_dir = "~/.local/share/noah-code/traces"
 
 [updates]
-auto_install = true
+auto_install = false
 interval_hours = 24
 ```
 
@@ -261,9 +263,10 @@ same installer with:
 sh install.sh
 ```
 
-Installs created by the one-line command check PyPI at most once every 24 hours and install newer
-Noah Code releases through uv. When an update is installed, Noah exits before starting the task
-so it cannot mix old and new runtime modules. Rerun the command to continue on the new version.
+Installs created by the one-line command check PyPI at most once every 24 hours. If a release is
+available, a new TUI session shows a temporary banner and keeps the version in the context rail.
+Run `noah update` when ready. When an update is installed, Noah exits before starting the task so
+it cannot mix old and new runtime modules. Rerun the command to continue on the new version.
 
 ```bash
 # Check without changing the installation
@@ -273,14 +276,15 @@ noah update --check
 noah update
 ```
 
-Disable automatic installation from trusted user configuration or the environment:
+Updates are notification-only by default. Enable unattended installation from trusted user
+configuration or the environment only when that behavior is desired:
 
 ```toml
 [updates]
-auto_install = false
+auto_install = true
 interval_hours = 24
 ```
 
 ```bash
-export NOAH_CODE_AUTO_UPDATE=0
+export NOAH_CODE_AUTO_UPDATE=1
 ```

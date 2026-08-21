@@ -12,6 +12,7 @@ from noah_code.config import (
     load_config,
     save_user_default_model,
     save_user_reasoning_effort,
+    save_user_theme,
     user_default_model,
 )
 
@@ -65,7 +66,7 @@ def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> N
         "[processes]\n"
         "max_jobs = 32\n"
         "[updates]\n"
-        "auto_install = false\n"
+        "auto_install = true\n"
     )
     cfg = load_config(tmp_path)
     assert cfg.auto_approve is False
@@ -75,7 +76,7 @@ def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> N
     assert cfg.lsp.enabled is True
     assert cfg.lsp.servers == {}
     assert cfg.processes.max_jobs == 8
-    assert cfg.updates.auto_install is True
+    assert cfg.updates.auto_install is False
 
 
 def test_auto_update_environment_override(tmp_path: Path, monkeypatch) -> None:
@@ -111,6 +112,21 @@ def test_save_user_default_model_preserves_existing_sections(
     loaded = load_config(tmp_path)
     assert loaded.model == "anthropic/claude-sonnet-4-5"
     assert loaded.ui.markdown is False
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_save_user_theme_preserves_ui_settings(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("model = 'openai/example'\n\n[ui]\nmarkdown = false\n")
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    saved_path = save_user_theme("noah-ocean")
+
+    assert saved_path == config_path
+    loaded = load_config(tmp_path)
+    assert loaded.ui.theme == "noah-ocean"
+    assert loaded.ui.markdown is False
+    assert loaded.model == "openai/example"
     assert config_path.stat().st_mode & 0o777 == 0o600
 
 

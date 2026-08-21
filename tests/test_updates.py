@@ -80,3 +80,23 @@ def test_auto_update_is_rate_limited(tmp_path: Path, monkeypatch) -> None:
     assert first and "updated to 0.2.0" in first
     assert second is None
     assert calls == [uv]
+
+
+def test_update_notice_reuses_cached_available_version(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(updates, "__version__", "0.1.0")
+    calls = 0
+
+    def check(**_kwargs):  # noqa: ANN003, ANN202
+        nonlocal calls
+        calls += 1
+        return updates.UpdateStatus(current="0.1.0", latest="0.2.0")
+
+    monkeypatch.setattr(updates, "check_for_update", check)
+
+    first = updates.maybe_check_for_update(interval_hours=24, timeout=1)
+    second = updates.maybe_check_for_update(interval_hours=24, timeout=1)
+
+    assert first == updates.UpdateStatus(current="0.1.0", latest="0.2.0")
+    assert second == first
+    assert calls == 1

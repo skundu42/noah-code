@@ -561,14 +561,16 @@ async def _interactive(
     use_console: bool,
     unsafe_inprocess_code_execution: bool,
 ) -> int:
-    try:
-        model = _configure_first_run_model(model)
-    except (OSError, ValueError) as exc:
-        click.echo(f"error: first-run model setup failed: {exc}", err=True)
-        return EXIT_CONFIG
-    except click.Abort:
-        click.echo("error: first-run model setup was cancelled", err=True)
-        return EXIT_CONFIG
+    first_run = user_default_model() is None
+    if first_run and (model is not None or use_console):
+        try:
+            model = _configure_first_run_model(model)
+        except (OSError, ValueError) as exc:
+            click.echo(f"error: first-run model setup failed: {exc}", err=True)
+            return EXIT_CONFIG
+        except click.Abort:
+            click.echo("error: first-run model setup was cancelled", err=True)
+            return EXIT_CONFIG
 
     frontend: Literal["tui", "console"] | None = "console" if use_console else None
     prepared, code = await _prepare(
@@ -586,10 +588,40 @@ async def _interactive(
         return code
     workspace, config, store, meta = prepared
     use_tui = config.ui.frontend == "tui" and not use_console
+    if first_run and model is None and not use_tui:
+        try:
+            model = _configure_first_run_model(model)
+        except (OSError, ValueError) as exc:
+            click.echo(f"error: first-run model setup failed: {exc}", err=True)
+            return EXIT_CONFIG
+        except click.Abort:
+            click.echo("error: first-run model setup was cancelled", err=True)
+            return EXIT_CONFIG
+        prepared, code = await _prepare(
+            path=path,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            auto=auto,
+            mode=mode,
+            continue_session=continue_session,
+            session_id=session_id,
+            frontend=frontend,
+            unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
+        )
+        if prepared is None:
+            return code
+        workspace, config, store, meta = prepared
     if use_tui:
         host = AgentHost(workspace, config, session_meta=meta, store=store)
+        onboarding_required = (
+            first_run
+            and model is None
+            and meta is None
+            and not os.environ.get("NOAH_CODE_MODEL")
+            and config.model == NoahCodeConfig().model
+        )
         try:
-            return await host.run_tui()
+            return await host.run_tui(onboarding_required=onboarding_required)
         except RuntimeError as exc:
             click.echo(f"error: {exc}", err=True)
             return EXIT_CONFIG

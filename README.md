@@ -38,7 +38,7 @@ and seccomp support. You also need an LLM provider account such as OpenAI, Anthr
 - Switch between implementation-focused **build** mode and read-only **plan** mode.
 - Approve actions once or for a session with ordered `allow`, `ask`, and `deny` rules.
 - Undo and redo journaled file edits across process restarts.
-- Work in an adaptive Atom One Dark cockpit, a classic console, or one-shot non-interactive mode.
+- Work in an adaptive themed cockpit, a classic console, or one-shot non-interactive mode.
 - Type `/` for a live-filtering command and configuration reference; press Enter to send.
 - Follow batched live tool output, then inspect compact execution records with `F2`.
 - Review `/diff` in a keyboard-driven staged/worktree ledger with per-file patches, line deltas,
@@ -99,8 +99,9 @@ noah update --check
 noah benchmark .
 ```
 
-Bring your own API key from inside the TUI by entering `/model`: choose the provider, paste the
-key into the masked field, choose the model, then select its reasoning effort. Like OpenCode,
+On the first TUI launch, Noah opens guided model setup automatically: choose the provider, paste
+the key into the masked field, choose the model, then select its reasoning effort. Reopen the same
+flow later with `/model`. Like OpenCode,
 Noah saves provider credentials in `~/.local/share/noah-code/auth.json`; the directory is
 owner-only and the file uses mode `0600`. API-key values are never written to Noah config,
 repository, or session files. Set `XDG_DATA_HOME` to relocate the data directory.
@@ -138,7 +139,8 @@ default for future sessions in every repository.
 The TUI keeps the conversation central and adds a session-and-plan rail on terminals at least
 110 columns wide. Tool output streams in a bounded activity panel and compacts after completion,
 keeping long runs responsive without deleting persisted session data. Press `F2` for activity
-details or `F3` for paginated conversation history.
+details or `F3` for paginated conversation history. Switch among Atom One Dark, Noah Ocean,
+Graphite, and High Contrast with `/theme`.
 
 The default `fast` profile uses compact NOOA trajectory rendering, bounded tool results, batched
 repository inspection, cache-friendly turn-boundary context refresh, and MCP tools from trusted
@@ -158,8 +160,9 @@ and `/tokens` for real provider-reported usage in the current run.
 
 ## Updates
 
-Noah Code checks PyPI for new versions at most once every 24 hours and updates uv-managed
-installations automatically. To check or update immediately:
+Noah Code checks PyPI for new versions at most once every 24 hours. New TUI sessions show a
+temporary banner when an update is available and retain the version in the context rail. Updates
+are explicit by default; to check or install immediately:
 
 ```bash
 noah update --check

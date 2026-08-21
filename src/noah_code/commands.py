@@ -30,6 +30,7 @@ class CommandSuggestion:
 BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("help", "Show available commands", host_only=True),
     CommandSpec("config", "Show every resolved setting or one path", "config [PATH]", True),
+    CommandSpec("theme", "Show or switch the interface theme", "theme [NAME]", True),
     CommandSpec("mode", "Show or switch the active mode", "mode [build|plan]", True),
     CommandSpec(
         "model", "Configure a provider or switch this session's model", "model [MODEL]", True

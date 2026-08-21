@@ -18,12 +18,14 @@ from noah_code.config import (
     NoahCodeConfig,
     save_user_default_model,
     save_user_reasoning_effort,
+    save_user_theme,
     user_default_model,
 )
 from noah_code.custom_commands import CustomCommand, discover_custom_commands
 from noah_code.event_bridge import install_event_bridge
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.sessions import SessionEventRecord, SessionMeta, SessionStore
+from noah_code.themes import THEME_NAMES, get_theme
 from noah_code.ui.console import ConsoleUI
 from noah_code.ui.protocol import HostUI
 from noah_code.usage import UsageSnapshot, UsageTracker
@@ -780,6 +782,32 @@ class AgentHost:
             else:
                 self.ui.render(_command_output(text))
             return "handled"
+        if name == "theme":
+            requested = args.strip().lower()
+            if not requested:
+                choices = ", ".join(THEME_NAMES)
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.STATUS,
+                        f"theme={self.config.ui.theme} available={choices}",
+                    )
+                )
+                return "handled"
+            try:
+                selected = get_theme(requested).name
+            except ValueError as exc:
+                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
+                return "handled"
+            path = save_user_theme(selected)
+            self.config.ui.theme = selected
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    f"theme set to {selected} in {path}",
+                    meta={"kind": "theme", "theme": selected},
+                )
+            )
+            return "handled"
         if name in self._custom_commands:
             return await self._run_custom_command(name, args)
         if name == "exit" or name == "quit":
@@ -1296,7 +1324,7 @@ class AgentHost:
         finally:
             await self.close()
 
-    async def run_tui(self) -> int:
+    async def run_tui(self, *, onboarding_required: bool = False) -> int:
         """Full-screen Textual UI. App owns input; host owns turns."""
         try:
             from noah_code.ui.textual_app import NoahCodeApp, TextualUI
@@ -1307,7 +1335,7 @@ class AgentHost:
 
         ui = TextualUI()
         self.ui = ui
-        app = NoahCodeApp(self, ui)
+        app = NoahCodeApp(self, ui, onboarding_required=onboarding_required)
         try:
             await app.run_async()
             return 0

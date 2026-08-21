@@ -182,3 +182,31 @@ def maybe_auto_update(*, interval_hours: int, timeout: float) -> str | None:
         next_state["error"] = str(exc)
         _write_state(next_state)
         return None
+
+
+def maybe_check_for_update(*, interval_hours: int, timeout: float) -> UpdateStatus | None:
+    """Return an available update at most once per interval, reusing cached availability."""
+
+    state = _read_state()
+    now = time.time()
+    checked_at = state.get("checked_at", 0)
+    if isinstance(checked_at, int | float) and now - checked_at < interval_hours * 3600:
+        latest = state.get("latest")
+        if isinstance(latest, str):
+            try:
+                cached = UpdateStatus(current=__version__, latest=latest)
+                return cached if cached.available else None
+            except UpdateError:
+                return None
+        return None
+
+    next_state: dict[str, object] = {"checked_at": now, "current": __version__}
+    try:
+        status = check_for_update(timeout=timeout)
+        next_state["latest"] = status.latest
+        _write_state(next_state)
+        return status if status.available else None
+    except UpdateError as exc:
+        next_state["error"] = str(exc)
+        _write_state(next_state)
+        return None

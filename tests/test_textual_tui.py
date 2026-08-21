@@ -30,6 +30,7 @@ from noah_code.ui.textual_app import (
     _normalize_markdown,
     _record_to_entries,
 )
+from noah_code.updates import UpdateStatus
 
 
 def _fake_host(tmp_path: Path):
@@ -52,6 +53,14 @@ def _fake_host(tmp_path: Path):
     host.configure_provider = AsyncMock(return_value="provider configured")
     host._mcp_attached = set()
     return host
+
+
+@pytest.fixture(autouse=True)
+def _disable_live_update_checks(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        "noah_code.ui.textual_app.maybe_check_for_update",
+        lambda **_kwargs: None,
+    )
 
 
 def _rendered_text(renderable) -> str:  # noqa: ANN001
@@ -296,7 +305,10 @@ async def test_tui_paints_before_host_start_and_queues_first_prompt(tmp_path: Pa
 
     async with app.run_test() as pilot:
         await pilot.pause()
-        assert "Starting agent" in _rendered_text(app.query_one("#welcome").content)
+        welcome = _rendered_text(app.query_one("#welcome").content)
+        assert "NOAH" in welcome
+        assert "Starting agent" not in welcome
+        assert "Starting" in _rendered_text(app.query_one("#context-rail").content)
         host.start.assert_awaited_once()
 
         composer = app.query_one("#composer")
@@ -311,6 +323,128 @@ async def test_tui_paints_before_host_start_and_queues_first_prompt(tmp_path: Pa
                 break
             await pilot.pause()
         host.handle_line.assert_awaited_once_with("Run after startup")
+
+
+@pytest.mark.asyncio
+async def test_first_run_opens_model_setup_before_starting_agent(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host._agent = None
+    host.meta = None
+    host.set_provider_api_key.return_value = SimpleNamespace(message="credential saved")
+
+    async def _start():  # noqa: ANN202
+        host._agent = MagicMock(mode="build")
+        host.agent.mode = "build"
+        host.meta = MagicMock(
+            session_id="abcd1234efgh",
+            model="openai/example-model",
+            title="untitled",
+        )
+        return host.meta
+
+    host.start = AsyncMock(side_effect=_start)
+    host.list_provider_infos.return_value = [
+        SimpleNamespace(
+            key="openai",
+            label="OpenAI",
+            description="OpenAI API models",
+            model_hint="openai/MODEL_NAME",
+            credential_hint="OPENAI_API_KEY",
+            configured=False,
+            active=False,
+        )
+    ]
+    app = NoahCodeApp(host, TextualUI(), onboarding_required=True)
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        for _ in range(20):
+            if isinstance(app.screen, FilteredPicker):
+                break
+            await pilot.pause()
+
+        assert isinstance(app.screen, FilteredPicker)
+        assert "MODEL SETUP" in app.screen.query_one("#picker-title").render().plain
+        host.start.assert_not_awaited()
+        assert app.query_one("#welcome").styles.display == "block"
+        rail = _rendered_text(app.query_one("#context-rail").content)
+        assert "Choose a model" in rail
+
+        await pilot.press("enter")
+        await pilot.pause()
+        app.screen.query_one("#prompt-input").value = "first-run-key"
+        await pilot.press("enter")
+        for _ in range(20):
+            if host.set_provider_api_key.await_count:
+                break
+            await pilot.pause()
+        app.screen.query_one("#prompt-input").value = "example-model"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")
+
+        for _ in range(40):
+            if app._agent_ready:
+                break
+            await pilot.pause()
+        assert app._agent_ready is True
+        host.start.assert_awaited_once()
+        assert app.query_one("#welcome").styles.display == "block"
+
+
+@pytest.mark.asyncio
+async def test_available_update_uses_temporary_banner_and_persistent_rail(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        "noah_code.ui.textual_app.maybe_check_for_update",
+        lambda **_kwargs: UpdateStatus(current="0.2.1", latest="0.3.0"),
+    )
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        for _ in range(20):
+            if app._available_update is not None:
+                break
+            await pilot.pause()
+
+        banner = app.query_one("#notice-banner")
+        assert banner.styles.display == "block"
+        assert "0.2.1 → 0.3.0" in _rendered_text(banner.content)
+        assert "noah update" in _rendered_text(banner.content)
+        rail = _rendered_text(app.query_one("#context-rail").content)
+        assert "UPDATE" in rail
+        assert "0.2.1 → 0.3.0" in rail
+
+
+@pytest.mark.asyncio
+async def test_theme_picker_applies_and_persists_theme(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "/theme"
+        await pilot.pause()
+        app.close_suggestions()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, FilteredPicker)
+
+        await pilot.press("down", "enter")
+        for _ in range(20):
+            if app._theme_name == "noah-ocean":
+                break
+            await pilot.pause()
+
+        assert app._theme_name == "noah-ocean"
+        assert composer.theme == "noah-ocean"
+        assert app.get_css_variables()["nc-canvas"] == "#07151d"
+        assert 'theme = "noah-ocean"' in config_path.read_text()
 
 
 @pytest.mark.asyncio
@@ -433,6 +567,31 @@ async def test_slash_suggestions_filter_navigate_and_complete(tmp_path: Path) ->
         rendered = _rendered_text(suggestions.content)
         assert "/model --global MODEL" in rendered
         assert app._suggestion_index == len(app._suggestion_matches) - 1
+
+
+@pytest.mark.asyncio
+async def test_slash_suggestion_selection_remains_visible_after_first_page(
+    tmp_path: Path,
+) -> None:
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        composer = app.query_one("#composer")
+        suggestions = app.query_one("#command-suggestions")
+        composer.text = "/"
+        await pilot.pause()
+
+        rendered = _rendered_text(suggestions.content)
+        assert "1–5 of 27" in rendered
+        assert "› /help" in rendered
+
+        await pilot.press("down", "down", "down", "down", "down")
+        rendered = _rendered_text(suggestions.content)
+
+        assert "2–6 of 27" in rendered
+        assert "› /reasoning" in rendered
+        assert "/help" not in rendered
 
 
 @pytest.mark.asyncio
@@ -694,7 +853,10 @@ async def test_model_setup_recovers_a_missing_credential_startup_failure(tmp_pat
             if app._phase == "startup failed":
                 break
             await pilot.pause()
-        assert "Type /model" in _log_text(app.query_one("#conversation"))
+        banner = app.query_one("#notice-banner")
+        assert banner.styles.display == "block"
+        assert "open /model" in _rendered_text(banner.content).lower()
+        assert app.query_one("#welcome").styles.display == "block"
 
         composer = app.query_one("#composer")
         composer.text = "/model"

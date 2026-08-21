@@ -11,6 +11,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from noah_code.themes import ThemeName, get_theme
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
@@ -67,7 +69,7 @@ class EfficiencyConfig(BaseModel):
 
 
 class UIConfig(BaseModel):
-    theme: Literal["atom-one-dark"] = "atom-one-dark"
+    theme: ThemeName = "atom-one-dark"
     show_reasoning: bool = False
     markdown: bool = True
     stream_shell: bool = True
@@ -75,7 +77,7 @@ class UIConfig(BaseModel):
 
 
 class UpdateConfig(BaseModel):
-    auto_install: bool = True
+    auto_install: bool = False
     interval_hours: int = Field(default=24, ge=1, le=24 * 30)
     check_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
 
@@ -339,6 +341,61 @@ def save_user_reasoning_effort(effort: str) -> Path:
     try:
         with os.fdopen(descriptor, "w") as stream:
             stream.write(content)
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return path
+
+
+def save_user_theme(theme: str) -> Path:
+    """Persist the UI theme inside the user ``[ui]`` table."""
+
+    selected = get_theme(theme.strip().lower()).name
+    path = _user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    existing = path.read_text() if path.is_file() else ""
+    lines = existing.splitlines(keepends=True)
+    replacement = f"theme = {json.dumps(selected)}\n"
+
+    table_start = next(
+        (index for index, line in enumerate(lines) if line.strip() == "[ui]"),
+        None,
+    )
+    if table_start is None:
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += "\n"
+        if lines and lines[-1].strip():
+            lines.append("\n")
+        lines.extend(["[ui]\n", replacement])
+    else:
+        table_end = next(
+            (
+                index
+                for index, line in enumerate(lines[table_start + 1 :], start=table_start + 1)
+                if line.lstrip().startswith("[")
+            ),
+            len(lines),
+        )
+        theme_line = next(
+            (
+                index
+                for index, line in enumerate(lines[table_start + 1 : table_end], start=table_start + 1)
+                if re.match(r"^\s*theme\s*=", line)
+            ),
+            None,
+        )
+        if theme_line is None:
+            lines.insert(table_end, replacement)
+        else:
+            lines[theme_line] = replacement
+
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".config-", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write("".join(lines))
         os.chmod(temporary_path, 0o600)
         os.replace(temporary_path, path)
     finally:

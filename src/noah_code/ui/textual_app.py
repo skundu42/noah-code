@@ -40,20 +40,26 @@ from noah_code.composer import mention_suggestions
 from noah_code.event_bridge import _describe_code_activity
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.sessions import SessionEventRecord
+from noah_code.themes import THEMES, ThemePalette, get_theme
 from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt
+from noah_code.updates import UpdateStatus, maybe_check_for_update
 
 if TYPE_CHECKING:
     from noah_code.host import AgentHost
 
 
-ATOM_ONE_DARK_TEXT_AREA = TextAreaTheme(
-    name="atom-one-dark",
-    base_style=Style(color="#d1d1d6", bgcolor="#17171a"),
-    cursor_style=Style(color="#101012", bgcolor="#b8a9ff"),
-    cursor_line_style=Style(bgcolor="#222226"),
-    bracket_matching_style=Style(color="#e6b673", bold=True),
-    selection_style=Style(bgcolor="#303036"),
-)
+def _text_area_theme(theme: ThemePalette) -> TextAreaTheme:
+    return TextAreaTheme(
+        name=theme.name,
+        base_style=Style(color=theme.text, bgcolor=theme.surface),
+        cursor_style=Style(color=theme.canvas, bgcolor=theme.accent),
+        cursor_line_style=Style(bgcolor=theme.raised),
+        bracket_matching_style=Style(color=theme.warning, bold=True),
+        selection_style=Style(bgcolor=theme.border),
+    )
+
+
+TEXT_AREA_THEMES = tuple(_text_area_theme(theme) for theme in THEMES.values())
 
 MAX_TRANSCRIPT_LINES = 10_000
 MAX_ACTIVITY_HISTORY = 100
@@ -62,6 +68,7 @@ RECENT_HISTORY_SIZE = 24
 STREAM_FLUSH_SECONDS = 0.05
 WIDE_MIN_COLUMNS = 110
 COMPACT_MAX_ROWS = 25
+UPDATE_BANNER_SECONDS = 12.0
 
 
 class HostEventsReady(Message):
@@ -260,22 +267,12 @@ def _coalesce_activity_text(previous: str, current: str) -> str | None:
     return f"✓ {left_verb} {_format_activity_files(paths + more, extra + more_extra)}"
 
 
-def _welcome_renderable(repository: str, *, starting: bool) -> Group:
-    """Focused empty state inspired by terminal-native coding tools."""
+def _welcome_renderable(theme: ThemePalette) -> Group:
+    """Render the quiet Noah mark shown until a session has user content."""
 
-    state = "Starting agent…" if starting else "Ready"
     return Group(
-        Text("NOAH", style="bold #f1f1f3", justify="center"),
-        Text("CODE", style="bold #b8a9ff", justify="center"),
-        Text(""),
-        Text(repository, style="#777781", justify="center"),
-        Text(state, style="#8bd5ca" if not starting else "#e6b673", justify="center"),
-        Text(""),
-        Text(
-            "/  commands     tab  build/plan     ctrl+p  palette",
-            style="#777781",
-            justify="center",
-        ),
+        Text("NOAH", style=f"bold {theme.text}", justify="center"),
+        Text("CODE", style=f"bold {theme.accent}", justify="center"),
     )
 
 
@@ -1101,12 +1098,22 @@ class NoahCodeApp(App[None]):
         Binding("question_mark", "show_help", "Help", show=False),
     ]
 
-    def __init__(self, host: AgentHost, ui: TextualUI) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        host: AgentHost,
+        ui: TextualUI,
+        *,
+        onboarding_required: bool = False,
+    ) -> None:
         self.host = host
         self.ui = ui
+        self._theme_name = host.config.ui.theme
+        super().__init__()
         self._turn_task: asyncio.Task[None] | None = None
         self._agent_ready = host._agent is not None
+        self._onboarding_required = onboarding_required
+        self._session_has_prompt = False
+        self._pre_prompt_status = "Choose a model to finish setup" if onboarding_required else ""
         self._pending_submit: str | None = None
         self._session_id = host.meta.session_id if host.meta else None
         self._interrupt_count = 0
@@ -1116,6 +1123,8 @@ class NoahCodeApp(App[None]):
         self._spinner_index = 0
         self._spinner_timer: Timer | None = None
         self._stream_timer: Timer | None = None
+        self._notice_timer: Timer | None = None
+        self._available_update: UpdateStatus | None = None
         self._stream_fragments: list[tuple[str, str]] = []
         self._activities: dict[str, ActivityRecord] = {}
         self._activity_history: deque[ActivityRecord] = deque(maxlen=MAX_ACTIVITY_HISTORY)
@@ -1136,15 +1145,22 @@ class NoahCodeApp(App[None]):
     def suggestions_open(self) -> bool:
         return bool(self._suggestion_matches)
 
+    @property
+    def theme_palette(self) -> ThemePalette:
+        return get_theme(self._theme_name)
+
+    def get_css_variables(self) -> dict[str, str]:
+        variables = super().get_css_variables()
+        variables.update(get_theme(self._theme_name).css_variables())
+        return variables
+
     def compose(self) -> ComposeResult:
         yield Static("", id="header")
+        yield Static("", id="notice-banner")
         with Horizontal(id="workspace-layout"):
             with Vertical(id="primary-pane"):
                 yield Static(
-                    _welcome_renderable(
-                        self.host.workspace.root.name or str(self.host.workspace.root),
-                        starting=not self._agent_ready,
-                    ),
+                    _welcome_renderable(self.theme_palette),
                     id="welcome",
                 )
                 yield RichLog(
@@ -1182,8 +1198,9 @@ class NoahCodeApp(App[None]):
         self.ui.bind_app(self)
         self._apply_layout(self.size.width, self.size.height)
         composer = self.query_one("#composer", ComposerTextArea)
-        composer.register_theme(ATOM_ONE_DARK_TEXT_AREA)
-        composer.theme = self.host.config.ui.theme
+        for theme in TEXT_AREA_THEMES:
+            composer.register_theme(theme)
+        composer.theme = self._theme_name
         composer.focus()
         self._spinner_timer = self.set_interval(
             0.25,
@@ -1191,12 +1208,73 @@ class NoahCodeApp(App[None]):
             pause=not self.ui.busy and self._agent_ready,
         )
         self.update_chrome(force=True)
-        if self._agent_ready:
+        self._check_update_notice()
+        if self._onboarding_required:
+            self._phase = "setup required"
+            self.call_after_refresh(self.action_model_setup)
+        elif self._agent_ready:
             self._load_recent_history()
         else:
             self._phase = "starting"
+            self._pre_prompt_status = "Starting Noah…"
             self.ui.set_busy(True)
             self._start_host()
+
+    def apply_theme(self, name: str) -> None:
+        """Apply a Noah palette immediately without restarting the session."""
+
+        selected = get_theme(name).name
+        self._theme_name = selected
+        self.host.config.ui.theme = selected
+        composer = self.query_one("#composer", ComposerTextArea)
+        composer.theme = selected
+        self.refresh_css(animate=False)
+        self.query_one("#welcome", Static).update(
+            _welcome_renderable(self.theme_palette),
+            layout=False,
+        )
+        self._rerender_transcript()
+        self.update_chrome(force=True)
+
+    @work(exclusive=True, group="update-check")
+    async def _check_update_notice(self) -> None:
+        status = await asyncio.to_thread(
+            maybe_check_for_update,
+            interval_hours=self.host.config.updates.interval_hours,
+            timeout=self.host.config.updates.check_timeout_seconds,
+        )
+        if status is None:
+            return
+        self._available_update = status
+        self._show_notice(
+            f"Update available  {status.current} → {status.latest}  ·  run noah update when ready",
+            kind="update",
+            temporary=True,
+        )
+        self.update_chrome(force=True)
+
+    def _show_notice(
+        self,
+        message: str,
+        *,
+        kind: str = "info",
+        temporary: bool = False,
+    ) -> None:
+        banner = self.query_one("#notice-banner", Static)
+        banner.remove_class("info", "update", "error")
+        banner.add_class(kind)
+        banner.update(message, layout=False)
+        banner.styles.display = "block"
+        if self._notice_timer is not None:
+            self._notice_timer.stop()
+            self._notice_timer = None
+        if temporary:
+            self._notice_timer = self.set_timer(UPDATE_BANNER_SECONDS, self._hide_notice)
+
+    def _hide_notice(self) -> None:
+        self._notice_timer = None
+        with contextlib.suppress(Exception):
+            self.query_one("#notice-banner", Static).styles.display = "none"
 
     @work(exclusive=True, group="startup")
     async def _start_host(self) -> None:
@@ -1206,22 +1284,19 @@ class NoahCodeApp(App[None]):
             await self.host.start()
         except Exception as exc:  # noqa: BLE001
             self._phase = "startup failed"
-            self._reveal_transcript()
-            self._append_entry(
-                TranscriptEntry(
-                    "ERROR",
-                    f"Agent could not start: {exc}\nType /model to configure a provider and retry.",
-                )
+            self._pre_prompt_status = "Startup failed · open /model to retry"
+            self._show_notice(
+                f"Agent could not start: {exc} · open /model to configure a provider and retry",
+                kind="error",
             )
         else:
             self._agent_ready = True
+            self._onboarding_required = False
             self._phase = "ready"
+            self._pre_prompt_status = "Ready for your first prompt"
             self._base_commands = all_command_suggestions(self.host._custom_commands)
             self.query_one("#welcome", Static).update(
-                _welcome_renderable(
-                    self.host.workspace.root.name or str(self.host.workspace.root),
-                    starting=False,
-                ),
+                _welcome_renderable(self.theme_palette),
                 layout=False,
             )
             if self._pending_submit:
@@ -1304,10 +1379,13 @@ class NoahCodeApp(App[None]):
             verb = "starting" if not self._agent_ready else "working"
             state = f"{verb} {'◐◓◑◒'[self._spinner_index]}"
         unread = f"  {self._unread_count} new" if self._unread_count else ""
-        header = (
-            f" noah   {repository}   {mode.upper()}   {model} · r:{effort_label}   "
-            f"{session_id}   {state}{unread} "
-        )
+        if self._session_has_prompt:
+            header = (
+                f" noah   {repository}   {mode.upper()}   {model} · r:{effort_label}   "
+                f"{session_id}   {state}{unread} "
+            )
+        else:
+            header = f" noah   {state}{unread} "
         if force or header != self._header_text:
             self._header_text = header
             with contextlib.suppress(Exception):
@@ -1327,35 +1405,60 @@ class NoahCodeApp(App[None]):
 
     def _build_rail_text(self) -> Text:
         meta = self.host.meta
+        palette = self.theme_palette
+        mode = self.host.agent.mode if self.host._agent else self.host.config.mode
+        model = meta.model if meta else self.host.config.model
+        effort = getattr(meta, "reasoning_effort", self.host.config.reasoning_effort)
         text = Text()
-        text.append("SESSION\n", style="bold #b8a9ff")
+        text.append("WORKSPACE\n", style=f"bold {palette.accent}")
+        text.append(
+            f"{self.host.workspace.root.name or self.host.workspace.root}\n",
+            style=palette.text,
+        )
+        text.append(f"{mode.upper()} · {model}\n", style=palette.muted)
+        text.append(
+            f"reasoning: {'auto' if effort == 'default' else effort}",
+            style=palette.muted,
+        )
+
+        text.append("\n\nSESSION\n", style=f"bold {palette.accent}")
         text.append(
             f"{meta.title if meta and meta.title != 'untitled' else 'Untitled session'}\n",
-            style="#d1d1d6",
+            style=palette.text,
         )
         if meta:
-            text.append(f"{meta.session_id[:8]}\n", style="#777781")
-        text.append("\nCURRENT\n", style="bold #b8a9ff")
+            text.append(f"{meta.session_id[:8]}\n", style=palette.muted)
+        text.append("\nCURRENT\n", style=f"bold {palette.accent}")
         if self._active_activity_id and self._active_activity_id in self._activities:
             record = self._activities[self._active_activity_id]
-            text.append("Running\n", style="#e6b673")
+            text.append("Running\n", style=palette.warning)
             label = record.label
             if len(label) > 28:
                 label = "…" + label[-27:]
-            text.append(label, style="#d1d1d6")
+            text.append(label, style=palette.text)
+        elif not self._session_has_prompt and self._pre_prompt_status:
+            text.append(self._pre_prompt_status, style=palette.muted)
         else:
-            text.append("Waiting for your next turn", style="#777781")
+            text.append("Waiting for your next turn", style=palette.muted)
+
+        if self._available_update is not None:
+            text.append("\n\nUPDATE\n", style=f"bold {palette.warning}")
+            text.append(
+                f"{self._available_update.current} → {self._available_update.latest}\n",
+                style=palette.text,
+            )
+            text.append("run: noah update", style=palette.muted)
 
         with contextlib.suppress(Exception):
             usage = self.host.usage_snapshot()
-            text.append("\n\nTOKENS\n", style="bold #b8a9ff")
+            text.append("\n\nTOKENS\n", style=f"bold {palette.accent}")
             text.append(
                 f"{usage.uncached_tokens:,} uncached · {usage.cache_hit_ratio:.0%} cache\n",
-                style="#d1d1d6",
+                style=palette.text,
             )
             text.append(
                 f"{usage.calls} calls · {usage.llm_seconds:.1f}s model",
-                style="#777781",
+                style=palette.muted,
             )
 
         todos: list[Any] = []
@@ -1364,17 +1467,17 @@ class NoahCodeApp(App[None]):
                 candidate = self.host.agent.todos.list_todos()
                 if isinstance(candidate, list):
                     todos = candidate
-        text.append("\n\nPLAN\n", style="bold #b8a9ff")
+        text.append("\n\nPLAN\n", style=f"bold {palette.accent}")
         if not todos:
-            text.append("No active plan", style="#777781")
+            text.append("No active plan", style=palette.muted)
             return text
         done = sum(1 for todo in todos if getattr(todo, "status", "") == "done")
-        text.append(f"{done}/{len(todos)} complete\n", style="#777781")
+        text.append(f"{done}/{len(todos)} complete\n", style=palette.muted)
         visible = [todo for todo in todos if getattr(todo, "status", "") != "done"][:6]
         for todo in visible:
             status = getattr(todo, "status", "open")
             icon = "●" if status == "blocked" else "○"
-            color = "#ed8796" if status == "blocked" else "#d1d1d6"
+            color = palette.error if status == "blocked" else palette.text
             text.append(f"{icon} {str(getattr(todo, 'title', 'Untitled'))[:28]}\n", style=color)
         return text
 
@@ -1385,6 +1488,9 @@ class NoahCodeApp(App[None]):
     def _append_entry(self, entry: TranscriptEntry) -> None:
         if entry.event_id and entry.event_id in self._transcript_event_ids:
             return
+        if entry.role == "YOU":
+            self._session_has_prompt = True
+            self._pre_prompt_status = ""
         at_end = self._follow_batch if self._follow_batch is not None else self._at_transcript_end()
         if entry.event_id:
             self._transcript_event_ids.add(entry.event_id)
@@ -1442,6 +1548,12 @@ class NoahCodeApp(App[None]):
         entries = [entry for record in records for entry in _record_to_entries(record)]
         if not entries:
             return
+        if not any(entry.role == "YOU" for entry in entries):
+            self._pre_prompt_status = "Ready for your first prompt"
+            self.update_chrome(force=True)
+            return
+        self._session_has_prompt = True
+        self._pre_prompt_status = ""
         self._reveal_transcript()
         existing = list(self._transcript_entries)
         history = [
@@ -1483,6 +1595,8 @@ class NoahCodeApp(App[None]):
     def _process_host_event(self, event: HostEvent) -> None:
         text = event.text.rstrip()
         if event.kind == HostEventKind.MESSAGE:
+            self._session_has_prompt = True
+            self._pre_prompt_status = ""
             self._finish_orphan_activity()
             plain_command = (
                 event.meta.get("source") == "command" or event.meta.get("format") == "plain"
@@ -1505,18 +1619,31 @@ class NoahCodeApp(App[None]):
             self._finish_activity(event)
         elif event.kind == HostEventKind.ERROR:
             self._finish_orphan_activity(state="error")
-            self._append_entry(TranscriptEntry("ERROR", text))
+            if self._session_has_prompt:
+                self._append_entry(TranscriptEntry("ERROR", text))
+            else:
+                self._pre_prompt_status = text
+                self._show_notice(text, kind="error")
         elif event.kind == HostEventKind.SUMMARY:
             self._append_entry(TranscriptEntry("SUMMARY", text, True))
         elif event.kind == HostEventKind.STATUS:
             kind = event.meta.get("kind")
-            if kind == "llm_start":
+            if kind == "theme":
+                self.apply_theme(str(event.meta.get("theme", self._theme_name)))
+            elif kind == "llm_start":
                 self._phase = "thinking"
             elif kind == "llm_end":
                 self._finish_orphan_activity()
                 self._phase = "ready"
             elif text.startswith("mode set to "):
                 self._phase = "ready"
+            elif not self._session_has_prompt:
+                if text.startswith("session="):
+                    self._pre_prompt_status = "Ready for your first prompt"
+                elif text.startswith("title=") or text.startswith("MCP"):
+                    pass
+                else:
+                    self._pre_prompt_status = text
             else:
                 self._append_entry(TranscriptEntry("STATUS", text))
         elif event.kind == HostEventKind.STOP:
@@ -1672,6 +1799,19 @@ class NoahCodeApp(App[None]):
                 for item in mode_options
                 if item.invocation.rsplit(" ", 1)[-1].startswith(mode_query)
             ]
+        if raw_lowered.startswith("/theme "):
+            theme_query = raw_lowered.removeprefix("/theme ").strip()
+            theme_options = [
+                CommandSuggestion(f"/theme {theme.name}", theme.description)
+                for theme in THEMES.values()
+            ]
+            if not theme_query:
+                return theme_options
+            return [
+                item
+                for item in theme_options
+                if item.invocation.rsplit(" ", 1)[-1].startswith(theme_query)
+            ]
         commands = list(self._base_commands)
         lowered = query.lower()
         if lowered.startswith("/config"):
@@ -1702,7 +1842,10 @@ class NoahCodeApp(App[None]):
             )
             return
         total = len(self._suggestion_matches)
-        window_size = 8
+        # The panel's border and vertical padding leave room for a heading plus
+        # five rows (three in compact mode). Keep the paging window within that
+        # visible area so the active row can never move into clipped content.
+        window_size = 3 if self.screen.has_class("compact") else 5
         start = min(
             max(self._suggestion_index - window_size + 1, 0),
             max(total - window_size, 0),
@@ -1710,14 +1853,29 @@ class NoahCodeApp(App[None]):
         visible = self._suggestion_matches[start : start + window_size]
         end = start + len(visible)
         count = f"{start + 1}–{end} of {total}" if total > window_size else f"{total} matches"
-        lines = [Text.assemble(("COMMANDS", "bold #b8a9ff"), (f"  {count}", "#777781"))]
+        palette = self.theme_palette
+        lines = [
+            Text.assemble(
+                ("COMMANDS", f"bold {palette.accent}"),
+                (f"  {count}", palette.muted),
+            )
+        ]
         for offset, item in enumerate(visible):
             index = start + offset
-            marker = "› " if index == self._suggestion_index else "  "
-            style = "bold #8bd5ca" if index == self._suggestion_index else "#d1d1d6"
+            if index == self._suggestion_index:
+                active_style = f"bold {palette.canvas} on {palette.accent}"
+                lines.append(
+                    Text.assemble(
+                        ("› ", active_style),
+                        (item.invocation, active_style),
+                        (f"  {item.description}", f"{palette.canvas} on {palette.accent}"),
+                    )
+                )
+                continue
             lines.append(
                 Text.assemble(
-                    (marker + item.invocation, style), (f"  {item.description}", "#777781")
+                    ("  " + item.invocation, palette.text),
+                    (f"  {item.description}", palette.muted),
                 )
             )
         widget.update(Group(*lines))
@@ -2049,11 +2207,20 @@ class NoahCodeApp(App[None]):
                     model,
                     reasoning_effort=reasoning_effort,
                 )
-            self._append_entry(TranscriptEntry("STATUS", status))
+            if self._session_has_prompt:
+                self._append_entry(TranscriptEntry("STATUS", status))
+            else:
+                self._pre_prompt_status = "Provider configured · starting agent"
+                self._show_notice("Provider configured", temporary=True)
             self.update_chrome(force=True)
             self._retry_startup_after_setup()
         except Exception as exc:  # noqa: BLE001
-            self._append_entry(TranscriptEntry("ERROR", f"Provider setup failed: {exc}"))
+            message = f"Provider setup failed: {exc}"
+            if self._session_has_prompt:
+                self._append_entry(TranscriptEntry("ERROR", message))
+            else:
+                self._pre_prompt_status = "Provider setup failed"
+                self._show_notice(message, kind="error")
 
     async def _pick_reasoning_effort(self, title: str) -> str | None:
         """Choose a portable LiteLLM reasoning effort or leave it provider-controlled."""
@@ -2096,6 +2263,53 @@ class NoahCodeApp(App[None]):
             self.update_chrome(force=True)
         except Exception as exc:  # noqa: BLE001
             self._append_entry(TranscriptEntry("ERROR", f"Reasoning setup failed: {exc}"))
+
+    @work(exclusive=True, group="theme-setup")
+    async def action_theme_setup(self) -> None:
+        """Choose, apply, and persist a semantic Noah color palette."""
+
+        try:
+            rows = [
+                (f"theme:{theme.name}", theme.label, theme.description)
+                for theme in THEMES.values()
+            ]
+            rows.sort(key=lambda row: row[0] != f"theme:{self._theme_name}")
+            choice = await self.push_screen_wait(
+                FilteredPicker(
+                    "Interface theme",
+                    rows,
+                    "Type to search · Enter apply · Esc close",
+                )
+            )
+            if not choice:
+                return
+            selected = choice.removeprefix("theme:")
+            await self._save_and_apply_theme(selected)
+        except Exception as exc:  # noqa: BLE001
+            message = f"Theme setup failed: {exc}"
+            if self._session_has_prompt:
+                self._append_entry(TranscriptEntry("ERROR", message))
+            else:
+                self._show_notice(message, kind="error")
+
+    async def _save_and_apply_theme(self, selected: str) -> None:
+        from noah_code.config import save_user_theme
+
+        path = await asyncio.to_thread(save_user_theme, selected)
+        self.apply_theme(selected)
+        message = f"Theme set to {selected} · saved in {path}"
+        if self._session_has_prompt:
+            self._append_entry(TranscriptEntry("STATUS", message))
+        else:
+            self._pre_prompt_status = "Ready for your first prompt"
+            self._show_notice(message, temporary=True)
+
+    @work(exclusive=True, group="theme-setup")
+    async def _apply_theme_command(self, selected: str) -> None:
+        try:
+            await self._save_and_apply_theme(selected)
+        except Exception as exc:  # noqa: BLE001
+            self._show_notice(f"Theme setup failed: {exc}", kind="error")
 
     @work(exclusive=True, group="model-setup")
     async def action_model_setup(self) -> None:
@@ -2149,7 +2363,7 @@ class NoahCodeApp(App[None]):
             info = next(item for item in infos if item.key == provider)
             preset = provider_preset(provider)
             credential_result = None
-            if preset.api_key_env is not None:
+            if preset.api_key_env is not None and not info.configured:
                 api_key = await self.push_screen_wait(
                     TextPromptModal(
                         f"Model setup · 2 of 4 · {info.label} API key",
@@ -2171,7 +2385,10 @@ class NoahCodeApp(App[None]):
             )
             if not model:
                 if credential_result:
-                    self._append_entry(TranscriptEntry("STATUS", credential_result.message))
+                    if self._session_has_prompt:
+                        self._append_entry(TranscriptEntry("STATUS", credential_result.message))
+                    else:
+                        self._show_notice(credential_result.message, temporary=True)
                 return
             reasoning_effort = await self._pick_reasoning_effort(
                 f"Model setup · {'4 of 4' if credential_result else '3 of 3'} · Reasoning"
@@ -2185,17 +2402,27 @@ class NoahCodeApp(App[None]):
             )
             if credential_result:
                 status = f"{status}\n{credential_result.message}."
-            self._append_entry(TranscriptEntry("STATUS", status))
+            if self._session_has_prompt:
+                self._append_entry(TranscriptEntry("STATUS", status))
+            else:
+                self._pre_prompt_status = "Model configured · starting agent"
+                self._show_notice("Model configured · starting Noah", temporary=True)
             self.update_chrome(force=True)
             self._retry_startup_after_setup()
         except Exception as exc:  # noqa: BLE001
-            self._append_entry(TranscriptEntry("ERROR", f"Model setup failed: {exc}"))
+            message = f"Model setup failed: {exc}"
+            if self._session_has_prompt:
+                self._append_entry(TranscriptEntry("ERROR", message))
+            else:
+                self._pre_prompt_status = "Model setup failed · open /model to retry"
+                self._show_notice(message, kind="error")
 
     def _retry_startup_after_setup(self) -> None:
         """Retry startup after credentials are configured from a failed shell."""
 
-        if self._agent_ready or self._phase != "startup failed":
+        if self._agent_ready or self._phase not in {"startup failed", "setup required"}:
             return
+        self._onboarding_required = False
         self._phase = "starting"
         self.ui.set_busy(True)
         self._start_host()
@@ -2234,6 +2461,8 @@ class NoahCodeApp(App[None]):
         changed_session = self._session_id is not None and current_session_id != self._session_id
         self._session_id = current_session_id
         self._agent_ready = True
+        self._session_has_prompt = False
+        self._pre_prompt_status = "Ready for your first prompt"
         self._config_commands = None
         self._base_commands = all_command_suggestions(self.host._custom_commands)
         if not changed_session:
@@ -2246,12 +2475,16 @@ class NoahCodeApp(App[None]):
         self.query_one("#conversation", RichLog).styles.display = "none"
         self.query_one("#welcome", Static).styles.display = "block"
         self.query_one("#welcome", Static).update(
-            _welcome_renderable(
-                self.host.workspace.root.name or str(self.host.workspace.root),
-                starting=False,
-            ),
+            _welcome_renderable(self.theme_palette),
             layout=False,
         )
+        if self._available_update is not None:
+            self._show_notice(
+                f"Update available  {self._available_update.current} → "
+                f"{self._available_update.latest}  ·  run noah update when ready",
+                kind="update",
+                temporary=True,
+            )
         self._load_recent_history()
         self.update_chrome(force=True)
 
@@ -2324,6 +2557,16 @@ class NoahCodeApp(App[None]):
             composer.text = ""
             self.close_suggestions()
             self.action_model_setup()
+            return
+        if text == "/theme":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_theme_setup()
+            return
+        if text.startswith("/theme "):
+            composer.text = ""
+            self.close_suggestions()
+            self._apply_theme_command(text.removeprefix("/theme ").strip())
             return
         if self._agent_ready and text == "/reasoning":
             composer.text = ""

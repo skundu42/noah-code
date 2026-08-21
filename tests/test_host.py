@@ -218,7 +218,14 @@ async def test_resume_uses_persisted_model(tmp_path: Path, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_config_slash_command_shows_scoped_setting(tmp_path: Path) -> None:
+async def test_config_slash_command_shows_scoped_setting(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        "noah_code.config._user_config_path",
+        lambda: tmp_path / "user-config.toml",
+    )
     workspace = Workspace(root=tmp_path.resolve())
     config = load_config(
         workspace.root,
@@ -236,6 +243,32 @@ async def test_config_slash_command_shows_scoped_setting(tmp_path: Path) -> None
     assert "atom-one-dark" in event.text
     assert event.meta == {"format": "plain", "source": "command"}
     assert "```" not in event.text
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_theme_slash_command_persists_and_emits_live_theme_event(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+    monkeypatch.setattr("noah_code.host.save_user_theme", lambda theme: config_path)
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+
+    action = await host.handle_line("/theme graphite")
+
+    assert action == "handled"
+    assert config.ui.theme == "graphite"
+    event = host.ui.render.call_args.args[0]
+    assert event.meta == {"kind": "theme", "theme": "graphite"}
     await host.close()
 
 

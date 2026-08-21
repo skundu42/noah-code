@@ -1,14 +1,3 @@
-$nc-canvas: #101012;
-$nc-surface: #17171a;
-$nc-raised: #222226;
-$nc-border: #303036;
-$nc-text: #d1d1d6;
-$nc-muted: #777781;
-$nc-accent: #b8a9ff;
-$nc-success: #8bd5ca;
-$nc-warning: #e6b673;
-$nc-error: #ed8796;
-
 Screen {
     background: $nc-canvas;
     color: $nc-text;
@@ -20,6 +9,26 @@ Screen {
     padding: 0 1;
     background: $nc-canvas;
     color: $nc-muted;
+}
+
+#notice-banner {
+    display: none;
+    height: 1;
+    padding: 0 2;
+    background: $nc-raised;
+    color: $nc-text;
+    border-left: thick $nc-accent;
+    content-align: left middle;
+}
+
+#notice-banner.update {
+    background: $nc-raised;
+    border-left: thick $nc-warning;
+}
+
+#notice-banner.error {
+    background: $nc-raised;
+    border-left: thick $nc-error;
 }
 
 #workspace-layout {
@@ -62,7 +71,7 @@ Screen {
     padding: 1 1;
     background: $nc-canvas;
     color: $nc-text;
-    border-left: solid #242428;
+    border-left: solid $nc-border;
 }
 
 #working-banner {
@@ -71,7 +80,7 @@ Screen {
     margin: 0 2;
     padding: 0 1;
     content-align: left middle;
-    background: #1a1915;
+    background: $nc-raised;
     border-left: thick $nc-warning;
     color: $nc-text;
 }
@@ -152,7 +161,7 @@ Screen {
 }
 
 .compact #command-suggestions {
-    max-height: 6;
+    max-height: 8;
 }
 
 .compact #live-activity {
@@ -235,7 +244,7 @@ DiffReviewScreen {
 #diff-validation {
     height: 5;
     padding: 1;
-    background: #141419;
+    background: $nc-surface;
     border-top: solid $nc-border;
 }
 

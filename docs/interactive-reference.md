@@ -21,7 +21,8 @@
 At an approval prompt, press `1` to approve once, `2` to remember the approval for the current
 session, or `3`/`Esc` to reject it.
 
-The TUI uses Atom One Dark by default. Its conversation-first layout adapts to terminal size. At
+The TUI uses Atom One Dark by default and also includes Noah Ocean, Graphite, and High Contrast.
+Switch and persist the active palette with `/theme`. Its conversation-first layout adapts to terminal size. At
 110 columns or wider, a context rail shows the session, active tool, and up to six open or blocked
 todos. Narrow terminals retain the transcript, live activity, suggestions, and composer without
 the rail. Terminals 25 rows high or shorter use compact spacing.
@@ -30,6 +31,10 @@ Type `/` in the composer to open the inline command list; the list remains visib
 continuously. Use `Up`/`Down` to highlight a command, `Enter` or `Tab` to complete it, and `Esc` to
 close the list. Press `Enter` again to run the completed command. Typing `/config` expands the list
 to every resolved configuration path and its current redacted value.
+
+Until a session has its first user prompt, the main pane keeps the Noah mark centered. Startup,
+workspace, model, mode, and update state live in the context rail on wide terminals. Existing
+sessions with user history restore their transcript normally.
 
 Tool and shell output is batched into a live execution panel instead of forcing one full-screen
 redraw for every chunk. While a turn is running, a spinner names the current action the way
@@ -44,6 +49,7 @@ latest 100 activity records, bounded by the configured `max_output_chars` per ac
 |---------|---------|
 | `/help` | Show interactive help |
 | `/config [PATH]` | Show every resolved setting or one nested path |
+| `/theme [NAME]` | Search, apply, and persist an interface theme |
 | `/mode` | Show or switch between `build` and `plan` |
 | `/model` | Choose a provider, masked API key, model, and optional reasoning effort |
 | `/model MODEL` | Switch the active session model |
