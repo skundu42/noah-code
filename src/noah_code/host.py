@@ -235,6 +235,12 @@ class AgentHost:
         self.meta = session_meta
         self._exit_requested = False
         self._title_task: asyncio.Task[Any] | None = None
+        self._budget_guard: Any = None
+        self._llm_cache: Any = None
+        self._hooks: Any = None
+        self._checkpoints: Any = None
+        self.last_checkpoint: dict[str, Any] | None = None
+        self._post_hook_tasks: list[asyncio.Task[Any]] = []
         self._trace_info = "auto (viewer if reachable)"
         self._active_turn: asyncio.Task[Any] | None = None
         self._event_unsubs: list[Any] = []
@@ -282,6 +288,11 @@ class AgentHost:
         # Textual shell can paint and remain responsive meanwhile.
         agent_class, get_llm_client = await asyncio.to_thread(_load_agent_runtime)
 
+        client_kwargs: dict[str, Any] = {}
+        if self._llm is None:
+            from noah_code.llm import reasoning_overrides, sampling_overrides
+
+            client_kwargs.update(sampling_overrides(self.config.sampling))
         llm = self._llm
         if llm is None:
             from noah_code.llm import reasoning_overrides
@@ -290,13 +301,27 @@ class AgentHost:
                 get_llm_client,
                 self.meta.model,
                 **reasoning_overrides(self.meta.reasoning_effort),
+                **client_kwargs,
             )
         lightweight_llm = llm
         if self.config.lightweight_model and self.config.lightweight_model != self.meta.model:
             lightweight_llm = await asyncio.to_thread(
                 get_llm_client,
                 self.config.lightweight_model,
+                **client_kwargs,
             )
+
+        from noah_code.budget import SharedBudgetLLM, wrap_with_budget
+        from noah_code.llm_cache import resolve_cache_settings, wrap_with_cache
+
+        llm, self._budget_guard = wrap_with_budget(llm, self.config.budget)
+        if isinstance(llm, SharedBudgetLLM):
+            # Both routes draw from one guard so caps span the whole session.
+            lightweight_llm = SharedBudgetLLM(lightweight_llm, self._budget_guard)
+        cache_mode, cache_dir = resolve_cache_settings()
+        llm = wrap_with_cache(llm, cache_dir, cache_mode)
+        lightweight_llm = wrap_with_cache(lightweight_llm, cache_dir, cache_mode)
+        self._llm_cache = llm if hasattr(llm, "stats") else None
 
         self._setup_tracing(self.meta.session_id)
         self._storage = self.store.open_storage(self.meta.session_id)
@@ -331,8 +356,32 @@ class AgentHost:
         agent.ws.set_shell_chunk_handler(self._on_shell_chunk)
         agent.processes.set_lifecycle_handler(self._on_process_lifecycle)
 
+        from noah_code.checkpoints import CheckpointManager
+        from noah_code.hooks import HookRunner
+
+        self._hooks = HookRunner(self.config.hooks, cwd=self.workspace.root)
+        if self._hooks.active:
+            runner = self._hooks
+
+            async def _pre_tool_guard(decision: Any) -> None:
+                outcome = await runner.run_pre(
+                    tool=str(decision.target)[:80],
+                    category=str(decision.category),
+                    target=str(decision.target),
+                )
+                if not outcome.allowed:
+                    raise PermissionError(outcome.reason)
+
+            agent._approvals.set_guard(_pre_tool_guard)
+
+        session_id = self.meta.session_id
+        self._checkpoints = CheckpointManager(
+            self.workspace.root,
+            session_id,
+            max_per_session=self.config.checkpoints.max_per_session,
+        )
         self._teardown_event_bridge()
-        self._event_unsubs = install_event_bridge(agent, self.ui.render, self._usage)
+        self._event_unsubs = install_event_bridge(agent, self._emit_with_hooks, self._usage)
 
         self._custom_commands = discover_custom_commands(self.workspace.root)
 
@@ -383,6 +432,69 @@ class AgentHost:
             with contextlib.suppress(Exception):
                 self.on_session_changed(self.meta)
         return self.meta
+
+    def _emit_with_hooks(self, event: HostEvent) -> None:
+        """Render an event; schedule post-tool hooks for tool completions."""
+
+        hooks = getattr(self, "_hooks", None)
+        if (
+            hooks is not None
+            and event.kind == HostEventKind.TOOL_FINISH
+            and hooks.active
+            and self.config.hooks.post_tool
+        ):
+            task = asyncio.create_task(
+                self._run_post_hooks(
+                    tool=str(event.meta.get("tool", "tool")),
+                    status=str(event.meta.get("result_status", "")),
+                    target=event.text,
+                )
+            )
+            self._post_hook_tasks.append(task)
+        self.ui.render(event)
+
+    async def _run_post_hooks(self, *, tool: str, status: str, target: str) -> None:
+        try:
+            failures = await self._hooks.run_post(
+                tool=tool, category="tool", target=target, status=status
+            )
+        except Exception:  # noqa: BLE001 - hooks must not break turns
+            logger.debug("post-tool hook crashed", exc_info=True)
+            return
+        for failure in failures:
+            self.ui.render(HostEvent(HostEventKind.STATUS, f"hook warning: {failure}"))
+
+    async def _flush_post_hooks(self) -> None:
+        tasks, self._post_hook_tasks = self._post_hook_tasks, []
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _sync_budget_cost(self) -> None:
+        guard = getattr(self, "_budget_guard", None)
+        if guard is None or not guard.active:
+            return
+        usage = self.usage_snapshot()
+        guard.add_usage(cost_usd=usage.cost_usd - guard.status()["cost_usd"])
+
+    async def _capture_checkpoint(self, label: str) -> None:
+        manager = self._checkpoints
+        if manager is None or not self.config.checkpoints.enabled:
+            return
+        try:
+            snapshot = await asyncio.to_thread(manager.capture, label)
+        except Exception as exc:  # noqa: BLE001 - checkpoints are best-effort
+            logger.debug("checkpoint capture failed", exc_info=True)
+            self.ui.render(HostEvent(HostEventKind.STATUS, f"checkpoint failed: {exc}"))
+            return
+        if snapshot is not None:
+            self.last_checkpoint = snapshot
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    f"checkpoint saved · {snapshot['ref']} · commit {snapshot['commit'][:10]}",
+                    meta={"kind": "checkpoint", "checkpoint": snapshot},
+                )
+            )
 
     def _teardown_event_bridge(self) -> None:
         for unsub in self._event_unsubs:
@@ -517,18 +629,28 @@ class AgentHost:
             await self._persist_async()
         return result
 
-    def undo_last_turn(self) -> str:
-        """Undo the latest reversible checkpoint and persist it."""
+    def _undo_last_turn_state(self) -> str:
+        """Undo the latest reversible checkpoint without touching session storage."""
 
         turn = self.agent.journal.latest_turn()
         if turn:
             self.agent.journal.capture_post_bytes_before_undo(turn)
         undone = self.agent.journal.undo()
-        self._persist()
         return f"undid turn {undone.turn_id[:8]} ({len(undone.mutations)} files)"
 
+    def undo_last_turn(self) -> str:
+        """Undo the latest reversible checkpoint and persist it synchronously."""
+
+        status = self._undo_last_turn_state()
+        self._persist()
+        return status
+
     async def undo_last_turn_async(self) -> str:
-        return await asyncio.to_thread(self.undo_last_turn)
+        status = await asyncio.to_thread(self._undo_last_turn_state)
+        # SQLiteStorageManager is thread-affine; only the filesystem-heavy undo
+        # runs in the worker, while snapshot persistence stays on this thread.
+        await self._persist_async()
+        return status
 
     def _require_idle_turn(self) -> None:
         """Refuse session switches while a turn is still running."""
@@ -1151,6 +1273,25 @@ class AgentHost:
         if name == "trace":
             self.ui.render(HostEvent(HostEventKind.STATUS, f"trace: {self._trace_info}"))
             return "handled"
+        if name == "checkpoints":
+            manager = getattr(self, "_checkpoints", None)
+            if manager is None:
+                self.ui.render(_command_output("(no checkpoint manager for this session)"))
+                return "handled"
+            entries = await asyncio.to_thread(manager.list)
+            if not entries:
+                enabled = self.config.checkpoints.enabled
+                hint = "" if enabled else "\nEnable with [checkpoints] enabled=true or --checkpoint"
+                self.ui.render(_command_output(f"(no checkpoints yet){hint}"))
+                return "handled"
+            rows = [
+                f"{entry['ref']}\t{entry['commit'][:12]}"
+                + (f" {entry['label']}" if entry["label"] else "")
+                for entry in entries
+            ]
+            text = "\n".join(rows) + "\n\nRestore with: noah checkpoints restore REF"
+            self.ui.render(_command_output(text))
+            return "handled"
         if name == "compact":
             try:
                 compacted = await agent.compact_history()
@@ -1210,12 +1351,17 @@ class AgentHost:
         return "continue"
 
     async def _switch_model(self, model: str, *, reasoning_effort: str | None = None) -> None:
-        from noah_code.llm import get_llm_client, reasoning_overrides
+        from noah_code.llm import get_llm_client, reasoning_overrides, sampling_overrides
 
         effort = reasoning_effort or (
             self.meta.reasoning_effort if self.meta else self.config.reasoning_effort
         )
-        llm = await asyncio.to_thread(get_llm_client, model, **reasoning_overrides(effort))
+        llm = await asyncio.to_thread(
+            get_llm_client,
+            model,
+            **reasoning_overrides(effort),
+            **sampling_overrides(self.config.sampling),
+        )
         self.agent.set_main_llm(
             llm,
             lightweight_follows_main=not bool(self.config.lightweight_model),
@@ -1275,6 +1421,7 @@ class AgentHost:
             )
             explanation = getattr(result, "explanation", "") or ""
             kind = getattr(result, "kind", None)
+            self._sync_budget_cost()
             self.ui.render(HostEvent(HostEventKind.STOP, _stop_text(kind, explanation)))
             if kind == RespondReason.NEED_INPUT:
                 exit_code = 0
@@ -1294,9 +1441,6 @@ class AgentHost:
             exit_code = 130
             explanation = "cancelled"
             self.ui.render(HostEvent(HostEventKind.STATUS, "turn cancelled"))
-            with contextlib.suppress(Exception):
-                # A cancelled task cannot await; persist synchronously.
-                self._persist()
             raise
         except Exception as exc:
             exit_code = 1
@@ -1315,7 +1459,12 @@ class AgentHost:
                         "file-journal undo may be incomplete",
                     )
                 )
-            if exit_code != 130:
+            if exit_code == 130:
+                # The cancelled task cannot await, but the journal must be
+                # finalized before it is serialized to the undo sidecar.
+                with contextlib.suppress(Exception):
+                    self._persist()
+            else:
                 await self._persist_async()
         return HostResult(
             exit_code=exit_code,

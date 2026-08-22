@@ -560,6 +560,8 @@ class CodingAgent(InteractiveAgent):
         - Prefer ``await self.ws.apply_patch(changes)`` for coherent edits. Each change is
           ``{"path": ..., "old": exact_text_or_None, "new": replacement_or_None}``;
           one call validates and atomically commits the full batch.
+        - ``await self.ws.apply_unified_diff(diff_text)`` applies a unified diff
+          (git-style ---/+++/@@ hunks) with the same atomic verification.
         - Use ``self.lsp`` for definitions, implementations, references, symbols, hover,
           diagnostics, rename previews, and compact repository maps before broad searches.
         - Use ``self.processes.start/logs/status/input/stop`` for servers, watchers, and

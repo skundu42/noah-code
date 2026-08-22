@@ -95,6 +95,45 @@ class ProcessConfig(BaseModel):
     stop_grace_seconds: float = Field(default=2.0, gt=0, le=30)
 
 
+class SamplingConfig(BaseModel):
+    """Deterministic sampling controls forwarded to the provider client."""
+
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    seed: int | None = Field(default=None, ge=0)
+
+    def overrides(self) -> dict[str, Any]:
+        return {k: v for k in ("temperature", "top_p", "seed") if (v := getattr(self, k)) is not None}
+
+
+class BudgetConfig(BaseModel):
+    """Hard session caps; the first breach cancels the turn and exits."""
+
+    max_tokens: int | None = Field(default=None, ge=1)
+    max_cost_usd: float | None = Field(default=None, gt=0.0)
+    max_seconds: float | None = Field(default=None, gt=0.0)
+
+
+class HookSpec(BaseModel):
+    """One shell hook bound to tool names via a glob pattern."""
+
+    match: str = "*"
+    command: str
+    timeout_seconds: float = Field(default=10.0, gt=0.0, le=600.0)
+
+
+class HooksConfig(BaseModel):
+    pre_tool: list[HookSpec] = Field(default_factory=list)
+    post_tool: list[HookSpec] = Field(default_factory=list)
+
+
+class CheckpointConfig(BaseModel):
+    """Automatic git worktree snapshots captured at turn boundaries."""
+
+    enabled: bool = False
+    max_per_session: int = Field(default=50, ge=1, le=500)
+
+
 class NoahCodeConfig(BaseModel):
     """Resolved configuration for a noah-code run."""
 
@@ -118,6 +157,10 @@ class NoahCodeConfig(BaseModel):
     lsp: LSPConfig = Field(default_factory=LSPConfig)
     processes: ProcessConfig = Field(default_factory=ProcessConfig)
     efficiency: EfficiencyConfig = Field(default_factory=EfficiencyConfig)
+    sampling: SamplingConfig = Field(default_factory=SamplingConfig)
+    budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    hooks: HooksConfig = Field(default_factory=HooksConfig)
+    checkpoints: CheckpointConfig = Field(default_factory=CheckpointConfig)
     mode: Literal["build", "plan"] = "build"
     max_file_bytes: int = 512_000
     max_output_chars: int = Field(default=16_000, ge=1000, le=1_000_000)
@@ -409,8 +452,10 @@ def _project_config_path(workspace: Path) -> Path:
 _USER_ONLY_CONFIG_KEYS = frozenset(
     {
         "auto_approve",
+        "budget",
         "efficiency",
         "enabled_skills",
+        "hooks",
         "mcp",
         "lsp",
         "permission_rules",
@@ -503,7 +548,13 @@ def load_config(
     merged = _deep_merge(merged, _env_overrides())
     if cli_overrides:
         cleaned = {k: v for k, v in cli_overrides.items() if v is not None}
+        extra_rules = cleaned.pop("extra_permission_rules", None)
         merged = _deep_merge(merged, cleaned)
+        if extra_rules:
+            # CLI --allow/--deny rules append after file rules; the engine is
+            # last-match-wins, so explicit denies outrank earlier allows.
+            existing = list(merged.get("permission_rules") or [])
+            merged["permission_rules"] = [*existing, *extra_rules]
     return NoahCodeConfig.model_validate(_normalize_raw(merged))
 
 

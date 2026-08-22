@@ -25,6 +25,10 @@ Measure coverage (a 70% total gate runs in CI):
 uv run pytest tests --cov=noah_code --cov-report=term-missing
 ```
 
+The automation/eval interface (`noah exec`, permission overrides, budget
+caps, hooks, checkpoints, and LLM record/replay) is documented in
+[exec-and-evals.md](exec-and-evals.md).
+
 Optional git hooks mirror the lint gate:
 
 ```bash

@@ -608,6 +608,57 @@ class WorkspaceTools(Skill):
                 rows.append(f"  {path}: {first}")
         return "\n".join(rows)
 
+    async def apply_unified_diff(
+        self,
+        diff_text: Annotated[
+            str,
+            spec(description="Unified diff text (git-style ---/+++/@@ hunks) to apply atomically"),
+        ],
+    ) -> str:
+        """Apply a unified diff as one transactional, journaled patch.
+
+        Context lines are verified against current file content; a mismatch
+        aborts before any file changes. Creates use '--- /dev/null' and
+        deletes use '+++ /dev/null'.
+        """
+        from noah_code.tools.diff_tools import (
+            materialize_change,
+            parse_unified_diff,
+        )
+
+        if not diff_text or not diff_text.strip():
+            raise ValueError("diff text is required")
+        parsed = parse_unified_diff(diff_text)
+        changes: list[dict[str, str | None]] = []
+        for file_diff in parsed:
+            resolved = await self._authorize_path(file_diff.path, PermissionCategory.EDIT)
+            current: str | None = None
+            if not file_diff.is_create:
+                try:
+                    data = resolved.read_bytes()
+                except OSError as exc:
+                    raise ValueError(f"cannot read patch target {file_diff.path}: {exc}") from exc
+                if b"\0" in data or len(data) > self._journal.blob_limit:
+                    raise ValueError(
+                        f"binary or oversized patch targets are not supported: {file_diff.path}"
+                    )
+                try:
+                    current = data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(
+                        f"non-UTF-8 patch targets are not supported: {file_diff.path}"
+                    ) from exc
+            materialized = materialize_change(file_diff, current)
+            changes.append(
+                {
+                    "path": str(resolved),
+                    "old": materialized.old,
+                    "new": materialized.new,
+                }
+            )
+        report = await self.apply_patch(changes)
+        return f"Applied unified diff ({len(parsed)} file(s)):\n{report}"
+
     async def run(
         self,
         command: Annotated[str, spec(description="Shell command")],

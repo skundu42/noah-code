@@ -173,6 +173,7 @@ noah update
 - [Interactive interface and sessions](docs/interactive-reference.md)
 - [Configuration, modes, permissions, and updates](docs/configuration.md)
 - [Generated-code security](docs/security.md)
+- [Eval harness and automation (`noah exec`, hooks, budgets, caching)](docs/exec-and-evals.md)
 - [Custom commands, skills, MCP, and tracing](docs/extensions.md)
 - [Development, CI, and releases](docs/development.md)
 - [Release notes](docs/releases/)

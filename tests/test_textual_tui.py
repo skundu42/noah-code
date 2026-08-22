@@ -1243,3 +1243,60 @@ async def test_session_actions_are_refused_while_turn_is_busy(tmp_path: Path) ->
         await pilot.pause()
         host.start_new_session.assert_not_called()
         assert "cancel it" in _log_text(app.query_one("#conversation"))
+
+
+@pytest.mark.asyncio
+async def test_enter_on_exact_command_submits_directly(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+
+        composer.text = "/help"
+        await pilot.pause()
+        assert app.suggestions_open
+        await pilot.press("enter")
+        for _ in range(40):
+            if host.handle_line.await_count:
+                break
+            await pilot.pause()
+        host.handle_line.assert_awaited_once_with("/help")
+        assert not app.suggestions_open
+        assert composer.text == ""
+
+
+@pytest.mark.asyncio
+async def test_enter_on_fully_typed_option_submits_without_second_press(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "/mode plan"
+        await pilot.pause()
+        assert app._suggestion_matches[app._suggestion_index].invocation == "/mode plan"
+
+        await pilot.press("enter")
+        for _ in range(40):
+            if host.handle_line.await_count:
+                break
+            await pilot.pause()
+        host.handle_line.assert_awaited_once_with("/mode plan")
+
+
+@pytest.mark.asyncio
+async def test_enter_with_args_beyond_placeholder_submits(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "/config model"
+        await pilot.pause()
+        await pilot.press("enter")
+        for _ in range(40):
+            if host.handle_line.await_count:
+                break
+            await pilot.pause()
+        host.handle_line.assert_awaited_once_with("/config model")

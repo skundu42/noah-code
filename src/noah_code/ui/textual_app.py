@@ -394,7 +394,7 @@ class ComposerTextArea(TextArea):
         if suggestions_open and event.key == "enter":
             event.stop()
             event.prevent_default()
-            app.accept_suggestion()  # type: ignore[attr-defined]
+            app.enter_suggestion_or_submit()  # type: ignore[attr-defined]
             return
         if suggestions_open and event.key == "escape":
             event.stop()
@@ -2008,7 +2008,7 @@ class NoahCodeApp(App[None]):
         widget.update(Group(*lines))
         widget.styles.display = "block"
         self.query_one("#context-hint", Static).update(
-            "↑/↓ choose · Enter/Tab select · Esc close",
+            "↑/↓ choose · Tab complete · Enter select/send · Esc close",
             layout=False,
         )
 
@@ -2036,6 +2036,34 @@ class NoahCodeApp(App[None]):
             composer.cursor_location = (0, len(replaced))
         self.close_suggestions()
         composer.focus()
+
+    def enter_suggestion_or_submit(self) -> None:
+        """Send an exactly-matched command at once; complete partial matches.
+
+        Selecting a fully typed option (`/diff`, `/mode plan`) executes it on
+        Enter instead of requiring a second press. Prefix states still
+        complete: `/the` → `/theme `, bare `/mode ` picks the highlighted
+        option, and `@` mentions always complete in place.
+        """
+        if not self._suggestion_matches:
+            return
+        highlighted = self._suggestion_matches[self._suggestion_index]
+        composer = self.query_one("#composer", ComposerTextArea)
+        raw = composer.text
+        stripped = raw.strip().lower()
+        if stripped.startswith("@"):
+            self.accept_suggestion()
+            return
+        invocation = highlighted.invocation.lower()
+        head = invocation.split(" [", 1)[0].rstrip()
+        ends_with_space = raw != raw.rstrip()
+        exact = stripped in {invocation, head}
+        args_typed = not invocation.startswith(stripped) and stripped.startswith(head + " ")
+        if (exact or args_typed) and not ends_with_space:
+            self.close_suggestions()
+            self.action_submit()
+            return
+        self.accept_suggestion()
 
     def close_suggestions(self) -> None:
         self._suggestion_matches = []

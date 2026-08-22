@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -173,6 +174,66 @@ async def test_ctrl_c_does_not_corrupt_sqlite(tmp_path: Path) -> None:
     sm = store.open_storage(meta.session_id)
     assert sm.get_latest_snapshot_id() is not None
     sm.close()
+
+
+@pytest.mark.asyncio
+async def test_async_undo_persists_on_sqlite_owner_thread(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    target = tmp_path / "example.txt"
+    target.write_text("before\n")
+    host.agent.journal.begin_turn()
+    mutation = host.agent.journal.record_preimage(target)
+    target.write_text("after\n")
+    host.agent.journal.record_postimage(mutation, target)
+    host.agent.journal.end_turn()
+
+    status = await host.undo_last_turn_async()
+
+    assert status.startswith("undid turn ")
+    assert target.read_text() == "before\n"
+    assert host._storage.get_latest_snapshot_id() is not None
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_persists_finalized_undo_journal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    target = tmp_path / "example.txt"
+    target.write_text("before\n")
+    mutation_recorded = asyncio.Event()
+
+    async def race_forever():
+        mutation = host.agent.journal.record_preimage(target)
+        target.write_text("after\n")
+        host.agent.journal.record_postimage(mutation, target)
+        mutation_recorded.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(host.agent.queue_manager, "race", race_forever)
+    turn = asyncio.create_task(host._run_user_turn("change the example"))
+    await mutation_recorded.wait()
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    journal = host.store.load_journal(host.meta.session_id)
+    assert len(journal["turns"]) == 1
+    assert journal["turns"][0]["mutations"][0]["path"] == str(target)
+    await host.close()
 
 
 @pytest.mark.asyncio

@@ -41,11 +41,21 @@ class ApprovalBroker:
     ) -> None:
         self._engine = engine
         self._handler = handler
+        self._guard: Callable[[PermissionDecision], Awaitable[None]] | None = None
         self._pending: dict[str, ApprovalRequest] = {}
         self._lock = asyncio.Lock()
 
     def set_handler(self, handler: ApprovalHandler | None) -> None:
         self._handler = handler
+
+    def set_guard(self, guard: Callable[[PermissionDecision], Awaitable[None]] | None) -> None:
+        """Install a pre-execution veto (tool-use hooks).
+
+        The guard runs for every gated call — including auto-allowed ones —
+        and may raise ``PermissionError`` to reject the operation.
+        """
+
+        self._guard = guard
 
     @property
     def pending(self) -> dict[str, ApprovalRequest]:
@@ -53,6 +63,8 @@ class ApprovalBroker:
 
     async def require(self, decision: PermissionDecision) -> None:
         """Raise PermissionError on deny; ask host on ask; no-op on allow."""
+        if self._guard is not None:
+            await self._guard(decision)
         if decision.action == "allow":
             return
         if decision.action == "deny":

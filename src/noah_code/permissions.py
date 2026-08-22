@@ -512,22 +512,23 @@ def _is_env_dump(command: str, tokens: list[str]) -> bool:
     Only consulted under ``--auto``, where there is no user to approve an
     ask; printenv/bare-env are handled separately by the always-on deny.
     """
-    for index, token in enumerate(tokens):
-        program = Path(token).name.lower()
-        rest = tokens[index + 1 :]
-        if program == "cat" and any(fnmatch.fnmatch(part, "/proc/*/environ") for part in rest):
-            return True
-        if fnmatch.fnmatch(token, "/proc/*/environ"):
-            return True
-        if program in _ENV_DUMP_PROGRAMS:
-            # Bare or flag-only invocations list variables; assignments do not.
-            if not rest or all(part.startswith("-") for part in rest):
+    if not tokens:
+        return False
+
+    program = Path(tokens[0]).name.lower()
+    rest = tokens[1:]
+    if any(fnmatch.fnmatch(part, "/proc/*/environ") for part in rest):
+        return True
+    if program in _ENV_DUMP_PROGRAMS:
+        # Bare or flag-only invocations list variables; assignments do not.
+        return not rest or all(part.startswith("-") for part in rest)
+    if program in _AUTO_ENV_INTERPRETERS:
+        for index in range(len(rest) - 1):
+            if rest[index] not in {"-c", "-e"}:
+                continue
+            code = rest[index + 1].lower()
+            if re.search(r"\bos\s*\.\s*environ\b", code) or re.search(
+                r"\bprocess\s*\.\s*env\b", code
+            ):
                 return True
-            continue
-        if program in _AUTO_ENV_INTERPRETERS:
-            for j in range(index + 1, len(tokens) - 1):
-                if tokens[j] in {"-c", "-e"}:
-                    code = tokens[j + 1].lower()
-                    if "environ" in code or "process.env" in code:
-                        return True
     return False

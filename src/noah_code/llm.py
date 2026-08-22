@@ -19,6 +19,20 @@ def reasoning_overrides(effort: str | None) -> dict[str, str]:
     return {} if normalized == "default" else {"reasoning_effort": normalized}
 
 
+def sampling_overrides(sampling: Any) -> dict[str, Any]:
+    """Client kwargs for configured temperature/top_p/seed; unset keys are omitted.
+
+    Omitting unset values matters: several providers reject explicit nulls,
+    and ``default`` must mean "provider decides".
+    """
+
+    return {
+        key: value
+        for key in ("temperature", "top_p", "seed")
+        if (value := getattr(sampling, key, None)) is not None
+    }
+
+
 def get_llm_client(name: str, **overrides: Any) -> Any:
     """Build a client while preventing custom-endpoint credential fallback.
 

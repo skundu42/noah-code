@@ -88,6 +88,13 @@ def test_auto_still_allows_var_assignments_and_shell_options() -> None:
     assert engine.decide("bash", "cat /proc/cpuinfo").action == "allow"
 
 
+def test_auto_env_dump_detection_ignores_arguments_and_plain_words() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    assert engine.decide("bash", "echo export").action == "allow"
+    assert engine.decide("bash", "rg readonly").action == "allow"
+    assert engine.decide("bash", "python -c \"print('environment')\"").action == "allow"
+
+
 def test_non_auto_env_builtins_still_ask() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=False)
     decision = engine.decide("bash", "set")

@@ -31,7 +31,7 @@ EXIT_DENIED = 3
 EXIT_SIGINT = 130
 
 SUBCOMMANDS = frozenset(
-    {"run", "sessions", "doctor", "config", "providers", "update", "benchmark"}
+    {"run", "exec", "checkpoints", "sessions", "doctor", "config", "providers", "update", "benchmark"}
 )
 
 _AUTO_UPDATE_CHECKED = False
@@ -39,6 +39,116 @@ _AUTO_UPDATE_CHECKED = False
 
 def _run_async(coro):  # noqa: ANN001
     return asyncio.run(coro)
+
+
+def _parse_rule_specs(specs: tuple[str, ...], action: str) -> list[dict[str, str]]:
+    from noah_code.exec_mode import parse_rule_spec
+
+    rules: list[dict[str, str]] = []
+    for spec in specs:
+        category, pattern, resolved_action = parse_rule_spec(spec, action)
+        rules.append({"category": category, "pattern": pattern, "action": resolved_action})
+    return rules
+
+
+def _eval_options(fn):  # noqa: ANN001
+    """Options shared by automation-facing commands (run/exec)."""
+
+    fn = click.option(
+        "--allow",
+        "allow_rules",
+        multiple=True,
+        metavar="CATEGORY:PATTERN",
+        help="Append an allow rule for this run, e.g. --allow 'edit:*' or --allow 'bash:git status*'",
+    )(fn)
+    fn = click.option(
+        "--deny",
+        "deny_rules",
+        multiple=True,
+        metavar="CATEGORY:PATTERN",
+        help="Append a deny rule for this run; denies always win over allows",
+    )(fn)
+    fn = click.option(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Hard cap on total prompt+completion tokens for the session",
+    )(fn)
+    fn = click.option(
+        "--max-cost-usd",
+        type=float,
+        default=None,
+        help="Hard cap on estimated provider cost in USD",
+    )(fn)
+    fn = click.option(
+        "--time-limit",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Hard wall-clock limit for the session",
+    )(fn)
+    fn = click.option("--temperature", type=float, default=None, help="Sampling temperature")(fn)
+    fn = click.option("--top-p", type=float, default=None, help="Nucleus sampling cutoff")(fn)
+    fn = click.option("--seed", type=int, default=None, help="Provider-side sampling seed")(fn)
+    fn = click.option(
+        "--llm-cache",
+        type=click.Path(),
+        default=None,
+        help="Directory for record/replay of provider responses",
+    )(fn)
+    fn = click.option(
+        "--llm-cache-mode",
+        type=click.Choice(["record", "replay", "auto", "off"]),
+        default=None,
+        help="Cache behavior when --llm-cache is set (default: auto)",
+    )(fn)
+    fn = click.option(
+        "--checkpoint/--no-checkpoint",
+        "checkpoint",
+        default=None,
+        help="Capture git worktree checkpoints at turn boundaries",
+    )(fn)
+    return fn
+
+
+def _apply_eval_overrides(
+    overrides: dict[str, Any],
+    *,
+    allow_rules: tuple[str, ...],
+    deny_rules: tuple[str, ...],
+    max_tokens: int | None,
+    max_cost_usd: float | None,
+    time_limit: float | None,
+    temperature: float | None,
+    top_p: float | None,
+    seed: int | None,
+    checkpoint: bool | None,
+) -> None:
+    """Fold automation flags into ``overrides`` in place."""
+
+    permission_extra = [*_parse_rule_specs(allow_rules, "allow"), *_parse_rule_specs(deny_rules, "deny")]
+    if permission_extra:
+        overrides["extra_permission_rules"] = permission_extra
+    budget: dict[str, Any] = {}
+    if max_tokens is not None:
+        budget["max_tokens"] = max_tokens
+    if max_cost_usd is not None:
+        budget["max_cost_usd"] = max_cost_usd
+    if time_limit is not None:
+        budget["max_seconds"] = time_limit
+    if budget:
+        overrides["budget"] = budget
+    sampling: dict[str, Any] = {}
+    if temperature is not None:
+        sampling["temperature"] = temperature
+    if top_p is not None:
+        sampling["top_p"] = top_p
+    if seed is not None:
+        sampling["seed"] = seed
+    if sampling:
+        overrides["sampling"] = sampling
+    if checkpoint is not None:
+        overrides["checkpoints"] = {"enabled": checkpoint}
 
 
 def _common_options(fn):  # noqa: ANN001
@@ -158,6 +268,7 @@ def cli_group() -> None:
 @cli_group.command("run")
 @click.argument("prompt")
 @click.argument("path", required=False, type=click.Path())
+@_eval_options
 @_common_options
 @click.option("--session", "session_id", default=None)
 def run_cmd(
@@ -169,11 +280,22 @@ def run_cmd(
     mode: str | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
+    allow_rules: tuple[str, ...],
+    deny_rules: tuple[str, ...],
+    max_tokens: int | None,
+    max_cost_usd: float | None,
+    time_limit: float | None,
+    temperature: float | None,
+    top_p: float | None,
+    seed: int | None,
+    llm_cache: str | None,
+    llm_cache_mode: str | None,
+    checkpoint: bool | None,
 ) -> None:
     """Non-interactive one-shot execution."""
     code = _run_async(
-        _run_once(
-            prompt=prompt,
+        _exec_session(
+            prompts=[prompt],
             path=path,
             model=model,
             reasoning_effort=reasoning_effort,
@@ -181,9 +303,165 @@ def run_cmd(
             mode=mode,
             session_id=session_id,
             unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
+            allow_rules=allow_rules,
+            deny_rules=deny_rules,
+            max_tokens=max_tokens,
+            max_cost_usd=max_cost_usd,
+            time_limit=time_limit,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+            checkpoint=checkpoint,
+            output_format="text",
         )
     )
     raise SystemExit(code)
+
+
+@cli_group.command("exec")
+@click.argument("prompt", required=False)
+@click.argument("path", required=False, type=click.Path())
+@_eval_options
+@_common_options
+@click.option("--session", "session_id", default=None, help="Resume a specific session id")
+@click.option(
+    "--output-format",
+    type=click.Choice(["text", "json", "stream-json"]),
+    default="text",
+    show_default=True,
+    help="text: human output · json: one final summary · stream-json: NDJSON event stream",
+)
+def exec_cmd(
+    prompt: str | None,
+    path: str | None,
+    model: str | None,
+    reasoning_effort: str | None,
+    auto: bool,
+    mode: str | None,
+    session_id: str | None,
+    unsafe_inprocess_code_execution: bool,
+    output_format: str,
+    allow_rules: tuple[str, ...],
+    deny_rules: tuple[str, ...],
+    max_tokens: int | None,
+    max_cost_usd: float | None,
+    time_limit: float | None,
+    temperature: float | None,
+    top_p: float | None,
+    seed: int | None,
+    llm_cache: str | None,
+    llm_cache_mode: str | None,
+    checkpoint: bool | None,
+) -> None:
+    """Scriptable multi-turn execution for evals and automation.
+
+    PROMPT runs as the first message. When stdin is not a TTY, each non-empty
+    stdin line becomes a follow-up message, enabling scripted multi-turn
+    sessions. Use --output-format stream-json for per-event NDJSON and json
+    for a single final summary document.
+    """
+    import os
+
+    from noah_code.exec_mode import read_followup_prompts
+
+    prompts: list[str] = [prompt] if prompt else []
+    stdin = getattr(sys, "stdin", None)
+    if stdin is not None and not stdin.isatty():
+        prompts.extend(read_followup_prompts(stdin))
+    if not prompts:
+        click.echo("error: provide PROMPT or pipe messages on stdin", err=True)
+        raise SystemExit(EXIT_CONFIG)
+
+    cache_dir = llm_cache or os.environ.get("NOAH_CODE_LLM_CACHE_DIR")
+    if cache_dir:
+        os.environ["NOAH_CODE_LLM_CACHE_DIR"] = str(cache_dir)
+        os.environ["NOAH_CODE_LLM_CACHE"] = llm_cache_mode or "auto"
+
+    code = _run_async(
+        _exec_session(
+            prompts=prompts,
+            path=path,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            auto=auto,
+            mode=mode,
+            session_id=session_id,
+            unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
+            allow_rules=allow_rules,
+            deny_rules=deny_rules,
+            max_tokens=max_tokens,
+            max_cost_usd=max_cost_usd,
+            time_limit=time_limit,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+            checkpoint=checkpoint,
+            output_format=output_format,  # type: ignore[arg-type]
+        )
+    )
+    raise SystemExit(code)
+
+
+@cli_group.group("checkpoints")
+def checkpoints_group() -> None:
+    """Inspect git worktree checkpoints captured at turn boundaries."""
+
+
+@checkpoints_group.command("list")
+@click.argument("session_id", required=False)
+@click.argument("path", required=False, type=click.Path())
+def checkpoints_list(session_id: str | None, path: str | None) -> None:
+
+    from noah_code.checkpoints import CheckpointManager
+    from noah_code.sessions import SessionStore
+
+    try:
+        workspace = open_workspace(path)
+        config = load_config(workspace.root)
+    except WorkspaceError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    target_session = session_id
+    if target_session is None:
+        store = SessionStore(config.session_dir)
+        latest = store.latest_for_workspace(workspace)
+        if latest is None:
+            click.echo("no sessions for this workspace", err=True)
+            raise SystemExit(EXIT_CONFIG)
+        target_session = latest.session_id
+    manager = CheckpointManager(
+        workspace.root, target_session, max_per_session=config.checkpoints.max_per_session
+    )
+    entries = manager.list()
+    if not entries:
+        click.echo(f"no checkpoints under {manager.ref_namespace}")
+        return
+    for entry in entries:
+        label = f" {entry['label']}" if entry["label"] else ""
+        click.echo(f"{entry['ref']}\t{entry['commit'][:12]}{label}")
+
+
+@checkpoints_group.command("restore")
+@click.argument("ref")
+@click.argument("path", required=False, type=click.Path())
+def checkpoints_restore(ref: str, path: str | None) -> None:
+    """Restore tracked files from a checkpoint ref into index+worktree."""
+
+    from noah_code.checkpoints import CheckpointError, CheckpointManager
+
+    try:
+        workspace = open_workspace(path)
+        config = load_config(workspace.root)
+    except WorkspaceError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    manager = CheckpointManager(workspace.root, "restore-cli",
+                                max_per_session=config.checkpoints.max_per_session)
+    try:
+        click.echo(manager.restore(ref))
+    except CheckpointError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
 
 
 @cli_group.group("sessions")
@@ -501,6 +779,7 @@ async def _prepare(
     session_id: str | None = None,
     frontend: Literal["tui", "console"] | None = None,
     unsafe_inprocess_code_execution: bool = False,
+    extra_overrides: dict[str, Any] | None = None,
 ):
     try:
         workspace = open_workspace(path)
@@ -521,6 +800,8 @@ async def _prepare(
         overrides["ui"] = {"frontend": frontend}
     if unsafe_inprocess_code_execution:
         overrides["unsafe_inprocess_code_execution"] = True
+    if extra_overrides:
+        overrides.update(extra_overrides)
     config = load_config(workspace.root, cli_overrides=overrides)
     if await _maybe_auto_update(config):
         return None, EXIT_OK
@@ -640,9 +921,9 @@ async def _interactive(
         return EXIT_SIGINT
 
 
-async def _run_once(
+async def _exec_session(
     *,
-    prompt: str,
+    prompts: list[str],
     path: str | None,
     model: str | None,
     reasoning_effort: str | None,
@@ -650,7 +931,34 @@ async def _run_once(
     mode: str | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
+    output_format: Literal["text", "json", "stream-json"],
+    allow_rules: tuple[str, ...] = (),
+    deny_rules: tuple[str, ...] = (),
+    max_tokens: int | None = None,
+    max_cost_usd: float | None = None,
+    time_limit: float | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    seed: int | None = None,
+    checkpoint: bool | None = None,
 ) -> int:
+    """Shared driver behind ``noah run`` and ``noah exec``."""
+
+    from noah_code.exec_mode import ExecDriver, JsonUI
+
+    eval_overrides: dict[str, Any] = {}
+    _apply_eval_overrides(
+        eval_overrides,
+        allow_rules=allow_rules,
+        deny_rules=deny_rules,
+        max_tokens=max_tokens,
+        max_cost_usd=max_cost_usd,
+        time_limit=time_limit,
+        temperature=temperature,
+        top_p=top_p,
+        seed=seed,
+        checkpoint=checkpoint,
+    )
     prepared, code = await _prepare(
         path=path,
         model=model,
@@ -660,19 +968,25 @@ async def _run_once(
         session_id=session_id,
         frontend="console",
         unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
+        extra_overrides=eval_overrides or None,
     )
     if prepared is None:
         return code
     workspace, config, store, meta = prepared
+    ui = JsonUI(stream=sys.stdout, mirror_text=output_format == "text")
     host = AgentHost(
         workspace,
         config,
         session_meta=meta,
         store=store,
-        ui=ConsoleUI(markdown=config.ui.markdown),
+        ui=ui,
     )
-    result = await host.run_once(prompt)
-    return result.exit_code
+    driver = ExecDriver(host, ui, output_format=output_format)
+    try:
+        return await driver.run(prompts)
+    except KeyboardInterrupt:
+        host.cancel_active_turn()
+        return EXIT_SIGINT
 
 
 def _launched_as_nc() -> bool:
