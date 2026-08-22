@@ -3,15 +3,10 @@
 from __future__ import annotations
 
 import re
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    import tomli as tomllib  # type: ignore[no-redef]
-
 
 _FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n(.*)\Z", re.DOTALL)
 
@@ -46,7 +41,7 @@ def _split_args(arguments: str) -> list[str]:
         return arguments.split()
 
 
-def _parse_frontmatter(raw: str) -> tuple[dict[str, Any], str]:
+def parse_frontmatter(raw: str) -> tuple[dict[str, Any], str]:
     match = _FRONTMATTER.match(raw)
     if not match:
         return {}, raw
@@ -82,7 +77,7 @@ def load_commands_from_dir(directory: Path, *, source: str) -> dict[str, CustomC
             raw = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        meta, body = _parse_frontmatter(raw)
+        meta, body = parse_frontmatter(raw)
         out[name] = CustomCommand(
             name=name,
             description=str(meta.get("description") or name),

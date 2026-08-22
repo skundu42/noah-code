@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from noah_code import nooa_compat
 from noah_code.config import NoahCodeConfig
 
 
@@ -210,7 +211,7 @@ def install_skills(agent: Any, workspace: Path, config: NoahCodeConfig) -> str:
             approved = getattr(agent, "_sandbox_approved_roots", None)
             if isinstance(approved, set):
                 for name in registry.activated():
-                    attr = registry._attr_map.get(name)  # noqa: SLF001 - registry has no public map
+                    attr = nooa_compat.skill_attribute(registry, name)
                     if attr:
                         approved.add(attr)
     except Exception as exc:  # noqa: BLE001

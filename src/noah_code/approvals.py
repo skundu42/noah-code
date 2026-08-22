@@ -87,14 +87,15 @@ class ApprovalBroker:
         )
         async with self._lock:
             self._pending[req_id] = request
+        handler = self._handler
         try:
-            if self._handler is None:
+            if handler is None:
                 # Non-interactive without --auto: treat ask as deny.
                 return ApprovalChoice.REJECT
 
             async def _resolve() -> None:
                 try:
-                    choice = await self._handler(request)
+                    choice = await handler(request)
                 except Exception as exc:
                     if not fut.done():
                         fut.set_exception(exc)

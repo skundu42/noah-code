@@ -94,6 +94,8 @@ class ActivityRecord:
     tool: str = "tool"
     state: str = "running"
     result: str = ""
+    thought: str = ""
+    detail: str = ""
     started_at: float = field(default_factory=time.monotonic)
     finished_at: float | None = None
     line_count: int = 0
@@ -344,11 +346,15 @@ def _record_to_entries(record: SessionEventRecord) -> list[TranscriptEntry]:
             arguments = payload.get("arguments")
             code = str(arguments.get("code", "")) if isinstance(arguments, dict) else ""
             label = _describe_code_activity(code)
-            text = _completed_activity_label(
+            activity: str | None = _completed_activity_label(
                 label,
                 failed=status in {"error", "failed", "fail"},
             )
-            return [TranscriptEntry("ACTIVITY", text, event_id=record.event_id)] if text else []
+            return (
+                [TranscriptEntry("ACTIVITY", activity, event_id=record.event_id)]
+                if activity
+                else []
+            )
         display_tool = tool.replace("_", " ").strip().capitalize() or "Tool"
         return [
             TranscriptEntry(
@@ -664,18 +670,26 @@ class TextPromptModal(ModalScreen[str | None]):
 
 
 class ActivityHistoryScreen(ModalScreen[None]):
-    """Inspect bounded full output for recent execution activities."""
+    """Expandable inspector for agent thoughts, actions, and full output."""
 
-    BINDINGS = [Binding("escape", "close", "Close", show=True)]
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=True),
+        Binding("t", "toggle_thought", "Thought", show=True),
+        Binding("a", "toggle_action", "Action", show=True),
+        Binding("o", "toggle_output", "Output", show=True),
+        Binding("e", "toggle_all", "Expand all", show=False),
+    ]
 
     def __init__(self, records: list[ActivityRecord]) -> None:
         super().__init__()
         self.records = list(reversed(records))
         self._by_id = {record.activity_id: record for record in self.records}
+        self._expanded: dict[str, set[str]] = {}
+        self._selected: ActivityRecord | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="detail-dialog"):
-            yield Label("ACTIVITY HISTORY", id="detail-title")
+            yield Label("ACTIVITY INSPECTOR", id="detail-title")
             with Horizontal(id="detail-body"):
                 yield OptionList(id="activity-list", compact=True)
                 yield RichLog(
@@ -686,13 +700,25 @@ class ActivityHistoryScreen(ModalScreen[None]):
                     min_width=0,
                     max_lines=2_000,
                 )
-            yield Static("↑/↓ select · Page Up/Down inspect · Esc close", id="detail-hint")
+            yield Static(
+                "↑/↓ select · T thought · A action · O output · E expand all · Esc close",
+                id="detail-hint",
+            )
 
     def on_mount(self) -> None:
         options = []
         for record in self.records:
             icon = "✓" if record.state == "complete" else "×" if record.state == "error" else "◆"
-            prompt = Text(f"{icon} {record.label}  {record.duration:.1f}s", style="#d1d1d6")
+            extras = []
+            if record.thought:
+                extras.append("✎")
+            if record.detail:
+                extras.append("⋮")
+            suffix = f"  {''.join(extras)}" if extras else ""
+            prompt = Text(
+                f"{icon} {record.label}  {record.duration:.1f}s{suffix}",
+                style="#d1d1d6",
+            )
             options.append(Option(prompt, id=record.activity_id))
         option_list = self.query_one("#activity-list", OptionList)
         if options:
@@ -703,19 +729,100 @@ class ActivityHistoryScreen(ModalScreen[None]):
         else:
             option_list.add_option(Option(Text("No activity yet", style="#777781"), disabled=True))
 
+    def _sections_for(self, record: ActivityRecord) -> set[str]:
+        expanded = self._expanded.setdefault(record.activity_id, {"output"})
+        # Output defaults open; everything else starts collapsed.
+        return expanded
+
+    def _toggle(self, section: str) -> None:
+        if self._selected is None:
+            return
+        sections = self._sections_for(self._selected)
+        if section in sections:
+            sections.discard(section)
+        else:
+            sections.add(section)
+        self._show_record(self._selected)
+
+    def action_toggle_thought(self) -> None:
+        self._toggle("thought")
+
+    def action_toggle_action(self) -> None:
+        self._toggle("action")
+
+    def action_toggle_output(self) -> None:
+        self._toggle("output")
+
+    def action_toggle_all(self) -> None:
+        if self._selected is None:
+            return
+        sections = self._sections_for(self._selected)
+        available = {name for name in ("thought", "action") if getattr(self._selected, name)}
+        available.add("output")
+        if available <= sections:
+            sections.clear()
+            sections.add("output")
+        else:
+            sections.update(available)
+        self._show_record(self._selected)
+
+    def _section_block(self, title: str, body: str, *, style: str) -> list[Any]:
+        blocks: list[Any] = [Text(f"▼ {title}", style=f"bold {style}")]
+        for line in (body or "").splitlines() or [""]:
+            blocks.append(Text(f"  {line}", style="#d1d1d6"))
+        blocks.append(Text(""))
+        return blocks
+
+    def _collapsed_block(self, title: str, preview: str) -> list[Any]:
+        preview = " ".join((preview or "").split())
+        if len(preview) > 64:
+            preview = preview[:61] + "…"
+        return [
+            Text.assemble(
+                (f"▶ {title}", "bold #777781"),
+                (f"  {preview}" if preview else "", "#777781"),
+            ),
+            Text(""),
+        ]
+
     def _show_record(self, record: ActivityRecord) -> None:
+        self._selected = record
         detail = self.query_one("#activity-detail", RichLog)
         detail.clear()
         detail.write(
             Text.assemble(
                 (f"{record.label}\n", "bold #b8a9ff"),
                 (
-                    f"{record.state} · {record.duration:.2f}s · {record.line_count} lines\n\n",
+                    f"{record.tool} · {record.state} · {record.duration:.2f}s · "
+                    f"{record.line_count} lines\n\n",
                     "#777781",
                 ),
-                (record.output or record.result or "No captured output", "#d1d1d6"),
             )
         )
+        sections = self._sections_for(record)
+        if record.thought:
+            if "thought" in sections:
+                for block in self._section_block("THOUGHT", record.thought, style="#c6a0f6"):
+                    detail.write(block)
+            else:
+                for block in self._collapsed_block("THOUGHT", record.thought):
+                    detail.write(block)
+        if record.detail:
+            if "action" in sections:
+                for block in self._section_block("ACTION", record.detail, style="#7dc4e4"):
+                    detail.write(block)
+            else:
+                for block in self._collapsed_block("ACTION", record.detail):
+                    detail.write(block)
+        output_body = record.output or record.result or ""
+        if "output" in sections or not output_body:
+            detail.write(Text("▼ OUTPUT", style="bold #e6b673"))
+            for line in output_body.splitlines() or ["(no captured output)"]:
+                detail.write(Text(f"  {line}", style="#d1d1d6"))
+        else:
+            head = "\n".join(output_body.splitlines()[:4])
+            for block in self._collapsed_block("OUTPUT", head):
+                detail.write(block)
 
     @on(OptionList.OptionHighlighted, "#activity-list")
     def _highlighted(self, event: OptionList.OptionHighlighted) -> None:
@@ -995,7 +1102,7 @@ class DiffReviewScreen(ModalScreen[None]):
     @work(exclusive=True, group="diff-mutation")
     async def action_undo(self) -> None:
         try:
-            status = self.host.undo_last_turn()
+            status = await self.host.undo_last_turn_async()
             self.review = await self.host.diff_review()
         except Exception as exc:  # noqa: BLE001
             self.query_one("#diff-status", Static).update(
@@ -1118,7 +1225,7 @@ class NoahCodeApp(App[None]):
         self._session_id = host.meta.session_id if host.meta else None
         self._interrupt_count = 0
         self._header_text = ""
-        self._rail_text = ""
+        self._rail_text: Text | str = ""
         self._phase = "ready"
         self._spinner_index = 0
         self._spinner_timer: Timer | None = None
@@ -1129,6 +1236,7 @@ class NoahCodeApp(App[None]):
         self._activities: dict[str, ActivityRecord] = {}
         self._activity_history: deque[ActivityRecord] = deque(maxlen=MAX_ACTIVITY_HISTORY)
         self._active_activity_id: str | None = None
+        self._last_thought: str = ""
         self._transcript_entries: list[TranscriptEntry] = []
         self._transcript_event_ids: set[str] = set()
         self._unread_count = 0
@@ -1139,6 +1247,7 @@ class NoahCodeApp(App[None]):
         self._base_commands = all_command_suggestions(host._custom_commands)
         self._config_commands: list[CommandSuggestion] | None = None
         self._composer_rows = 4
+        self._app_mounted = False
         host.on_session_changed = lambda _meta: self.call_later(self._session_changed)
 
     @property
@@ -1195,6 +1304,7 @@ class NoahCodeApp(App[None]):
         )
 
     def on_mount(self) -> None:
+        self._app_mounted = True
         self.ui.bind_app(self)
         self._apply_layout(self.size.width, self.size.height)
         composer = self.query_one("#composer", ComposerTextArea)
@@ -1315,7 +1425,7 @@ class NoahCodeApp(App[None]):
             self.screen.set_class(width >= WIDE_MIN_COLUMNS, "wide")
             self.screen.set_class(height <= COMPACT_MAX_ROWS, "compact")
         self._resize_composer(
-            self.query_one("#composer", ComposerTextArea).text if self.is_mounted else ""
+            self.query_one("#composer", ComposerTextArea).text if self._app_mounted else ""
         )
 
     def _tick_busy(self) -> None:
@@ -1344,14 +1454,18 @@ class NoahCodeApp(App[None]):
             elif self._phase not in {"ready", "thinking"}:
                 label = self._phase.replace("_", " ").strip().capitalize()
             frame = "◐◓◑◒"[self._spinner_index]
-            banner.update(
-                Text.assemble(
-                    (f"{frame}  ", "bold #e6b673"),
-                    (label, "#d1d1d6"),
-                    (elapsed, "#777781"),
-                ),
-                layout=False,
-            )
+            parts: list[tuple[str, str]] = [
+                (f"{frame}  ", "bold #e6b673"),
+                (label, "#d1d1d6"),
+                (elapsed, "#777781"),
+            ]
+            thought = " ".join(self._last_thought.split())
+            if thought:
+                if len(thought) > 60:
+                    thought = thought[:57] + "…"
+                parts.append(("\n", ""))
+                parts.append((f"   ✎ {thought}", "#777781"))
+            banner.update(Text.assemble(*parts), layout=False)
             banner.styles.display = "block"
             with contextlib.suppress(Exception):
                 if self._active_activity_id and self._active_activity_id in self._activities:
@@ -1608,8 +1722,10 @@ class NoahCodeApp(App[None]):
                     markdown=not plain_command,
                 )
             )
-        elif event.kind == HostEventKind.REASONING and self.host.config.ui.show_reasoning:
-            self._append_entry(TranscriptEntry("STATUS", f"Thinking: {text}"))
+        elif event.kind == HostEventKind.REASONING:
+            self._attach_thought(text)
+            if self.host.config.ui.show_reasoning:
+                self._append_entry(TranscriptEntry("STATUS", f"Thinking: {text}"))
         elif event.kind == HostEventKind.TOOL_START:
             self._start_activity(event)
         elif event.kind == HostEventKind.SHELL_CHUNK:
@@ -1655,6 +1771,15 @@ class NoahCodeApp(App[None]):
             if review is not None:
                 self.push_screen(DiffReviewScreen(self.host, review))
 
+    def _attach_thought(self, text: str) -> None:
+        """Attach reasoning to the live activity and the banner ticker."""
+
+        self._last_thought = text
+        record = self._activities.get(self._active_activity_id or "")
+        if record is not None:
+            record.thought = text if not record.thought else f"{record.thought}\n{text}"
+        self._update_working_banner()
+
     def _activity_id(self, event: HostEvent) -> str:
         activity_id = str(event.meta.get("activity_id", "") or "")
         if activity_id:
@@ -1669,9 +1794,11 @@ class NoahCodeApp(App[None]):
             activity_id=activity_id,
             label=event.text or str(event.meta.get("tool", "tool")),
             tool=str(event.meta.get("tool", "tool")),
+            detail=str(event.meta.get("detail", "") or ""),
         )
         self._activities[activity_id] = record
         self._active_activity_id = activity_id
+        self._last_thought = ""
         self._phase = record.label
         output = self.query_one("#activity-output", RichLog)
         output.clear()
@@ -1915,7 +2042,7 @@ class NoahCodeApp(App[None]):
         self._render_suggestions()
 
     def _resize_composer(self, text: str) -> None:
-        if not self.is_mounted:
+        if not self._app_mounted:
             return
         rows = min(max(text.count("\n") + 3, 3), 8)
         if self.screen.has_class("compact"):
@@ -1940,20 +2067,37 @@ class NoahCodeApp(App[None]):
         self.action_submit()
 
     async def request_approval(self, request: ApprovalRequest) -> ApprovalChoice:
-        result = await self.push_screen_wait(ApprovalModal(request))
+        try:
+            result = await self.push_screen_wait(ApprovalModal(request))
+        except asyncio.CancelledError:
+            # The turn was cancelled while the modal was up; dismissing it here
+            # keeps input from being blocked by a stranded overlay.
+            self._dismiss_stranded_modal()
+            raise
         return result if result is not None else ApprovalChoice.REJECT
 
     async def request_questions(self, prompts: list[QuestionPrompt]) -> QuestionAnswer:
         selections: list[str] = []
         custom_parts: list[str] = []
         for prompt in prompts:
-            result = await self.push_screen_wait(QuestionModal(prompt))
+            try:
+                result = await self.push_screen_wait(QuestionModal(prompt))
+            except asyncio.CancelledError:
+                self._dismiss_stranded_modal()
+                raise
             if result is None:
                 continue
             selections.extend(result.selections)
             if result.custom:
                 custom_parts.append(result.custom)
         return QuestionAnswer(selections=selections, custom=" ".join(custom_parts).strip())
+
+    def _dismiss_stranded_modal(self) -> None:
+        """Pop a modal left on screen by a cancelled push_screen_wait await."""
+
+        with contextlib.suppress(Exception):
+            if isinstance(self.screen, (ApprovalModal, QuestionModal)):
+                self.pop_screen()
 
     def action_show_help(self) -> None:
         self._append_entry(
@@ -1963,8 +2107,14 @@ class NoahCodeApp(App[None]):
     @work(exclusive=True, group="palette")
     async def action_palette(self) -> None:
         rows = []
+        seen_ids: set[str] = set()
         for command in self._base_commands:
             insertion = _command_insertion(command.invocation)
+            if insertion in seen_ids:
+                # A custom command shadowing a builtin would produce a
+                # duplicate Option id and crash the palette; builtins win.
+                continue
+            seen_ids.add(insertion)
             rows.append((insertion, command.invocation, command.description))
         choice = await self.push_screen_wait(
             FilteredPicker("Commands", rows, "↑/↓ select · Enter insert · Esc close")
@@ -2431,6 +2581,16 @@ class NoahCodeApp(App[None]):
     async def action_sessions(self) -> None:
         if not self._agent_ready:
             return
+        if self.ui.busy:
+            # Switching mid-turn would run the live turn against closed
+            # storage and detach its journal.
+            self._append_entry(
+                TranscriptEntry(
+                    "STATUS",
+                    "A turn is running; cancel it (Ctrl+C) before switching sessions",
+                )
+            )
+            return
         try:
             sessions = await asyncio.to_thread(self.host.list_session_metas)
             rows = [
@@ -2453,6 +2613,14 @@ class NoahCodeApp(App[None]):
     @work(exclusive=True, group="sessions")
     async def action_new_session(self) -> None:
         if not self._agent_ready:
+            return
+        if self.ui.busy:
+            self._append_entry(
+                TranscriptEntry(
+                    "STATUS",
+                    "A turn is running; cancel it (Ctrl+C) before starting a new session",
+                )
+            )
             return
         await self.host.start_new_session()
 

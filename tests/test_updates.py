@@ -13,10 +13,10 @@ class _Response:
     def __init__(self, payload: dict) -> None:
         self._raw = json.dumps(payload).encode()
 
-    def __enter__(self):  # noqa: ANN204
+    def __enter__(self):
         return self
 
-    def __exit__(self, *_args) -> None:  # noqa: ANN002
+    def __exit__(self, *_args) -> None:
         return None
 
     def read(self, _limit: int) -> bytes:
@@ -45,7 +45,7 @@ def test_upgrade_uses_uv_tool_upgrade(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(updates, "is_uv_tool_install", lambda _uv: True)
     calls: list[list[str]] = []
 
-    def fake_run(command, **_kwargs):  # noqa: ANN001, ANN202
+    def fake_run(command, **_kwargs):
         calls.append(command)
         return SimpleNamespace(returncode=0, stdout="upgraded", stderr="")
 
@@ -87,7 +87,7 @@ def test_update_notice_reuses_cached_available_version(tmp_path: Path, monkeypat
     monkeypatch.setattr(updates, "__version__", "0.1.0")
     calls = 0
 
-    def check(**_kwargs):  # noqa: ANN003, ANN202
+    def check(**_kwargs):
         nonlocal calls
         calls += 1
         return updates.UpdateStatus(current="0.1.0", latest="0.2.0")

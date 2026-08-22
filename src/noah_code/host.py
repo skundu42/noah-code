@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from noah_code import nooa_compat
 from noah_code.approvals import ApprovalChoice
 from noah_code.commands import config_text, help_text, parse_slash
 from noah_code.config import (
@@ -37,10 +38,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _friendly_agent_error(exc: Exception, profile: str) -> str:
+def _friendly_agent_error(exc: Exception) -> str:
     """Turn framework/provider failures into bounded, actionable UI copy."""
 
-    _ = profile
     raw = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(exc)).strip()
     iteration = re.search(r"Generation failed after (\d+) iterations \(max_iterations=(\d+)\)", raw)
     if iteration:
@@ -199,7 +199,7 @@ def _json_safe(value: Any) -> Any:
             pass
     if hasattr(value, "items") and not isinstance(value, type):
         try:
-            return {str(k): _json_safe(v) for k, v in value.items()}  # type: ignore[arg-type]
+            return {str(k): _json_safe(v) for k, v in value.items()}
         except Exception:  # noqa: BLE001
             pass
     return str(value)
@@ -231,11 +231,10 @@ class AgentHost:
         self.store = store or SessionStore(config.session_dir)
         self._llm = llm
         self._agent: CodingAgent | None = None
-        self._storage = None
+        self._storage: Any = None
         self.meta = session_meta
-        self._cancel_turn = False
         self._exit_requested = False
-        self._last_stop = ""
+        self._title_task: asyncio.Task[Any] | None = None
         self._trace_info = "auto (viewer if reachable)"
         self._active_turn: asyncio.Task[Any] | None = None
         self._event_unsubs: list[Any] = []
@@ -313,13 +312,16 @@ class AgentHost:
         restored = self._storage.restore_latest_snapshot(agent)
         if restored:
             # Re-bind host-owned nosnapshot infrastructure after restore.
-            agent._engine.mode = getattr(agent, "mode", self.meta.mode)  # type: ignore[attr-defined]
+            agent._engine.mode = agent.mode
             agent._engine.load_session_rules(self.meta.permission_rules)
-            agent.journal.load_dict(self.meta.journal)
+            journal_data = await asyncio.to_thread(
+                self.store.load_journal, self.meta.session_id
+            )
+            agent.journal.load_dict(journal_data or self.meta.journal)
             if self.meta.todos:
                 agent.todos.from_dict(self.meta.todos)
         else:
-            agent.set_mode(self.meta.mode)  # type: ignore[arg-type]
+            agent.set_mode(self.meta.mode)
             agent.v.mode = self.meta.mode
             agent.v.model = self.meta.model
 
@@ -405,24 +407,56 @@ class AgentHost:
     def _on_agent_message(self, text: str, **_kwargs: Any) -> None:
         self.ui.render(HostEvent(HostEventKind.MESSAGE, text))
 
-    def _persist(self) -> None:
-        if self._agent is None or self.meta is None or self._storage is None:
-            return
+    def _persist_state(self) -> dict:
+        """Serialize agent-owned state for persistence. Thread-safe; touches no SQLite."""
+
+        if self._agent is None or self.meta is None:
+            return {}
         self.meta.mode = self._agent.mode
         self.meta.model = getattr(self._agent.v, "model", self.meta.model) or self.meta.model
         self.meta.permission_rules = self._agent.engine.snapshot_session_rules()
-        self.meta.journal = self._agent.journal.to_dict()
+        # Undo blobs live in a pruned sidecar so meta.json stays small and
+        # cheap to rewrite on every turn end.
+        self.meta.journal = {}
         self.meta.todos = _json_safe(self._agent.todos.to_dict())
         with contextlib.suppress(Exception):
             title = getattr(self._agent.v, "title", None)
             if title:
                 self.meta.title = str(title)
+        return self._agent.journal.to_dict()
+
+    def _write_persist_files(self, journal_data: dict) -> None:
+        """Write meta.json and the undo sidecar. File I/O only."""
+
+        if self.meta is None:
+            return
+        with contextlib.suppress(Exception):
+            self.store.save_journal(self.meta.session_id, journal_data)
         self.store.save_meta(self.meta)
+
+    def _persist(self) -> None:
+        if self._agent is None or self.meta is None or self._storage is None:
+            return
+        journal_data = self._persist_state()
+        self._write_persist_files(journal_data)
         self._storage.save_snapshot(self._agent)
+
+    async def _persist_async(self) -> None:
+        """Serialize and write session files off the UI event loop.
+
+        NOOA's SQLiteStorageManager is thread-affine, so the snapshot write
+        itself must stay on the event-loop thread.
+        """
+
+        journal_data = await asyncio.to_thread(self._persist_state)
+        await asyncio.to_thread(self._write_persist_files, journal_data)
+        if self._agent is not None and self._storage is not None:
+            with contextlib.suppress(Exception):
+                self._storage.save_snapshot(self._agent)
 
     async def close(self) -> None:
         try:
-            self._persist()
+            await self._persist_async()
         finally:
             self._teardown_event_bridge()
             if self._agent is not None:
@@ -480,23 +514,35 @@ class AgentHost:
             result = await self.agent.git.revert(path, scope)
         finally:
             self.agent.journal.end_turn()
-            self._persist()
+            await self._persist_async()
         return result
 
     def undo_last_turn(self) -> str:
         """Undo the latest reversible checkpoint and persist it."""
 
-        turn = self.agent.journal._turns[-1] if self.agent.journal.can_undo() else None
+        turn = self.agent.journal.latest_turn()
         if turn:
             self.agent.journal.capture_post_bytes_before_undo(turn)
         undone = self.agent.journal.undo()
         self._persist()
         return f"undid turn {undone.turn_id[:8]} ({len(undone.mutations)} files)"
 
+    async def undo_last_turn_async(self) -> str:
+        return await asyncio.to_thread(self.undo_last_turn)
+
+    def _require_idle_turn(self) -> None:
+        """Refuse session switches while a turn is still running."""
+
+        task = self._active_turn
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            raise RuntimeError("a turn is still running; cancel it before switching sessions")
+
     async def start_new_session(self) -> SessionMeta:
         """Persist current session and open a fresh one in-process."""
-        self._persist()
+        self._require_idle_turn()
+        await self._persist_async()
         self._teardown_event_bridge()
+        self._cancel_title_task()
         if self._agent is not None:
             with contextlib.suppress(Exception):
                 await self._agent.close_tools()
@@ -511,8 +557,10 @@ class AgentHost:
 
     async def switch_session(self, session_id: str) -> SessionMeta:
         """Persist current session and resume another."""
-        self._persist()
+        self._require_idle_turn()
+        await self._persist_async()
         self._teardown_event_bridge()
+        self._cancel_title_task()
         if self._agent is not None:
             with contextlib.suppress(Exception):
                 await self._agent.close_tools()
@@ -630,7 +678,7 @@ class AgentHost:
         if reasoning_effort is not None:
             save_user_reasoning_effort(selected_effort)
         self.config.model = selected_model
-        self.config.reasoning_effort = selected_effort  # type: ignore[assignment]
+        self.config.reasoning_effort = selected_effort
         suffix = f"; alias saved in {config_path}" if config_path else ""
         return (
             f"Using {provider_label}: {selected_model} (reasoning={selected_effort}). "
@@ -705,7 +753,6 @@ class AgentHost:
 
     def cancel_active_turn(self) -> None:
         """Cancel the in-flight turn and pending approvals (Ctrl-C)."""
-        self._cancel_turn = True
         if self._agent is not None:
             self._agent.approvals.cancel_all()
         task = self._active_turn
@@ -720,7 +767,6 @@ class AgentHost:
         if skill_prompt is None:
             return "handled"
         line = skill_prompt
-        self._cancel_turn = False
         self.ui.set_busy(True)
         self._active_turn = asyncio.current_task()
         try:
@@ -758,7 +804,7 @@ class AgentHost:
         except Exception as exc:  # noqa: BLE001
             self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
             return None
-        attr = getattr(self.agent.skills, "_attr_map", {}).get(info.registry_name)  # noqa: SLF001
+        attr = nooa_compat.skill_attribute(self.agent.skills, info.registry_name)
         approved = getattr(self.agent, "_sandbox_approved_roots", None)
         if attr and isinstance(approved, set):
             approved.add(attr)
@@ -877,7 +923,7 @@ class AgentHost:
             if mode not in {"build", "plan"}:
                 self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /mode [build|plan]"))
                 return "handled"
-            agent.set_mode(mode)  # type: ignore[arg-type]
+            agent.set_mode(mode)
             if self.meta:
                 self.meta.mode = mode
                 self.store.save_meta(self.meta)
@@ -939,7 +985,7 @@ class AgentHost:
             await self._switch_model(model, reasoning_effort=requested)
             if make_global:
                 path = save_user_reasoning_effort(requested)
-                self.config.reasoning_effort = requested  # type: ignore[assignment]
+                self.config.reasoning_effort = requested
                 self.ui.render(
                     HostEvent(
                         HostEventKind.STATUS,
@@ -963,12 +1009,16 @@ class AgentHost:
                 self.ui.render(HostEvent(HostEventKind.ERROR, f"provider error: {exc}"))
             return "handled"
         if name == "session":
+            current = self.meta
+            if current is None:
+                self.ui.render(_command_output("(no active session)"))
+                return "handled"
             self.ui.render(
                 _command_output(
-                    f"id={self.meta.session_id}\ntitle={self.meta.title}\n"
-                    f"mode={agent.mode}\nmodel={self.meta.model}\n"
-                    f"reasoning_effort={self.meta.reasoning_effort}\n"
-                    f"workspace={self.meta.workspace_path}"
+                    f"id={current.session_id}\ntitle={current.title}\n"
+                    f"mode={agent.mode}\nmodel={current.model}\n"
+                    f"reasoning_effort={current.reasoning_effort}\n"
+                    f"workspace={current.workspace_path}"
                 )
             )
             return "handled"
@@ -1082,7 +1132,7 @@ class AgentHost:
             return "handled"
         if name == "undo":
             try:
-                self.ui.render(HostEvent(HostEventKind.STATUS, self.undo_last_turn()))
+                self.ui.render(HostEvent(HostEventKind.STATUS, await self.undo_last_turn_async()))
             except Exception as exc:  # noqa: BLE001
                 self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
             return "handled"
@@ -1133,7 +1183,7 @@ class AgentHost:
     ) -> Literal["continue", "exit", "handled"]:
         cmd = self._custom_commands[name]
         if cmd.mode in {"build", "plan"}:
-            self.agent.set_mode(cmd.mode)  # type: ignore[arg-type]
+            self.agent.set_mode(cmd.mode)
             if self.meta:
                 self.meta.mode = cmd.mode
                 self.store.save_meta(self.meta)
@@ -1191,7 +1241,9 @@ class AgentHost:
         from noah_code.composer import expand_turn
 
         agent = self.agent
-        agent.refresh_context_sources()
+        # git status + instruction-file reads are subprocess/file work; keep
+        # them off the UI event loop.
+        await asyncio.to_thread(agent.refresh_context_sources)
         agent.journal.begin_turn()
         expanded = expand_turn(text, self.workspace.root, attach_paths=attach_paths)
         if expanded.images:
@@ -1202,13 +1254,14 @@ class AgentHost:
                     f"attached {len(expanded.images)} image(s) for show()",
                 )
             )
-        agent._user_messages_in.put(expanded.text)
+        nooa_compat.queue_user_message(agent, expanded.text)
 
         if self.meta and self.meta.title == "untitled":
             if self.config.efficiency.deterministic_titles:
                 self._set_session_title(_deterministic_title(text))
             else:
-                asyncio.create_task(self._maybe_title(text))
+                # Keep a strong reference; the event loop only holds tasks weakly.
+                self._title_task = asyncio.create_task(self._maybe_title(text))
 
         exit_code = 0
         explanation = ""
@@ -1222,7 +1275,6 @@ class AgentHost:
             )
             explanation = getattr(result, "explanation", "") or ""
             kind = getattr(result, "kind", None)
-            self._last_stop = explanation
             self.ui.render(HostEvent(HostEventKind.STOP, _stop_text(kind, explanation)))
             if kind == RespondReason.NEED_INPUT:
                 exit_code = 0
@@ -1242,17 +1294,19 @@ class AgentHost:
             exit_code = 130
             explanation = "cancelled"
             self.ui.render(HostEvent(HostEventKind.STATUS, "turn cancelled"))
+            with contextlib.suppress(Exception):
+                # A cancelled task cannot await; persist synchronously.
+                self._persist()
             raise
         except Exception as exc:
             exit_code = 1
-            explanation = _friendly_agent_error(exc, self.config.efficiency.profile)
+            explanation = _friendly_agent_error(exc)
             self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
             logger.debug("handle() failed", exc_info=True)
         finally:
             agent.journal.end_turn()
-            self._last_turn_shell_bypass = bool(
-                agent.journal._turns and agent.journal._turns[-1].shell_may_bypass
-            )
+            latest = agent.journal.latest_turn()
+            self._last_turn_shell_bypass = bool(latest and latest.shell_may_bypass)
             if self._last_turn_shell_bypass:
                 self.ui.render(
                     HostEvent(
@@ -1261,7 +1315,8 @@ class AgentHost:
                         "file-journal undo may be incomplete",
                     )
                 )
-            self._persist()
+            if exit_code != 130:
+                await self._persist_async()
         return HostResult(
             exit_code=exit_code,
             explanation=explanation,
@@ -1269,12 +1324,23 @@ class AgentHost:
         )
 
     async def _maybe_title(self, text: str) -> None:
+        session_id = self.meta.session_id if self.meta else None
         try:
             title = await self.agent.name_session(text)
-            title = (title or "").strip().strip('"')[:60]
-            self._set_session_title(title)
         except Exception:  # noqa: BLE001 - never fail the main task
             logger.debug("title generation failed", exc_info=True)
+            return
+        if session_id and (self.meta is None or self.meta.session_id != session_id):
+            # The user switched sessions while the title call was in flight;
+            # never write a stale title into the new session's meta.
+            return
+        title = (title or "").strip().strip('"')[:60]
+        self._set_session_title(title)
+
+    def _cancel_title_task(self) -> None:
+        if self._title_task is not None and not self._title_task.done():
+            self._title_task.cancel()
+        self._title_task = None
 
     def _set_session_title(self, title: str) -> None:
         selected = (title or "").strip().strip('"')[:60]

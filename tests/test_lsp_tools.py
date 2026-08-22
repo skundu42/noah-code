@@ -41,12 +41,12 @@ async def test_lsp_navigation_and_rename_preview_use_one_lazy_client(tmp_path: P
     class FakeClient:
         command = ("fake-lsp",)
 
-        async def open_document(self, path, language):  # noqa: ANN001, ANN202
+        async def open_document(self, path, language):
             assert path == source
             assert language == "python"
             return source.as_uri()
 
-        async def request(self, method, params, *, timeout=None):  # noqa: ANN001, ANN202
+        async def request(self, method, params, *, timeout=None):
             del timeout
             if method in {"textDocument/definition", "textDocument/implementation"}:
                 return [{"uri": source.as_uri(), "range": {"start": {"line": 0, "character": 4}}}]

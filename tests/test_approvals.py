@@ -16,7 +16,7 @@ async def test_cancel_all_rejects_in_flight_approval() -> None:
     engine = PermissionEngine([PermissionRule(category="edit", pattern="*", action="ask")])
     started = asyncio.Event()
 
-    async def slow_handler(_req):  # noqa: ANN001
+    async def slow_handler(_req):
         started.set()
         await asyncio.sleep(30)
         return ApprovalChoice.SESSION

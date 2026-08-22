@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 from html.parser import HTMLParser
@@ -122,8 +123,12 @@ class WebTools(Skill):
 
         normalized = _require_http_url(url)
         await self._approvals.require(self._engine.decide(PermissionCategory.WEBFETCH, normalized))
-        content_type, body = self._transport.fetch(
-            normalized, timeout=self._timeout, max_bytes=self._max_bytes
+        # Blocking network I/O must not freeze the agent event loop.
+        content_type, body = await asyncio.to_thread(
+            self._transport.fetch,
+            normalized,
+            timeout=self._timeout,
+            max_bytes=self._max_bytes,
         )
         text = _to_text(content_type, body)
         if len(text) > _MAX_CHARS:
@@ -138,8 +143,11 @@ class WebTools(Skill):
             raise ValueError("search query is required")
         await self._approvals.require(self._engine.decide(PermissionCategory.WEBSEARCH, cleaned))
         url = self._search_url.format(query=quote_plus(cleaned))
-        _content_type, body = self._transport.fetch(
-            url, timeout=self._timeout, max_bytes=self._max_bytes
+        _content_type, body = await asyncio.to_thread(
+            self._transport.fetch,
+            url,
+            timeout=self._timeout,
+            max_bytes=self._max_bytes,
         )
         parser = _SearchLinks()
         parser.feed(body)

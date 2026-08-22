@@ -7,6 +7,7 @@ from typing import Any
 
 from nooa import Skill
 
+from noah_code import nooa_compat
 from noah_code.agents import AgentSpec, discover_agents
 from noah_code.approvals import ApprovalBroker
 from noah_code.permissions import PermissionCategory, PermissionEngine
@@ -112,7 +113,7 @@ async def run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> str:
     parent.engine.mode = spec.mode
     child._render_message = lambda text, **_kwargs: messages.append(str(text))  # noqa: ARG005
     try:
-        child._user_messages_in.put(prompt)
+        nooa_compat.queue_user_message(child, prompt)
         wins = await child.queue_manager.race()
         notification: dict[str, list] = {}
         for name, item in wins:

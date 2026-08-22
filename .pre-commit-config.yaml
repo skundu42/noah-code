@@ -1,0 +1,8 @@
+# Pre-commit hooks mirroring the CI lint gate.
+# Install with: uv run pre-commit install  (or `pre-commit install` once installed)
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.1
+    hooks:
+      - id: ruff-check
+        args: [--fix]

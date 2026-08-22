@@ -23,6 +23,7 @@ from nooa.strategies.codeact_lite import PlainCodeActBlockFormatter
 from nooa.tools import TodoManager
 from nooa.tools.shell_tools import ShellTools
 
+from noah_code import nooa_compat
 from noah_code.approvals import ApprovalBroker
 from noah_code.config import NoahCodeConfig
 from noah_code.macos_sandbox import build_macos_profile, macos_worker_main
@@ -142,7 +143,7 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
 
     def _walk_path(self, path: list[str]) -> Any:
         normalized = tuple(path)
-        approved_roots = getattr(self._agent, "_sandbox_approved_roots", set())
+        approved_roots: set[str] = getattr(self._agent, "_sandbox_approved_roots", set())
         dynamically_allowed = bool(normalized and normalized[0] in approved_roots)
         if not normalized or not (self._path_allowed(normalized) or dynamically_allowed):
             display = ".".join(path) or "<root>"
@@ -250,10 +251,10 @@ class _LeanPermissionCodeActStrategy(_PermissionCodeActStrategy):
 
     async def execute(self, runtime: Any, call: Any) -> Any:
         original = runtime.agent.render_config
-        truncation = runtime.agent._truncation
+        event_format = nooa_compat.truncation_event_format(runtime.agent)
         runtime.agent.render_config = original.model_copy(
             update={
-                "block_formatter": PlainCodeActBlockFormatter(event_format=truncation.event_format)
+                "block_formatter": PlainCodeActBlockFormatter(event_format=event_format)
             }
         )
         try:
@@ -436,7 +437,7 @@ class CodingAgent(InteractiveAgent):
             if context_window
             else 100_000
         )
-        for summarizer in getattr(self, "_summarizers", []):
+        for summarizer in nooa_compat.summarizers(self):
             current = summarizer.config
             summarizer.config = TokenBudgetConfig(
                 max_tokens=maximum,
@@ -451,8 +452,7 @@ class CodingAgent(InteractiveAgent):
         self._llm = llm
         if lightweight_follows_main:
             self._lightweight_llm = llm
-            for summarizer in getattr(self, "_summarizers", []):
-                summarizer._llm = llm
+            nooa_compat.rebind_summarizer_llms(self, llm)
         self.sync_model_limits()
 
     @hidden
@@ -468,19 +468,7 @@ class CodingAgent(InteractiveAgent):
     async def compact_history(self) -> bool:
         """Compact the oldest eligible history now, at an explicit turn boundary."""
 
-        compacted = False
-        for summarizer in getattr(self, "_summarizers", []):
-            tags = summarizer.target_event_manager.keys()
-            preserve = summarizer.config.preserve_recent
-            if summarizer._pending_task is not None or len(tags) <= preserve:
-                continue
-            summarizer._schedule_summarization(tags[0], tags[-(preserve + 1)])
-            if summarizer._pending_task is not None:
-                await summarizer._pending_task
-                had_summary = summarizer._pending_summary is not None
-                summarizer._apply_pending_summary()
-                compacted = compacted or had_summary
-        return compacted
+        return await nooa_compat.compact_summarizers(self)
 
     @hidden
     @strategy(

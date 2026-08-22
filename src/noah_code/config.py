@@ -6,18 +6,13 @@ import json
 import os
 import re
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from noah_code.themes import ThemeName, get_theme
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    import tomli as tomllib  # type: ignore[no-redef]
-
 
 PermissionAction = Literal["allow", "ask", "deny"]
 ReasoningEffort = Literal["default", "none", "minimal", "low", "medium", "high", "xhigh"]

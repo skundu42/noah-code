@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
 import sqlite3
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -19,6 +22,11 @@ if TYPE_CHECKING:
 
 class SessionError(RuntimeError):
     """Session load/create failure."""
+
+
+# Undo-journal sidecars keep the most recent turns only; meta.json stays small
+# and fast to rewrite on every turn end.
+JOURNAL_SIDECAR_MAX_TURNS = 20
 
 
 @dataclass(frozen=True)
@@ -73,6 +81,9 @@ class SessionStore:
     def _meta_path(self, session_id: str) -> Path:
         return self._session_path(session_id) / "meta.json"
 
+    def _journal_path(self, session_id: str) -> Path:
+        return self._session_path(session_id) / "journal.json"
+
     def _db_path(self, session_id: str) -> Path:
         return self._session_path(session_id) / "session.db"
 
@@ -100,10 +111,50 @@ class SessionStore:
 
     def save_meta(self, meta: SessionMeta) -> None:
         meta.updated_at = time.time()
-        path = self._meta_path(meta.session_id)
+        self._atomic_write_json(self._meta_path(meta.session_id), meta.to_json())
+
+    def save_journal(self, session_id: str, data: dict) -> None:
+        """Persist the undo journal sidecar with bounded retention."""
+
+        pruned = {
+            "turns": list(data.get("turns", []))[-JOURNAL_SIDECAR_MAX_TURNS:],
+            "redo": list(data.get("redo", []))[-JOURNAL_SIDECAR_MAX_TURNS:],
+        }
+        self._atomic_write_json(
+            self._journal_path(session_id), json.dumps(pruned, indent=1)
+        )
+
+    def load_journal(self, session_id: str) -> dict:
+        """Load the undo sidecar; fall back to legacy embedded meta journals."""
+
+        path = self._journal_path(session_id)
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                return {}
+            return data if isinstance(data, dict) else {}
+        try:
+            legacy = self.load_meta(session_id).journal
+        except SessionError:
+            return {}
+        return legacy or {}
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: str) -> None:
+        """Temp file + fsync + rename with 0600 already applied pre-replace."""
+
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(meta.to_json())
-        path.chmod(0o600)
+        descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temp_name, 0o600)
+            os.replace(temp_name, path)
+        finally:
+            Path(temp_name).unlink(missing_ok=True)
 
     def load_meta(self, session_id: str) -> SessionMeta:
         path = self._meta_path(session_id)
@@ -143,9 +194,15 @@ class SessionStore:
 
     def list_sessions(self, workspace: Workspace | None = None) -> list[SessionMeta]:
         items: list[SessionMeta] = []
-        for child in sorted(
-            self.session_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True
-        ):
+
+        def mtime(child: Path) -> float:
+            try:
+                return child.stat().st_mtime
+            except OSError:
+                # A session can vanish between iterdir and stat.
+                return 0.0
+
+        for child in sorted(self.session_dir.iterdir(), key=mtime, reverse=True):
             if not child.is_dir():
                 continue
             meta_path = child / "meta.json"
@@ -210,7 +267,10 @@ class SessionStore:
         params = (before, limit) if before is not None else (limit,)
         uri = f"{db_path.resolve().as_uri()}?mode=ro"
         try:
-            with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+            with (
+                contextlib.closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection,
+                connection,
+            ):
                 rows = connection.execute(query, params).fetchall()
         except sqlite3.Error as exc:
             raise SessionError(f"cannot read history for session {session_id}: {exc}") from exc

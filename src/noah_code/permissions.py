@@ -150,13 +150,16 @@ class PermissionDecision:
 
 
 def is_secret_path(path: str | Path) -> bool:
+    # Case-insensitive by design: default macOS/Windows filesystems are
+    # case-insensitive, so CERT.PEM is the same file as cert.pem there, and on
+    # case-sensitive filesystems a false positive only costs one approval.
     p = Path(path)
-    name = p.name
+    name = p.name.lower()
     if name in _SECRET_ALLOW:
         return False
     if name in _SECRET_BASENAMES:
         return True
-    if name.startswith(".env.") and name not in _SECRET_ALLOW:
+    if name.startswith(".env."):
         return True
     if any(name.endswith(suf) for suf in _SECRET_SUFFIXES):
         return True
@@ -165,7 +168,7 @@ def is_secret_path(path: str | Path) -> bool:
     parts = p.parts
     if ".git" in parts:
         return True
-    return name.endswith(".db") and "noah-code" in str(p)
+    return name.endswith(".db") and "noah-code" in str(p).lower()
 
 
 def _match_rule(rule: PermissionRule, category: str, target: str) -> bool:
@@ -205,7 +208,6 @@ class PermissionEngine:
         if (
             category in {PermissionCategory.READ, PermissionCategory.EDIT}
             and is_secret_path(normalized)
-            and Path(normalized).name not in _SECRET_ALLOW
         ):
             return PermissionDecision(
                 category=category,
@@ -321,6 +323,16 @@ class PermissionEngine:
                     reason="mutating or unrecognized git commands are not auto-approved",
                     remember_pattern=command,
                 )
+
+        if self.auto_approve and _is_env_dump(command, tokens):
+            return PermissionDecision(
+                category=PermissionCategory.BASH,
+                target=command,
+                action="deny",
+                matching_rule=None,
+                reason="environment dump denied under auto-approval",
+                remember_pattern=command,
+            )
 
         for pat in _ALWAYS_DENY_BASH:
             if pat.search(command):
@@ -476,8 +488,46 @@ def _command_has_external_path(command: str) -> bool:
         if token.startswith("-") and "=" not in token:
             continue
         for piece in pieces:
+            # Fail closed on expansion syntax: $HOME, ${HOME}, and `cmd`
+            # resolve outside the workspace at execution time, so a plan-mode
+            # readonly allow must never treat them as internal paths.
+            if "$" in piece or "`" in piece:
+                return True
             if piece.startswith(("~", "/")) or piece == "..":
                 return True
             if ".." in Path(piece).parts:
                 return True
+    return False
+
+
+_ENV_DUMP_PROGRAMS = frozenset(
+    {"set", "declare", "local", "typeset", "readonly", "export"}
+)
+_AUTO_ENV_INTERPRETERS = frozenset({"python", "python3", "node", "perl", "ruby", "php"})
+
+
+def _is_env_dump(command: str, tokens: list[str]) -> bool:
+    """Detect commands whose primary effect is printing environment state.
+
+    Only consulted under ``--auto``, where there is no user to approve an
+    ask; printenv/bare-env are handled separately by the always-on deny.
+    """
+    for index, token in enumerate(tokens):
+        program = Path(token).name.lower()
+        rest = tokens[index + 1 :]
+        if program == "cat" and any(fnmatch.fnmatch(part, "/proc/*/environ") for part in rest):
+            return True
+        if fnmatch.fnmatch(token, "/proc/*/environ"):
+            return True
+        if program in _ENV_DUMP_PROGRAMS:
+            # Bare or flag-only invocations list variables; assignments do not.
+            if not rest or all(part.startswith("-") for part in rest):
+                return True
+            continue
+        if program in _AUTO_ENV_INTERPRETERS:
+            for j in range(index + 1, len(tokens) - 1):
+                if tokens[j] in {"-c", "-e"}:
+                    code = tokens[j + 1].lower()
+                    if "environ" in code or "process.env" in code:
+                        return True
     return False

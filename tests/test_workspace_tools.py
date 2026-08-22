@@ -16,7 +16,7 @@ from noah_code.tools.workspace_tools import WorkspaceTools, _matches_glob
 from noah_code.workspace import Workspace, WorkspaceError, open_workspace
 
 
-async def _always_once(req):  # noqa: ANN001
+async def _always_once(req):
     return ApprovalChoice.ONCE
 
 
@@ -93,7 +93,7 @@ async def test_build_edit_asks_without_auto(tmp_path: Path) -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="build", auto_approve=False)
     rejected = []
 
-    async def _reject(req):  # noqa: ANN001
+    async def _reject(req):
         rejected.append(req)
         return ApprovalChoice.REJECT
 
@@ -196,7 +196,7 @@ async def test_atomic_patch_rolls_back_commit_failure(
     real_replace = __import__("os").replace
     commits = 0
 
-    def fail_second_commit(source, destination):  # noqa: ANN001, ANN202
+    def fail_second_commit(source, destination):
         nonlocal commits
         if ".noah-" in str(source):
             commits += 1
@@ -399,5 +399,72 @@ async def test_list_files_caps_during_walk(tmp_path: Path) -> None:
         files = [item for item in listed if not item.startswith("...")]
         assert len(files) == 2
         assert any(item.startswith("...") for item in listed)
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_file_ops_survive_shell_cd_drift(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("root = 1\n")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("nested = 1\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        await ws.run("cd src")
+        m = await ws.read("app.py", lines=(1, 1))
+        assert "root = 1" in m.text
+        await ws.replace(m, "root = 2\n")
+        assert (tmp_path / "app.py").read_text() == "root = 2\n"
+        assert (tmp_path / "src" / "app.py").read_text() == "nested = 1\n"
+        await ws.write_file("app.py", "root = 3\n")
+        assert (tmp_path / "app.py").read_text() == "root = 3\n"
+        assert (tmp_path / "src" / "app.py").read_text() == "nested = 1\n"
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_match_anchor_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("one\ntwo\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        m = await ws.read("a.py", lines=(1, 1))
+        # Concurrent modification between read and edit.
+        (tmp_path / "a.py").write_text("changed\ntwo\n")
+        with pytest.raises(ValueError, match="stale edit anchor"):
+            await ws.replace(m, "ONE\n")
+        # Anchors stay stale after an edit until the file is re-read.
+        fresh = await ws.read("a.py", lines=(1, 1))
+        await ws.replace(fresh, "CHANGED\n")
+        with pytest.raises(ValueError, match="stale edit anchor"):
+            await ws.replace(fresh, "OTHER\n")
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_anchored_edit_preserves_crlf_and_encoding(tmp_path: Path) -> None:
+    (tmp_path / "win.py").write_bytes(b"a = 1\r\nb = 2\r\nc = 3\r\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        m = await ws.read("win.py", lines=(2, 2))
+        await ws.replace(m, "b = 20")
+        data = (tmp_path / "win.py").read_bytes()
+        assert data == b"a = 1\r\nb = 20\r\nc = 3\r\n"
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_write_file_is_atomic_and_mode_preserving(tmp_path: Path) -> None:
+    target = tmp_path / "script.sh"
+    target.write_text("#!/bin/sh\necho hi\n")
+    target.chmod(0o755)
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        result = await ws.write_file("script.sh", "#!/bin/sh\necho bye\n")
+        assert "script.sh" in result.message
+        assert target.stat().st_mode & 0o777 == 0o755
+        assert not list(tmp_path.glob(".script.sh*"))
     finally:
         await ws.close()

@@ -232,6 +232,7 @@ def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> 
                     "activity_id": activity_id,
                     "tool": name,
                     "state": "running",
+                    "detail": _action_detail(name, args),
                 },
             )
         )
@@ -254,7 +255,7 @@ def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> 
             parts.append(line)
         activity_id = str(getattr(event, "tool_call_id", "") or getattr(event, "id", ""))
         # Stream truncated stdout/stderr as shell-like chunks when present.
-        if stdout and len(stdout) > 0:
+        if stdout:
             emit(
                 HostEvent(
                     HostEventKind.SHELL_CHUNK,
@@ -326,6 +327,11 @@ def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> 
         if usage is not None:
             usage.llm_complete(event)
 
+    def on_reasoning(event: Any) -> None:
+        text = str(getattr(event, "content", "") or "").strip()
+        if text:
+            emit(HostEvent(HostEventKind.REASONING, _truncate(text, 2000)))
+
     def on_summary(event: Any) -> None:
         text = str(getattr(event, "content", "") or getattr(event, "summary", "") or "")
         if text:
@@ -338,6 +344,7 @@ def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> 
         ("LLMCallStart", on_llm_start),
         ("LLMCallEnd", on_llm_end),
         ("LLMComplete", on_llm_complete),
+        ("Reasoning", on_reasoning),
         ("Summary", on_summary),
     ):
         try:
@@ -353,6 +360,18 @@ def _brief_args(args: dict[str, Any]) -> str:
         return ""
     keys = list(args.keys())[:3]
     return ", ".join(f"{k}=…" for k in keys)
+
+
+def _action_detail(name: str, args: dict[str, Any], *, limit: int = 1200) -> str:
+    """Bounded raw action payload for the expandable activity inspector."""
+
+    if name == "execute_python":
+        return str(args.get("code", ""))[:limit]
+    rows = []
+    for key, value in list(args.items())[:6]:
+        rendered = " ".join(str(value).split())
+        rows.append(f"{key}: {rendered[:200]}")
+    return "\n".join(rows)[:limit]
 
 
 def _truncate(text: str, limit: int) -> str:

@@ -10,7 +10,7 @@ from noah_code.permissions import PermissionEngine
 from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt, QuestionTools
 
 
-async def _always_once(_req):  # noqa: ANN001
+async def _always_once(_req):
     return ApprovalChoice.ONCE
 
 

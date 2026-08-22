@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import os
 import signal
@@ -94,7 +95,7 @@ class ProcessTools(Skill):
         if runtime <= 0:
             raise ValueError("timeout must be positive")
         if os.name == "nt":
-            argv = ("cmd.exe", "/d", "/s", "/c", command)
+            argv: tuple[str, ...] = ("cmd.exe", "/d", "/s", "/c", command)
         else:
             argv = (os.environ.get("SHELL") or "/bin/sh", "-lc", command)
         process = await asyncio.create_subprocess_exec(
@@ -225,11 +226,19 @@ class ProcessTools(Skill):
     ) -> None:
         if stream is None:
             return
+        # Incremental decoding keeps multibyte UTF-8 sequences that straddle
+        # read-chunk boundaries from turning into U+FFFD garbage.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         while True:
             chunk = await stream.read(4096)
             if not chunk:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    self._append(job, stream_name, tail)
                 return
-            self._append(job, stream_name, chunk.decode(errors="replace"))
+            text = decoder.decode(chunk)
+            if text:
+                self._append(job, stream_name, text)
 
     def _append(self, job: BackgroundJob, stream: str, text: str) -> None:
         event = ProcessEvent(job.next_sequence, stream, text, time.monotonic())

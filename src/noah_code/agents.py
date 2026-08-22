@@ -6,9 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from noah_code.custom_commands import _parse_frontmatter
+from noah_code.custom_commands import parse_frontmatter
 
-AgentKind = Literal["primary", "subagent"]
 AgentMode = Literal["build", "plan"]
 
 
@@ -19,7 +18,6 @@ class AgentSpec:
     name: str
     description: str
     prompt: str
-    kind: AgentKind = "subagent"
     mode: AgentMode = "build"
     readonly: bool = False
     todos: bool = True
@@ -39,7 +37,6 @@ def builtin_agents() -> list[AgentSpec]:
                 "mutating commands. Search and read until you can answer with file paths "
                 "and short evidence. Prefer self.ws.search, self.ws.read, and self.lsp."
             ),
-            kind="subagent",
             mode="plan",
             readonly=True,
             todos=False,
@@ -53,7 +50,6 @@ def builtin_agents() -> list[AgentSpec]:
                 "work and return a concise result to the parent. Do not manage todos. "
                 "Make the smallest coherent change and report what you did."
             ),
-            kind="subagent",
             mode="build",
             readonly=False,
             todos=False,
@@ -86,7 +82,7 @@ def _load_markdown_agents(directory: Path, *, source: str) -> dict[str, AgentSpe
             raw = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        meta, body = _parse_frontmatter(raw)
+        meta, body = parse_frontmatter(raw)
         mode_raw = str(meta.get("mode") or "build").strip().lower()
         mode: AgentMode = "plan" if mode_raw in {"plan", "readonly", "read-only"} else "build"
         readonly = _truthy(meta.get("readonly")) or mode == "plan"
@@ -94,7 +90,6 @@ def _load_markdown_agents(directory: Path, *, source: str) -> dict[str, AgentSpe
             name=name,
             description=str(meta.get("description") or name),
             prompt=body.strip(),
-            kind="subagent",
             mode="plan" if readonly else mode,
             readonly=readonly,
             todos=_truthy(meta.get("todos"), default=False),

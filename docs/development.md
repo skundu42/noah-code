@@ -7,11 +7,29 @@ Install the development environment and run the local checks:
 ```bash
 uv sync --extra dev --extra mcp --extra tracing
 uv run ruff check src tests
+uv run mypy src/noah_code
 uv run pytest tests
 uv build
 ```
 
-The default test suite is hermetic and does not require network access or provider keys.
+The default test suite is hermetic and does not require network access or provider keys. A single
+opt-in test performs a live HTTP fetch; run it explicitly on a connected machine:
+
+```bash
+uv run pytest tests -m integration
+```
+
+Measure coverage (a 70% total gate runs in CI):
+
+```bash
+uv run pytest tests --cov=noah_code --cov-report=term-missing
+```
+
+Optional git hooks mirror the lint gate:
+
+```bash
+uvx pre-commit install
+```
 
 Run the deterministic efficiency fixture without making provider calls:
 
@@ -27,8 +45,9 @@ per-token estimate; use `/tokens` during a real session for provider-reported us
 ## CI
 
 GitHub Actions runs the complete test suite on Python 3.12 and 3.13, plus platform smoke tests on
-Linux and macOS for arm64 and x86_64. Every pull request and push to `main` must pass lint, tests,
-lockfile validation, and a package build.
+Linux and macOS for arm64 and x86_64. Every pull request and push to `main` must pass lint, static
+type checking (mypy), tests with a 70% coverage floor, lockfile validation, and a package build.
+Concurrent runs for the same reference are cancelled automatically.
 
 ## Releases
 

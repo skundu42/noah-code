@@ -56,21 +56,21 @@ def _fake_host(tmp_path: Path):
 
 
 @pytest.fixture(autouse=True)
-def _disable_live_update_checks(monkeypatch) -> None:  # noqa: ANN001
+def _disable_live_update_checks(monkeypatch) -> None:
     monkeypatch.setattr(
         "noah_code.ui.textual_app.maybe_check_for_update",
         lambda **_kwargs: None,
     )
 
 
-def _rendered_text(renderable) -> str:  # noqa: ANN001
+def _rendered_text(renderable) -> str:
     output = StringIO()
     console = Console(file=output, width=160, color_system=None)
     console.print(renderable)
     return output.getvalue()
 
 
-def _log_text(log) -> str:  # noqa: ANN001
+def _log_text(log) -> str:
     return "\n".join(strip.text for strip in log.lines)
 
 
@@ -293,7 +293,7 @@ async def test_tui_paints_before_host_start_and_queues_first_prompt(tmp_path: Pa
     host.meta = None
     start_gate = asyncio.Event()
 
-    async def _start():  # noqa: ANN202
+    async def _start():
         await start_gate.wait()
         host._agent = MagicMock(mode="build")
         host.agent.mode = "build"
@@ -332,7 +332,7 @@ async def test_first_run_opens_model_setup_before_starting_agent(tmp_path: Path)
     host.meta = None
     host.set_provider_api_key.return_value = SimpleNamespace(message="credential saved")
 
-    async def _start():  # noqa: ANN202
+    async def _start():
         host._agent = MagicMock(mode="build")
         host.agent.mode = "build"
         host.meta = MagicMock(
@@ -395,7 +395,7 @@ async def test_first_run_opens_model_setup_before_starting_agent(tmp_path: Path)
 async def test_available_update_uses_temporary_banner_and_persistent_rail(
     tmp_path: Path,
     monkeypatch,
-) -> None:  # noqa: ANN001
+) -> None:
     monkeypatch.setattr(
         "noah_code.ui.textual_app.maybe_check_for_update",
         lambda **_kwargs: UpdateStatus(current="0.2.1", latest="0.3.0"),
@@ -421,7 +421,7 @@ async def test_available_update_uses_temporary_banner_and_persistent_rail(
 async def test_theme_picker_applies_and_persists_theme(
     tmp_path: Path,
     monkeypatch,
-) -> None:  # noqa: ANN001
+) -> None:
     config_path = tmp_path / "config.toml"
     monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
     app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
@@ -836,7 +836,7 @@ async def test_model_setup_recovers_a_missing_credential_startup_failure(tmp_pat
     host.set_provider_api_key.return_value = SimpleNamespace(message="credential saved")
     attempts = 0
 
-    async def _start():  # noqa: ANN202
+    async def _start():
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -1140,3 +1140,106 @@ async def test_approval_modal_reject_is_safe_default(tmp_path: Path) -> None:
                 break
             await pilot.pause()
         assert result_box == [ApprovalChoice.ONCE]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_attaches_to_activity_and_banner_shows_thought(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host.config.ui.show_reasoning = False
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.set_busy(True)
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                "Reading src/a.py",
+                meta={"activity_id": "read-1", "tool": "execute_python"},
+            )
+        )
+        await pilot.pause()
+        ui.render(HostEvent(HostEventKind.REASONING, "Check the export path first"))
+        await pilot.pause()
+
+        record = app._activities["read-1"]
+        assert "export path" in record.thought
+        assert app._last_thought == "Check the export path first"
+        banner_text = _rendered_text(app.query_one("#working-banner").content)
+        assert "✎" in banner_text
+        # Reasoning stays out of the transcript when show_reasoning is off.
+        transcript = _log_text(app.query_one("#conversation"))
+        assert "Thinking:" not in transcript
+
+
+@pytest.mark.asyncio
+async def test_activity_inspector_expands_thought_and_action_sections(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                "Reading src/a.py",
+                meta={
+                    "activity_id": "read-1",
+                    "tool": "execute_python",
+                    "detail": "text = await self.ws.read('src/a.py')",
+                },
+            )
+        )
+        ui.render(
+            HostEvent(
+                HostEventKind.REASONING,
+                "Confirm the module exports before editing",
+            )
+        )
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_FINISH,
+                "complete",
+                meta={"activity_id": "read-1", "result_status": "complete"},
+            )
+        )
+        await pilot.pause(0.08)
+
+        await pilot.press("f2")
+        await pilot.pause()
+        inspector = app.screen
+        detail_text = _log_text(inspector.query_one("#activity-detail"))
+        # Thought and action start collapsed with previews; output starts open.
+        assert "▶ THOUGHT" in detail_text
+        assert "▶ ACTION" in detail_text
+        assert "▼ OUTPUT" in detail_text
+
+        await pilot.press("t")
+        await pilot.pause()
+        expanded = _log_text(inspector.query_one("#activity-detail"))
+        assert "▼ THOUGHT" in expanded
+        assert "Confirm the module exports" in expanded
+
+        await pilot.press("a")
+        await pilot.pause()
+        expanded = _log_text(inspector.query_one("#activity-detail"))
+        assert "▼ ACTION" in expanded
+        assert "ws.read('src/a.py')" in expanded
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_session_actions_are_refused_while_turn_is_busy(tmp_path: Path) -> None:
+    from unittest.mock import AsyncMock
+
+    host = _fake_host(tmp_path)
+    host.start_new_session = AsyncMock(side_effect=AssertionError("must not switch"))
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.set_busy(True)
+        await pilot.pause()
+        await pilot.press("ctrl+n")
+        await pilot.pause()
+        host.start_new_session.assert_not_called()
+        assert "cancel it" in _log_text(app.query_one("#conversation"))

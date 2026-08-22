@@ -13,7 +13,7 @@ from noah_code.tools.task_tools import TaskTools
 from noah_code.workspace import Workspace
 
 
-async def _always_once(_req):  # noqa: ANN001
+async def _always_once(_req):
     return ApprovalChoice.ONCE
 
 
@@ -23,7 +23,7 @@ async def test_task_run_uses_named_agent_and_permission(tmp_path: Path) -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
     seen: dict[str, str] = {}
 
-    async def runner(spec, prompt: str) -> str:  # noqa: ANN001
+    async def runner(spec, prompt: str) -> str:
         seen["name"] = spec.name
         seen["mode"] = spec.mode
         seen["prompt"] = prompt

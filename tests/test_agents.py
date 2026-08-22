@@ -15,7 +15,6 @@ def test_builtin_explore_is_readonly_without_todos() -> None:
     assert explore.mode == "plan"
     assert explore.readonly is True
     assert explore.todos is False
-    assert explore.kind == "subagent"
     assert "codebase" in explore.description.lower()
 
     assert general.mode == "build"

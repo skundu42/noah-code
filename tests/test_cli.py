@@ -108,7 +108,7 @@ def test_first_run_cli_override_becomes_global_default(monkeypatch, tmp_path: Pa
 def test_existing_global_default_skips_first_run_prompt(monkeypatch) -> None:
     monkeypatch.setattr("noah_code.cli.user_default_model", lambda: "global-model")
 
-    def unexpected_prompt(*args, **kwargs):  # noqa: ANN002, ANN003
+    def unexpected_prompt(*args, **kwargs):
         raise AssertionError("prompt should not be shown")
 
     monkeypatch.setattr("noah_code.cli.click.prompt", unexpected_prompt)

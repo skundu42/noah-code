@@ -37,6 +37,63 @@ def test_secret_paths() -> None:
     assert not is_secret_path(".env.example")
 
 
+def test_secret_paths_match_case_insensitively() -> None:
+    assert is_secret_path("CERT.PEM")
+    assert is_secret_path("Server.KEY")
+    assert is_secret_path("ID_RSA")
+    assert is_secret_path(".ENV")
+    assert is_secret_path(".Env.Local")
+    assert is_secret_path("CREDENTIALS.JSON")
+    assert is_secret_path("Service-Account.JSON")
+    assert is_secret_path("deploy/ID_ED25519")
+    assert not is_secret_path(".ENV.EXAMPLE")
+    assert not is_secret_path("README.MD")
+
+
+def test_default_read_rule_denies_uppercase_secret_names() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    assert engine.decide("read", "CERT.PEM").action == "deny"
+    assert engine.decide("read", "ID_RSA").action == "deny"
+    assert engine.decide("edit", ".ENV").action == "deny"
+    assert engine.decide("bash", "cat CERT.PEM").action == "deny"
+
+
+def test_plan_mode_rejects_variable_expansion_paths() -> None:
+    plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
+    assert plan.decide("bash", "rg pattern $HOME/secrets").action == "deny"
+    assert plan.decide("bash", "rg pattern ${HOME}/x").action == "deny"
+    assert plan.decide("bash", "head `pwd`/../etc/passwd").action == "deny"
+    assert plan.decide("bash", "--flag=$HOME/x rg p .").action == "deny"
+    assert plan.decide("bash", "rg pattern ./src").action == "allow"
+
+
+def test_auto_denies_environment_dumps() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    assert engine.decide("bash", "set").action == "deny"
+    assert engine.decide("bash", "declare -p").action == "deny"
+    assert engine.decide("bash", "export").action == "deny"
+    assert engine.decide("bash", "export -p").action == "deny"
+    assert engine.decide("bash", "readonly").action == "deny"
+    assert engine.decide("bash", "cat /proc/self/environ").action == "deny"
+    assert engine.decide("bash", "cat /proc/1/environ").action == "deny"
+    assert engine.decide("bash", "python -c 'import os; print(os.environ)'").action == "deny"
+    assert engine.decide("bash", "node -e 'console.log(process.env)'").action == "deny"
+
+
+def test_auto_still_allows_var_assignments_and_shell_options() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    assert engine.decide("bash", "export FOO=bar").action == "allow"
+    assert engine.decide("bash", "declare x=1").action == "allow"
+    assert engine.decide("bash", "python -c 'print(1+1)'").action == "allow"
+    assert engine.decide("bash", "cat /proc/cpuinfo").action == "allow"
+
+
+def test_non_auto_env_builtins_still_ask() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=False)
+    decision = engine.decide("bash", "set")
+    assert decision.action == "ask"
+
+
 def test_default_secret_deny_and_example_allow() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
     assert engine.decide("read", ".env").action == "deny"

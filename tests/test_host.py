@@ -34,7 +34,7 @@ def test_iteration_limit_error_recommends_narrower_follow_up() -> None:
         "Generation failed after 40 iterations (max_iterations=40). Unable to complete `handle`."
     )
 
-    text = _friendly_agent_error(error, "fast")
+    text = _friendly_agent_error(error)
 
     assert text == (
         "Reached the iteration limit (40/40 turns). "
@@ -54,7 +54,7 @@ async def test_overflow_compacts_and_retries_handle_once() -> None:
 
     calls = {"n": 0}
 
-    async def handle(_notification):  # noqa: ANN001
+    async def handle(_notification):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("maximum context length exceeded")
@@ -80,7 +80,7 @@ async def test_overflow_does_not_retry_when_compaction_is_a_no_op() -> None:
 
     calls = {"n": 0}
 
-    async def handle(_notification):  # noqa: ANN001
+    async def handle(_notification):
         calls["n"] += 1
         raise RuntimeError("prompt is too long")
 
@@ -99,7 +99,7 @@ async def test_overflow_does_not_retry_when_compaction_is_a_no_op() -> None:
 async def test_second_overflow_is_not_recovered() -> None:
     from types import SimpleNamespace
 
-    async def handle(_notification):  # noqa: ANN001
+    async def handle(_notification):
         raise RuntimeError("context window exceeded")
 
     async def compact_history() -> bool:
@@ -113,7 +113,7 @@ async def test_second_overflow_is_not_recovered() -> None:
 
 
 def test_generic_agent_error_is_single_line_and_bounded() -> None:
-    text = _friendly_agent_error(RuntimeError("provider\n" + "x" * 1000), "fast")
+    text = _friendly_agent_error(RuntimeError("provider\n" + "x" * 1000))
 
     assert "\n" not in text
     assert len(text) <= 700
@@ -180,7 +180,7 @@ async def test_approval_deny_stable_ids() -> None:
     engine = PermissionEngine([PermissionRule(category="edit", pattern="*", action="ask")])
     seen = []
 
-    async def handler(req):  # noqa: ANN001
+    async def handler(req):
         seen.append(req.id)
         return ApprovalChoice.REJECT
 
@@ -221,7 +221,7 @@ async def test_resume_uses_persisted_model(tmp_path: Path, monkeypatch) -> None:
 async def test_config_slash_command_shows_scoped_setting(
     tmp_path: Path,
     monkeypatch,
-) -> None:  # noqa: ANN001
+) -> None:
     monkeypatch.setattr(
         "noah_code.config._user_config_path",
         lambda: tmp_path / "user-config.toml",
@@ -250,7 +250,7 @@ async def test_config_slash_command_shows_scoped_setting(
 async def test_theme_slash_command_persists_and_emits_live_theme_event(
     tmp_path: Path,
     monkeypatch,
-) -> None:  # noqa: ANN001
+) -> None:
     config_path = tmp_path / "config.toml"
     monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
     monkeypatch.setattr("noah_code.host.save_user_theme", lambda theme: config_path)
@@ -314,7 +314,7 @@ async def test_dollar_skill_invocation_activates_instructions_and_runs_task(tmp_
     host = AgentHost(workspace, config, llm=FakeLLMClient())
     await host.start()
 
-    async def approve(_request):  # noqa: ANN001, ANN202
+    async def approve(_request):
         return ApprovalChoice.ONCE
 
     host.agent.approvals.set_handler(approve)
@@ -463,7 +463,7 @@ async def test_model_switch_persists_for_current_session(tmp_path: Path, monkeyp
     requested: list[str] = []
     switched_client = FakeLLMClient()
 
-    def get_client(model: str):  # noqa: ANN202
+    def get_client(model: str):
         requested.append(model)
         return switched_client
 
@@ -574,7 +574,7 @@ async def test_reasoning_command_rebuilds_client_and_persists_session(
     calls: list[tuple[str, dict[str, str]]] = []
     replacement = FakeLLMClient()
 
-    def get_client(model: str, **kwargs):  # noqa: ANN003, ANN202
+    def get_client(model: str, **kwargs):
         calls.append((model, kwargs))
         return replacement
 

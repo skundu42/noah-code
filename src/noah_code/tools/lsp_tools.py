@@ -544,7 +544,7 @@ class LSPTools(Skill):
         await self._authorize_target(query or "*")
         lsp_rows: list[str] = []
         tried: set[str] = set()
-        for path in self._map._files():
+        for path in await asyncio.to_thread(self._map._files):  # noqa: SLF001 - bounded git listing
             language = _LANGUAGES.get(path.suffix.lower())
             if language is None or language in tried or self._command(language) is None:
                 continue
@@ -566,7 +566,7 @@ class LSPTools(Skill):
                 break
         if lsp_rows:
             return "\n".join(lsp_rows)
-        rows = self._map.build(query, limit=self._max_symbols)
+        rows = await asyncio.to_thread(self._map.build, query, limit=self._max_symbols)
         return "\n".join(item.render() for item in rows) or "(no symbols)"
 
     async def repository_map(
@@ -643,7 +643,7 @@ class LSPTools(Skill):
     async def changed_symbols(self) -> str:
         """Summarize declarations in Git-changed files."""
         await self._authorize_target("changed-files")
-        paths = self._changed_paths()
+        paths = await asyncio.to_thread(self._changed_paths)
         if not paths:
             return "(no changed source files)"
         sections: list[str] = []
@@ -709,11 +709,11 @@ class LSPTools(Skill):
     def _command(self, language: str) -> tuple[str, ...] | None:
         override = self._overrides.get(language)
         if override:
-            executable = shutil.which(override[0]) or override[0]
-            return (executable, *override[1:])
+            resolved = shutil.which(override[0]) or override[0]
+            return (resolved, *override[1:])
         for candidate in _SERVER_CANDIDATES.get(language, ()):
-            if executable := shutil.which(candidate[0]):
-                return (executable, *candidate[1:])
+            if found := shutil.which(candidate[0]):
+                return (found, *candidate[1:])
         return None
 
     async def _cached_request(

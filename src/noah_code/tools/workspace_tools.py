@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import difflib
 import gc
+import hashlib
 import os
 import re
 import shlex
@@ -13,10 +14,17 @@ import sys
 import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal, cast
 
 from nooa import Skill, hidden, spec
-from nooa.tools.shell_tools import Match, ShellResult, ShellTools, StreamDone, StreamEvent
+from nooa.tools.shell_tools import (
+    FileWrite,
+    Match,
+    ShellResult,
+    ShellTools,
+    StreamDone,
+    StreamEvent,
+)
 
 from noah_code.approvals import ApprovalBroker
 from noah_code.permissions import (
@@ -28,6 +36,11 @@ from noah_code.permissions import (
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tool_output import ToolOutputStore
 from noah_code.workspace import Workspace, WorkspaceError
+
+# Module-level aliases: inside the class body the tool methods named ``list``
+# would shadow builtins.list in parameter annotations.
+InspectTargets = list[str]
+PatchChanges = list[dict[str, str | None]]
 
 _IGNORED_LIST_DIRS = frozenset(
     {
@@ -135,6 +148,14 @@ class WorkspaceTools(Skill):
         # callers. Batched inspections can otherwise launch multiple shells
         # and orphan every process except the last one assigned to the session.
         self._shell_start_lock = asyncio.Lock()
+        # Delegated file operations pin the shell's path resolution to the
+        # workspace root so a model-driven `cd` inside the persistent shell can
+        # never redirect an authorized operation at a different file.
+        self._file_op_lock = asyncio.Lock()
+        # sha256 of raw bytes at read() time, keyed by absolute path. Anchored
+        # (Match) edits verify this fingerprint before splicing so a stale
+        # anchor fails loudly instead of corrupting a concurrently changed file.
+        self._read_fingerprints: dict[str, str] = {}
 
     def set_lsp(self, lsp: Any) -> None:
         """Attach diagnostics after both services have been constructed."""
@@ -175,8 +196,9 @@ class WorkspaceTools(Skill):
     ) -> Match | str:
         """Read a file range; oversized reads return a managed preview, not an edit anchor."""
         resolved = await self._authorize_path(path, PermissionCategory.READ)
-        rel = self._workspace.relpath(resolved)
-        result = await self._shell.read(rel, lines=lines)
+        async with self._pinned_shell_cwd():
+            result = await self._shell.read(str(resolved), lines=lines)
+        self._record_read_fingerprint(resolved)
         bounded = self._bound(result.text)
         if bounded != result.text:
             # A head/tail preview is not contiguous file content and therefore
@@ -191,7 +213,7 @@ class WorkspaceTools(Skill):
     ) -> ShellResult:
         """Return bounded ripgrep text; call read() on a result to get an edit anchor."""
         resolved = await self._authorize_path(path, PermissionCategory.READ)
-        target = self._workspace.relpath(resolved) or "."
+        target = str(resolved) if resolved != self._workspace.root.resolve() else "."
         cmd = " ".join(
             shlex.quote(a) for a in ["rg", "-n", "--no-heading", "-S", "--", pattern, target]
         )
@@ -274,11 +296,11 @@ class WorkspaceTools(Skill):
     async def inspect(
         self,
         searches: Annotated[
-            list[str] | None,
+            InspectTargets | None,
             spec(description="Regex/fixed searches to run concurrently"),
         ] = None,
         files: Annotated[
-            list[str] | None,
+            InspectTargets | None,
             spec(description="Workspace files to read concurrently"),
         ] = None,
         symbols: Annotated[
@@ -288,8 +310,8 @@ class WorkspaceTools(Skill):
     ) -> str:
         """Batch focused repository searches and reads into one compact result."""
 
-        queries = list(dict.fromkeys(searches or []))
-        paths = list(dict.fromkeys(files or []))
+        queries: list[str] = list(dict.fromkeys(searches or []))
+        paths: list[str] = list(dict.fromkeys(files or []))
         if len(queries) > 8 or len(paths) > 8:
             raise ValueError("inspect accepts at most 8 searches and 8 files")
         if not queries and not paths and not symbols:
@@ -334,9 +356,17 @@ class WorkspaceTools(Skill):
         """Edit via Match anchor (preferred) or unique string replacement."""
         if isinstance(match, Match):
             resolved = await self._authorize_path(match.path, PermissionCategory.EDIT)
+            expected = self._read_fingerprints.get(str(resolved))
+            if expected is not None:
+                actual = self._hash_path(resolved)
+                if actual != expected:
+                    raise ValueError(
+                        f"stale edit anchor: {self._workspace.relpath(resolved)} changed "
+                        "since read(); call read() again to refresh the Match"
+                    )
             mut = self._journal.record_preimage(resolved)
             try:
-                result = await self._shell.replace(match, new_text)
+                result = self._native_replace_match(resolved, match, new_text)
             except Exception:
                 self._journal.discard_mutation(mut)
                 raise
@@ -346,7 +376,8 @@ class WorkspaceTools(Skill):
             resolved = await self._authorize_path(match, PermissionCategory.EDIT)
             mut = self._journal.record_preimage(resolved)
             try:
-                result = await self._shell.replace(match, new_text, new)
+                async with self._pinned_shell_cwd():
+                    result = await self._shell.replace(str(resolved), new_text, new)
             except Exception:
                 self._journal.discard_mutation(mut)
                 raise
@@ -373,7 +404,7 @@ class WorkspaceTools(Skill):
         resolved = await self._authorize_path(path, PermissionCategory.EDIT)
         mut = self._journal.record_preimage(resolved)
         try:
-            result = await self._shell.write_file(path, content)
+            result = self._atomic_write_bytes(resolved, content.encode("utf-8"), content)
         except Exception:
             self._journal.discard_mutation(mut)
             raise
@@ -392,7 +423,7 @@ class WorkspaceTools(Skill):
     async def apply_patch(
         self,
         changes: Annotated[
-            list[dict[str, str | None]],
+            PatchChanges,
             spec(
                 description=(
                     "Atomic file changes: path plus exact old text and new text; "
@@ -434,13 +465,13 @@ class WorkspaceTools(Skill):
             )
 
         for item in prepared:
-            path: Path = item["resolved"]
+            target = cast(Path, item["resolved"])
             old = item["old"]
             new = item["new"]
-            exists = path.is_file()
-            if path.exists() and not exists:
+            exists = target.is_file()
+            if target.exists() and not exists:
                 raise ValueError(f"patch target is not a file: {item['path']}")
-            before_bytes = path.read_bytes() if exists else None
+            before_bytes = target.read_bytes() if exists else None
             if before_bytes is not None and len(before_bytes) > self._journal.blob_limit:
                 raise ValueError(
                     f"patch target exceeds atomic rollback limit ({self._journal.blob_limit} bytes): "
@@ -466,13 +497,14 @@ class WorkspaceTools(Skill):
                 after = None
                 operation = "delete"
             else:
-                occurrences = before.count(old)
+                current_text = before or ""
+                occurrences = current_text.count(str(old))
                 if occurrences != 1:
                     raise ValueError(
                         f"update preimage must match exactly once in {item['path']} "
                         f"(found {occurrences})"
                     )
-                after = before.replace(old, new, 1)
+                after = current_text.replace(str(old), str(new), 1)
                 operation = "update"
             item.update(
                 before=before,
@@ -480,7 +512,7 @@ class WorkspaceTools(Skill):
                 after=after,
                 after_bytes=after.encode() if after is not None else None,
                 operation=operation,
-                mode=path.stat().st_mode if exists else None,
+                mode=target.stat().st_mode if exists else None,
             )
 
         temporary: dict[Path, Path] = {}
@@ -490,19 +522,21 @@ class WorkspaceTools(Skill):
         try:
             # Stage every write on the target filesystem before committing.
             for item in prepared:
-                path: Path = item["resolved"]
+                target = cast(Path, item["resolved"])
                 after_bytes: bytes | None = item["after_bytes"]
                 if after_bytes is None:
                     continue
                 missing: list[Path] = []
-                parent = path.parent
+                parent = target.parent
                 probe = parent
                 while not probe.exists() and probe.is_relative_to(self._workspace.root):
                     missing.append(probe)
                     probe = probe.parent
                 parent.mkdir(parents=True, exist_ok=True)
                 created_dirs.extend(reversed(missing))
-                descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.noah-", dir=parent)
+                descriptor, temp_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.noah-", dir=parent
+                )
                 temp_path = Path(temp_name)
                 with os.fdopen(descriptor, "wb") as stream:
                     stream.write(after_bytes)
@@ -510,23 +544,23 @@ class WorkspaceTools(Skill):
                     os.fsync(stream.fileno())
                 if item["mode"] is not None:
                     temp_path.chmod(item["mode"])
-                temporary[path] = temp_path
+                temporary[target] = temp_path
 
             # Close the TOCTOU window: every file must still match its preflight bytes.
             for item in prepared:
-                path: Path = item["resolved"]
-                current = path.read_bytes() if path.exists() else None
+                target = cast(Path, item["resolved"])
+                current = target.read_bytes() if target.exists() else None
                 if current != item["before_bytes"]:
                     raise RuntimeError(f"concurrent modification detected: {item['path']}")
 
             for item in prepared:
                 mutations.append(self._journal.record_preimage(item["resolved"]))
             for item in prepared:
-                path: Path = item["resolved"]
+                target = cast(Path, item["resolved"])
                 if item["after_bytes"] is None:
-                    path.unlink()
+                    target.unlink()
                 else:
-                    os.replace(temporary.pop(path), path)
+                    os.replace(temporary.pop(target), target)
                 committed.append(item)
             for mutation, item in zip(mutations, prepared, strict=True):
                 self._journal.record_postimage(mutation, item["resolved"])
@@ -627,7 +661,9 @@ class WorkspaceTools(Skill):
             return decision
         # Shell syntax is too ambiguous to auto-approve safely. Interactive
         # sessions may still approve the exact command once.
-        action = "deny" if self._engine.auto_approve else "ask"
+        action: Literal["allow", "ask", "deny"] = (
+            "deny" if self._engine.auto_approve else "ask"
+        )
         reason = (
             "compound/uncertain shell commands cannot be auto-approved"
             if action == "deny"
@@ -661,6 +697,118 @@ class WorkspaceTools(Skill):
         """Single-flight NOOA's lazy persistent-shell startup."""
         async with self._shell_start_lock:
             await self._shell.session.start()
+
+    @contextlib.asynccontextmanager
+    async def _pinned_shell_cwd(self):
+        """Resolve delegated file operations against the workspace root.
+
+        NOOA joins every delegated path onto its live shell cwd. Pinning that
+        cwd (and passing absolute paths) keeps a model-driven `cd` from
+        redirecting an authorized operation at a different file.
+        """
+
+        async with self._file_op_lock:
+            original = self._shell.cwd
+            self._shell.cwd = self._workspace.root.resolve()
+            try:
+                yield
+            finally:
+                self._shell.cwd = original
+
+    def _record_read_fingerprint(self, resolved: Path) -> None:
+        digest = self._hash_path(resolved)
+        if digest is None:
+            return
+        if len(self._read_fingerprints) > 512:
+            # Conservative bound: forget everything and require fresh reads.
+            self._read_fingerprints.clear()
+        self._read_fingerprints[str(resolved)] = digest
+
+    @staticmethod
+    def _hash_path(path: Path) -> str | None:
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    def _native_replace_match(
+        self, resolved: Path, match: Match, new_text: str
+    ) -> FileWrite:
+        """Byte-preserving anchored splice with an atomic commit.
+
+        Unlike the upstream shell splice this never re-encodes or newline-
+        normalizes untouched regions: bytes are decoded losslessly, only the
+        anchor lines change, and the result lands via temp+fsync+rename.
+        """
+
+        data = resolved.read_bytes()
+        if b"\0" in data:
+            raise ValueError("binary files are not editable via replace()")
+        codec = "utf-8"
+        try:
+            text = data.decode(codec)
+        except UnicodeDecodeError:
+            codec = "latin-1"  # byte-lossless fallback for legacy encodings
+            text = data.decode(codec)
+        all_lines = text.splitlines(keepends=True)
+        total = len(all_lines)
+        start = max(1, int(match.start))
+        end = min(total, int(match.end))
+        if start > total:
+            raise ValueError(
+                f"stale edit anchor: {self._workspace.relpath(resolved)} has {total} lines; "
+                "call read() again to refresh the Match"
+            )
+        removed = all_lines[start - 1 : end]
+        replacement = new_text
+        if replacement and not replacement.endswith("\n") and end < total:
+            eol = "\r\n" if removed and removed[-1].endswith("\r\n") else "\n"
+            replacement += eol
+        new_content = "".join(all_lines[: start - 1]) + replacement + "".join(all_lines[end:])
+        mode = resolved.stat().st_mode & 0o7777
+        self._atomic_write_bytes(resolved, new_content.encode(codec), new_content, mode=mode)
+        diff = f"--- a/{match.path}\n+++ b/{match.path}\n"
+        diff += f"@@ -{start},{end - start + 1} @@\n"
+        return FileWrite(
+            path=match.path,
+            message=f"Edited {match.path} (replaced lines {start}-{end})",
+            diff=diff,
+            new_text=replacement,
+        )
+
+    def _atomic_write_bytes(
+        self,
+        resolved: Path,
+        data: bytes,
+        display_source: str,
+        *,
+        mode: int | None = None,
+    ) -> FileWrite:
+        """Atomically create/overwrite a file without newline translation."""
+
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        if mode is None and resolved.exists():
+            mode = resolved.stat().st_mode & 0o7777
+        descriptor, temp_name = tempfile.mkstemp(prefix=f".{resolved.name}.noah-", dir=resolved.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if mode is not None:
+                os.chmod(temp_name, mode)
+            os.replace(temp_name, resolved)
+        finally:
+            Path(temp_name).unlink(missing_ok=True)
+        line_count = (
+            display_source.count("\n") + (1 if display_source and not display_source.endswith("\n") else 0)
+        )
+        display = self._workspace.relpath(resolved)
+        return FileWrite(
+            path=str(resolved),
+            message=f"Created {display} ({line_count} lines)",
+            new_text=display_source,
+        )
 
     def _cap_shell_result(self, result: ShellResult) -> ShellResult:
         stdout = self._bound(result.stdout)

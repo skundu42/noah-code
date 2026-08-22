@@ -31,7 +31,7 @@ class _RecordingUI:
     def render(self, event: HostEvent) -> None:
         self.events.append(event)
 
-    async def ask_approval(self, _request) -> ApprovalChoice:  # noqa: ANN001
+    async def ask_approval(self, _request) -> ApprovalChoice:
         return ApprovalChoice.ONCE
 
     async def ask_questions(self, prompts: list[QuestionPrompt]) -> QuestionAnswer:
@@ -176,9 +176,14 @@ def test_cli_config_and_doctor_expose_wave1(tmp_path: Path) -> None:
     assert help_result.exit_code == 0
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_live_webfetch_example_dot_com() -> None:
-    """Optional public-network check for the real urllib transport."""
+    """Optional public-network check for the real urllib transport.
+
+    Deselected by default via ``addopts``; run explicitly with
+    ``pytest -m integration`` on a network-connected machine.
+    """
 
     from noah_code.approvals import ApprovalBroker
     from noah_code.config import DEFAULT_PERMISSION_RULES
@@ -186,7 +191,7 @@ async def test_live_webfetch_example_dot_com() -> None:
 
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
 
-    async def _once(_req):  # noqa: ANN001
+    async def _once(_req):
         return ApprovalChoice.ONCE
 
     web = WebTools(engine, ApprovalBroker(engine, handler=_once))
