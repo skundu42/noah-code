@@ -5,8 +5,7 @@ define them):
 
 .. code-block:: toml
 
-    [hooks.pre_tool]
-    [[hooks.pre_tool.rules]]
+    [[hooks.pre_tool]]
     match = "execute_python"
     command = "echo $NOAH_HOOK_TARGET >> /tmp/tool-log"
     timeout_seconds = 5

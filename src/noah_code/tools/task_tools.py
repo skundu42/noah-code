@@ -55,7 +55,9 @@ class TaskTools(Skill):
         spec = self._resolve(name)
         if self._engine.mode == "plan" and not spec.readonly:
             raise PermissionError("plan mode cannot run mutating agents")
-        await self._approvals.require(self._engine.decide(PermissionCategory.TASK, spec.name))
+        await self._approvals.require(
+            self._engine.decide(PermissionCategory.TASK, spec.name, tool="task")
+        )
         assignment = prompt.strip()
         if not assignment:
             raise ValueError("task prompt is required")

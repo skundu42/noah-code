@@ -53,7 +53,11 @@ class QuestionTools(Skill):
         if not cleaned:
             raise ValueError("question requires at least one option")
         await self._approvals.require(
-            self._engine.decide(PermissionCategory.QUESTION, header.strip() or prompt.strip())
+            self._engine.decide(
+                PermissionCategory.QUESTION,
+                header.strip() or prompt.strip(),
+                tool="question",
+            )
         )
         item = QuestionPrompt(
             header=header.strip() or "Question",

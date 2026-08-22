@@ -87,7 +87,7 @@ class ProcessTools(Skill):
             finished = [job_id for job_id, job in self._jobs.items() if job.state != "running"]
             for job_id in finished[: max(1, len(self._jobs) - self._max_jobs * 3)]:
                 self._jobs.pop(job_id, None)
-        decision = self._ws._shell_decision(command)
+        decision = self._ws._shell_decision(command, tool="processes_start")
         await self._ws._approvals.require(decision)
         if not self._ws._engine.is_readonly_command(command):
             self._ws._journal.mark_shell_bypass()

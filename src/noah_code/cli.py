@@ -151,6 +151,15 @@ def _apply_eval_overrides(
         overrides["checkpoints"] = {"enabled": checkpoint}
 
 
+def _apply_llm_cache_env(llm_cache: str | None, llm_cache_mode: str | None) -> None:
+    """Export record/replay settings so host wrapping sees them."""
+
+    cache_dir = llm_cache or os.environ.get("NOAH_CODE_LLM_CACHE_DIR")
+    if cache_dir:
+        os.environ["NOAH_CODE_LLM_CACHE_DIR"] = str(cache_dir)
+        os.environ["NOAH_CODE_LLM_CACHE"] = llm_cache_mode or "auto"
+
+
 def _common_options(fn):  # noqa: ANN001
     fn = click.option(
         "--unsafe-inprocess-code-execution",
@@ -293,6 +302,7 @@ def run_cmd(
     checkpoint: bool | None,
 ) -> None:
     """Non-interactive one-shot execution."""
+    _apply_llm_cache_env(llm_cache, llm_cache_mode)
     code = _run_async(
         _exec_session(
             prompts=[prompt],
@@ -360,8 +370,6 @@ def exec_cmd(
     sessions. Use --output-format stream-json for per-event NDJSON and json
     for a single final summary document.
     """
-    import os
-
     from noah_code.exec_mode import read_followup_prompts
 
     prompts: list[str] = [prompt] if prompt else []
@@ -372,10 +380,7 @@ def exec_cmd(
         click.echo("error: provide PROMPT or pipe messages on stdin", err=True)
         raise SystemExit(EXIT_CONFIG)
 
-    cache_dir = llm_cache or os.environ.get("NOAH_CODE_LLM_CACHE_DIR")
-    if cache_dir:
-        os.environ["NOAH_CODE_LLM_CACHE_DIR"] = str(cache_dir)
-        os.environ["NOAH_CODE_LLM_CACHE"] = llm_cache_mode or "auto"
+    _apply_llm_cache_env(llm_cache, llm_cache_mode)
 
     code = _run_async(
         _exec_session(
@@ -447,7 +452,11 @@ def checkpoints_list(session_id: str | None, path: str | None) -> None:
 def checkpoints_restore(ref: str, path: str | None) -> None:
     """Restore tracked files from a checkpoint ref into index+worktree."""
 
-    from noah_code.checkpoints import CheckpointError, CheckpointManager
+    from noah_code.checkpoints import (
+        CheckpointError,
+        CheckpointManager,
+        session_id_from_checkpoint_ref,
+    )
 
     try:
         workspace = open_workspace(path)
@@ -455,8 +464,17 @@ def checkpoints_restore(ref: str, path: str | None) -> None:
     except WorkspaceError as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
-    manager = CheckpointManager(workspace.root, "restore-cli",
-                                max_per_session=config.checkpoints.max_per_session)
+    target_session = session_id_from_checkpoint_ref(ref)
+    if target_session is None:
+        store = SessionStore(config.session_dir)
+        latest = store.latest_for_workspace(workspace)
+        if latest is None:
+            click.echo("error: provide a full checkpoint ref or a session to restore", err=True)
+            raise SystemExit(EXIT_CONFIG)
+        target_session = latest.session_id
+    manager = CheckpointManager(
+        workspace.root, target_session, max_per_session=config.checkpoints.max_per_session
+    )
     try:
         click.echo(manager.restore(ref))
     except CheckpointError as exc:

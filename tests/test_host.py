@@ -10,8 +10,9 @@ import pytest
 from nooa.unifiedllm import FakeLLMClient
 
 from noah_code.approvals import ApprovalBroker, ApprovalChoice
+from noah_code.budget import SharedBudgetLLM
 from noah_code.commands import help_text
-from noah_code.config import NoahCodeConfig, PermissionRule, load_config
+from noah_code.config import BudgetConfig, NoahCodeConfig, PermissionRule, load_config
 from noah_code.host import (
     AgentHost,
     _friendly_agent_error,
@@ -19,10 +20,20 @@ from noah_code.host import (
     _is_context_overflow,
     _stop_text,
 )
+from noah_code.llm_cache import CachedLLM
 from noah_code.mcp_setup import MCPInstallResult
 from noah_code.permissions import PermissionEngine
 from noah_code.sessions import SessionStore
 from noah_code.workspace import Workspace
+
+
+def _unwrap_llm(llm):
+    seen: set[int] = set()
+    current = llm
+    while hasattr(current, "_inner") and id(current) not in seen:
+        seen.add(id(current))
+        current = current._inner
+    return current
 
 
 def test_agent_protocol_status_is_plain_language() -> None:
@@ -534,11 +545,77 @@ async def test_model_switch_persists_for_current_session(tmp_path: Path, monkeyp
 
     assert action == "handled"
     assert requested == ["next-model"]
-    assert host.agent._llm is switched_client
+    assert _unwrap_llm(host.agent._llm) is switched_client
     assert host.meta is not None
     assert host.meta.model == "next-model"
     assert host.store.load_meta(host.meta.session_id).model == "next-model"
     assert host.config.model == "initial-model"
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_turn_captures_checkpoint_when_enabled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import subprocess
+    from types import SimpleNamespace
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "eval@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Eval"], cwd=tmp_path, check=True)
+    (tmp_path / "base.txt").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path, check=True)
+
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={
+            "session_dir": str(tmp_path / "sessions"),
+            "checkpoints": {"enabled": True},
+        },
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+
+    async def instant_race():
+        return []
+
+    async def instant_handle(_agent, _notification, render=None):  # noqa: ANN001
+        return SimpleNamespace(kind="DONE", explanation="ok")
+
+    host.agent.queue_manager.race = instant_race
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", instant_handle)
+    result = await host._run_user_turn("do the work")
+
+    assert result.exit_code == 0
+    assert host.last_checkpoint is not None
+    assert host.last_checkpoint["ref"].endswith("0001")
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_model_switch_keeps_budget_and_cache_wrappers(tmp_path: Path, monkeypatch) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = NoahCodeConfig(
+        session_dir=tmp_path / "sessions",
+        budget=BudgetConfig(max_tokens=1000),
+    )
+    monkeypatch.setenv("NOAH_CODE_LLM_CACHE", "record")
+    monkeypatch.setenv("NOAH_CODE_LLM_CACHE_DIR", str(tmp_path / "llm-cache"))
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    guard = host._budget_guard
+    assert guard is not None and guard.active
+    switched_client = FakeLLMClient()
+    monkeypatch.setattr("noah_code.llm.get_llm_client", lambda _model, **_kw: switched_client)
+
+    await host._switch_model("next-model")
+
+    llm = host.agent._llm
+    assert isinstance(llm, CachedLLM)
+    assert isinstance(llm._inner, SharedBudgetLLM)
+    assert llm._inner._guard is guard
     await host.close()
 
 
@@ -559,9 +636,11 @@ async def test_model_switch_updates_implicit_lightweight_model(tmp_path: Path, m
 
     await host._switch_model("next-model")
 
-    assert host.agent._llm is switched_client
-    assert host.agent._lightweight_llm is switched_client
-    assert all(summarizer._llm is switched_client for summarizer in host.agent._summarizers)
+    assert _unwrap_llm(host.agent._llm) is switched_client
+    assert _unwrap_llm(host.agent._lightweight_llm) is switched_client
+    assert all(
+        _unwrap_llm(summarizer._llm) is switched_client for summarizer in host.agent._summarizers
+    )
     await host.close()
 
 
@@ -645,7 +724,7 @@ async def test_reasoning_command_rebuilds_client_and_persists_session(
 
     assert action == "handled"
     assert calls == [(host.meta.model, {"reasoning_effort": "high"})]
-    assert host.agent._llm is replacement
+    assert _unwrap_llm(host.agent._llm) is replacement
     assert host.meta.reasoning_effort == "high"
     assert host.store.load_meta(host.meta.session_id).reasoning_effort == "high"
     await host.close()

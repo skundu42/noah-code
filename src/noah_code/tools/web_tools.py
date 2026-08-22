@@ -122,7 +122,9 @@ class WebTools(Skill):
         """Read a public HTTP(S) page and return readable text."""
 
         normalized = _require_http_url(url)
-        await self._approvals.require(self._engine.decide(PermissionCategory.WEBFETCH, normalized))
+        await self._approvals.require(
+            self._engine.decide(PermissionCategory.WEBFETCH, normalized, tool="web_fetch")
+        )
         # Blocking network I/O must not freeze the agent event loop.
         content_type, body = await asyncio.to_thread(
             self._transport.fetch,
@@ -141,7 +143,9 @@ class WebTools(Skill):
         cleaned = query.strip()
         if not cleaned:
             raise ValueError("search query is required")
-        await self._approvals.require(self._engine.decide(PermissionCategory.WEBSEARCH, cleaned))
+        await self._approvals.require(
+            self._engine.decide(PermissionCategory.WEBSEARCH, cleaned, tool="web_search")
+        )
         url = self._search_url.format(query=quote_plus(cleaned))
         _content_type, body = await asyncio.to_thread(
             self._transport.fetch,

@@ -364,8 +364,11 @@ class AgentHost:
             runner = self._hooks
 
             async def _pre_tool_guard(decision: Any) -> None:
+                tool = str(getattr(decision, "tool", "") or "").strip() or str(
+                    decision.category
+                )
                 outcome = await runner.run_pre(
-                    tool=str(decision.target)[:80],
+                    tool=tool[:80],
                     category=str(decision.category),
                     target=str(decision.target),
                 )
@@ -919,7 +922,7 @@ class AgentHost:
             )
             return None
         info = candidates[0]
-        decision = self.agent.engine.decide("skill", info.registry_name)
+        decision = self.agent.engine.decide("skill", info.registry_name, tool="skill")
         try:
             await self.agent.approvals.require(decision)
             self.agent.skills.activate([info.registry_name])
@@ -1350,6 +1353,21 @@ class AgentHost:
             self.ui.set_status(self.status_prompt())
         return "continue"
 
+    def _apply_runtime_llm_wrappers(self, llm: Any) -> Any:
+        """Re-apply session budget and record/replay wraps after a client swap."""
+
+        from noah_code.budget import SharedBudgetLLM
+        from noah_code.llm_cache import resolve_cache_settings, wrap_with_cache
+
+        guard = getattr(self, "_budget_guard", None)
+        if guard is not None and guard.active:
+            llm = SharedBudgetLLM(llm, guard)
+        cache_mode, cache_dir = resolve_cache_settings()
+        llm = wrap_with_cache(llm, cache_dir, cache_mode)
+        if hasattr(llm, "stats"):
+            self._llm_cache = llm
+        return llm
+
     async def _switch_model(self, model: str, *, reasoning_effort: str | None = None) -> None:
         from noah_code.llm import get_llm_client, reasoning_overrides, sampling_overrides
 
@@ -1362,6 +1380,7 @@ class AgentHost:
             **reasoning_overrides(effort),
             **sampling_overrides(self.config.sampling),
         )
+        llm = self._apply_runtime_llm_wrappers(llm)
         self.agent.set_main_llm(
             llm,
             lightweight_follows_main=not bool(self.config.lightweight_model),
@@ -1466,6 +1485,8 @@ class AgentHost:
                     self._persist()
             else:
                 await self._persist_async()
+                label = " ".join(text.split())[:80] or "turn"
+                await self._capture_checkpoint(label)
         return HostResult(
             exit_code=exit_code,
             explanation=explanation,

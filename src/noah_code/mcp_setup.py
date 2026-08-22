@@ -239,7 +239,7 @@ async def attach_mcp_server(
     """Permission-check and attach a single configured MCP server."""
 
     if trusted:
-        decision = engine.decide(PermissionCategory.MCP, name)
+        decision = engine.decide(PermissionCategory.MCP, name, tool="mcp")
         if startup and decision.action == "ask":
             decision = replace(
                 decision,
@@ -250,7 +250,7 @@ async def attach_mcp_server(
         saved = engine.auto_approve
         engine.auto_approve = False
         try:
-            decision = engine.decide(PermissionCategory.MCP, name)
+            decision = engine.decide(PermissionCategory.MCP, name, tool="mcp")
         finally:
             engine.auto_approve = saved
         if decision.action == "ask" and (saved or startup):

@@ -79,12 +79,12 @@ Declared in **user** configuration only (`~/.config/noah-code/config.toml`);
 a cloned repository can never define hooks.
 
 ```toml
-[[hooks.pre_tool.rules]]
+[[hooks.pre_tool]]
 match = "execute_python"      # glob over tool name or permission category
 command = "/opt/guards/log-tool.sh"
 timeout_seconds = 5
 
-[[hooks.post_tool.rules]]
+[[hooks.post_tool]]
 match = "ws_run"
 command = "make lint-quiet || true"
 ```

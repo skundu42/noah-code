@@ -133,7 +133,7 @@ class GitTools(Skill):
 
     async def revert(self, path: str, scope: str) -> str:
         """Revert one explicitly selected file after host/UI confirmation."""
-        resolved = await self._ws._authorize_path(path, "edit")
+        resolved = await self._ws._authorize_path(path, "edit", tool="git_revert")
         if scope == "unstaged":
             current = resolved.read_text(errors="strict") if resolved.exists() else None
             index_content = await self._git("show", f":{path}")

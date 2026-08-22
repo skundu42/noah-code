@@ -168,6 +168,27 @@ def test_save_user_reasoning_effort_preserves_sections(tmp_path: Path, monkeypat
     assert config_path.stat().st_mode & 0o777 == 0o600
 
 
+def test_user_hooks_load_from_flat_array_tables(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "user-config.toml"
+    config_path.write_text(
+        "[[hooks.pre_tool]]\n"
+        'match = "execute_python"\n'
+        'command = "/opt/guards/log-tool.sh"\n'
+        "timeout_seconds = 5\n"
+        "\n"
+        "[[hooks.post_tool]]\n"
+        'match = "ws_run"\n'
+        'command = "make lint-quiet || true"\n'
+    )
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    loaded = load_config(tmp_path)
+
+    assert loaded.hooks.pre_tool[0].match == "execute_python"
+    assert loaded.hooks.pre_tool[0].command == "/opt/guards/log-tool.sh"
+    assert loaded.hooks.post_tool[0].match == "ws_run"
+
+
 def test_reasoning_effort_environment_override(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("NOAH_CODE_REASONING_EFFORT", "LOW")
     assert load_config(tmp_path).reasoning_effort == "low"

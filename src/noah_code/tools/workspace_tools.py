@@ -13,6 +13,7 @@ import shlex
 import sys
 import tempfile
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
@@ -195,7 +196,7 @@ class WorkspaceTools(Skill):
         ] = None,
     ) -> Match | str:
         """Read a file range; oversized reads return a managed preview, not an edit anchor."""
-        resolved = await self._authorize_path(path, PermissionCategory.READ)
+        resolved = await self._authorize_path(path, PermissionCategory.READ, tool="ws_read")
         async with self._pinned_shell_cwd():
             result = await self._shell.read(str(resolved), lines=lines)
         self._record_read_fingerprint(resolved)
@@ -212,7 +213,7 @@ class WorkspaceTools(Skill):
         path: Annotated[str, spec(description="Subdirectory or file to search")] = ".",
     ) -> ShellResult:
         """Return bounded ripgrep text; call read() on a result to get an edit anchor."""
-        resolved = await self._authorize_path(path, PermissionCategory.READ)
+        resolved = await self._authorize_path(path, PermissionCategory.READ, tool="ws_search")
         target = str(resolved) if resolved != self._workspace.root.resolve() else "."
         cmd = " ".join(
             shlex.quote(a) for a in ["rg", "-n", "--no-heading", "-S", "--", pattern, target]
@@ -228,7 +229,7 @@ class WorkspaceTools(Skill):
     ) -> list[str]:
         """List files under path matching a glob (deterministic, no shell)."""
         self._assert_internal_glob(pattern)
-        root = await self._authorize_path(path, PermissionCategory.READ)
+        root = await self._authorize_path(path, PermissionCategory.READ, tool="ws_list")
         workspace_root = self._workspace.root.resolve()
         matches: list[str] = []
         truncated = False
@@ -355,7 +356,9 @@ class WorkspaceTools(Skill):
     ) -> Any:
         """Edit via Match anchor (preferred) or unique string replacement."""
         if isinstance(match, Match):
-            resolved = await self._authorize_path(match.path, PermissionCategory.EDIT)
+            resolved = await self._authorize_path(
+                match.path, PermissionCategory.EDIT, tool="ws_edit"
+            )
             expected = self._read_fingerprints.get(str(resolved))
             if expected is not None:
                 actual = self._hash_path(resolved)
@@ -373,7 +376,7 @@ class WorkspaceTools(Skill):
             self._journal.record_postimage(mut, resolved)
             return result
         if isinstance(match, str):
-            resolved = await self._authorize_path(match, PermissionCategory.EDIT)
+            resolved = await self._authorize_path(match, PermissionCategory.EDIT, tool="ws_edit")
             mut = self._journal.record_preimage(resolved)
             try:
                 async with self._pinned_shell_cwd():
@@ -401,7 +404,7 @@ class WorkspaceTools(Skill):
         content: Annotated[str, spec(description="Full file content")],
     ) -> Any:
         """Create or overwrite a file with content."""
-        resolved = await self._authorize_path(path, PermissionCategory.EDIT)
+        resolved = await self._authorize_path(path, PermissionCategory.EDIT, tool="write_file")
         mut = self._journal.record_preimage(resolved)
         try:
             result = self._atomic_write_bytes(resolved, content.encode("utf-8"), content)
@@ -451,7 +454,9 @@ class WorkspaceTools(Skill):
             path = str(raw.get("path") or "").strip()
             if not path:
                 raise ValueError("every patch change requires path")
-            resolved = await self._authorize_path(path, PermissionCategory.EDIT)
+            resolved = await self._authorize_path(
+                path, PermissionCategory.EDIT, tool="apply_patch"
+            )
             if resolved in seen:
                 raise ValueError(f"patch target repeated: {path}")
             seen.add(resolved)
@@ -631,7 +636,9 @@ class WorkspaceTools(Skill):
         parsed = parse_unified_diff(diff_text)
         changes: list[dict[str, str | None]] = []
         for file_diff in parsed:
-            resolved = await self._authorize_path(file_diff.path, PermissionCategory.EDIT)
+            resolved = await self._authorize_path(
+                file_diff.path, PermissionCategory.EDIT, tool="apply_patch"
+            )
             current: str | None = None
             if not file_diff.is_create:
                 try:
@@ -706,8 +713,8 @@ class WorkspaceTools(Skill):
                 self._on_shell_chunk(getattr(event, "kind", "stdout"), getattr(event, "text", ""))
             yield event
 
-    def _shell_decision(self, command: str) -> PermissionDecision:
-        decision = self._engine.decide(PermissionCategory.BASH, command)
+    def _shell_decision(self, command: str, *, tool: str = "ws_run") -> PermissionDecision:
+        decision = self._engine.decide(PermissionCategory.BASH, command, tool=tool)
         if decision.denied or not self._engine.is_uncertain_shell(command):
             return decision
         # Shell syntax is too ambiguous to auto-approve safely. Interactive
@@ -720,13 +727,10 @@ class WorkspaceTools(Skill):
             if action == "deny"
             else "compound/uncertain shell command requires approval"
         )
-        return PermissionDecision(
-            category=PermissionCategory.BASH,
-            target=command,
+        return replace(
+            decision,
             action=action,
-            matching_rule=decision.matching_rule,
             reason=reason,
-            remember_pattern=decision.remember_pattern,
         )
 
     @hidden
@@ -913,18 +917,20 @@ class WorkspaceTools(Skill):
             timed_out=result.timed_out,
         )
 
-    async def _authorize_path(self, path: str, category: str) -> Path:
+    async def _authorize_path(self, path: str, category: str, *, tool: str = "") -> Path:
         try:
             resolved = self._workspace.resolve(path)
             rel = str(resolved.relative_to(self._workspace.root))
-            decision = self._engine.decide(category, rel)
+            decision = self._engine.decide(category, rel, tool=tool)
         except WorkspaceError as exc:
             abs_path = Path(path).expanduser()
             if not abs_path.is_absolute():
                 abs_path = (self._workspace.root / path).resolve()
             else:
                 abs_path = abs_path.resolve()
-            decision = self._engine.decide(PermissionCategory.EXTERNAL_DIRECTORY, str(abs_path))
+            decision = self._engine.decide(
+                PermissionCategory.EXTERNAL_DIRECTORY, str(abs_path), tool=tool
+            )
             await self._approvals.require(decision)
             raise WorkspaceError(
                 f"path outside workspace requires dedicated external handling: {path}"

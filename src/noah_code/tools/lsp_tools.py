@@ -734,14 +734,18 @@ class LSPTools(Skill):
     async def _authorize_path(self, path: str) -> Path:
         resolved = self._workspace.resolve(path)
         rel = self._workspace.relpath(resolved)
-        await self._approvals.require(self._engine.decide(PermissionCategory.READ, rel))
+        await self._approvals.require(
+            self._engine.decide(PermissionCategory.READ, rel, tool="lsp")
+        )
         await self._authorize_target(rel)
         return resolved
 
     async def _authorize_target(self, target: str) -> None:
         if not self._enabled:
             raise RuntimeError("LSP tools are disabled in Noah configuration")
-        await self._approvals.require(self._engine.decide(PermissionCategory.LSP, target))
+        await self._approvals.require(
+            self._engine.decide(PermissionCategory.LSP, target, tool="lsp")
+        )
 
     @staticmethod
     def _position(line: int, column: int) -> dict[str, int]:

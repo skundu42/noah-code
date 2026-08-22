@@ -5,11 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from nooa.unifiedllm import FakeLLMClient
 
 from noah_code.approvals import ApprovalBroker
-from noah_code.config import HooksConfig, HookSpec, PermissionRule
+from noah_code.config import HooksConfig, HookSpec, NoahCodeConfig, PermissionRule
 from noah_code.hooks import HookRunner
+from noah_code.host import AgentHost
 from noah_code.permissions import PermissionCategory, PermissionEngine
+from noah_code.workspace import Workspace
 
 
 def _runner(tmp_path: Path, pre: list[HookSpec] | None = None, post: list[HookSpec] | None = None):
@@ -86,6 +89,32 @@ async def test_broker_guard_vetoes_even_allowed_decisions() -> None:
     assert decision.allowed
     with pytest.raises(PermissionError, match="pre-tool hook"):
         await broker.require(decision)
+
+
+@pytest.mark.asyncio
+async def test_host_pre_tool_hook_matches_framework_tool_name(tmp_path: Path) -> None:
+    log = tmp_path / "hook.log"
+    workspace = Workspace(root=tmp_path.resolve())
+    config = NoahCodeConfig(
+        session_dir=tmp_path / "sessions",
+        auto_approve=True,
+        hooks=HooksConfig(
+            pre_tool=[
+                HookSpec(
+                    match="write_file",
+                    command=f'echo "$NOAH_HOOK_TOOL" >> {log}',
+                )
+            ]
+        ),
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    try:
+        await host.agent.ws.write_file("note.txt", "hello")
+        assert log.exists()
+        assert "write_file" in log.read_text()
+    finally:
+        await host.close()
 
 
 @pytest.mark.asyncio

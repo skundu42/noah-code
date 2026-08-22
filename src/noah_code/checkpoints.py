@@ -33,12 +33,21 @@ class CheckpointManager:
         self._root = workspace_root
         self._session_id = session_id
         self._max = max_per_session
-        self._seq = 0
+        self._seq = self._highest_existing_seq()
         self.last: dict | None = None
 
     @property
     def ref_namespace(self) -> str:
         return f"{REF_PREFIX}/{self._session_id}"
+
+    def _highest_existing_seq(self) -> int:
+        """Resume after the highest ref already stored for this session."""
+
+        try:
+            entries = self.list()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return 0
+        return max((int(item["seq"]) for item in entries), default=0)
 
     def _git(self, *args: str, env_index: str | None = None) -> subprocess.CompletedProcess[bytes]:
         import os
@@ -158,6 +167,18 @@ class CheckpointManager:
             if self._git("update-ref", "-d", item["ref"]).returncode == 0:
                 removed += 1
         return removed
+
+
+def session_id_from_checkpoint_ref(ref: str) -> str | None:
+    """Extract ``<session>`` from ``refs/noah-code/checkpoints/<session>/<seq>``."""
+
+    prefix = f"{REF_PREFIX}/"
+    if not ref.startswith(prefix):
+        return None
+    session, sep, seq = ref[len(prefix) :].rpartition("/")
+    if not sep or not session or not seq:
+        return None
+    return session
 
 
 def _err(result: subprocess.CompletedProcess[bytes]) -> str:

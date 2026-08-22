@@ -5,7 +5,7 @@ from __future__ import annotations
 import fnmatch
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -135,6 +135,7 @@ class PermissionDecision:
     matching_rule: PermissionRule | None
     reason: str
     remember_pattern: str
+    tool: str = ""
 
     @property
     def allowed(self) -> bool:
@@ -202,7 +203,11 @@ class PermissionEngine:
     def load_session_rules(self, raw: list[dict] | None) -> None:
         self._session_rules = [PermissionRule.model_validate(r) for r in (raw or [])]
 
-    def decide(self, category: str, target: str) -> PermissionDecision:
+    def decide(self, category: str, target: str, *, tool: str = "") -> PermissionDecision:
+        decision = self._decide(category, target)
+        return replace(decision, tool=tool) if tool else decision
+
+    def _decide(self, category: str, target: str) -> PermissionDecision:
         normalized = target.strip() or "*"
         # Hard denies for secrets on read/edit.
         if (

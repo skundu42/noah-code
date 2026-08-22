@@ -99,3 +99,37 @@ def test_max_per_session_stops_capturing(git_repo: Path) -> None:
     assert manager.capture() is not None
     assert manager.capture() is not None
     assert manager.capture() is None
+
+
+def test_new_manager_continues_existing_session_sequence(git_repo: Path) -> None:
+    first = CheckpointManager(git_repo, "abcdef123456")
+    first.capture("turn one")
+    first.capture("turn two")
+
+    resumed = CheckpointManager(git_repo, "abcdef123456")
+    third = resumed.capture("turn three")
+
+    assert third is not None and third["ref"].endswith("0003")
+    assert [entry["seq"] for entry in resumed.list()] == [1, 2, 3]
+
+
+def test_cli_restore_accepts_ref_from_list(git_repo: Path) -> None:
+    from click.testing import CliRunner
+
+    from noah_code.cli import cli_group
+
+    manager = CheckpointManager(git_repo, "sess-restore")
+    (git_repo / "tracked.txt").write_text("version 1\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "v1")
+    snapshot = manager.capture("before edit")
+    assert snapshot is not None
+    (git_repo / "tracked.txt").write_text("version 2\n")
+
+    result = CliRunner().invoke(
+        cli_group, ["checkpoints", "restore", snapshot["ref"], str(git_repo)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "restored" in result.output
+    assert (git_repo / "tracked.txt").read_text() == "version 1\n"
