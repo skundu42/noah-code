@@ -65,6 +65,7 @@ def test_slash_allowlists_match_spec() -> None:
     assert frozenset({"status", "tokens", "todos", "help", "trace"}) == SAFE_SLASH_WHILE_BUSY
     assert "undo" in BLOCKED_SLASH_WHILE_BUSY
     assert "compact" in BLOCKED_SLASH_WHILE_BUSY
+    assert "worktree" in BLOCKED_SLASH_WHILE_BUSY
 
 
 def test_expansion_failed_only_when_mentions_or_attaches_resolve_nothing() -> None:

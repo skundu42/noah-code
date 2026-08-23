@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -14,6 +17,22 @@ from noah_code.config import load_config
 from noah_code.host import AgentHost
 from noah_code.sessions import SessionError, SessionStore
 from noah_code.workspace import Workspace
+from noah_code.worktree import WorktreeManager, repo_id_for
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _init_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-q")
+    _git(path, "config", "user.email", "eval@example.com")
+    _git(path, "config", "user.name", "Eval")
+    (path / "README.md").write_text("hello\n")
+    _git(path, "add", ".")
+    _git(path, "commit", "-q", "-m", "init")
+    return path
 
 
 @pytest.mark.asyncio
@@ -63,6 +82,82 @@ async def test_session_workspace_mismatch(tmp_path: Path) -> None:
     meta = store.create(ws1, model="m")
     with pytest.raises(SessionError):
         store.verify_workspace(meta, ws2)
+
+
+def test_old_meta_without_worktree_fields_loads(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    store = SessionStore(tmp_path / "sessions")
+    meta = store.create(workspace, model="m")
+    path = store.session_dir / meta.session_id / "meta.json"
+    data = json.loads(path.read_text())
+    data.pop("repo_id", None)
+    data.pop("worktree_name", None)
+    path.write_text(json.dumps(data))
+    loaded = store.load_meta(meta.session_id)
+    assert loaded.repo_id == ""
+    assert loaded.worktree_name == ""
+
+
+def test_family_listing_includes_primary_and_copy(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    other = _init_repo(tmp_path / "other")
+    store = SessionStore(tmp_path / "data" / "sessions")
+    primary = Workspace(root=repo)
+    main = store.create(primary, model="m")
+    copy = WorktreeManager(repo, tmp_path / "data" / "worktree").create("iso")
+    isolated = store.create(
+        Workspace(root=copy.directory),
+        model="m",
+        worktree_name=copy.name,
+    )
+    outsider = store.create(Workspace(root=other), model="m")
+
+    ids = {item.session_id for item in store.list_sessions(primary)}
+    assert main.session_id in ids
+    assert isolated.session_id in ids
+    assert outsider.session_id not in ids
+    named = {item.session_id: item.worktree_name for item in store.list_sessions(primary)}
+    assert named[isolated.session_id] == "iso"
+
+
+def test_verify_workspace_stays_path_identity(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    store = SessionStore(tmp_path / "data" / "sessions")
+    copy = WorktreeManager(repo, tmp_path / "data" / "worktree").create("iso")
+    meta = store.create(Workspace(root=copy.directory), model="m", worktree_name="iso")
+    primary = Workspace(root=repo)
+    with pytest.raises(SessionError):
+        store.verify_workspace(meta, primary)
+    assert store.same_family(meta, primary)
+
+
+def test_workspace_for_resume_rebinds_to_copy(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    store = SessionStore(tmp_path / "data" / "sessions")
+    copy = WorktreeManager(repo, tmp_path / "data" / "worktree").create("iso")
+    meta = store.create(Workspace(root=copy.directory), model="m", worktree_name="iso")
+    rebound = store.workspace_for_resume(meta, Workspace(root=repo))
+    assert rebound.root == copy.directory.resolve()
+    assert repo_id_for(rebound.root) == repo_id_for(repo)
+
+
+def test_workspace_for_resume_missing_path(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    store = SessionStore(tmp_path / "data" / "sessions")
+    copy = WorktreeManager(repo, tmp_path / "data" / "worktree").create("iso")
+    meta = store.create(Workspace(root=copy.directory), model="m", worktree_name="iso")
+    shutil.rmtree(copy.directory)
+    with pytest.raises(SessionError, match="worktree missing"):
+        store.workspace_for_resume(meta, Workspace(root=repo))
+
+
+def test_workspace_for_resume_rejects_other_repo(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    other = _init_repo(tmp_path / "other")
+    store = SessionStore(tmp_path / "sessions")
+    meta = store.create(Workspace(root=repo), model="m")
+    with pytest.raises(SessionError, match="belongs to"):
+        store.workspace_for_resume(meta, Workspace(root=other))
 
 
 def test_session_id_cannot_escape_store(tmp_path: Path) -> None:

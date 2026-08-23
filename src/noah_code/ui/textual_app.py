@@ -1490,6 +1490,8 @@ class NoahCodeApp(App[None]):
         effort_label = "auto" if effort == "default" else effort
         session_id = meta.session_id[:8] if meta else "new"
         repository = self.host.workspace.root.name or str(self.host.workspace.root)
+        if meta and meta.worktree_name:
+            repository = f"{repository} · {meta.worktree_name}"
         state = self._phase
         if self.ui.busy:
             verb = "starting" if not self._agent_ready else "working"
@@ -1533,6 +1535,8 @@ class NoahCodeApp(App[None]):
             f"{self.host.workspace.root.name or self.host.workspace.root}\n",
             style=palette.text,
         )
+        if meta and meta.worktree_name:
+            text.append(f"worktree · {meta.worktree_name}\n", style=palette.muted)
         text.append(f"{mode.upper()} · {model}\n", style=palette.muted)
         text.append(
             f"reasoning: {'auto' if effort == 'default' else effort}",
@@ -2632,7 +2636,11 @@ class NoahCodeApp(App[None]):
                 (
                     session.session_id,
                     session.title if session.title != "untitled" else session.session_id[:8],
-                    f"{session.mode} · {session.model}",
+                    (
+                        f"{session.worktree_name} · {session.mode} · {session.model}"
+                        if session.worktree_name
+                        else f"{session.mode} · {session.model}"
+                    ),
                 )
                 for session in sessions
             ]

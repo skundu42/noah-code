@@ -50,6 +50,12 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("session", "Show current session", host_only=True),
     CommandSpec("sessions", "List or switch sessions", "sessions [SESSION_ID]", True),
     CommandSpec("new", "Start a new session", host_only=True),
+    CommandSpec(
+        "worktree",
+        "Create, list, or remove an isolated git worktree session",
+        "worktree [create|list|remove]",
+        True,
+    ),
     CommandSpec("continue", "Resume most recent session", host_only=True),
     CommandSpec("compact", "Trigger history summarization", host_only=True),
     CommandSpec("todos", "Show todo list", host_only=True),

@@ -252,6 +252,7 @@ class AgentHost:
         self._usage = UsageTracker()
         self.steer_queue = SteerQueue()
         self._pending_attach_paths: list[Path] = []
+        self._pending_worktree_name = ""
         self.on_session_changed: Any = None  # optional UI callback
 
     @property
@@ -276,15 +277,36 @@ class AgentHost:
             enable_tracing(exporters=exps)
 
     async def start(self) -> SessionMeta:
+        from noah_code.worktree import infer_worktree_name, repo_id_for, worktree_storage_root
+
         if self.meta is None:
             self.meta = self.store.create(
                 self.workspace,
                 model=self.config.model,
                 mode=self.config.mode,
                 reasoning_effort=self.config.reasoning_effort,
+                repo_id=repo_id_for(self.workspace.root),
+                worktree_name=self._pending_worktree_name
+                or infer_worktree_name(
+                    self.workspace.root, worktree_storage_root(self.config.session_dir)
+                ),
             )
+            self._pending_worktree_name = ""
         else:
             self.store.verify_workspace(self.meta, self.workspace)
+            inferred = infer_worktree_name(
+                self.workspace.root, worktree_storage_root(self.config.session_dir)
+            )
+            repo = repo_id_for(self.workspace.root)
+            dirty = False
+            if repo and not self.meta.repo_id:
+                self.meta.repo_id = repo
+                dirty = True
+            if inferred and not self.meta.worktree_name:
+                self.meta.worktree_name = inferred
+                dirty = True
+            if dirty:
+                self.store.save_meta(self.meta)
 
         # Python's first NOOA import initializes LiteLLM's provider registry and
         # is by far the largest cold-start cost. Do it in a worker thread so the
@@ -606,7 +628,10 @@ class AgentHost:
         effort_label = "auto" if effort == "default" else effort
         queued = self.steer_queue.snapshot()["count"]
         suffix = f" queued · {queued}" if queued else ""
-        return f"noah [{mode}|{model}|r:{effort_label}|{sid}{title}]{suffix}"
+        worktree = ""
+        if self.meta and self.meta.worktree_name:
+            worktree = f"|wt:{self.meta.worktree_name}"
+        return f"noah [{mode}|{model}|r:{effort_label}|{sid}{title}{worktree}]{suffix}"
 
     def usage_snapshot(self) -> UsageSnapshot:
         return self._usage.snapshot()
@@ -669,11 +694,19 @@ class AgentHost:
         if task is not None and task is not asyncio.current_task() and not task.done():
             raise RuntimeError("a turn is still running; cancel it before switching sessions")
 
-    async def start_new_session(self) -> SessionMeta:
+    async def start_new_session(
+        self,
+        workspace: Workspace | None = None,
+        *,
+        worktree_name: str = "",
+    ) -> SessionMeta:
         """Persist current session and open a fresh one in-process."""
         self._require_idle_turn()
         self._clear_steer_state()
         await self._persist_async()
+        if workspace is not None:
+            self.workspace = workspace
+        self._pending_worktree_name = worktree_name
         self._teardown_event_bridge()
         self._cancel_title_task()
         if self._agent is not None:
@@ -704,13 +737,93 @@ class AgentHost:
         self._agent = None
         self._usage = UsageTracker()
         meta = self.store.load_meta(session_id)
-        self.store.verify_workspace(meta, self.workspace)
+        self.workspace = self.store.workspace_for_resume(meta, self.workspace)
         self.meta = meta
         self._exit_requested = False
         return await self.start()
 
     def list_session_metas(self) -> list[SessionMeta]:
         return self.store.list_sessions(self.workspace)
+
+    def worktree_manager(self) -> Any:
+        from noah_code.worktree import WorktreeManager, worktree_storage_root
+
+        return WorktreeManager(self.workspace.root, worktree_storage_root(self.config.session_dir))
+
+    async def create_worktree_session(self, name: str | None = None) -> SessionMeta:
+        """Create a linked worktree and start a new session there."""
+
+        self._require_idle_turn()
+        info = await asyncio.to_thread(self.worktree_manager().create, name)
+        try:
+            return await self.start_new_session(
+                Workspace(root=info.directory), worktree_name=info.name
+            )
+        except Exception:
+            with contextlib.suppress(Exception):
+                self.worktree_manager().remove(info.name)
+            raise
+
+    def remove_worktree(self, name: str) -> Any:
+        from noah_code.worktree import WorktreeError
+
+        manager = self.worktree_manager()
+        matches = [item for item in manager.list() if item.name == name or str(item.directory) == name]
+        if matches and matches[0].directory.resolve() == self.workspace.root.resolve():
+            raise WorktreeError("switch away from this worktree before removing it")
+        return manager.remove(name)
+
+    async def _handle_worktree(self, args: str) -> Literal["handled"]:
+        from noah_code.worktree import WorktreeError
+
+        parts = shlex.split(args) if args.strip() else []
+        action = parts[0] if parts else "create"
+        rest = parts[1:]
+        if action == "create":
+            name = rest[0] if rest else None
+            try:
+                meta = await self.create_worktree_session(name)
+            except Exception as exc:  # noqa: BLE001
+                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
+                return "handled"
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    f"worktree {meta.worktree_name} · session {meta.session_id} · "
+                    f"{meta.workspace_path}",
+                )
+            )
+            return "handled"
+        if action == "list":
+            try:
+                rows = self.worktree_manager().list()
+            except WorktreeError as exc:
+                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
+                return "handled"
+            text = (
+                "\n".join(f"{item.name}  {item.branch}  {item.directory}" for item in rows)
+                or "(none)"
+            )
+            self.ui.render(_command_output(text))
+            return "handled"
+        if action == "remove":
+            if not rest:
+                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /worktree remove NAME"))
+                return "handled"
+            try:
+                info = self.remove_worktree(rest[0])
+            except WorktreeError as exc:
+                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
+                return "handled"
+            self.ui.render(HostEvent(HostEventKind.STATUS, f"removed worktree {info.name}"))
+            return "handled"
+        self.ui.render(
+            HostEvent(
+                HostEventKind.ERROR,
+                "usage: /worktree [create [NAME]|list|remove NAME]",
+            )
+        )
+        return "handled"
 
     def list_skill_infos(self) -> list[Any]:
         """Return display metadata for all loaded and document skills."""
@@ -1051,6 +1164,8 @@ class AgentHost:
                 HostEvent(HostEventKind.STATUS, f"started new session {meta.session_id}")
             )
             return "handled"
+        if name == "worktree":
+            return await self._handle_worktree(args)
         if name == "skills":
             skills = getattr(agent, "skills", None)
             if skills is None:
@@ -1205,6 +1320,7 @@ class AgentHost:
                     f"mode={agent.mode}\nmodel={current.model}\n"
                     f"reasoning_effort={current.reasoning_effort}\n"
                     f"workspace={current.workspace_path}"
+                    + (f"\nworktree={current.worktree_name}" if current.worktree_name else "")
                 )
             )
             return "handled"
@@ -1221,6 +1337,7 @@ class AgentHost:
             text = (
                 "\n".join(
                     f"{s.session_id}  {s.mode:5}  {s.title}"
+                    + (f"  {s.worktree_name}" if s.worktree_name else "")
                     + ("  ← current" if self.meta and s.session_id == self.meta.session_id else "")
                     for s in rows
                 )

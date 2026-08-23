@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -26,6 +27,7 @@ from noah_code.mcp_setup import MCPInstallResult
 from noah_code.permissions import PermissionEngine
 from noah_code.sessions import SessionStore
 from noah_code.workspace import Workspace
+from noah_code.worktree import WorktreeError
 
 
 def _unwrap_llm(llm):
@@ -1070,4 +1072,97 @@ async def test_status_prompt_includes_queued_count(tmp_path: Path) -> None:
     host = AgentHost(workspace, config, llm=FakeLLMClient())
     host.steer_queue.push("also run pytest")
     assert "queued · 1" in host.status_prompt()
+    await host.close()
+
+
+def _init_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "eval@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Eval"], cwd=path, check=True)
+    (path / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True, capture_output=True)
+    return path
+
+
+@pytest.mark.asyncio
+async def test_worktree_create_starts_isolated_session(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    config = load_config(
+        repo,
+        cli_overrides={"session_dir": str(tmp_path / "sessions"), "auto_approve": True},
+    )
+    host = AgentHost(Workspace(root=repo), config, llm=FakeLLMClient())
+    first = await host.start()
+    first_root = host.workspace.root
+    host.ui.render = MagicMock()
+
+    action = await host.handle_line("/new")
+    assert action == "handled"
+    assert host.workspace.root == first_root
+    in_place = host.meta.session_id
+    assert in_place != first.session_id
+    assert not host.meta.worktree_name
+
+    action = await host.handle_line("/worktree create isol")
+    assert action == "handled"
+    assert host.meta.session_id not in {first.session_id, in_place}
+    assert host.meta.worktree_name == "isol"
+    assert host.workspace.root != first_root
+    assert (host.workspace.root / "README.md").read_text() == "hello\n"
+    assert f"wt:{host.meta.worktree_name}" in host.status_prompt()
+
+    family = {item.session_id for item in host.list_session_metas()}
+    assert {first.session_id, in_place, host.meta.session_id} <= family
+
+    with pytest.raises(WorktreeError, match="switch away"):
+        host.remove_worktree("isol")
+
+    await host.switch_session(first.session_id)
+    assert host.workspace.root == first_root
+    host.remove_worktree("isol")
+    assert all(item.name != "isol" for item in host.worktree_manager().list())
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_worktree_slash_blocked_while_turn_running(tmp_path: Path, monkeypatch) -> None:
+    host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+    host.ui.render = MagicMock()
+    host.create_worktree_session = AsyncMock(side_effect=AssertionError("must not create"))
+
+    async def forever() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(forever())
+    host._active_turn = task
+    try:
+        action = await host.handle_line("/worktree create isol")
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert action == "handled"
+    host.create_worktree_session.assert_not_awaited()
+    assert "blocked" in host.ui.render.call_args.args[0].text
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_worktree_create_fails_outside_git(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    first_id = host.meta.session_id
+    host.ui.render = MagicMock()
+    action = await host.handle_line("/worktree create isol")
+    assert action == "handled"
+    assert host.meta.session_id == first_id
+    assert "git repo" in host.ui.render.call_args.args[0].text
     await host.close()

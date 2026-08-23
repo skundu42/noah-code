@@ -53,7 +53,7 @@ Approval and `ask.question` modals keep the composer. Queueing resumes after the
 These slash commands still run while a turn is in progress: `/status`, `/tokens`, `/todos`,
 `/help`, `/trace`. `/attach PATH` remembers the file for the next queued follow-up. `/exit` cancels
 the turn (and the queue) then leaves. Mutating commands wait until the turn finishes, including
-`/undo`, `/redo`, `/mode`, `/model`, `/diff`, `/new`, `/sessions`, and `/compact`.
+`/undo`, `/redo`, `/mode`, `/model`, `/diff`, `/new`, `/sessions`, `/worktree`, and `/compact`.
 
 Tool and shell output is batched into a live execution panel instead of forcing one full-screen
 redraw for every chunk. While a turn is running, a spinner names the current action the way
@@ -76,7 +76,8 @@ latest 100 activity records, bounded by the configured `max_output_chars` per ac
 | `/reasoning [EFFORT]` | Show or set default/none/minimal/low/medium/high/xhigh for this session |
 | `/reasoning --global EFFORT` | Set reasoning effort for this and future sessions |
 | `/providers [use PROVIDER MODEL]` | Search and securely configure API providers |
-| `/session`, `/sessions`, `/new`, `/continue` | Inspect, switch, create, and resume sessions |
+| `/session`, `/sessions`, `/new`, `/continue` | Inspect, switch, create, and resume sessions. `/sessions` lists the whole git-repo family (primary checkout plus isolated copies) |
+| `/worktree` | Opt-in isolation: create a linked git worktree and start a new session there. Subcommands: `create [NAME]`, `list`, `remove NAME`. `/new` stays on the current directory. CLI: `noah worktree create` prints a path and does not start a session |
 | `/compact` | Apply a coding checkpoint to eligible older context |
 | `/tokens` | Show tokens, cache hits, cost, model wait, and tool-output volume |
 | `/efficiency [fast|balanced|deep]` | Show or switch live tool-output budgets |
@@ -114,11 +115,17 @@ after resuming it. Other sessions and repositories keep their existing defaults 
 noah sessions list .
 noah sessions show SESSION_ID
 noah sessions delete SESSION_ID
+noah worktree create [NAME]
+noah worktree list
+noah worktree remove NAME
 ```
 
 Each session has a NOOA-backed SQLite database plus metadata for its workspace identity, model,
 mode, title, remembered permission rules, todos, and edit journal. Session files are created with
-private filesystem permissions and cannot accidentally be resumed against another workspace.
+private filesystem permissions. `/sessions` lists every session in the same git repository family
+(primary checkout plus Noah worktree copies). Switching or `noah --session` / `--continue` rebinds
+the workspace to that session's stored path. A missing copy errors with `worktree missing` instead
+of falling back to the current directory. Deleting a session does not remove its worktree.
 
 The latest 50 persisted user, agent, summary, error, and activity events are restored after the
 TUI's first paint. `F3` loads older history in read-only pages of 50, so resuming a long session

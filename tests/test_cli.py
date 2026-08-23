@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -183,3 +184,45 @@ def test_providers_add_saves_prefixed_default(monkeypatch, tmp_path: Path) -> No
     assert "reasoning effort: high" in result.output
     assert 'model = "anthropic/example-model"' in config_path.read_text()
     assert 'reasoning_effort = "high"' in config_path.read_text()
+
+
+def _init_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "eval@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Eval"], cwd=path, check=True)
+    (path / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True, capture_output=True)
+    return path
+
+
+def test_worktree_cli_create_list_remove(tmp_path: Path, monkeypatch) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))
+    runner = CliRunner()
+
+    created = runner.invoke(cli_group, ["worktree", "create", "isol", "-C", str(repo)])
+    assert created.exit_code == 0
+    assert created.output.startswith("isol\tnoah/isol\t")
+    directory = Path(created.output.strip().split("\t")[-1])
+    assert (directory / "README.md").read_text() == "hello\n"
+
+    listed = runner.invoke(cli_group, ["worktree", "list", "-C", str(repo)])
+    assert listed.exit_code == 0
+    assert "isol" in listed.output
+
+    removed = runner.invoke(cli_group, ["worktree", "remove", "isol", "-C", str(repo)])
+    assert removed.exit_code == 0
+    assert "removed isol" in removed.output
+
+    empty = runner.invoke(cli_group, ["worktree", "list", "-C", str(repo)])
+    assert empty.exit_code == 0
+    assert "(none)" in empty.output
+
+
+def test_worktree_cli_create_requires_git(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))
+    result = CliRunner().invoke(cli_group, ["worktree", "create", "isol", "-C", str(tmp_path)])
+    assert result.exit_code == 2
+    assert "git repo" in result.output

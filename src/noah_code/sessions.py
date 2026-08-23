@@ -10,11 +10,12 @@ import sqlite3
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from noah_code.workspace import Workspace
+from noah_code.worktree import family_id, infer_worktree_name, repo_id_for, worktree_storage_root
 
 if TYPE_CHECKING:
     from nooa.storage import SQLiteStorageManager
@@ -53,13 +54,27 @@ class SessionMeta:
     permission_rules: list[dict] = field(default_factory=list)
     journal: dict = field(default_factory=dict)
     todos: dict = field(default_factory=dict)
+    repo_id: str = ""
+    worktree_name: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
 
     @classmethod
     def from_json(cls, raw: str) -> SessionMeta:
-        return cls(**json.loads(raw))
+        data = json.loads(raw)
+        allowed = {item.name for item in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in allowed})
+
+    def family_id(self) -> str:
+        if self.repo_id:
+            return self.repo_id
+        path = Path(self.workspace_path)
+        if path.is_dir():
+            inferred = repo_id_for(path)
+            if inferred:
+                return inferred
+        return self.workspace_identity
 
 
 class SessionStore:
@@ -94,10 +109,16 @@ class SessionStore:
         model: str,
         mode: str = "build",
         reasoning_effort: str = "default",
+        repo_id: str | None = None,
+        worktree_name: str = "",
     ) -> SessionMeta:
         session_id = uuid.uuid4().hex[:12]
         path = self._session_path(session_id)
         path.mkdir(parents=True, exist_ok=False, mode=0o700)
+        resolved_repo = repo_id if repo_id is not None else repo_id_for(workspace.root)
+        resolved_name = worktree_name or infer_worktree_name(
+            workspace.root, worktree_storage_root(self.session_dir)
+        )
         meta = SessionMeta(
             session_id=session_id,
             workspace_path=str(workspace.root),
@@ -105,6 +126,8 @@ class SessionStore:
             model=model,
             mode=mode,
             reasoning_effort=reasoning_effort,
+            repo_id=resolved_repo,
+            worktree_name=resolved_name,
         )
         self.save_meta(meta)
         return meta
@@ -217,7 +240,7 @@ class SessionStore:
                 or re.fullmatch(r"[0-9a-f]{12}", meta.session_id) is None
             ):
                 continue
-            if workspace and meta.workspace_identity != workspace.identity:
+            if workspace and meta.family_id() != family_id(workspace.root, workspace.identity):
                 continue
             items.append(meta)
         return items
@@ -239,6 +262,26 @@ class SessionStore:
             raise SessionError(
                 f"session {meta.session_id} belongs to {meta.workspace_path}, not {workspace.root}"
             )
+
+    def same_family(self, meta: SessionMeta, workspace: Workspace) -> bool:
+        if meta.workspace_identity == workspace.identity:
+            return True
+        launched = family_id(workspace.root, workspace.identity)
+        return bool(launched) and meta.family_id() == launched
+
+    def workspace_for_resume(self, meta: SessionMeta, launched: Workspace) -> Workspace:
+        """Rebound the launch workspace onto a family session's stored path."""
+
+        if not self.same_family(meta, launched):
+            raise SessionError(
+                f"session {meta.session_id} belongs to {meta.workspace_path}, not {launched.root}"
+            )
+        target = Path(meta.workspace_path).expanduser()
+        if not target.is_dir():
+            raise SessionError(f"worktree missing: {meta.workspace_path}")
+        rebound = Workspace(root=target.resolve())
+        self.verify_workspace(meta, rebound)
+        return rebound
 
     def load_event_page(
         self,

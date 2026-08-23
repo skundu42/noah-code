@@ -12,4 +12,5 @@ htmlcov/
 traces/
 .DS_Store
 docs/superpowers/plans/
+docs/superpowers/specs/
 .noah-code/

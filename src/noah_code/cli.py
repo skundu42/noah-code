@@ -39,6 +39,7 @@ SUBCOMMANDS = frozenset(
         "bench",
         "checkpoints",
         "sessions",
+        "worktree",
         "doctor",
         "config",
         "providers",
@@ -511,7 +512,10 @@ def sessions_list(path: str | None) -> None:
         config = load_config(workspace.root)
         store = SessionStore(config.session_dir)
         for s in store.list_sessions(workspace):
-            click.echo(f"{s.session_id}\t{s.mode}\t{s.model}\t{s.title}\t{s.workspace_path}")
+            click.echo(
+                f"{s.session_id}\t{s.mode}\t{s.model}\t{s.title}\t{s.workspace_path}"
+                + (f"\t{s.worktree_name}" if s.worktree_name else "")
+            )
     except (WorkspaceError, SessionError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
@@ -543,6 +547,72 @@ def sessions_delete(session_id: str) -> None:
     except (WorkspaceError, SessionError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
+
+
+def _worktree_manager(path: str | None):
+    from noah_code.worktree import WorktreeManager, worktree_storage_root
+
+    workspace = open_workspace(path)
+    config = load_config(workspace.root)
+    return WorktreeManager(workspace.root, worktree_storage_root(config.session_dir))
+
+
+@cli_group.group("worktree")
+def worktree_group() -> None:
+    """Create, list, or remove isolated git worktrees."""
+
+
+@worktree_group.command("create")
+@click.argument("name", required=False)
+@click.option("-C", "--path", "path", type=click.Path(), default=None)
+def worktree_create(name: str | None, path: str | None) -> None:
+    """Create a linked worktree copy. Does not start a session."""
+
+    from noah_code.worktree import WorktreeError
+
+    try:
+        info = _worktree_manager(path).create(name)
+    except (WorkspaceError, WorktreeError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    click.echo(f"{info.name}\t{info.branch}\t{info.directory}")
+
+
+@worktree_group.command("list")
+@click.option("-C", "--path", "path", type=click.Path(), default=None)
+def worktree_list(path: str | None) -> None:
+    from noah_code.worktree import WorktreeError
+
+    try:
+        rows = _worktree_manager(path).list()
+    except (WorkspaceError, WorktreeError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    if not rows:
+        click.echo("(none)")
+        return
+    for item in rows:
+        click.echo(f"{item.name}\t{item.branch}\t{item.directory}")
+
+
+@worktree_group.command("remove")
+@click.argument("name")
+@click.option("-C", "--path", "path", type=click.Path(), default=None)
+def worktree_remove(name: str, path: str | None) -> None:
+    from noah_code.worktree import WorktreeError
+
+    try:
+        manager = _worktree_manager(path)
+        matches = [
+            item for item in manager.list() if item.name == name or str(item.directory) == name
+        ]
+        if matches and matches[0].directory.resolve() == Path.cwd().resolve():
+            raise WorktreeError("switch away from this worktree before removing it")
+        info = manager.remove(name)
+    except (WorkspaceError, WorktreeError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    click.echo(f"removed {info.name}")
 
 
 @cli_group.command("benchmark")
@@ -1015,12 +1085,13 @@ async def _prepare(
     try:
         if session_id:
             meta = store.load_meta(session_id)
-            store.verify_workspace(meta, workspace)
+            workspace = store.workspace_for_resume(meta, workspace)
         elif continue_session:
             meta = store.latest_for_workspace(workspace)
             if meta is None:
                 click.echo("error: no prior session for this workspace", err=True)
                 return None, EXIT_CONFIG
+            workspace = store.workspace_for_resume(meta, workspace)
         if meta is not None and (model is not None or reasoning_effort is not None):
             if model is not None:
                 meta.model = config.model
