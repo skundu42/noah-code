@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
@@ -37,6 +38,7 @@ class TaskTools(Skill):
         self._approvals = approvals
         self._runner = runner
         self._parent = parent
+        self._mutation_lock = asyncio.Lock()
 
     def list(self) -> str:
         """List built-in and markdown agents available to ``run``."""
@@ -61,7 +63,8 @@ class TaskTools(Skill):
         runner = self._runner or _default_runner(self._parent)
         if runner is None:
             raise RuntimeError("subagent runner is not configured")
-        return await runner(spec, assignment)
+        async with self._agent_lane(spec):
+            return await runner(spec, assignment)
 
     async def run_many(self, assignments: Sequence[tuple[str, str]]) -> str:
         """Run independent subagent assignments concurrently.
@@ -85,7 +88,7 @@ class TaskTools(Skill):
 
         async def _one(spec: AgentSpec, prompt: str) -> str:
             try:
-                async with semaphore:
+                async with semaphore, self._agent_lane(spec):
                     runner = self._runner or _default_runner(self._parent)
                     if runner is None:
                         raise RuntimeError("subagent runner is not configured")
@@ -113,6 +116,16 @@ class TaskTools(Skill):
         config = getattr(self._parent, "_config", None)
         value = getattr(getattr(config, "efficiency", None), "max_concurrent_subagents", None)
         return int(value or 3)
+
+    @contextlib.asynccontextmanager
+    async def _agent_lane(self, spec: AgentSpec):  # noqa: ANN202
+        """Allow read-only fan-out while serializing workspace mutators."""
+
+        if spec.readonly:
+            yield
+            return
+        async with self._mutation_lock:
+            yield
 
     def _resolve(self, name: str) -> AgentSpec:
         requested = name.strip().lstrip("@").lower()
@@ -154,22 +167,50 @@ async def run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> str:
 
     parent_cap = getattr(parent._config, "max_iterations", 40)  # noqa: SLF001
     child_cap = None if parent_cap is None else min(int(parent_cap), 16)
+    child_model = spec.model or getattr(parent._config, "model", None)  # noqa: SLF001
     config: NoahCodeConfig = parent._config.model_copy(  # noqa: SLF001
         update={
             "mode": spec.mode,
             "max_iterations": child_cap,
+            "model": child_model,
         }
     )
+    child_llm = parent._llm  # noqa: SLF001
+    if spec.model:
+        from noah_code.budget import SharedBudgetLLM, _PrefixObserverOnly
+        from noah_code.llm import ResilientLLM, get_llm_client, reasoning_overrides
+
+        child_llm = await asyncio.to_thread(
+            get_llm_client,
+            spec.model,
+            **reasoning_overrides(config.reasoning_effort),
+            **config.sampling.overrides(),
+        )
+        child_llm = ResilientLLM(child_llm, config.reliability.retries)
+        guard = getattr(parent, "_budget_guard", None)
+        usage = getattr(parent, "_usage_tracker", None)
+        if guard is not None and guard.active:
+            child_llm = SharedBudgetLLM(child_llm, guard, prefix_observer=usage)
+        elif usage is not None:
+            child_llm = _PrefixObserverOnly(child_llm, usage)
     messages: list[str] = []
     child = CodingAgent(
         parent.ws._workspace,  # noqa: SLF001
         config,
-        llm=parent._llm,  # noqa: SLF001
-        lightweight_llm=getattr(parent, "_lightweight_llm", parent._llm),
+        llm=child_llm,
+        lightweight_llm=(
+            child_llm
+            if spec.model
+            else getattr(parent, "_lightweight_llm", parent._llm)  # noqa: SLF001
+        ),
         storage=InMemoryStorageManager(),
         engine=_child_engine(parent.engine, spec.mode),
         approvals=parent.approvals,
         journal=parent.journal,
+        runtime=getattr(parent, "_runtime", None),
+        coordinator=getattr(parent, "_coordinator", None),
+        budget_guard=getattr(parent, "_budget_guard", None),
+        usage_tracker=getattr(parent, "_usage_tracker", None),
         nested=True,
         nested_prompt=spec.prompt,
     )

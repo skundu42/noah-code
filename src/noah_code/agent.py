@@ -40,7 +40,7 @@ from noah_code.tools.process_tools import ProcessTools
 from noah_code.tools.question_tools import QuestionTools
 from noah_code.tools.task_tools import TaskTools
 from noah_code.tools.web_tools import WebTools
-from noah_code.tools.workspace_tools import WorkspaceTools
+from noah_code.tools.workspace_tools import WorkspaceMutationCoordinator, WorkspaceTools
 from noah_code.workspace import Workspace, WorkspaceError
 
 
@@ -199,7 +199,10 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
         self._restrictions = restrictions
         self._spec = resolve_spec(worker_config)
         self._degraded: list[str] = []
-        self._ctx = mp.get_context(config.start_method)
+        # Forking a multithreaded Textual process can deadlock in inherited
+        # locks and is deprecated on macOS/Python 3.12. This custom executor's
+        # initialization payload is spawn-safe, so start a clean interpreter.
+        self._ctx = mp.get_context("spawn")
         self._proc: mp.process.BaseProcess | None = None
         self._conn: Any = None
         self._lock = asyncio.Lock()
@@ -341,6 +344,10 @@ class CodingAgent(InteractiveAgent):
         engine: PermissionEngine | None = None,
         approvals: ApprovalBroker | None = None,
         journal: SnapshotJournal | None = None,
+        runtime: Any = None,
+        coordinator: WorkspaceMutationCoordinator | None = None,
+        budget_guard: Any = None,
+        usage_tracker: Any = None,
         nested: bool = False,
         nested_prompt: str | None = None,
         **kwargs: Any,
@@ -361,8 +368,20 @@ class CodingAgent(InteractiveAgent):
             auto_approve=config.auto_approve,
         )
         self._engine.mode = config.mode
-        self._approvals = approvals or ApprovalBroker(self._engine)
+        self._approvals = approvals or ApprovalBroker(
+            self._engine,
+            runtime=runtime,
+            timeout_seconds=config.reliability.interaction_timeout_seconds,
+        )
+        self._approvals.set_runtime(
+            runtime,
+            timeout_seconds=config.reliability.interaction_timeout_seconds,
+        )
         self._journal = journal or SnapshotJournal(blob_limit=config.undo_blob_limit)
+        self._runtime = runtime
+        self._coordinator = coordinator or WorkspaceMutationCoordinator()
+        self._budget_guard = budget_guard
+        self._usage_tracker = usage_tracker
 
         self.lsp = LSPTools(
             workspace,
@@ -391,6 +410,10 @@ class CodingAgent(InteractiveAgent):
             output_retention_hours=config.efficiency.tool_output_retention_hours,
             default_timeout=config.command_timeout,
             lsp=self.lsp,
+            runtime=runtime,
+            coordinator=self._coordinator,
+            output_store_root=runtime.artifact_dir if runtime is not None else None,
+            output_store_max_bytes=config.reliability.artifact_max_bytes,
         )
         self.processes = ProcessTools(
             self.ws,
@@ -398,12 +421,23 @@ class CodingAgent(InteractiveAgent):
             max_runtime_seconds=config.processes.max_runtime_seconds,
             max_buffer_chars=config.processes.max_buffer_chars,
             stop_grace_seconds=config.processes.stop_grace_seconds,
+            runtime=runtime,
         )
         self.todos = TodoManager()
         self.git = GitTools(self.ws)
-        self.github = GithubTools(workspace.root, self._engine, self._approvals)
+        self.github = GithubTools(
+            workspace.root,
+            self._engine,
+            self._approvals,
+            runtime=runtime,
+        )
         self.web = WebTools(self._engine, self._approvals)
-        self.ask = QuestionTools(self._engine, self._approvals)
+        self.ask = QuestionTools(
+            self._engine,
+            self._approvals,
+            runtime=runtime,
+            timeout_seconds=config.reliability.interaction_timeout_seconds,
+        )
         self.plan = PlanTools(workspace.root, self, self.ask, self._engine)
         self.memory = MemoryTools(
             workspace.root,
@@ -742,7 +776,7 @@ class CodingAgent(InteractiveAgent):
         - ``result = await self.ws.run("pytest -q")`` runs validation; inspect
           ``result.returncode``, ``result.stdout``, and ``result.stderr``.
         - ``await self.web.fetch(url)`` reads a page; ``await self.web.search(query)``
-          searches the public web. Both ask for approval by default.
+          searches the public web. Both are read-only and allowed by default.
         - ``await self.github.list()`` / ``view(number)`` inspect pull requests.
         - ``await self.github.create(title, body)`` pushes HEAD and opens a PR.
         - ``await self.github.push()`` updates the remote branch.

@@ -34,6 +34,17 @@ def test_managed_output_rejects_invalid_ids(tmp_path: Path) -> None:
         store.read("../../secret")
 
 
+def test_managed_output_is_content_addressed_and_enforces_quota(tmp_path: Path) -> None:
+    store = ToolOutputStore(tmp_path / "outputs", max_total_bytes=20)
+
+    first = store.store("same output")
+    assert store.store("same output") == first
+    assert len(list((tmp_path / "outputs").glob("*.txt"))) == 1
+
+    with pytest.raises(RuntimeError, match="quota"):
+        store.store("a second unique payload")
+
+
 def test_efficiency_profiles_do_not_cap_codeact_iterations() -> None:
     config = NoahCodeConfig(max_iterations=40)
     assert _codeact_config(config).max_iterations == 40

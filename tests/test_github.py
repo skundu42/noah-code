@@ -12,6 +12,7 @@ from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.config import DEFAULT_PERMISSION_RULES
 from noah_code.github import GithubError, GithubManager
 from noah_code.permissions import PermissionEngine
+from noah_code.runtime_state import RuntimeStateStore
 from noah_code.tools.github_tools import GithubTools
 
 
@@ -180,3 +181,59 @@ async def test_github_tools_list_is_allowed(tmp_path: Path) -> None:
     )
     assert await tools.list() == "(none)"
     assert asked["n"] == 0
+
+
+def test_create_recovery_reuses_existing_pull_request_without_replaying(tmp_path: Path) -> None:
+    payload = json.dumps(
+        {
+            "number": 7,
+            "title": "Already created",
+            "url": "https://github.com/acme/repo/pull/7",
+            "headRefName": "fix",
+            "baseRefName": "main",
+            "state": "OPEN",
+        }
+    )
+    runner = _FakeRunner(
+        {
+            (
+                "gh",
+                "pr",
+                "view",
+                "--json",
+                "number,title,url,headRefName,baseRefName,state",
+            ): _ok(["gh"], payload)
+        }
+    )
+
+    info = GithubManager(tmp_path, runner=runner).create("Already created", recover=True)
+
+    assert info.number == 7
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in runner.calls)
+    assert ["git", "push", "-u", "origin", "HEAD"] not in runner.calls
+
+
+@pytest.mark.asyncio
+async def test_github_effect_result_is_cached_after_success(tmp_path: Path) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+
+    class Manager:
+        calls = 0
+
+        def push(self) -> str:
+            self.calls += 1
+            return "pushed once"
+
+    manager = Manager()
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    tools = GithubTools(
+        tmp_path,
+        engine,
+        ApprovalBroker(engine),
+        manager=manager,  # type: ignore[arg-type]
+        runtime=runtime,
+    )
+
+    assert await tools.push() == "pushed once"
+    assert await tools.push() == "pushed once"
+    assert manager.calls == 1

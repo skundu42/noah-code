@@ -19,6 +19,7 @@ from noah_code.mcp_setup import (
     save_user_mcp_server,
 )
 from noah_code.permissions import PermissionEngine
+from noah_code.runtime_state import RuntimeStateStore
 
 
 def test_load_mcp_servers_accepts_claude_json_and_normalizes_transport(tmp_path: Path) -> None:
@@ -198,3 +199,50 @@ async def test_install_mcp_attaches_trusted_servers_at_startup(
     attach.assert_awaited_once()
     assert attach.await_args.kwargs["startup"] is True
     assert attach.await_args.kwargs["trusted"] is True
+
+
+@pytest.mark.asyncio
+async def test_mutating_mcp_calls_are_cached_and_ambiguous_replays_are_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = ModuleType("nooa.mcp")
+
+    class FakeTool:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def _call_tool(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+            self.calls += 1
+            return {"name": name, "arguments": arguments, "call": self.calls}
+
+    tool = FakeTool()
+
+    class FakeManager:
+        @staticmethod
+        def create_from_server(_name: str, **_spec: object) -> FakeTool:
+            return tool
+
+    fake.MCPManager = FakeManager
+    monkeypatch.setitem(sys.modules, "nooa.mcp", fake)
+    runtime = RuntimeStateStore(tmp_path / "session")
+    agent = SimpleNamespace(_runtime=runtime, _sandbox_approved_roots=set())
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+
+    attr = await attach_mcp_server(
+        agent,
+        "issues",
+        {"command": "true"},
+        engine=engine,
+        approvals=ApprovalBroker(engine),
+        startup=True,
+    )
+    attached = getattr(agent, attr)
+    first = await attached._call_tool("create_issue", {"title": "Race"})
+    second = await attached._call_tool("create_issue", {"title": "Race"})
+    assert first == second
+    assert tool.calls == 1
+
+    runtime.begin_effect("mcp", "issues.create_issue", {"title": "Ambiguous"})
+    with pytest.raises(RuntimeError, match="may already have completed"):
+        await attached._call_tool("create_issue", {"title": "Ambiguous"})
+    assert tool.calls == 1

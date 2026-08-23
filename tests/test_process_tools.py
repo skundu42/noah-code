@@ -13,6 +13,7 @@ from nooa.tools.shell_tools import ShellTools
 from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.config import DEFAULT_PERMISSION_RULES
 from noah_code.permissions import PermissionEngine
+from noah_code.runtime_state import RuntimeStateStore
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tools.process_tools import ProcessTools
 from noah_code.tools.workspace_tools import WorkspaceTools
@@ -23,7 +24,12 @@ async def _approve_once(_request) -> ApprovalChoice:
     return ApprovalChoice.ONCE
 
 
-def _manager(tmp_path: Path, *, auto: bool = False) -> ProcessTools:
+def _manager(
+    tmp_path: Path,
+    *,
+    auto: bool = False,
+    runtime: RuntimeStateStore | None = None,
+) -> ProcessTools:
     workspace = Workspace(tmp_path.resolve())
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=auto)
     journal = SnapshotJournal()
@@ -35,7 +41,12 @@ def _manager(tmp_path: Path, *, auto: bool = False) -> ProcessTools:
         ApprovalBroker(engine, handler=None if auto else _approve_once),
         journal,
     )
-    return ProcessTools(tools, max_runtime_seconds=5, stop_grace_seconds=0.2)
+    return ProcessTools(
+        tools,
+        max_runtime_seconds=5,
+        stop_grace_seconds=0.2,
+        runtime=runtime,
+    )
 
 
 @pytest.mark.asyncio
@@ -96,3 +107,27 @@ async def test_background_job_accepts_input_and_stop_owns_process_group(tmp_path
         assert not manager.has_running()
     finally:
         await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_background_job_status_and_logs_survive_manager_restart(tmp_path: Path) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+    manager = _manager(tmp_path, runtime=runtime)
+    try:
+        command = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote(
+            "print('durable output')"
+        )
+        started = await manager.start(command, name="durable")
+        job_id = started.split()[1]
+        async with asyncio.timeout(3):
+            while "completed" not in await manager.status(job_id):
+                await asyncio.sleep(0.02)
+    finally:
+        await manager.close()
+
+    reopened = _manager(tmp_path, runtime=RuntimeStateStore(tmp_path / "session"))
+    try:
+        assert "[completed]" in await reopened.status(job_id)
+        assert "durable output" in await reopened.logs(job_id)
+    finally:
+        await reopened.close()

@@ -128,6 +128,7 @@ class _LSPClient:
         self._stderr_task: asyncio.Task[None] | None = None
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._next_id = 0
+        self._start_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._diagnostics: dict[str, list[dict[str, Any]]] = {}
         self._diagnostic_events: dict[str, asyncio.Event] = {}
@@ -135,44 +136,76 @@ class _LSPClient:
         self._closed = False
 
     async def start(self) -> None:
-        if self.process is not None:
+        if self._closed:
+            raise RuntimeError("LSP client is closed")
+        if self.process is not None and self.process.returncode is None:
             return
-        self.process = await asyncio.create_subprocess_exec(
-            *self.command,
-            cwd=self.root,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=os.name != "nt",
-        )
-        self._reader_task = asyncio.create_task(self._read_loop(), name="noah-lsp-reader")
-        self._stderr_task = asyncio.create_task(self._drain_stderr(), name="noah-lsp-stderr")
-        initialize = {
-            "processId": os.getpid(),
-            "clientInfo": {"name": "noah-code", "version": "0.1"},
-            "rootUri": _path_uri(self.root),
-            "workspaceFolders": [{"uri": _path_uri(self.root), "name": self.root.name}],
-            "capabilities": {
-                "workspace": {"workspaceFolders": True, "symbol": {"dynamicRegistration": False}},
-                "textDocument": {
-                    "definition": {"linkSupport": True},
-                    "implementation": {"linkSupport": True},
-                    "references": {},
-                    "hover": {"contentFormat": ["markdown", "plaintext"]},
-                    "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
-                    "rename": {"prepareSupport": True},
-                    "diagnostic": {},
-                    "synchronization": {"didSave": True},
+        async with self._start_lock:
+            if self.process is not None and self.process.returncode is None:
+                return
+            self.process = None
+            self._open_documents.clear()
+            self._diagnostics.clear()
+            self._diagnostic_events.clear()
+            self.process = await asyncio.create_subprocess_exec(
+                *self.command,
+                cwd=self.root,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=os.name != "nt",
+            )
+            self._reader_task = asyncio.create_task(self._read_loop(), name="noah-lsp-reader")
+            self._stderr_task = asyncio.create_task(self._drain_stderr(), name="noah-lsp-stderr")
+            initialize = {
+                "processId": os.getpid(),
+                "clientInfo": {"name": "noah-code", "version": "0.2"},
+                "rootUri": _path_uri(self.root),
+                "workspaceFolders": [{"uri": _path_uri(self.root), "name": self.root.name}],
+                "capabilities": {
+                    "workspace": {
+                        "workspaceFolders": True,
+                        "symbol": {"dynamicRegistration": False},
+                    },
+                    "textDocument": {
+                        "definition": {"linkSupport": True},
+                        "implementation": {"linkSupport": True},
+                        "references": {},
+                        "hover": {"contentFormat": ["markdown", "plaintext"]},
+                        "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
+                        "rename": {"prepareSupport": True},
+                        "diagnostic": {},
+                        "synchronization": {"didSave": True},
+                    },
                 },
-            },
-        }
-        await self.request("initialize", initialize, timeout=max(self.timeout, 10.0))
-        await self.notify("initialized", {})
+            }
+            try:
+                await self._request_started(
+                    "initialize", initialize, timeout=max(self.timeout, 10.0)
+                )
+                await self._notify_started("initialized", {})
+            except Exception:
+                process, self.process = self.process, None
+                if process is not None and process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                raise
 
     async def request(
         self, method: str, params: dict[str, Any], *, timeout: float | None = None
     ) -> Any:
         await self.start()
+        try:
+            return await self._request_started(method, params, timeout=timeout)
+        except (BrokenPipeError, ConnectionResetError, RuntimeError):
+            if self.process is not None and self.process.returncode is None:
+                raise
+            await self.start()
+            return await self._request_started(method, params, timeout=timeout)
+
+    async def _request_started(
+        self, method: str, params: dict[str, Any], *, timeout: float | None = None
+    ) -> Any:
         self._next_id += 1
         request_id = self._next_id
         future = asyncio.get_running_loop().create_future()
@@ -185,6 +218,9 @@ class _LSPClient:
 
     async def notify(self, method: str, params: dict[str, Any]) -> None:
         await self.start()
+        await self._notify_started(method, params)
+
+    async def _notify_started(self, method: str, params: dict[str, Any]) -> None:
         await self._send({"jsonrpc": "2.0", "method": method, "params": params})
 
     async def open_document(self, path: Path, language: str) -> str:
@@ -289,12 +325,16 @@ class _LSPClient:
     async def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         if self.process is not None and self.process.returncode is None:
             with contextlib.suppress(Exception):
-                await self.request("shutdown", {}, timeout=1.0)
+                # Use the already-started transport directly: setting
+                # ``_closed`` first makes the public request path reject its
+                # own graceful-shutdown request.
+                await self._request_started("shutdown", {}, timeout=1.0)
             with contextlib.suppress(Exception):
-                await self.notify("exit", {})
+                await self._notify_started("exit", {})
+        self._closed = True
+        if self.process is not None and self.process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 if os.name != "nt":
                     os.killpg(self.process.pid, signal.SIGTERM)

@@ -58,6 +58,21 @@ class UsageSnapshot:
             ]
         )
 
+    def to_dict(self) -> dict[str, int | float]:
+        return {
+            "calls": self.calls,
+            "failed_calls": self.failed_calls,
+            "prompt_tokens": self.prompt_tokens,
+            "cached_tokens": self.cached_tokens,
+            "completion_tokens": self.completion_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cost_usd": self.cost_usd,
+            "llm_seconds": self.llm_seconds,
+            "tool_output_chars": self.tool_output_chars,
+            "prefix_calls": self.prefix_calls,
+            "prefix_append_only": self.prefix_append_only,
+        }
+
 
 class UsageTracker:
     def __init__(self) -> None:
@@ -140,3 +155,22 @@ class UsageTracker:
                 prefix_calls=self._prefix_calls,
                 prefix_append_only=self._prefix_append_only,
             )
+
+    def load_dict(self, data: dict[str, Any] | None) -> None:
+        """Restore cumulative accounting without restoring in-flight timers."""
+
+        if not data:
+            return
+        with self._lock:
+            self._started.clear()
+            self._calls = max(int(data.get("calls", 0)), 0)
+            self._failed = max(int(data.get("failed_calls", 0)), 0)
+            self._prompt = max(int(data.get("prompt_tokens", 0)), 0)
+            self._cached = max(int(data.get("cached_tokens", 0)), 0)
+            self._completion = max(int(data.get("completion_tokens", 0)), 0)
+            self._reasoning = max(int(data.get("reasoning_tokens", 0)), 0)
+            self._cost = max(float(data.get("cost_usd", 0.0)), 0.0)
+            self._seconds = max(float(data.get("llm_seconds", 0.0)), 0.0)
+            self._tool_chars = max(int(data.get("tool_output_chars", 0)), 0)
+            self._prefix_calls = max(int(data.get("prefix_calls", 0)), 0)
+            self._prefix_append_only = max(int(data.get("prefix_append_only", 0)), 0)

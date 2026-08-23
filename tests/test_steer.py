@@ -61,7 +61,9 @@ def test_push_keeps_attach_paths() -> None:
 
 
 def test_safe_slash_allowlist_matches_spec() -> None:
-    assert frozenset({"status", "tokens", "todos", "help", "trace"}) == SAFE_SLASH_WHILE_BUSY
+    assert frozenset(
+        {"status", "health", "tokens", "todos", "help", "trace"}
+    ) == SAFE_SLASH_WHILE_BUSY
 
 
 def test_expansion_failed_only_when_mentions_or_attaches_resolve_nothing() -> None:

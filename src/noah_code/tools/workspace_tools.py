@@ -12,10 +12,11 @@ import re
 import shlex
 import sys
 import tempfile
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from pathlib import Path
-from typing import Annotated, Any, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from nooa import Skill, hidden, spec
 from nooa.tools.shell_tools import (
@@ -37,6 +38,9 @@ from noah_code.permissions import (
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tool_output import ToolOutputStore
 from noah_code.workspace import Workspace, WorkspaceError
+
+if TYPE_CHECKING:
+    from noah_code.runtime_state import RuntimeStateStore
 
 # Module-level aliases: inside the class body the tool methods named ``list``
 # would shadow builtins.list in parameter annotations.
@@ -61,6 +65,13 @@ _IGNORED_LIST_DIRS = frozenset(
         ".cursor",
     }
 )
+
+
+class WorkspaceMutationCoordinator:
+    """One mutation lane shared by a parent agent and all nested agents."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
 
 
 def _pattern_keeps_dir(pattern: str, name: str) -> bool:
@@ -130,6 +141,10 @@ class WorkspaceTools(Skill):
         output_retention_hours: int = 24,
         default_timeout: float = 60.0,
         lsp: Any = None,
+        runtime: RuntimeStateStore | None = None,
+        coordinator: WorkspaceMutationCoordinator | None = None,
+        output_store_root: Path | None = None,
+        output_store_max_bytes: int = 2_000_000_000,
     ) -> None:
         super().__init__()
         self._workspace = workspace
@@ -141,10 +156,17 @@ class WorkspaceTools(Skill):
         self._max_output_lines = max_output_lines
         self._max_search_results = max_search_results
         self._max_file_results = max_file_results
-        self._output_store = ToolOutputStore(retention_hours=output_retention_hours)
+        self._output_store = ToolOutputStore(
+            root=output_store_root,
+            retention_hours=None if output_store_root is not None else output_retention_hours,
+            max_total_bytes=output_store_max_bytes,
+        )
         self._default_timeout = default_timeout
         self._on_shell_chunk: Any = None
         self._lsp = lsp
+        self._runtime = runtime
+        self._coordinator = coordinator or WorkspaceMutationCoordinator()
+        self._mutation_checkpoint_handler: Any = None
         # NOOA 0.0.9 starts BashSession lazily without guarding concurrent
         # callers. Batched inspections can otherwise launch multiple shells
         # and orphan every process except the last one assigned to the session.
@@ -180,6 +202,15 @@ class WorkspaceTools(Skill):
     def set_shell_chunk_handler(self, handler: Any) -> None:
         """Optional callback(stream: str, text: str) for UI streaming."""
         self._on_shell_chunk = handler
+
+    def set_mutation_checkpoint_handler(self, handler: Any) -> None:
+        """Install an async host callback used before untracked shell effects."""
+
+        self._mutation_checkpoint_handler = handler
+
+    async def checkpoint_before_shell(self, command: str) -> None:
+        if self._mutation_checkpoint_handler is not None:
+            await self._mutation_checkpoint_handler(command)
 
     @hidden
     @property
@@ -355,6 +386,10 @@ class WorkspaceTools(Skill):
         new: Annotated[str | None, spec(description="Path-form replacement")] = None,
     ) -> Any:
         """Edit via Match anchor (preferred) or unique string replacement."""
+        async with self._coordinator.lock:
+            return await self._replace_locked(match, new_text, new)
+
+    async def _replace_locked(self, match: Any, new_text: str, new: str | None) -> Any:
         if isinstance(match, Match):
             resolved = await self._authorize_path(
                 match.path, PermissionCategory.EDIT, tool="ws_edit"
@@ -367,24 +402,30 @@ class WorkspaceTools(Skill):
                         f"stale edit anchor: {self._workspace.relpath(resolved)} changed "
                         "since read(); call read() again to refresh the Match"
                     )
+            durable = self._begin_durable_file_operation(resolved)
             mut = self._journal.record_preimage(resolved)
             try:
                 result = self._native_replace_match(resolved, match, new_text)
+                self._journal.record_postimage(mut, resolved)
+                self._complete_durable_file_operation(durable, resolved)
             except Exception:
                 self._journal.discard_mutation(mut)
+                self._rollback_durable_file_operation(durable)
                 raise
-            self._journal.record_postimage(mut, resolved)
             return result
         if isinstance(match, str):
             resolved = await self._authorize_path(match, PermissionCategory.EDIT, tool="ws_edit")
+            durable = self._begin_durable_file_operation(resolved)
             mut = self._journal.record_preimage(resolved)
             try:
                 async with self._pinned_shell_cwd():
                     result = await self._shell.replace(str(resolved), new_text, new)
+                self._journal.record_postimage(mut, resolved)
+                self._complete_durable_file_operation(durable, resolved)
             except Exception:
                 self._journal.discard_mutation(mut)
+                self._rollback_durable_file_operation(durable)
                 raise
-            self._journal.record_postimage(mut, resolved)
             return result
         raise TypeError("replace expects a Match or path string")
 
@@ -404,14 +445,21 @@ class WorkspaceTools(Skill):
         content: Annotated[str, spec(description="Full file content")],
     ) -> Any:
         """Create or overwrite a file with content."""
+        async with self._coordinator.lock:
+            return await self._write_file_locked(path, content)
+
+    async def _write_file_locked(self, path: str, content: str) -> Any:
         resolved = await self._authorize_path(path, PermissionCategory.EDIT, tool="write_file")
+        durable = self._begin_durable_file_operation(resolved)
         mut = self._journal.record_preimage(resolved)
         try:
             result = self._atomic_write_bytes(resolved, content.encode("utf-8"), content)
+            self._journal.record_postimage(mut, resolved)
+            self._complete_durable_file_operation(durable, resolved)
         except Exception:
             self._journal.discard_mutation(mut)
+            self._rollback_durable_file_operation(durable)
             raise
-        self._journal.record_postimage(mut, resolved)
         return result
 
     async def write(
@@ -442,6 +490,10 @@ class WorkspaceTools(Skill):
         the entire current file. Every target is authorized and preflighted
         before any file changes. A failed commit rolls the whole batch back.
         """
+        async with self._coordinator.lock:
+            return await self._apply_patch_locked(changes)
+
+    async def _apply_patch_locked(self, changes: PatchChanges) -> str:
         if not changes:
             raise ValueError("patch requires at least one change")
         if len(changes) > 50:
@@ -522,6 +574,7 @@ class WorkspaceTools(Skill):
 
         temporary: dict[Path, Path] = {}
         mutations = []
+        durable_operations: list[tuple[str, Path]] = []
         committed: list[dict[str, Any]] = []
         created_dirs: list[Path] = []
         try:
@@ -558,6 +611,14 @@ class WorkspaceTools(Skill):
                 if current != item["before_bytes"]:
                     raise RuntimeError(f"concurrent modification detected: {item['path']}")
 
+            operation_group = uuid.uuid4().hex
+            for item in prepared:
+                target = cast(Path, item["resolved"])
+                durable = self._begin_durable_file_operation(
+                    target, operation_group=operation_group
+                )
+                if durable:
+                    durable_operations.append((durable, target))
             for item in prepared:
                 mutations.append(self._journal.record_preimage(item["resolved"]))
             for item in prepared:
@@ -566,9 +627,12 @@ class WorkspaceTools(Skill):
                     target.unlink()
                 else:
                     os.replace(temporary.pop(target), target)
+                self._fsync_directory(target.parent)
                 committed.append(item)
             for mutation, item in zip(mutations, prepared, strict=True):
                 self._journal.record_postimage(mutation, item["resolved"])
+            if durable_operations and self._runtime is not None:
+                self._runtime.complete_file_operations(durable_operations)
         except Exception as exc:
             rollback_error: Exception | None = None
             try:
@@ -580,6 +644,8 @@ class WorkspaceTools(Skill):
                 rollback_error = rollback_exc
             for mutation in mutations:
                 self._journal.discard_mutation(mutation)
+            for durable, _target in reversed(durable_operations):
+                self._rollback_durable_file_operation(durable)
             for directory in reversed(created_dirs):
                 with contextlib.suppress(OSError):
                     directory.rmdir()
@@ -676,10 +742,12 @@ class WorkspaceTools(Skill):
         decision = self._shell_decision(command)
         await self._approvals.require(decision)
         if not self._engine.is_readonly_command(command):
+            await self.checkpoint_before_shell(command)
             self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
             self._on_shell_chunk("status", f"$ {command}\n")
-        async with self._file_op_lock:
+        mutating = not self._engine.is_readonly_command(command)
+        async with self._mutation_guard(mutating), self._file_op_lock:
             await self._ensure_shell_started()
             result = await self._shell.run(
                 command,
@@ -703,10 +771,12 @@ class WorkspaceTools(Skill):
         decision = self._shell_decision(command)
         await self._approvals.require(decision)
         if not self._engine.is_readonly_command(command):
+            await self.checkpoint_before_shell(command)
             self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
             self._on_shell_chunk("status", f"$ {command}\n")
-        async with self._file_op_lock:
+        mutating = not self._engine.is_readonly_command(command)
+        async with self._mutation_guard(mutating), self._file_op_lock:
             await self._ensure_shell_started()
             try:
                 async for event in self._shell.run_stream(
@@ -741,6 +811,29 @@ class WorkspaceTools(Skill):
             action=action,
             reason=reason,
         )
+
+    @contextlib.asynccontextmanager
+    async def _mutation_guard(self, enabled: bool):  # noqa: ANN202
+        if not enabled:
+            yield
+            return
+        async with self._coordinator.lock:
+            yield
+
+    def _begin_durable_file_operation(
+        self, path: Path, *, operation_group: str = ""
+    ) -> str:
+        if self._runtime is None:
+            return ""
+        return self._runtime.begin_file_operation(path, operation_group=operation_group)
+
+    def _complete_durable_file_operation(self, operation_id: str, path: Path) -> None:
+        if operation_id and self._runtime is not None:
+            self._runtime.complete_file_operation(operation_id, path)
+
+    def _rollback_durable_file_operation(self, operation_id: str) -> None:
+        if operation_id and self._runtime is not None:
+            self._runtime.rollback_file_operation(operation_id)
 
     @hidden
     async def run_trusted_readonly(self, command: str) -> ShellResult:
@@ -899,6 +992,7 @@ class WorkspaceTools(Skill):
             if mode is not None:
                 os.chmod(temp_name, mode)
             os.replace(temp_name, resolved)
+            self._fsync_directory(resolved.parent)
         finally:
             Path(temp_name).unlink(missing_ok=True)
         line_count = (
@@ -910,6 +1004,18 @@ class WorkspaceTools(Skill):
             message=f"Created {display} ({line_count} lines)",
             new_text=display_source,
         )
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        """Make a completed rename durable across sudden power loss."""
+
+        if os.name == "nt":
+            return
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _cap_shell_result(self, result: ShellResult) -> ShellResult:
         stdout = self._bound(result.stdout)

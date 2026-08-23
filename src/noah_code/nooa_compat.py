@@ -15,6 +15,12 @@ def queue_user_message(agent: Any, text: str) -> None:
     agent._user_messages_in.put(text)
 
 
+def queue_system_message(agent: Any, text: str) -> None:
+    """Wake an InteractiveAgent with a host-owned lifecycle notification."""
+
+    agent._system_messages_in.put(text)
+
+
 def skill_attribute(skills: Any, registry_name: str) -> str | None:
     """Agent attribute name a registry skill was installed under."""
 

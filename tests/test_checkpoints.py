@@ -94,11 +94,13 @@ def test_non_git_workspace_is_a_noop(tmp_path: Path) -> None:
     assert manager.capture() is None
 
 
-def test_max_per_session_stops_capturing(git_repo: Path) -> None:
+def test_max_per_session_uses_rolling_retention(git_repo: Path) -> None:
     manager = CheckpointManager(git_repo, "abcdef123456", max_per_session=2)
     assert manager.capture() is not None
     assert manager.capture() is not None
-    assert manager.capture() is None
+    third = manager.capture()
+    assert third is not None
+    assert [entry["seq"] for entry in manager.list()] == [2, 3]
 
 
 def test_new_manager_continues_existing_session_sequence(git_repo: Path) -> None:

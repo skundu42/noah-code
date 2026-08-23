@@ -20,6 +20,8 @@ from noah_code.worktree import family_id, infer_worktree_name, repo_id_for, work
 if TYPE_CHECKING:
     from nooa.storage import SQLiteStorageManager
 
+    from noah_code.runtime_state import RuntimeStateStore, WorkspaceLease
+
 
 class SessionError(RuntimeError):
     """Session load/create failure."""
@@ -101,6 +103,32 @@ class SessionStore:
 
     def _db_path(self, session_id: str) -> Path:
         return self._session_path(session_id) / "session.db"
+
+    def open_runtime(
+        self, session_id: str, *, max_events: int = 20_000
+    ) -> RuntimeStateStore:
+        """Open Noah's durable host-state store for one validated session."""
+
+        from noah_code.runtime_state import RuntimeStateStore
+
+        return RuntimeStateStore(self._session_path(session_id), max_events=max_events)
+
+    def session_size(self, session_id: str) -> int:
+        path = self._session_path(session_id)
+        return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+    def acquire_workspace_lease(
+        self, session_id: str, workspace: Workspace
+    ) -> WorkspaceLease:
+        """Exclusively claim a checkout while this process may mutate it."""
+
+        from noah_code.runtime_state import WorkspaceLease
+
+        return WorkspaceLease.acquire(
+            self.session_dir / ".leases",
+            workspace.root,
+            session_id,
+        )
 
     def create(
         self,
@@ -252,9 +280,15 @@ class SessionStore:
     def delete(self, session_id: str) -> None:
         import shutil
 
+        from nooa.storage.sqlite import delete_sqlite_database
+
         path = self._session_path(session_id)
         if not path.exists():
             raise SessionError(f"session not found: {session_id}")
+        try:
+            delete_sqlite_database(self._db_path(session_id))
+        except Exception as exc:
+            raise SessionError(f"cannot delete active session {session_id}: {exc}") from exc
         shutil.rmtree(path)
 
     def verify_workspace(self, meta: SessionMeta, workspace: Workspace) -> None:

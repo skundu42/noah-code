@@ -9,6 +9,7 @@ Enforcement points:
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from typing import Any
@@ -26,7 +27,10 @@ class BudgetGuard:
     def __init__(self, config: BudgetConfig) -> None:
         self._config = config
         self._lock = threading.RLock()
+        self._provider_lock = threading.Lock()
+        self._async_provider_lock = asyncio.Lock()
         self._started = time.monotonic()
+        self._started_wall = time.time()
         self._prompt_tokens = 0
         self._completion_tokens = 0
         self._cost_usd = 0.0
@@ -46,7 +50,9 @@ class BudgetGuard:
             return self._prompt_tokens + self._completion_tokens
 
     def elapsed_seconds(self) -> float:
-        return max(time.monotonic() - self._started, 0.0)
+        monotonic_elapsed = max(time.monotonic() - self._started, 0.0)
+        wall_elapsed = max(time.time() - self._started_wall, 0.0)
+        return max(monotonic_elapsed, wall_elapsed)
 
     def add_usage(
         self,
@@ -124,14 +130,38 @@ class BudgetGuard:
                     "max_seconds": self._config.max_seconds,
                 },
                 "exceeded": self.exceeded,
+                "started_at": self._started_wall,
             }
 
+    def load_state(self, data: dict[str, Any] | None) -> None:
+        """Restore cumulative session limits after a process restart."""
 
-def _usage_from_response(response: Any) -> tuple[int, int]:
+        if not data:
+            return
+        with self._lock:
+            self._prompt_tokens = max(int(data.get("prompt_tokens", 0)), 0)
+            self._completion_tokens = max(int(data.get("completion_tokens", 0)), 0)
+            self._cost_usd = max(float(data.get("cost_usd", 0.0)), 0.0)
+            started_at = float(data.get("started_at", time.time()))
+            self._started_wall = min(started_at, time.time())
+            elapsed = max(time.time() - self._started_wall, 0.0)
+            self._started = time.monotonic() - elapsed
+            exceeded = data.get("exceeded")
+            self.exceeded = str(exceeded) if exceeded else None
+
+
+def _usage_from_response(response: Any) -> tuple[int, int, float]:
     usage = getattr(response, "usage", None) or {}
     prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
     completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-    return prompt, completion
+    hidden = getattr(response, "_hidden_params", None) or {}
+    cost = float(
+        usage.get("cost_usd")
+        or usage.get("cost")
+        or hidden.get("response_cost")
+        or 0.0
+    )
+    return prompt, completion, max(cost, 0.0)
 
 
 class BudgetedLLM:
@@ -155,24 +185,38 @@ class BudgetedLLM:
             self._prefix_observer.observe_prefix(messages)
 
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
-        self._guard.enforce()
-        self._observe_prefix(messages)
-        response = await self._inner.acall(
-            messages, tools=tools, output_model=output_model, **kwargs
-        )
-        prompt, completion = _usage_from_response(response)
-        self._guard.add_usage(prompt_tokens=prompt, completion_tokens=completion)
-        self._guard.enforce()
-        return response
+        # Active caps serialize reservations across parent and subagent routes;
+        # without this lane, concurrent calls can all pass the same preflight.
+        async with self._guard._async_provider_lock:
+            self._guard.enforce()
+            self._observe_prefix(messages)
+            response = await self._inner.acall(
+                messages, tools=tools, output_model=output_model, **kwargs
+            )
+            prompt, completion, cost = _usage_from_response(response)
+            self._guard.add_usage(
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+                cost_usd=cost,
+            )
+            self._guard.enforce()
+            return response
 
     def call(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
-        self._guard.enforce()
-        self._observe_prefix(messages)
-        response = self._inner.call(messages, tools=tools, output_model=output_model, **kwargs)
-        prompt, completion = _usage_from_response(response)
-        self._guard.add_usage(prompt_tokens=prompt, completion_tokens=completion)
-        self._guard.enforce()
-        return response
+        with self._guard._provider_lock:
+            self._guard.enforce()
+            self._observe_prefix(messages)
+            response = self._inner.call(
+                messages, tools=tools, output_model=output_model, **kwargs
+            )
+            prompt, completion, cost = _usage_from_response(response)
+            self._guard.add_usage(
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+                cost_usd=cost,
+            )
+            self._guard.enforce()
+            return response
 
     def count_tokens(self, text: str) -> int:
         return self._inner.count_tokens(text)

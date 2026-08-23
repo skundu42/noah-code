@@ -85,8 +85,23 @@ class GithubManager:
         title: str | None = None,
         body: str = "",
         base: str | None = None,
+        *,
+        recover: bool = False,
     ) -> PullRequestInfo:
         self._require_ready()
+        if recover:
+            existing = self._run(
+                self.root,
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    "--json",
+                    "number,title,url,headRefName,baseRefName,state",
+                ],
+            )
+            if existing.returncode == 0:
+                return _parse_pr(_parse_json_object(existing.stdout))
         resolved_title = (title or self._latest_subject()).strip()
         if not resolved_title:
             raise GithubError("pull request title is required")
@@ -133,11 +148,24 @@ class GithubManager:
             raise GithubError(_message(result))
         return branch
 
-    def comment(self, number: int, body: str) -> str:
+    def comment(self, number: int, body: str, *, recover: bool = False) -> str:
         self._require_ready()
         text = body.strip()
         if not text:
             raise GithubError("comment text is required")
+        if recover:
+            viewed = self._run(
+                self.root,
+                ["gh", "pr", "view", str(int(number)), "--json", "comments"],
+            )
+            if viewed.returncode == 0:
+                payload = _parse_json_object(viewed.stdout)
+                comments = payload.get("comments") or []
+                if any(
+                    isinstance(item, dict) and str(item.get("body") or "").strip() == text
+                    for item in comments
+                ):
+                    return f"comment already present on #{int(number)}"
         result = self._run(
             self.root,
             ["gh", "pr", "comment", str(int(number)), "--body", text],

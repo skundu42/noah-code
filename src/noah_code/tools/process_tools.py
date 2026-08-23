@@ -5,17 +5,22 @@ from __future__ import annotations
 import asyncio
 import codecs
 import contextlib
+import json
 import os
 import signal
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Annotated, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Any
 
 from nooa import Skill, hidden, spec
 
 from noah_code.tools.workspace_tools import WorkspaceTools
+
+if TYPE_CHECKING:
+    from noah_code.runtime_state import RuntimeStateStore
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,7 @@ class BackgroundJob:
     name: str
     command: str
     process: asyncio.subprocess.Process
+    log_path: Path | None = None
     started_at: float = field(default_factory=time.monotonic)
     finished_at: float | None = None
     returncode: int | None = None
@@ -57,6 +63,7 @@ class ProcessTools(Skill):
         max_runtime_seconds: float = 3600.0,
         max_buffer_chars: int = 64_000,
         stop_grace_seconds: float = 2.0,
+        runtime: RuntimeStateStore | None = None,
     ) -> None:
         super().__init__()
         self._ws = workspace_tools
@@ -66,6 +73,7 @@ class ProcessTools(Skill):
         self._stop_grace = stop_grace_seconds
         self._jobs: dict[str, BackgroundJob] = {}
         self._on_lifecycle: Any = None
+        self._runtime = runtime
 
     async def start(
         self,
@@ -90,6 +98,7 @@ class ProcessTools(Skill):
         decision = self._ws._shell_decision(command, tool="processes_start")
         await self._ws._approvals.require(decision)
         if not self._ws._engine.is_readonly_command(command):
+            await self._ws.checkpoint_before_shell(command)
             self._ws._journal.mark_shell_bypass()
         runtime = min(timeout or self._max_runtime, self._max_runtime)
         if runtime <= 0:
@@ -107,13 +116,33 @@ class ProcessTools(Skill):
             start_new_session=os.name != "nt",
         )
         job_id = uuid.uuid4().hex[:8]
+        log_path = self._runtime.process_log_dir / f"{job_id}.jsonl" if self._runtime else None
+        if log_path is not None:
+            log_path.touch(mode=0o600, exist_ok=False)
         job = BackgroundJob(
             id=job_id,
             name=(name.strip() or command.split()[0])[:60],
             command=command,
             process=process,
+            log_path=log_path,
         )
         self._jobs[job_id] = job
+        if self._runtime is not None:
+            try:
+                self._runtime.register_job(
+                    job_id=job_id,
+                    name=job.name,
+                    command=command,
+                    pid=process.pid,
+                    timeout_seconds=runtime,
+                    log_path=log_path or self._runtime.process_log_dir / f"{job_id}.jsonl",
+                )
+            except Exception:
+                await self._terminate(job)
+                self._jobs.pop(job_id, None)
+                if log_path is not None:
+                    log_path.unlink(missing_ok=True)
+                raise
         readers = (
             asyncio.create_task(
                 self._read(job, "stdout", process.stdout), name=f"noah-job-{job_id}-out"
@@ -139,7 +168,10 @@ class ProcessTools(Skill):
         max_chars: Annotated[int, spec(description="Maximum returned log characters")] = 12_000,
     ) -> str:
         """Return only retained log events newer than cursor, plus the next cursor."""
-        job = self._job(job_id)
+        selected = job_id.strip()
+        if selected not in self._jobs and self._runtime is not None:
+            return self._durable_logs(selected, cursor=cursor, max_chars=max_chars)
+        job = self._job(selected)
         limit = min(max(max_chars, 1000), 32_000)
         events = [event for event in job.events if event.sequence > cursor]
         retained_from = job.events[0].sequence if job.events else job.next_sequence
@@ -166,10 +198,24 @@ class ProcessTools(Skill):
     ) -> str:
         """Show one job or a compact list of all session jobs."""
         if job_id.strip():
-            return self._status_line(self._job(job_id))
-        if not self._jobs:
+            selected = job_id.strip()
+            if selected in self._jobs:
+                return self._status_line(self._job(selected))
+            record = self._runtime.job(selected) if self._runtime is not None else None
+            if record is None:
+                raise KeyError(f"unknown background job: {selected}")
+            return self._durable_status_line(record)
+        if not self._jobs and self._runtime is None:
             return "(no background jobs)"
-        return "\n".join(self._status_line(job) for job in self._jobs.values())
+        rows = [self._status_line(job) for job in self._jobs.values()]
+        if self._runtime is not None:
+            active_ids = set(self._jobs)
+            rows.extend(
+                self._durable_status_line(record)
+                for record in self._runtime.jobs()
+                if str(record["job_id"]) not in active_ids
+            )
+        return "\n".join(rows) or "(no background jobs)"
 
     async def input(
         self,
@@ -195,6 +241,8 @@ class ProcessTools(Skill):
         if job.state != "running":
             return self._status_line(job)
         job.state = "stopping"
+        if self._runtime is not None:
+            self._runtime.update_job(job.id, "stopping")
         await self._terminate(job)
         await asyncio.gather(
             *(task for task in job.tasks if task.get_name().endswith("-wait")),
@@ -248,6 +296,20 @@ class ProcessTools(Skill):
         while job.events and job.event_chars > self._max_buffer:
             removed = job.events.popleft()
             job.event_chars -= len(removed.text)
+        if job.log_path is not None:
+            payload = json.dumps(
+                {
+                    "sequence": event.sequence,
+                    "stream": stream,
+                    "text": text,
+                    "timestamp": time.time(),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            with job.log_path.open("a", encoding="utf-8") as output:
+                output.write(payload + "\n")
+                output.flush()
 
     async def _wait(
         self,
@@ -263,7 +325,9 @@ class ProcessTools(Skill):
             job.state = "stopped"
         job.returncode = returncode
         job.finished_at = time.monotonic()
-        self._emit(job, f"{job.state} exit={returncode}")
+        if self._runtime is not None:
+            self._runtime.update_job(job.id, job.state, returncode=returncode)
+        self._emit(job, f"{job.state} exit={returncode}", terminal=True)
         self._close_transport(job.process)
         await asyncio.sleep(0)
 
@@ -314,10 +378,17 @@ class ProcessTools(Skill):
             with contextlib.suppress(Exception):
                 transport.close()
 
-    def _emit(self, job: BackgroundJob, message: str) -> None:
+    def _emit(self, job: BackgroundJob, message: str, *, terminal: bool = False) -> None:
         if self._on_lifecycle is not None:
-            with contextlib.suppress(Exception):
-                self._on_lifecycle(job.id, job.name, message)
+            try:
+                self._on_lifecycle(job.id, job.name, message, terminal)
+            except TypeError:
+                # Compatibility for third-party UI handlers written against
+                # the original three-argument callback.
+                with contextlib.suppress(Exception):
+                    self._on_lifecycle(job.id, job.name, message)
+            except Exception:
+                pass
 
     def _job(self, job_id: str) -> BackgroundJob:
         selected = job_id.strip()
@@ -330,9 +401,57 @@ class ProcessTools(Skill):
         exit_text = "" if job.returncode is None else f" exit={job.returncode}"
         return f"{job.id} [{job.state}] {job.name} · {job.elapsed:.1f}s{exit_text}"
 
+    @staticmethod
+    def _durable_status_line(record: dict[str, Any]) -> str:
+        finished = float(record.get("finished_at") or time.time())
+        elapsed = max(finished - float(record.get("started_at") or finished), 0.0)
+        returncode = record.get("returncode")
+        exit_text = "" if returncode is None else f" exit={returncode}"
+        return (
+            f"{record['job_id']} [{record['state']}] {record['name']} · "
+            f"{elapsed:.1f}s{exit_text}"
+        )
+
+    def _durable_logs(self, job_id: str, *, cursor: int, max_chars: int) -> str:
+        assert self._runtime is not None
+        record = self._runtime.job(job_id)
+        if record is None:
+            raise KeyError(f"unknown background job: {job_id}")
+        path = Path(str(record["log_path"]))
+        rows: list[str] = []
+        used = 0
+        next_cursor = cursor
+        if path.is_file():
+            for raw in path.read_text(errors="replace").splitlines():
+                try:
+                    event = json.loads(raw)
+                    sequence = int(event.get("sequence", 0))
+                    if sequence <= cursor:
+                        continue
+                    text = str(event.get("text", ""))
+                    if event.get("stream") == "stderr":
+                        text = "! " + text
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                if used + len(text) > min(max(max_chars, 1000), 32_000):
+                    break
+                rows.append(text.rstrip("\n"))
+                used += len(text)
+                next_cursor = sequence
+        body = "\n".join(rows) or "(no new output)"
+        return (
+            f"{body}\n\n{self._durable_status_line(record)} · "
+            f"next_cursor={max(next_cursor, cursor)}"
+        )
+
     @hidden
     async def close(self) -> None:
         running = [job for job in self._jobs.values() if job.process.returncode is None]
+        for job in running:
+            if job.state == "running":
+                job.state = "stopping"
+                if self._runtime is not None:
+                    self._runtime.update_job(job.id, "stopping")
         await asyncio.gather(*(self._terminate(job) for job in running), return_exceptions=True)
         current = asyncio.current_task()
         for job in self._jobs.values():

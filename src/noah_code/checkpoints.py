@@ -78,8 +78,11 @@ class CheckpointManager:
 
         if not self.available():
             return None
-        if self._seq >= self._max:
-            return None
+        entries = self.list()
+        if len(entries) >= self._max:
+            # Rolling retention keeps checkpoint protection active throughout
+            # long sessions instead of silently stopping at the first limit.
+            self.prune_to(max(self._max - 1, 0))
         head = self._head_commit()
         with tempfile.NamedTemporaryFile(prefix="noah-index-") as handle:
             index_path = handle.name
@@ -97,13 +100,13 @@ class CheckpointManager:
                 raise CheckpointError(f"checkpoint write-tree failed: {_err(tree)}")
             tree_id = tree.stdout.decode().strip()
         parents = ["-p", head] if head else []
-        message = f"noah-code checkpoint {self._seq + 1:04d}" + (f" · {label}" if label else "")
+        message = f"noah-code checkpoint {self._seq + 1:08d}" + (f" · {label}" if label else "")
         commit = self._git("commit-tree", tree_id, *parents, "-m", message)
         if commit.returncode != 0:
             raise CheckpointError(f"checkpoint commit failed: {_err(commit)}")
         commit_id = commit.stdout.decode().strip()
         self._seq += 1
-        ref = f"{self.ref_namespace}/{self._seq:04d}"
+        ref = f"{self.ref_namespace}/{self._seq:08d}"
         update = self._git("update-ref", ref, commit_id)
         if update.returncode != 0:
             raise CheckpointError(f"checkpoint ref update failed: {_err(update)}")
@@ -137,8 +140,8 @@ class CheckpointManager:
                 {
                     "ref": refname,
                     "commit": objectname,
-                    "seq": int(seq_text[:4]) if seq_text[:4].isdigit() else 0,
-                    "label": seq_text[5:] if len(seq_text) > 5 and seq_text[4] == "-" else "",
+                    "seq": int(seq_text) if seq_text.isdigit() else 0,
+                    "label": "",
                 }
             )
         out.sort(key=lambda item: item["seq"])
@@ -163,7 +166,8 @@ class CheckpointManager:
     def prune_to(self, keep: int) -> int:
         entries = self.list()
         removed = 0
-        for item in entries[:-keep] if keep < len(entries) else []:
+        targets = entries if keep <= 0 else entries[:-keep] if keep < len(entries) else []
+        for item in targets:
             if self._git("update-ref", "-d", item["ref"]).returncode == 0:
                 removed += 1
         return removed

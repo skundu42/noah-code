@@ -8,9 +8,11 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-STEER_QUEUE_CAP = 5
+STEER_QUEUE_CAP = 100
 
-SAFE_SLASH_WHILE_BUSY = frozenset({"status", "tokens", "todos", "help", "trace"})
+SAFE_SLASH_WHILE_BUSY = frozenset(
+    {"status", "health", "tokens", "todos", "help", "trace"}
+)
 
 
 @dataclass(frozen=True)
@@ -19,24 +21,48 @@ class SteerItem:
 
     text: str
     attach_paths: tuple[Path, ...] = ()
+    sequence: int | None = None
 
 
 class SteerQueue:
-    """Bounded FIFO of follow-ups. Not persisted across sessions."""
+    """Thread-safe bounded FIFO; the host persists sequenced entries durably."""
 
     def __init__(self, *, max_items: int = STEER_QUEUE_CAP) -> None:
         self._max = max_items
         self._items: deque[SteerItem] = deque()
         self._lock = Lock()
 
-    def push(self, text: str, attach_paths: list[Path] | None = None) -> bool:
+    def push(
+        self,
+        text: str,
+        attach_paths: list[Path] | None = None,
+        *,
+        sequence: int | None = None,
+    ) -> bool:
         """Append an item. Returns True if the oldest item was dropped."""
 
-        item = SteerItem(text=text, attach_paths=tuple(attach_paths or ()))
+        return self.push_with_dropped(
+            text,
+            attach_paths,
+            sequence=sequence,
+        ) is not None
+
+    def push_with_dropped(
+        self,
+        text: str,
+        attach_paths: list[Path] | None = None,
+        *,
+        sequence: int | None = None,
+    ) -> SteerItem | None:
+        """Append an item and return the evicted oldest item, if any."""
+
+        item = SteerItem(
+            text=text,
+            attach_paths=tuple(attach_paths or ()),
+            sequence=sequence,
+        )
         with self._lock:
-            dropped = len(self._items) >= self._max
-            if dropped:
-                self._items.popleft()
+            dropped = self._items.popleft() if len(self._items) >= self._max else None
             self._items.append(item)
             return dropped
 
@@ -49,6 +75,14 @@ class SteerQueue:
     def clear(self) -> None:
         with self._lock:
             self._items.clear()
+
+    def drain(self) -> list[SteerItem]:
+        """Remove and return every queued item in delivery order."""
+
+        with self._lock:
+            items = list(self._items)
+            self._items.clear()
+            return items
 
     def snapshot(self) -> dict[str, int | str | None]:
         with self._lock:

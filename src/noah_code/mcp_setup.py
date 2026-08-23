@@ -7,6 +7,7 @@ import json
 import os
 import re
 import tempfile
+import types
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,11 @@ _RESERVED_AGENT_ATTRS = frozenset(
         "_sandbox_approved_roots",
         "_shell",
     }
+)
+_MUTATING_MCP_TOOL = re.compile(
+    r"^(?:create|update|delete|remove|send|post|put|patch|comment|reply|push|"
+    r"merge|close|write|set|add|upload|publish|execute|run|trigger|cancel|approve|reject)(?:_|$)",
+    re.IGNORECASE,
 )
 
 
@@ -266,6 +272,43 @@ async def attach_mcp_server(
         name,
         **_normalized_spec(spec),
     )
+    runtime = getattr(agent, "_runtime", None)
+    if runtime is not None:
+        original_call = tool._call_tool
+
+        async def _durable_mcp_call(
+            _self: Any,
+            tool_name: str,
+            arguments: dict[str, Any] | None = None,
+        ) -> Any:
+            clean = {key: value for key, value in (arguments or {}).items() if value is not None}
+            if _MUTATING_MCP_TOOL.match(tool_name) is None:
+                return await original_call(tool_name, clean)
+            effect_key, cached, result, recovering = runtime.begin_effect(
+                "mcp",
+                f"{name}.{tool_name}",
+                clean,
+            )
+            if cached:
+                return result
+            if recovering:
+                runtime.fail_effect(
+                    effect_key,
+                    "ambiguous after process interruption; automatic replay refused",
+                )
+                raise RuntimeError(
+                    f"MCP mutation {name}.{tool_name} may already have completed before a "
+                    "crash; inspect the remote system before retrying with changed arguments"
+                )
+            try:
+                value = await original_call(tool_name, clean)
+            except Exception as exc:
+                runtime.fail_effect(effect_key, str(exc))
+                raise
+            runtime.complete_effect(effect_key, value)
+            return value
+
+        tool._call_tool = types.MethodType(_durable_mcp_call, tool)
     attr = re_attr(name)
     setattr(agent, attr, tool)
     approved = getattr(agent, "_sandbox_approved_roots", None)

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 from noah_code.config import PermissionRule
 from noah_code.permissions import PermissionDecision, PermissionEngine
@@ -38,15 +40,25 @@ class ApprovalBroker:
         engine: PermissionEngine,
         *,
         handler: ApprovalHandler | None = None,
+        runtime: Any = None,
+        timeout_seconds: float = 86_400.0,
     ) -> None:
         self._engine = engine
         self._handler = handler
         self._guard: Callable[[PermissionDecision], Awaitable[None]] | None = None
         self._pending: dict[str, ApprovalRequest] = {}
         self._lock = asyncio.Lock()
+        self._ui_lock = asyncio.Lock()
+        self._runtime = runtime
+        self._timeout_seconds = timeout_seconds
 
     def set_handler(self, handler: ApprovalHandler | None) -> None:
         self._handler = handler
+
+    def set_runtime(self, runtime: Any, *, timeout_seconds: float | None = None) -> None:
+        self._runtime = runtime
+        if timeout_seconds is not None:
+            self._timeout_seconds = timeout_seconds
 
     def set_guard(self, guard: Callable[[PermissionDecision], Awaitable[None]] | None) -> None:
         """Install a pre-execution veto (tool-use hooks).
@@ -94,20 +106,33 @@ class ApprovalBroker:
         request = ApprovalRequest(
             id=req_id,
             decision=decision,
-            created_at=loop.time(),
+            created_at=time.time(),
             future=fut,
         )
+        if self._runtime is not None:
+            from dataclasses import asdict
+
+            self._runtime.begin_interaction(
+                "approval",
+                asdict(decision),
+                interaction_id=req_id,
+            )
         async with self._lock:
             self._pending[req_id] = request
         handler = self._handler
         try:
             if handler is None:
                 # Non-interactive without --auto: treat ask as deny.
+                if self._runtime is not None:
+                    self._runtime.resolve_interaction(
+                        req_id, ApprovalChoice.REJECT.value, state="rejected"
+                    )
                 return ApprovalChoice.REJECT
 
             async def _resolve() -> None:
                 try:
-                    choice = await handler(request)
+                    async with self._ui_lock:
+                        choice = await handler(request)
                 except Exception as exc:
                     if not fut.done():
                         fut.set_exception(exc)
@@ -117,7 +142,29 @@ class ApprovalBroker:
 
             task = asyncio.create_task(_resolve())
             try:
-                return await fut
+                try:
+                    choice = await asyncio.wait_for(fut, timeout=self._timeout_seconds)
+                except TimeoutError:
+                    if self._runtime is not None:
+                        self._runtime.resolve_interaction(
+                            req_id, "timeout", state="timed_out"
+                        )
+                    return ApprovalChoice.REJECT
+                if self._runtime is not None:
+                    self._runtime.resolve_interaction(req_id, choice.value)
+                return choice
+            except asyncio.CancelledError:
+                if self._runtime is not None:
+                    self._runtime.resolve_interaction(
+                        req_id, "cancelled", state="cancelled"
+                    )
+                raise
+            except Exception as exc:
+                if self._runtime is not None:
+                    self._runtime.resolve_interaction(
+                        req_id, str(exc), state="error"
+                    )
+                raise
             finally:
                 if not task.done():
                     task.cancel()
@@ -131,4 +178,8 @@ class ApprovalBroker:
         for req in list(self._pending.values()):
             if not req.future.done():
                 req.future.set_result(ApprovalChoice.REJECT)
+            if self._runtime is not None:
+                self._runtime.resolve_interaction(
+                    req.id, ApprovalChoice.REJECT.value, state="cancelled"
+                )
         self._pending.clear()

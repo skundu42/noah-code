@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import re
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,21 +22,54 @@ class BoundedOutput:
 class ToolOutputStore:
     """Keep large raw results out of model history without losing access."""
 
-    def __init__(self, root: Path | None = None, *, retention_hours: int = 24) -> None:
+    def __init__(
+        self,
+        root: Path | None = None,
+        *,
+        retention_hours: int | None = 24,
+        max_total_bytes: int = 2_000_000_000,
+    ) -> None:
         self.root = (
             root or Path.home() / ".cache" / "noah-code" / "tool-output"
         ).expanduser()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
-        self.retention_seconds = retention_hours * 3600
-        self._cleanup_expired()
+        self.retention_seconds = retention_hours * 3600 if retention_hours is not None else None
+        self.max_total_bytes = max(int(max_total_bytes), 1)
+        if self.retention_seconds is not None:
+            self._cleanup_expired()
 
     def store(self, text: str) -> str:
-        output_id = uuid.uuid4().hex[:20]
+        import hashlib
+
+        encoded = text.encode("utf-8")
+        output_id = hashlib.sha256(encoded).hexdigest()[:20]
         path = self._path(output_id)
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write(text)
+        if path.is_file():
+            if path.read_bytes() != encoded:
+                raise RuntimeError(f"managed output hash collision: {output_id}")
+            os.utime(path, None)
+            return output_id
+        used = sum(
+            candidate.stat().st_size
+            for candidate in self.root.glob("*.txt")
+            if _OUTPUT_ID.fullmatch(candidate.stem)
+        )
+        if used + len(encoded) > self.max_total_bytes:
+            raise RuntimeError(
+                f"managed tool-output quota exceeded "
+                f"({used + len(encoded):,} > {self.max_total_bytes:,} bytes)"
+            )
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if path.read_bytes() != encoded:
+                raise RuntimeError(f"managed output hash collision: {output_id}") from None
+            return output_id
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
         return output_id
 
     def read(self, output_id: str, lines: tuple[int, int] | None = None) -> str:
@@ -86,6 +118,8 @@ class ToolOutputStore:
         return self.root / f"{output_id}.txt"
 
     def _cleanup_expired(self) -> None:
+        if self.retention_seconds is None:
+            return
         cutoff = time.time() - self.retention_seconds
         for path in self.root.glob("*.txt"):
             if _OUTPUT_ID.fullmatch(path.stem) is None:

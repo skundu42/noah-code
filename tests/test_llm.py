@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from noah_code.llm import get_llm_client, reasoning_overrides
+from noah_code.config import RetryConfig
+from noah_code.llm import ResilientLLM, get_llm_client, reasoning_overrides
 
 
 def test_reasoning_overrides_omits_provider_default() -> None:
@@ -73,3 +75,88 @@ def test_custom_alias_without_explicit_auth_policy_fails_closed(monkeypatch) -> 
         get_llm_client("ambiguous-gateway")
 
     downstream.assert_not_called()
+
+
+class _SequenceClient:
+    def __init__(self, *outcomes: object, model: str = "test/model") -> None:
+        self.outcomes = list(outcomes)
+        self.model = model
+        self.calls = 0
+
+    async def acall(self, *_args, **_kwargs):
+        outcome = self.outcomes[self.calls]
+        self.calls += 1
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def call(self, *_args, **_kwargs):
+        outcome = self.outcomes[self.calls]
+        self.calls += 1
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def _retry_config(*, attempts: int = 3) -> RetryConfig:
+    return RetryConfig(
+        max_attempts=attempts,
+        base_delay_seconds=0,
+        max_delay_seconds=0.1,
+        jitter_ratio=0,
+        request_timeout_seconds=2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resilient_llm_retries_transient_async_failure() -> None:
+    expected = SimpleNamespace(content="ok")
+    client = _SequenceClient(TimeoutError("provider timed out"), expected)
+    retries: list[dict] = []
+    resilient = ResilientLLM(client, _retry_config(), on_retry=retries.append)
+
+    assert await resilient.acall([]) is expected
+    assert client.calls == 2
+    assert retries == [
+        {
+            "model": "test/model",
+            "attempt": 1,
+            "fallback_index": 0,
+            "delay_seconds": 0.0,
+            "error": "TimeoutError",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resilient_llm_fails_over_after_primary_retries() -> None:
+    primary = _SequenceClient(
+        ConnectionError("connection reset"),
+        ConnectionError("connection reset"),
+        model="primary",
+    )
+    expected = SimpleNamespace(content="fallback")
+    fallback = _SequenceClient(expected, model="fallback")
+    resilient = ResilientLLM(primary, _retry_config(attempts=2), fallbacks=[fallback])
+
+    assert await resilient.acall([]) is expected
+    assert primary.calls == 2
+    assert fallback.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_resilient_llm_does_not_retry_non_transient_error() -> None:
+    client = _SequenceClient(ValueError("invalid request: unsupported schema"), "unused")
+    resilient = ResilientLLM(client, _retry_config())
+
+    with pytest.raises(ValueError, match="invalid request"):
+        await resilient.acall([])
+    assert client.calls == 1
+
+
+def test_resilient_llm_retries_synchronous_failure() -> None:
+    expected = SimpleNamespace(content="ok")
+    client = _SequenceClient(ConnectionError("connection closed"), expected)
+
+    assert ResilientLLM(client, _retry_config()).call([]) is expected
+    assert client.calls == 2

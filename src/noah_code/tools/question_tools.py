@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from nooa import Skill
 
@@ -37,11 +38,16 @@ class QuestionTools(Skill):
         approvals: ApprovalBroker,
         *,
         handler: QuestionHandler | None = None,
+        runtime: Any = None,
+        timeout_seconds: float = 86_400.0,
     ) -> None:
         super().__init__()
         self._engine = engine
         self._approvals = approvals
         self._handler = handler
+        self._runtime = runtime
+        self._timeout_seconds = timeout_seconds
+        self._ui_lock = asyncio.Lock()
 
     def set_handler(self, handler: QuestionHandler | None) -> None:
         self._handler = handler
@@ -66,7 +72,38 @@ class QuestionTools(Skill):
         )
         if self._handler is None:
             raise PermissionError("question tool has no UI handler")
-        answer = await self._handler([item])
+        runtime = self._runtime
+        interaction_id = ""
+        if runtime is not None:
+            interaction_id = runtime.begin_interaction(
+                "question",
+                {
+                    "header": item.header,
+                    "prompt": item.prompt,
+                    "options": list(item.options),
+                },
+            )
+        try:
+            async with self._ui_lock:
+                answer = await asyncio.wait_for(
+                    self._handler([item]),
+                    timeout=self._timeout_seconds,
+                )
+        except asyncio.CancelledError:
+            if interaction_id:
+                assert runtime is not None
+                runtime.resolve_interaction(interaction_id, "cancelled", state="cancelled")
+            raise
+        except TimeoutError as exc:
+            if interaction_id:
+                assert runtime is not None
+                runtime.resolve_interaction(interaction_id, "timeout", state="timed_out")
+            raise TimeoutError("user question timed out") from exc
+        except Exception as exc:
+            if interaction_id:
+                assert runtime is not None
+                runtime.resolve_interaction(interaction_id, str(exc), state="error")
+            raise
         chosen = answer.selections or []
         custom = answer.custom.strip()
         parts = [
@@ -74,6 +111,12 @@ class QuestionTools(Skill):
             item.prompt,
             "A: " + "; ".join([*chosen, *([custom] if custom else [])]),
         ]
+        if interaction_id:
+            assert runtime is not None
+            runtime.resolve_interaction(
+                interaction_id,
+                {"selections": chosen, "custom": custom},
+            )
         return "\n".join(part for part in parts if part).strip()
 
 

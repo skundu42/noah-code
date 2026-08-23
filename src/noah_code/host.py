@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import shlex
@@ -37,6 +38,7 @@ from noah_code.workspace import Workspace
 
 if TYPE_CHECKING:
     from noah_code.agent import CodingAgent
+    from noah_code.runtime_state import RunRecord, RuntimeStateStore, WorkspaceLease
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +211,8 @@ class AgentHost:
         self._llm = llm
         self._agent: CodingAgent | None = None
         self._storage: Any = None
+        self._runtime: RuntimeStateStore | None = None
+        self._workspace_lease: WorkspaceLease | None = None
         self.meta = session_meta
         self._exit_requested = False
         self._title_task: asyncio.Task[Any] | None = None
@@ -227,6 +231,9 @@ class AgentHost:
         self._mcp_errors: dict[str, str] = {}
         self._usage = UsageTracker()
         self.steer_queue = SteerQueue()
+        self._wake_event = asyncio.Event()
+        self._current_run_id: str | None = None
+        self._interrupted_run: RunRecord | None = None
         self._pending_attach_paths: list[Path] = []
         self._pending_worktree_name = ""
         self.on_session_changed: Any = None  # optional UI callback
@@ -244,9 +251,15 @@ class AgentHost:
 
         set_session(session_id)
         exps = []
-        if self.config.tracing.jsonl_dir:
-            path = Path(self.config.tracing.jsonl_dir).expanduser()
-            path.mkdir(parents=True, exist_ok=True)
+        path = (
+            Path(self.config.tracing.jsonl_dir).expanduser()
+            if self.config.tracing.jsonl_dir
+            else self._runtime.session_path / "traces"
+            if self._runtime is not None
+            else None
+        )
+        if path is not None:
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
             exps.append(exporters.jsonl(trace_dir=str(path)))
             self._trace_info = str(path / f"{session_id}.jsonl")
         if exps:
@@ -284,20 +297,73 @@ class AgentHost:
             if dirty:
                 self.store.save_meta(self.meta)
 
+        if self.config.reliability.workspace_lease and self._workspace_lease is None:
+            self._workspace_lease = await asyncio.to_thread(
+                self.store.acquire_workspace_lease,
+                self.meta.session_id,
+                self.workspace,
+            )
+        self._runtime = await asyncio.to_thread(
+            self.store.open_runtime,
+            self.meta.session_id,
+            max_events=self.config.reliability.max_runtime_events,
+        )
+        checkpoint = await asyncio.to_thread(self._runtime.load_checkpoint)
+        usage_state = await asyncio.to_thread(
+            self._runtime.get_state,
+            "live:usage",
+            checkpoint.get("usage"),
+        )
+        if isinstance(usage_state, dict):
+            self._usage.load_dict(usage_state)
+        persisted_meta = checkpoint.get("meta")
+        if isinstance(persisted_meta, dict) and persisted_meta.get("session_id") == self.meta.session_id:
+            recovered_meta = SessionMeta.from_json(json.dumps(persisted_meta))
+            # The runtime checkpoint is written as one generation and is the
+            # authoritative host-state view when JSON sidecars lag a crash.
+            self.meta = recovered_meta
+        recovered_files = await asyncio.to_thread(self._runtime.recover_file_operations)
+        recovered_jobs = await asyncio.to_thread(
+            self._runtime.recover_orphan_jobs,
+            grace_seconds=self.config.processes.stop_grace_seconds,
+        )
+        interrupted_interactions = await asyncio.to_thread(
+            self._runtime.interrupt_pending_interactions
+        )
+        if recovered_files:
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    f"recovered {len(recovered_files)} interrupted file operation(s)",
+                )
+            )
+        if recovered_jobs:
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    f"cleaned {len(recovered_jobs)} orphaned background job(s)",
+                )
+            )
+        if interrupted_interactions:
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    f"expired {interrupted_interactions} interrupted interaction(s)",
+                )
+            )
+        self._interrupted_run = await asyncio.to_thread(self._runtime.latest_incomplete_run)
+
         # Python's first NOOA import initializes LiteLLM's provider registry and
         # is by far the largest cold-start cost. Do it in a worker thread so the
         # Textual shell can paint and remain responsive meanwhile.
         agent_class, get_llm_client = await asyncio.to_thread(_load_agent_runtime)
+        from noah_code.llm import ResilientLLM, reasoning_overrides, sampling_overrides
 
         client_kwargs: dict[str, Any] = {}
         if self._llm is None:
-            from noah_code.llm import reasoning_overrides, sampling_overrides
-
             client_kwargs.update(sampling_overrides(self.config.sampling))
         llm = self._llm
         if llm is None:
-            from noah_code.llm import reasoning_overrides
-
             llm = await asyncio.to_thread(
                 get_llm_client,
                 self.meta.model,
@@ -312,6 +378,42 @@ class AgentHost:
                 **client_kwargs,
             )
 
+        retry_config = self.config.reliability.retries
+        fallback_names = [
+            name for name in retry_config.fallback_models if name and name != self.meta.model
+        ]
+        fallback_clients = await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    get_llm_client,
+                    name,
+                    **reasoning_overrides(self.meta.reasoning_effort),
+                    **client_kwargs,
+                )
+                for name in fallback_names
+            )
+        )
+
+        def _record_retry(payload: dict[str, Any]) -> None:
+            if self._runtime is not None:
+                self._runtime.event("llm.retry", payload)
+
+        shared_route = lightweight_llm is llm
+        llm = ResilientLLM(
+            llm,
+            retry_config,
+            fallbacks=fallback_clients,
+            on_retry=_record_retry,
+        )
+        if shared_route:
+            lightweight_llm = llm
+        else:
+            lightweight_llm = ResilientLLM(
+                lightweight_llm,
+                retry_config,
+                on_retry=_record_retry,
+            )
+
         from noah_code.budget import SharedBudgetLLM, _PrefixObserverOnly, wrap_with_budget
         from noah_code.llm_replies import wrap_conversational_replies
 
@@ -322,6 +424,13 @@ class AgentHost:
         llm, self._budget_guard = wrap_with_budget(
             llm, self.config.budget, prefix_observer=self._usage
         )
+        budget_state = await asyncio.to_thread(
+            self._runtime.get_state,
+            "live:budget",
+            checkpoint.get("budget"),
+        )
+        if isinstance(budget_state, dict):
+            self._budget_guard.load_state(budget_state)
         if isinstance(llm, SharedBudgetLLM):
             # Both routes draw from one guard so caps span the whole session.
             lightweight_llm = SharedBudgetLLM(
@@ -339,6 +448,9 @@ class AgentHost:
             llm=llm,
             lightweight_llm=lightweight_llm,
             storage=self._storage,
+            runtime=self._runtime,
+            budget_guard=self._budget_guard,
+            usage_tracker=self._usage,
         )
         # Restore snapshot if present.
         restored = self._storage.restore_latest_snapshot(agent)
@@ -346,10 +458,15 @@ class AgentHost:
             # Re-bind host-owned nosnapshot infrastructure after restore.
             agent._engine.mode = agent.mode
             agent._engine.load_session_rules(self.meta.permission_rules)
-            journal_data = await asyncio.to_thread(self.store.load_journal, self.meta.session_id)
+            journal_data = checkpoint.get("journal")
+            if not isinstance(journal_data, dict):
+                journal_data = await asyncio.to_thread(
+                    self.store.load_journal, self.meta.session_id
+                )
             agent.journal.load_dict(journal_data or self.meta.journal)
-            if self.meta.todos:
-                agent.todos.from_dict(self.meta.todos)
+            todos = checkpoint.get("todos", self.meta.todos)
+            if isinstance(todos, dict) and todos:
+                agent.todos.from_dict(todos)
         else:
             agent.set_mode(self.meta.mode)
             agent.v.mode = self.meta.mode
@@ -386,6 +503,13 @@ class AgentHost:
             session_id,
             max_per_session=self.config.checkpoints.max_per_session,
         )
+        if self.config.checkpoints.capture_before_mutation:
+
+            async def _checkpoint_shell(command: str) -> None:
+                label = "before shell · " + " ".join(command.split())[:60]
+                await self._capture_checkpoint(label)
+
+            agent.ws.set_mutation_checkpoint_handler(_checkpoint_shell)
         self._teardown_event_bridge()
         self._event_unsubs = install_event_bridge(
             agent,
@@ -397,6 +521,16 @@ class AgentHost:
         self._custom_commands = discover_custom_commands(self.workspace.root)
 
         self._agent = agent
+
+        assert self._runtime is not None
+        for item in await asyncio.to_thread(self._runtime.pending_inbox):
+            dropped = self.steer_queue.push_with_dropped(
+                item.text,
+                attach_paths=[Path(path) for path in item.attach_paths],
+                sequence=item.sequence,
+            )
+            if dropped is not None and dropped.sequence is not None:
+                self._runtime.acknowledge_inbox(dropped.sequence, dropped=True)
 
         self._mcp_attached = set()
         self._mcp_errors = {}
@@ -447,6 +581,24 @@ class AgentHost:
     def _emit_with_hooks(self, event: HostEvent) -> None:
         """Render an event; schedule post-tool hooks for tool completions."""
 
+        if self._runtime is not None and event.kind in {
+            HostEventKind.TOOL_START,
+            HostEventKind.TOOL_FINISH,
+            HostEventKind.ERROR,
+            HostEventKind.STOP,
+            HostEventKind.APPROVAL,
+        }:
+            self._runtime.event(
+                f"host.{event.kind.value}",
+                {
+                    "text": safe_error_message(event.text, limit=500),
+                    "meta_keys": sorted(str(key) for key in event.meta),
+                    "run_id": self._current_run_id,
+                },
+            )
+            self._runtime.set_state("live:usage", self.usage_snapshot().to_dict())
+            if self._budget_guard is not None:
+                self._runtime.set_state("live:budget", self._budget_guard.status())
         hooks = getattr(self, "_hooks", None)
         if (
             hooks is not None
@@ -518,7 +670,9 @@ class AgentHost:
     def _on_shell_chunk(self, stream: str, text: str) -> None:
         self.ui.render(HostEvent(HostEventKind.SHELL_CHUNK, text, meta={"stream": stream}))
 
-    def _on_process_lifecycle(self, job_id: str, name: str, message: str) -> None:
+    def _on_process_lifecycle(
+        self, job_id: str, name: str, message: str, terminal: bool = False
+    ) -> None:
         """Push lifecycle changes to the UI without streaming logs into model context."""
 
         self.ui.render(
@@ -528,6 +682,8 @@ class AgentHost:
                 meta={"kind": "background_job", "job_id": job_id},
             )
         )
+        if terminal:
+            self._wake_event.set()
 
     def _on_agent_message(self, text: str, **_kwargs: Any) -> None:
         self.ui.render(HostEvent(HostEventKind.MESSAGE, text))
@@ -555,8 +711,19 @@ class AgentHost:
 
         if self.meta is None:
             return
-        with contextlib.suppress(Exception):
-            self.store.save_journal(self.meta.session_id, journal_data)
+        if self._runtime is not None:
+            usage = self.usage_snapshot()
+            budget = self._budget_guard.status() if self._budget_guard is not None else {}
+            self._runtime.save_checkpoint(
+                {
+                    "meta": json.loads(self.meta.to_json()),
+                    "journal": journal_data,
+                    "todos": self.meta.todos,
+                    "usage": usage.to_dict(),
+                    "budget": budget,
+                }
+            )
+        self.store.save_journal(self.meta.session_id, journal_data)
         self.store.save_meta(self.meta)
 
     def _persist(self) -> None:
@@ -576,8 +743,7 @@ class AgentHost:
         journal_data = await asyncio.to_thread(self._persist_state)
         await asyncio.to_thread(self._write_persist_files, journal_data)
         if self._agent is not None and self._storage is not None:
-            with contextlib.suppress(Exception):
-                self._storage.save_snapshot(self._agent)
+            self._storage.save_snapshot(self._agent)
 
     async def close(self) -> None:
         try:
@@ -603,6 +769,14 @@ class AgentHost:
                     flush_traces()
                 except Exception:  # noqa: BLE001
                     logger.debug("trace flush failed", exc_info=True)
+            self._agent = None
+            self._runtime = None
+            self._release_workspace_lease()
+
+    def _release_workspace_lease(self) -> None:
+        lease, self._workspace_lease = self._workspace_lease, None
+        if lease is not None:
+            lease.close()
 
     def status_prompt(self) -> str:
         sid = self.meta.session_id[:8] if self.meta else "?"
@@ -709,6 +883,8 @@ class AgentHost:
             self._storage.close()
             self._storage = None
         self._agent = None
+        self._runtime = None
+        self._release_workspace_lease()
         self._usage = UsageTracker()
         self.meta = None
         self._exit_requested = False
@@ -728,6 +904,8 @@ class AgentHost:
             self._storage.close()
             self._storage = None
         self._agent = None
+        self._runtime = None
+        self._release_workspace_lease()
         self._usage = UsageTracker()
         meta = self.store.load_meta(session_id)
         self.workspace = self.store.workspace_for_resume(meta, self.workspace)
@@ -1149,7 +1327,7 @@ class AgentHost:
 
     def cancel_active_turn(self) -> None:
         """Cancel the in-flight turn and pending approvals (Ctrl-C)."""
-        self._clear_steer_state()
+        self._clear_steer_state(drop_durable=True)
         if self._agent is not None:
             self._agent.approvals.cancel_all()
         task = self._active_turn
@@ -1160,8 +1338,12 @@ class AgentHost:
         task = self._active_turn
         return task is not None and not task.done()
 
-    def _clear_steer_state(self) -> None:
-        self.steer_queue.clear()
+    def _clear_steer_state(self, *, drop_durable: bool = False) -> None:
+        queued = self.steer_queue.drain()
+        if drop_durable and self._runtime is not None:
+            for item in queued:
+                if item.sequence is not None:
+                    self._runtime.acknowledge_inbox(item.sequence, dropped=True)
         self._pending_attach_paths.clear()
 
     def take_pending_attaches(self) -> list[Path]:
@@ -1172,11 +1354,23 @@ class AgentHost:
         """Queue a follow-up for the current turn. Returns True if oldest dropped."""
 
         paths = list(attach_paths or []) + self.take_pending_attaches()
-        dropped = self.steer_queue.push(text, attach_paths=paths or None)
-        if dropped:
+        sequence = (
+            self._runtime.enqueue_inbox(text, paths or None)
+            if self._runtime is not None
+            else None
+        )
+        dropped_item = self.steer_queue.push_with_dropped(
+            text,
+            attach_paths=paths or None,
+            sequence=sequence,
+        )
+        if dropped_item is not None:
+            if self._runtime is not None and dropped_item.sequence is not None:
+                self._runtime.acknowledge_inbox(dropped_item.sequence, dropped=True)
             self.ui.render(HostEvent(HostEventKind.STATUS, "steer dropped oldest"))
+        self._wake_event.set()
         self.ui.set_status(self.status_prompt())
-        return dropped
+        return dropped_item is not None
 
     async def handle_line(self, line: str) -> Literal["continue", "exit", "handled"]:
         slash = parse_slash(line)
@@ -1189,7 +1383,14 @@ class AgentHost:
         self.ui.set_busy(True)
         self._active_turn = asyncio.current_task()
         try:
-            await self._run_user_turn(line)
+            continuable = (
+                self._runtime.latest_incomplete_run() if self._runtime is not None else None
+            )
+            run_id = continuable.run_id if continuable and continuable.state == "waiting_user" else None
+            if run_id is None:
+                await self._run_user_turn(line)
+            else:
+                await self._run_user_turn(line, run_id=run_id)
             return "continue"
         finally:
             self._active_turn = None
@@ -1546,6 +1747,12 @@ class AgentHost:
                 )
             )
             return "handled"
+        if name == "health":
+            health = self._runtime.health() if self._runtime is not None else {}
+            rows = ["Durable runtime health"]
+            rows.extend(f"  {key}  {value}" for key, value in health.items())
+            self.ui.render(_command_output("\n".join(rows)))
+            return "handled"
         if name == "tokens":
             self.ui.render(_command_output(self.usage_snapshot().format()))
             evicted = nooa_compat.evicted_output_chars(self.agent)
@@ -1758,9 +1965,13 @@ class AgentHost:
                 return False
             expanded = self._expand_user_text(item.text, list(item.attach_paths))
             if expansion_failed(item, expanded):
+                if self._runtime is not None and item.sequence is not None:
+                    self._runtime.acknowledge_inbox(item.sequence, dropped=True)
                 self.ui.render(HostEvent(HostEventKind.STATUS, "steer dropped · could not expand"))
                 continue
             self._deliver_expanded(agent, expanded)
+            if self._runtime is not None and item.sequence is not None:
+                self._runtime.acknowledge_inbox(item.sequence)
             preview = " ".join(item.text.split())[:60]
             self.ui.render(HostEvent(HostEventKind.STATUS, f"steer applied · {preview}"))
             self.ui.set_status(self.status_prompt())
@@ -1771,27 +1982,60 @@ class AgentHost:
         text: str,
         *,
         attach_paths: list[Path] | None = None,
+        run_id: str | None = None,
+        recovery: bool = False,
     ) -> HostResult:
         from nooa.interactive import RespondReason
 
         agent = self.agent
+        runtime = self._runtime
+        if self.meta is not None:
+            session_bytes = await asyncio.to_thread(
+                self.store.session_size, self.meta.session_id
+            )
+            if session_bytes > self.config.reliability.session_max_bytes:
+                raise RuntimeError(
+                    "session storage quota exceeded "
+                    f"({session_bytes:,} > "
+                    f"{self.config.reliability.session_max_bytes:,} bytes); "
+                    "archive or delete old sessions before continuing"
+                )
         # git status + instruction-file reads are subprocess/file work; keep
-        # them off the UI event loop.
+        # them off the UI event loop. Do this before recording the run: a
+        # failure here has not delivered the request or performed effects and
+        # therefore must not create a phantom interrupted run.
         await asyncio.to_thread(agent.refresh_context_sources)
         agent.inject_status_snapshot()
-        agent.journal.begin_turn()
-        self._deliver_expanded(agent, self._expand_user_text(text, attach_paths))
         background_origin = self._background_task_origin(agent)
-
-        if self.meta and self.meta.title == "untitled":
-            if self.config.efficiency.deterministic_titles:
-                self._set_session_title(_deterministic_title(text))
+        if runtime is not None:
+            if run_id is None:
+                run_id = runtime.begin_run(text)
             else:
-                self._start_title_task(text, background_origin)
+                runtime.transition_run(run_id, "recovering" if recovery else "running")
+        self._current_run_id = run_id
 
         exit_code = 0
         explanation = ""
+        run_state: Any = "running"
         try:
+            agent.journal.begin_turn()
+            if recovery:
+                nooa_compat.queue_system_message(
+                    agent,
+                    "The previous Noah process stopped before this run reached a terminal state. "
+                    "Crash recovery has rolled back incomplete file writes and cleaned orphaned "
+                    "processes. Reinspect the workspace, check completed effects before repeating "
+                    f"them, and continue the original request:\n\n{text}",
+                )
+            else:
+                self._deliver_expanded(agent, self._expand_user_text(text, attach_paths))
+
+            if not recovery and self.meta and self.meta.title == "untitled":
+                if self.config.efficiency.deterministic_titles:
+                    self._set_session_title(_deterministic_title(text))
+                else:
+                    self._start_title_task(text, background_origin)
+
             while True:
                 try:
                     wins = await agent.queue_manager.race()
@@ -1805,67 +2049,128 @@ class AgentHost:
                     kind = getattr(result, "kind", None)
                     self._sync_budget_cost()
                     self.ui.render(HostEvent(HostEventKind.STOP, _stop_text(kind, explanation)))
-                    if kind == RespondReason.NEED_INPUT:
+                    if kind in {RespondReason.NEED_INPUT, RespondReason.GET_USER_INPUT}:
                         exit_code = 0
-                    elif kind == RespondReason.WAIT and not agent.processes.has_running():
-                        self.ui.render(
-                            HostEvent(
-                                HostEventKind.ERROR,
-                                "Agent returned WAIT without a running background job; "
-                                "start one with self.processes.start() or finish with DONE.",
+                        run_state = "waiting_user"
+                        if runtime is not None and run_id is not None:
+                            runtime.transition_run(
+                                run_id,
+                                "waiting_user",
+                                wake_kind="user",
+                                wake_ref=explanation,
                             )
+                    elif kind == RespondReason.WAIT:
+                        # Clear before checking state so a terminal callback
+                        # cannot race between the check and the wait.
+                        self._wake_event.clear()
+                        if self._apply_next_steer(agent):
+                            continue
+                        if not agent.processes.has_running():
+                            exit_code = 1
+                            run_state = "failed"
+                            explanation = (
+                                "Agent returned WAIT without a running background job; "
+                                "start one with self.processes.start() or finish with DONE."
+                            )
+                            self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
+                            break
+                        run_state = "waiting_process"
+                        if runtime is not None and run_id is not None:
+                            runtime.transition_run(
+                                run_id,
+                                "waiting_process",
+                                wake_kind="process",
+                                wake_ref=explanation,
+                            )
+                        await self._wake_event.wait()
+                        run_state = "running"
+                        if runtime is not None and run_id is not None:
+                            runtime.transition_run(run_id, "running")
+                        if self._apply_next_steer(agent):
+                            continue
+                        agent.inject_status_snapshot(force=True)
+                        nooa_compat.queue_system_message(
+                            agent,
+                            "A background process changed state. Inspect self.processes.status() "
+                            "and consume any relevant logs, then continue the task.",
                         )
+                        continue
                     else:
                         exit_code = 0
+                        run_state = "completed"
                 except PermissionError as exc:
                     exit_code = 3
+                    run_state = "failed"
                     explanation = str(exc)
                     self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
                 except asyncio.CancelledError:
                     exit_code = 130
+                    run_state = "cancelled"
                     explanation = "cancelled"
-                    self.steer_queue.clear()
+                    self._clear_steer_state(drop_durable=True)
                     self.ui.render(HostEvent(HostEventKind.STATUS, "turn cancelled"))
                     raise
                 except Exception as exc:
                     exit_code = 1
+                    run_state = "failed"
                     explanation = _friendly_agent_error(exc)
-                    self.steer_queue.clear()
                     self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
                     logger.debug("handle() failed", exc_info=True)
                     break
 
                 if exit_code == 1:
                     break
-                if not self._apply_next_steer(agent):
-                    break
+                if self._apply_next_steer(agent):
+                    run_state = "running"
+                    if runtime is not None and run_id is not None:
+                        runtime.transition_run(run_id, "running")
+                    continue
+                if run_state != "waiting_user" and exit_code != 0:
+                    run_state = "failed"
+                break
         finally:
-            await self._flush_post_hooks(cancel=exit_code == 130)
-            agent.journal.end_turn()
-            latest = agent.journal.latest_turn()
-            self._last_turn_shell_bypass = bool(latest and latest.shell_may_bypass)
-            if self._last_turn_shell_bypass:
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.STATUS,
-                        "warning: this turn ran mutating shell commands; "
-                        "file-journal undo may be incomplete",
+            try:
+                await self._flush_post_hooks(cancel=exit_code == 130)
+                agent.journal.end_turn()
+                latest = agent.journal.latest_turn()
+                self._last_turn_shell_bypass = bool(latest and latest.shell_may_bypass)
+                if self._last_turn_shell_bypass:
+                    self.ui.render(
+                        HostEvent(
+                            HostEventKind.STATUS,
+                            "warning: this turn ran mutating shell commands; "
+                            "file-journal undo may be incomplete",
+                        )
                     )
-                )
-            if exit_code == 130:
-                # Persist synchronously so the journal is serialized before
-                # cancellation propagates out of the turn task.
-                with contextlib.suppress(Exception):
-                    self._persist()
-            else:
-                await self._persist_async()
-                label = " ".join(text.split())[:80] or "turn"
-                await self._capture_checkpoint(label)
-                if exit_code == 0:
-                    self._track_background_task(
-                        self._maybe_remember(text, background_origin),
-                        name="noah-memory",
+                if exit_code == 130:
+                    # Keep cancellation propagation reliable even if storage is
+                    # already unavailable during process teardown.
+                    with contextlib.suppress(Exception):
+                        self._persist()
+                else:
+                    await self._persist_async()
+                    label = " ".join(text.split())[:80] or "turn"
+                    await self._capture_checkpoint(label)
+                    if exit_code == 0 and run_state == "completed":
+                        self._track_background_task(
+                            self._maybe_remember(text, background_origin),
+                            name="noah-memory",
+                        )
+                if runtime is not None and run_id is not None:
+                    runtime.transition_run(
+                        run_id,
+                        run_state,
+                        wake_kind="user" if run_state == "waiting_user" else "",
+                        wake_ref=explanation if run_state == "waiting_user" else "",
+                        error=explanation if run_state == "failed" else "",
                     )
+            except Exception as persist_error:
+                if runtime is not None and run_id is not None:
+                    with contextlib.suppress(Exception):
+                        runtime.transition_run(run_id, "failed", error=str(persist_error))
+                raise
+            finally:
+                self._current_run_id = None
         return HostResult(
             exit_code=exit_code,
             explanation=explanation,
@@ -2000,9 +2305,40 @@ class AgentHost:
             self.agent.v.title = selected
             self.store.save_meta(self.meta)
 
+    async def resume_interrupted_run(self) -> HostResult | None:
+        """Automatically continue a non-terminal run recovered at startup."""
+
+        record = self._interrupted_run
+        if (
+            record is None
+            or record.state == "waiting_user"
+            or not self.config.reliability.auto_resume_interrupted_runs
+        ):
+            return None
+        self._interrupted_run = None
+        self.ui.render(
+            HostEvent(
+                HostEventKind.STATUS,
+                f"resuming interrupted run {record.run_id[:8]} · previous state={record.state}",
+            )
+        )
+        self.ui.set_busy(True)
+        self._active_turn = asyncio.current_task()
+        try:
+            return await self._run_user_turn(
+                record.user_text,
+                run_id=record.run_id,
+                recovery=True,
+            )
+        finally:
+            self._active_turn = None
+            self.ui.set_busy(False)
+            self.ui.set_status(self.status_prompt())
+
     async def run_interactive(self) -> int:
         """Line-oriented console loop."""
         await self.start()
+        await self.resume_interrupted_run()
         interrupt_count = 0
         try:
             while not self._exit_requested:
@@ -2077,6 +2413,7 @@ class AgentHost:
 
                 self.agent.approvals.set_handler(_reject)
 
+            await self.resume_interrupted_run()
             result = await self._run_user_turn(prompt)
             return result
         finally:

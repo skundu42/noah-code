@@ -196,6 +196,42 @@ async def test_run_many_respects_concurrency_limit(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_many_serializes_mutating_agents_but_keeps_readers_parallel(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    workspace = Workspace(root=tmp_path.resolve())
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    tasks = TaskTools(workspace, engine, ApprovalBroker(engine, handler=_always_once))
+    active_mutators = 0
+    peak_mutators = 0
+    active_total = 0
+    peak_total = 0
+
+    async def runner(spec, _prompt: str) -> str:
+        nonlocal active_mutators, peak_mutators, active_total, peak_total
+        active_total += 1
+        peak_total = max(peak_total, active_total)
+        if not spec.readonly:
+            active_mutators += 1
+            peak_mutators = max(peak_mutators, active_mutators)
+        await asyncio.sleep(0.02)
+        if not spec.readonly:
+            active_mutators -= 1
+        active_total -= 1
+        return "ok"
+
+    tasks._runner = runner  # noqa: SLF001
+    await tasks.run_many(
+        [("general", "edit a"), ("general", "edit b"), ("explore", "inspect")]
+    )
+
+    assert peak_mutators == 1
+    assert peak_total >= 2
+
+
+@pytest.mark.asyncio
 async def test_run_many_captures_per_item_errors(tmp_path: Path) -> None:
     workspace = Workspace(root=tmp_path.resolve())
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)

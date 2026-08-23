@@ -193,7 +193,7 @@ them with `/agents`. Repository files cannot replace the built-in `explore` or `
 and unsafe linked or oversized repository definitions are ignored. Plan mode can run read-only
 agents only.
 
-`self.web.fetch(url)` and `self.web.search(query)` ask before leaving the machine. Fetch follows a
+`self.web.fetch(url)` and `self.web.search(query)` are read-only and allowed by default. Fetch follows a
 bounded number of redirects and accepts only public HTTP(S) destinations; private, loopback,
 link-local, and mixed public/private DNS results are rejected at every hop.
 `self.ask.question(header, prompt, options)` pauses the turn for a structured choice.

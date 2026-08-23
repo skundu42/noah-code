@@ -65,6 +65,29 @@ class EfficiencyConfig(BaseModel):
     max_concurrent_subagents: int = Field(default=3, ge=1, le=8)
 
 
+class RetryConfig(BaseModel):
+    """Provider retry and failover policy for transient model failures."""
+
+    max_attempts: int = Field(default=5, ge=1, le=12)
+    base_delay_seconds: float = Field(default=0.5, ge=0.0, le=30.0)
+    max_delay_seconds: float = Field(default=20.0, ge=0.1, le=300.0)
+    jitter_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
+    request_timeout_seconds: float = Field(default=180.0, gt=1.0, le=3600.0)
+    fallback_models: list[str] = Field(default_factory=list)
+
+
+class ReliabilityConfig(BaseModel):
+    """Durability and unattended-operation limits."""
+
+    auto_resume_interrupted_runs: bool = True
+    interaction_timeout_seconds: float = Field(default=86_400.0, gt=1.0, le=604_800.0)
+    artifact_max_bytes: int = Field(default=2_000_000_000, ge=1_000_000)
+    session_max_bytes: int = Field(default=5_000_000_000, ge=10_000_000)
+    max_runtime_events: int = Field(default=20_000, ge=1000, le=1_000_000)
+    workspace_lease: bool = True
+    retries: RetryConfig = Field(default_factory=RetryConfig)
+
+
 class UIConfig(BaseModel):
     theme: ThemeName = "atom-one-dark"
     show_reasoning: bool = False
@@ -92,7 +115,7 @@ class ProcessConfig(BaseModel):
     """Bounds for background commands owned by one Noah session."""
 
     max_jobs: int = Field(default=8, ge=1, le=32)
-    max_runtime_seconds: float = Field(default=3600.0, gt=1, le=86_400)
+    max_runtime_seconds: float = Field(default=86_400.0, gt=1, le=604_800)
     max_buffer_chars: int = Field(default=64_000, ge=4000, le=2_000_000)
     stop_grace_seconds: float = Field(default=2.0, gt=0, le=30)
 
@@ -134,8 +157,9 @@ class HooksConfig(BaseModel):
 class CheckpointConfig(BaseModel):
     """Automatic git worktree snapshots captured at turn boundaries."""
 
-    enabled: bool = False
+    enabled: bool = True
     max_per_session: int = Field(default=50, ge=1, le=500)
+    capture_before_mutation: bool = True
 
 
 class NoahCodeConfig(BaseModel):
@@ -165,6 +189,7 @@ class NoahCodeConfig(BaseModel):
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     hooks: HooksConfig = Field(default_factory=HooksConfig)
     checkpoints: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
     mode: Literal["build", "plan"] = "build"
     max_file_bytes: int = 512_000
     max_output_chars: int = Field(default=16_000, ge=1000, le=1_000_000)
@@ -494,6 +519,7 @@ _USER_ONLY_CONFIG_KEYS = frozenset(
         "lsp",
         "permission_rules",
         "processes",
+        "reliability",
         "session_dir",
         "tracing",
         "unsafe_inprocess_code_execution",

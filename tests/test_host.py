@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -966,7 +967,7 @@ async def test_permission_error_still_drains_remaining_steer(
 
 
 @pytest.mark.asyncio
-async def test_handle_crash_clears_queue_and_stops(tmp_path: Path, monkeypatch) -> None:
+async def test_handle_crash_preserves_queue_for_recovery(tmp_path: Path, monkeypatch) -> None:
     host, _queued, races = await _host_for_steer(tmp_path, monkeypatch)
     host.steer_queue.push("should not run")
 
@@ -978,8 +979,99 @@ async def test_handle_crash_clears_queue_and_stops(tmp_path: Path, monkeypatch) 
 
     assert result.exit_code == 1
     assert races["n"] == 1
-    assert len(host.steer_queue) == 0
+    assert len(host.steer_queue) == 1
     await host.close()
+
+
+@pytest.mark.asyncio
+async def test_waiting_run_resumes_when_background_job_finishes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from types import SimpleNamespace
+
+    from nooa.interactive import RespondReason
+
+    host, _queued, races = await _host_for_steer(tmp_path, monkeypatch)
+    host.agent.processes.has_running = MagicMock(return_value=True)
+    handles = {"n": 0}
+
+    async def handle(_agent, _notification, render=None):  # noqa: ANN001
+        handles["n"] += 1
+        if handles["n"] == 1:
+            return SimpleNamespace(kind=RespondReason.WAIT, explanation="waiting for tests")
+        return SimpleNamespace(kind=RespondReason.DONE, explanation="tests passed")
+
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    turn = asyncio.create_task(host._run_user_turn("run the full suite"))
+    async with asyncio.timeout(3):
+        while True:
+            record = host._runtime.latest_incomplete_run()  # noqa: SLF001
+            if record is not None and record.state == "waiting_process":
+                break
+            await asyncio.sleep(0.01)
+
+    assert not turn.done()
+    host._on_process_lifecycle("job-1", "pytest", "completed exit=0", terminal=True)
+    result = await asyncio.wait_for(turn, timeout=3)
+
+    assert result.exit_code == 0
+    assert handles["n"] == 2
+    assert races["n"] == 2
+    assert host._runtime.latest_incomplete_run() is None  # noqa: SLF001
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_context_refresh_failure_does_not_create_phantom_run(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.agent.refresh_context_sources = MagicMock(side_effect=RuntimeError("git unavailable"))
+
+    with pytest.raises(RuntimeError, match="git unavailable"):
+        await host._run_user_turn("make an edit")
+
+    assert host._runtime.latest_incomplete_run() is None  # noqa: SLF001
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_run_is_discovered_and_resumed_on_restart(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    first = AgentHost(workspace, config, llm=FakeLLMClient())
+    meta = await first.start()
+    assert first._runtime is not None  # noqa: SLF001
+    run_id = first._runtime.begin_run("finish the refactor")  # noqa: SLF001
+    first._runtime.transition_run(run_id, "waiting_process")  # noqa: SLF001
+    await first.close()
+
+    resumed = AgentHost(
+        workspace,
+        config,
+        llm=FakeLLMClient(),
+        session_meta=meta,
+    )
+    await resumed.start()
+    resumed._run_user_turn = AsyncMock(return_value=SimpleNamespace(exit_code=0))
+
+    await resumed.resume_interrupted_run()
+
+    resumed._run_user_turn.assert_awaited_once_with(
+        "finish the refactor",
+        run_id=run_id,
+        recovery=True,
+    )
+    assert resumed._runtime is not None  # noqa: SLF001
+    resumed._runtime.transition_run(run_id, "cancelled")  # noqa: SLF001
+    await resumed.close()
 
 
 @pytest.mark.asyncio

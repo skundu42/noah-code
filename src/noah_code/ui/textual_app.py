@@ -1531,6 +1531,11 @@ class NoahCodeApp(App[None]):
                 kind="error",
             )
         else:
+            resume = getattr(self.host, "resume_interrupted_run", None)
+            if callable(resume):
+                pending_resume = resume()
+                if inspect.isawaitable(pending_resume):
+                    await pending_resume
             self._agent_ready = True
             self._onboarding_required = False
             self._phase = "ready"
