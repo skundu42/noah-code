@@ -28,9 +28,10 @@ The parent agent invokes nested NOOA agents with `self.task.run("explore", promp
 `self.task.run("general", prompt)`, and fans out independent units concurrently with
 `self.task.run_many([("explore", "..."), ("general", "...")])`. Each child gets isolated
 in-memory session storage, its own permission-engine clone (so concurrent children never race
-on mode), and the same approval broker. Results are bounded: oversized transcripts are
-condensed by the lightweight model (fallback: truncation with a recall pointer) before they
-enter the parent's context. Tune with `subagent_result_max_chars` and
+on mode), and the same approval broker. Read-only agents can fan out concurrently; agents that can
+mutate the checkout share one mutation lane and cannot write over each other. Results are bounded:
+oversized transcripts are condensed by the lightweight model (fallback: truncation with a recall
+pointer) before they enter the parent's context. Tune with `subagent_result_max_chars` and
 `max_concurrent_subagents` under `[efficiency]`. Add project or user markdown agents:
 
 - `~/.config/noah-code/agents/*.md`
@@ -40,6 +41,7 @@ enter the parent's context. Tune with `subagent_result_max_chars` and
 ---
 description: Review a diff without editing
 readonly: true
+model: openrouter/anthropic/claude-sonnet-4
 ---
 Review the assigned change. Cite files. Do not edit.
 ```
@@ -119,8 +121,34 @@ Attachment is gated by the `mcp` permission category and asks by default; truste
 that prompt at startup. Set `efficiency.lazy_mcp = true` in trusted user configuration to catalog
 servers without connecting them until `/mcp connect`.
 
+Mutating MCP calls use Noah's durable external-effect ledger. Repeating a call that completed
+returns its recorded result. If Noah stopped after dispatch but before recording the response, it
+refuses to replay the same mutation automatically and asks the agent to inspect the remote system
+first. Read-only MCP calls are not ledgered.
+
+## Tool hooks
+
+Trusted user configuration can run bounded shell hooks before or after matching tool operations:
+
+```toml
+[hooks]
+pre_tool = [
+  { match = "ws_*", command = "./scripts/pre-tool-check", timeout_seconds = 10 }
+]
+post_tool = [
+  { match = "*", command = "./scripts/audit-tool", timeout_seconds = 10 }
+]
+```
+
+`match` uses shell-style glob patterns against the tool name. A pre-tool hook can veto execution by
+returning a non-zero status. Post-tool hooks are owned background tasks: Noah drains them before
+persisting or closing the session. Hooks are ignored in repository configuration because they run
+local executables; define them only in `~/.config/noah-code/config.toml`.
+
 ## Tracing
 
 Noah Code integrates with NOOA tracing. When a local viewer is available, spans can be exported
-to it. JSONL export can also be enabled in user configuration. Use `/trace` to inspect the active
-destination.
+to it. Tracing is enabled by default, and JSONL output goes into the active session directory unless
+`tracing.jsonl_dir` selects another trusted location. Use `/trace` to inspect the destination and
+`/health` to inspect bounded runtime-event and artifact state. Trace files count toward the total
+session-storage quota when they use the default location.

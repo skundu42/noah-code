@@ -51,24 +51,28 @@ a second turn. Chrome shows `queued · n`. When the in-flight `handle()` returns
 `NEED_INPUT`, or `WAIT`), the host injects the next item in the same journaled turn — one persist
 and one checkpoint for the whole steered run. `/undo` therefore reverts every follow-up together.
 
-The queue holds at most 5 items. A sixth `Enter` drops the oldest and status-prints
+The queue holds at most 100 items. A 101st `Enter` drops the oldest and status-prints
 `steer dropped oldest`. `@path` mentions and `/attach` paths expand when the item is injected, not
 when it is queued. A follow-up that names files Noah cannot resolve is dropped; later items stay.
-`Ctrl+C` cancels the turn and clears the queue. Switching or starting a session also clears it.
+Sequenced items are persisted in the session runtime database, so an unexpected process exit does
+not lose them. `Ctrl+C` cancels the turn and clears the queue. Switching or starting a session also
+clears it.
 
 Approval and `ask.question` modals keep the composer. Queueing resumes after the modal closes.
 
 These slash commands still run while a turn is in progress: `/status`, `/tokens`, `/todos`,
-`/help`, `/trace`. `/attach PATH` remembers the file for the next queued follow-up. `/exit` cancels
-the turn (and the queue) then leaves. Mutating commands wait until the turn finishes, including
-`/undo`, `/redo`, `/mode`, `/model`, `/diff`, `/new`, `/sessions`, `/worktree`, `/pr`, `/plan`, `/memory`, and `/compact`.
+`/health`, `/help`, `/trace`. `/attach PATH` remembers the file for the next queued follow-up.
+`/exit` cancels the turn (and the queue) then leaves. Mutating commands wait until the turn
+finishes, including `/undo`, `/redo`, `/mode`, `/model`, `/diff`, `/new`, `/sessions`, `/worktree`,
+`/pr`, `/plan`, `/memory`, and `/compact`.
 
 Tool and shell output is batched into a live execution panel instead of forcing one full-screen
 redraw for every chunk. While a turn is running, a traveling four-waypoint Noah path names the
-current action (`Read src/parser.py`, `Bash pytest -q`, `Git status`) and shows elapsed time. When the tool finishes, the
-panel collapses to one transcript line such as `✓ Read src/parser.py`. Consecutive reads or writes
-merge into a single line (`✓ Read a.py, b.py +1`) so the chat stays compact. `F2` retains the
-latest 100 activity records, bounded by the configured `max_output_chars` per activity.
+current action (`Read src/parser.py`, `Bash pytest -q`, `Git status`) and shows elapsed time. When
+the tool finishes, the panel collapses to one transcript line such as `✓ Read src/parser.py`.
+Consecutive reads or writes merge into a single line (`✓ Read a.py, b.py +1`) so the chat stays
+compact. `F2` retains the latest 100 activity records, bounded by the configured
+`max_output_chars` per activity.
 
 ## Built-in slash commands
 
@@ -93,6 +97,7 @@ latest 100 activity records, bounded by the configured `max_output_chars` per ac
 | `/tokens` | Show tokens, cache hits, cost, model wait, and tool-output volume |
 | `/efficiency [fast|balanced|deep]` | Show or switch live tool-output budgets |
 | `/todos` | Show the agent's current task list |
+| `/health` | Show durable run, job, inbox, interaction, event, database, and artifact health |
 | `/agents` | List built-in and markdown subagents |
 | `/attach PATH` | Attach a workspace file or image to the next turn |
 | `/status` | Inspect the current session and repository state |
@@ -101,6 +106,7 @@ latest 100 activity records, bounded by the configured `max_output_chars` per ac
 | `/skills [add PATH]` | Search compatible Codex/Claude skills or import a skill folder |
 | `/mcp [connect|add]` | Search, connect, or add MCP servers. Trusted user servers connect at session start |
 | `/trace` | Show the active tracing destination |
+| `/checkpoints` | List rolling Git worktree checkpoints and the restore command |
 | `/exit` | End the session |
 
 Examples:
@@ -137,24 +143,38 @@ noah pr checkout N
 noah pr comment N TEXT
 ```
 
-Each session has a NOOA-backed SQLite database plus metadata for its workspace identity, model,
-mode, title, remembered permission rules, todos, and edit journal. Session files are created with
-private filesystem permissions. `/sessions` lists every session in the same git repository family
-(primary checkout plus Noah worktree copies). Switching or `noah --session` / `--continue` rebinds
-the workspace to that session's stored path. A missing copy errors with `worktree missing` instead
-of falling back to the current directory. Deleting a session does not remove its worktree.
+Each session has a NOOA-backed conversation database, a separate durable host-runtime database,
+and metadata for its workspace identity, model, mode, title, remembered permission rules, todos,
+and edit journal. The runtime database tracks active runs, steering, interactions, file intents,
+external effects, jobs, usage, budgets, and bounded operational events. Session files are created
+with private filesystem permissions. `/sessions` lists every session in the same Git repository
+family (primary checkout plus Noah worktree copies). Switching or `noah --session` / `--continue`
+rebinds the workspace to that session's stored path. A missing copy errors with `worktree missing`
+instead of falling back to the current directory. Deleting a session does not remove its worktree.
 
-The latest 50 persisted user, agent, summary, error, and activity events are restored after the
+The latest 24 persisted user, agent, summary, error, and activity events are restored after the
 TUI's first paint. `F3` loads older history in read-only pages of 50, so resuming a long session
 does not delay input or load the entire database into the transcript.
+
+### Crash recovery and checkout ownership
+
+Only one Noah process can own a canonical checkout. The lease is released by the operating system
+if Noah exits or crashes; use `/worktree create` for concurrent coding sessions. When a session is
+reopened, Noah rolls back incomplete workspace-tool file operations, cleans verified orphaned
+process groups, expires prompts owned by the previous process, restores pending steering and
+budget counters, and discovers the latest interrupted run.
+
+Runs that were active or waiting on a managed process resume automatically. Runs waiting for user
+input remain paused and continue with the next user message. `/health` exposes the current durable
+state. See [Reliability and long-running sessions](reliability.md) for the complete recovery model.
 
 Long conversations compact earlier than the provider limit and preserve a recent tail. The
 checkpoint retains the objective, decisions, changed files, validation results, blockers, and
 next actions. Force compaction with `/compact`; it reports when there is not yet enough history.
 
 Large model-facing tool results are bounded by characters and lines. The full result remains in
-Noah's private managed-output cache and can be fetched by output ID and line range, keeping
-context small without losing diagnostic data.
+the session's private, content-addressed artifact store and can be fetched by output ID and line
+range after a restart, keeping context small without losing diagnostic data.
 
 File edits made through workspace tools record pre-images and post-images with content hashes:
 
@@ -180,9 +200,12 @@ The agent can use `self.lsp.definition`, `implementation`, `references`, `docume
 declaration map remains available when no server is installed. Rename is preview-only.
 
 Long-running commands use `self.processes.start`, `logs`, `status`, `input`, and `stop`. Jobs are
-owned by the current session, run in separate process groups, have bounded runtime and retained
-output, and are terminated when Noah closes. `logs` accepts a cursor and returns only new output.
-Lifecycle updates appear in the TUI without copying continuous logs into model context.
+owned by the current session, run in separate process groups, have bounded runtime and durable
+JSONL output, and are terminated when Noah closes. After an abnormal exit, startup verifies the
+recorded process identity before cleaning an orphan. `logs` accepts a cursor and returns only new
+output, including output from jobs recovered after restart. Lifecycle updates appear in the TUI
+without copying continuous logs into model context. An agent waiting for a job wakes and continues
+the same turn when the job finishes.
 
 ### Subagents, web, questions, and attachments
 
@@ -191,11 +214,12 @@ The parent agent can run isolated NOOA subagents with `self.task.run("explore", 
 Custom agents are markdown files in `.noah-code/agents/` or `~/.config/noah-code/agents/`. List
 them with `/agents`. Repository files cannot replace the built-in `explore` or `general` agents,
 and unsafe linked or oversized repository definitions are ignored. Plan mode can run read-only
-agents only.
+agents only. Read-only agents may run concurrently; mutating agents share one serialized mutation
+lane so parallel delegation cannot corrupt the checkout.
 
-`self.web.fetch(url)` and `self.web.search(query)` are read-only and allowed by default. Fetch follows a
-bounded number of redirects and accepts only public HTTP(S) destinations; private, loopback,
-link-local, and mixed public/private DNS results are rejected at every hop.
+`self.web.fetch(url)` and `self.web.search(query)` are read-only and allowed by default. Fetch
+follows a bounded number of redirects and accepts only public HTTP(S) destinations; private,
+loopback, link-local, and mixed public/private DNS results are rejected at every hop.
 `self.ask.question(header, prompt, options)` pauses the turn for a structured choice.
 
 Type `@path` in the composer to inline a workspace file or attach a PNG/JPEG/WebP/GIF as a NOOA

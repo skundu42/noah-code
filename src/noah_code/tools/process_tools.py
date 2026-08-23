@@ -60,7 +60,7 @@ class ProcessTools(Skill):
         workspace_tools: WorkspaceTools,
         *,
         max_jobs: int = 8,
-        max_runtime_seconds: float = 3600.0,
+        max_runtime_seconds: float = 86_400.0,
         max_buffer_chars: int = 64_000,
         stop_grace_seconds: float = 2.0,
         runtime: RuntimeStateStore | None = None,

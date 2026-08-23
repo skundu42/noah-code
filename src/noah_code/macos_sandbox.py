@@ -1,4 +1,4 @@
-"""Native macOS containment for NOOA's forked CodeAct worker."""
+"""Native macOS containment for NOOA's spawned CodeAct worker."""
 
 from __future__ import annotations
 

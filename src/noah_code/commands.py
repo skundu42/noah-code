@@ -75,6 +75,7 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("todos", "Show todo list", host_only=True),
     CommandSpec("status", "Show mode/model/session/context", host_only=True),
     CommandSpec("health", "Show durable runtime health", host_only=True),
+    CommandSpec("checkpoints", "List rolling Git worktree checkpoints", host_only=True),
     CommandSpec("tokens", "Show token, cache, cost, and latency usage", host_only=True),
     CommandSpec(
         "efficiency",

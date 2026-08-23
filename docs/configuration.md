@@ -112,6 +112,8 @@ max_output_lines = 250
 max_search_results = 100
 max_file_results = 500
 tool_output_retention_hours = 24
+subagent_result_max_chars = 4000
+max_concurrent_subagents = 3
 
 [lsp]
 enabled = true
@@ -122,9 +124,46 @@ max_symbols = 300
 
 [processes]
 max_jobs = 8
-max_runtime_seconds = 3600
+max_runtime_seconds = 86400 # 24 hours
 max_buffer_chars = 64000
 stop_grace_seconds = 2
+
+[sampling]
+# Omit values to use provider defaults.
+# temperature = 0.2
+# top_p = 0.95
+# seed = 42
+
+[budget]
+# Persistent session-wide limits; omitted values are unlimited.
+# max_tokens = 500000
+# max_cost_usd = 25
+# max_seconds = 28800
+
+[checkpoints]
+enabled = true
+max_per_session = 50
+capture_before_mutation = true
+
+[reliability]
+auto_resume_interrupted_runs = true
+interaction_timeout_seconds = 86400
+artifact_max_bytes = 2000000000
+session_max_bytes = 5000000000
+max_runtime_events = 20000
+workspace_lease = true
+
+[reliability.retries]
+max_attempts = 5
+base_delay_seconds = 0.5
+max_delay_seconds = 20
+jitter_ratio = 0.2
+request_timeout_seconds = 180
+fallback_models = []
+
+[hooks]
+# pre_tool = [{ match = "ws_*", command = "./scripts/pre-tool-check" }]
+# post_tool = [{ match = "*", command = "./scripts/audit-tool" }]
 
 [ui]
 theme = "atom-one-dark" # atom-one-dark, noah-ocean, graphite, or high-contrast
@@ -142,6 +181,7 @@ target_chars = 2500
 [tracing]
 enabled = true
 viewer = true
+# By default JSONL traces live inside each session directory.
 # jsonl_dir = "~/.local/share/noah-code/traces"
 
 [updates]
@@ -162,10 +202,12 @@ Supported environment overrides include:
 - `NOAH_CODE_AUTO_UPDATE`
 
 Repository-controlled configuration cannot weaken the host trust boundary. Project config is
-ignored for `auto_approve`, `efficiency`, `enabled_skills`, `lsp`, `mcp`, `permission_rules`,
-`processes`, `session_dir`, `tracing`, `updates`, and `unsafe_inprocess_code_execution`. Put those
-settings in trusted user config, the environment, or an explicit CLI flag. Language-server
-overrides are user-only because they launch local executables.
+ignored for `auto_approve`, `budget`, `efficiency`, `enabled_skills`, `hooks`, `lsp`, `mcp`,
+`permission_rules`, `processes`, `reliability`, `session_dir`, `tracing`, `updates`, and
+`unsafe_inprocess_code_execution`. Put those settings in trusted user config, the environment, or
+an explicit CLI flag. Language-server overrides and hooks are user-only because they launch local
+executables; reliability and budget settings are user-only so repository content cannot weaken
+host limits.
 
 A user-configured `permission_rules` array replaces the default rule array. Copy forward every
 default you still want before adding overrides. Hard secret, destructive-shell, and plan-mode
@@ -219,15 +261,35 @@ safety rail (default 40), not an efficiency-profile cap. Switch without restarti
 /efficiency deep
 ```
 
-Oversized results are not discarded. Noah writes the exact output to a private cache file for the
-configured retention period, returns a bounded head/tail preview, and gives the agent an output ID
-for focused line-range retrieval. A truncated file preview is never returned as an editable Match
-anchor.
+Oversized results are not discarded. During a durable session Noah writes the exact output to a
+private, content-addressed artifact store, returns a bounded head/tail preview, and gives the agent
+an output ID for focused line-range retrieval. Artifacts remain available when the session is
+resumed and count toward `reliability.artifact_max_bytes` and `session_max_bytes`. A truncated file
+preview is never returned as an editable Match anchor. `tool_output_retention_hours` applies to the
+fallback cache used when workspace tools are embedded without a durable session runtime.
 
 Set `lightweight_model` to route compaction to a faster or cheaper model. If it is omitted, that
 route follows live `/model` switches. Compaction starts at 35% of the active main model's context
 window by default, preserves the six newest events, and writes a coding checkpoint covering the
 objective, decisions, files, validation, blockers, and next steps.
+
+### Budgets, checkpoints, and reliability
+
+`[budget]` limits are cumulative across the parent agent, lightweight route, and custom-model
+subagents. Token, cost, and elapsed-time counters survive process restarts. When a configured cap
+is exceeded, the breach is sticky and later model calls fail before contacting the provider.
+
+Git checkpoints are enabled by default and use rolling retention: once the configured maximum is
+reached, Noah removes the oldest ref and continues capturing instead of silently stopping.
+`capture_before_mutation` protects shell-driven changes; workspace-tool edits additionally use
+durable pre-images and the persistent `/undo` journal.
+
+`[reliability.retries]` controls transient model-call retries and ordered fallback models. Noah does
+not retry authentication, invalid-request, content-policy, or context-window failures through this
+route. `[reliability]` also controls crash-run resumption, interaction timeouts, session and artifact
+quotas, event retention, and the exclusive checkout lease. See
+[Reliability and long-running sessions](reliability.md) for the recovery sequence and operational
+limits.
 
 ## Modes and permissions
 

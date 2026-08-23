@@ -91,7 +91,7 @@ class WorkspaceLease:
             detail = f" ({owner})" if owner else ""
             raise WorkspaceAlreadyActiveError(
                 f"workspace is already active in another Noah process{detail}: {canonical}. "
-                "Use /worktree new for concurrent coding sessions."
+                "Use /worktree create for concurrent coding sessions."
             ) from exc
 
         payload = json.dumps(

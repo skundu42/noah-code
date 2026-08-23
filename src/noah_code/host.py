@@ -1829,7 +1829,7 @@ class AgentHost:
             entries = await asyncio.to_thread(manager.list)
             if not entries:
                 enabled = self.config.checkpoints.enabled
-                hint = "" if enabled else "\nEnable with [checkpoints] enabled=true or --checkpoint"
+                hint = "" if enabled else "\nEnable with [checkpoints] enabled=true"
                 self.ui.render(_command_output(f"(no checkpoints yet){hint}"))
                 return "handled"
             rows = [

@@ -1,8 +1,10 @@
 <div align="center">
 
+<img src="https://raw.githubusercontent.com/skundu42/noah-code/main/docs/assets/noah-logo.svg" alt="Noah Code terminal wordmark" width="760">
+
 # Noah Code
 
-**A terminal coding agent built on NVIDIA's NOAA framework**
+**A durable, repository-aware terminal coding agent built on NVIDIA's NOOA framework**
 
 [![PyPI](https://img.shields.io/pypi/v/noah-code.svg)](https://pypi.org/project/noah-code/)
 [![CI](https://github.com/skundu42/noah-code/actions/workflows/ci.yml/badge.svg)](https://github.com/skundu42/noah-code/actions/workflows/ci.yml)
@@ -10,7 +12,7 @@
 
 </div>
 
-![Noah Code handling a repository change in its terminal interface](docs/assets/noah-in-action.svg)
+![Noah Code handling a repository change in its terminal interface](https://raw.githubusercontent.com/skundu42/noah-code/main/docs/assets/noah-in-action.svg)
 
 <p align="center"><sub>The real Textual interface, captured from a deterministic Noah Code session.</sub></p>
 
@@ -49,10 +51,10 @@ configuration or session history.
   preimages, concurrent-change detection, immediate diagnostics, and rollback.
 - **Visible execution.** Stream bounded shell output while commands run, keep servers and watchers
   as managed background jobs, and revisit activity details with `F2`.
-- **Recoverable work.** Review staged and unstaged changes in `/diff`, then undo or redo journaled
-  file edits even after restarting Noah.
-- **Persistent sessions.** Resume repository-scoped conversations, todos, model choices, and
-  automatically compacted context without losing the full underlying tool results.
+- **Crash-safe work.** Durable file intents roll back interrupted workspace-tool writes, Git
+  checkpoints protect shell-driven changes, and interrupted model runs resume after restart.
+- **Persistent sessions.** Resume repository-scoped conversations, steering, todos, model choices,
+  budgets, background-job logs, and compacted context without losing full tool results.
 - **Token-efficient by construction.** Lean tool-output bounds with disk-backed recall, condensed
   subagent results, cache-stable request prefixes (volatile status arrives as appended events),
   and pointer-eviction compaction — measured live with `/tokens`.
@@ -60,6 +62,9 @@ configuration or session history.
   **plan** mode, with ordered `allow`, `ask`, and `deny` permission rules.
 - **Extensible workflows.** Add slash commands, opt-in skills, MCP servers, or markdown subagents;
   attach `@files` and images when the task needs more context.
+- **Long-running by design.** Provider retries and configurable fallback models handle transient
+  failures, while workspace leases, bounded artifacts, durable process ownership, and `/health`
+  keep unattended sessions observable.
 
 Noah follows repository instructions from `AGENTS.md`, `CLAUDE.md`, and
 `.noah-code/instructions.md`.
@@ -125,6 +130,8 @@ Type `/` to search the full command and configuration reference. The most common
 | `/theme` | Choose Atom One Dark, Noah Ocean, Graphite, or High Contrast |
 | `/diff` | Review staged and unstaged changes |
 | `/undo` / `/redo` | Traverse the persistent edit journal |
+| `/checkpoints` | List rolling Git worktree checkpoints |
+| `/health` | Inspect durable run, job, inbox, event, and artifact state |
 | `/tokens` | Inspect tokens, cache usage, prefix stability, model wait, and tool output |
 | `/efficiency` | Switch between `fast`, `balanced`, and `deep` budgets |
 
@@ -132,6 +139,23 @@ On wide terminals, the side rail prioritizes the active operation, Git branch an
 session, model usage, update state, and plan. Git status is refreshed in the background at turn
 boundaries, so the animated working state stays responsive. The main pane remains centered on the
 large Noah wordmark until the first prompt, then becomes the conversation and execution timeline.
+
+## Sessions and crash recovery
+
+Start a new session with `noah .`, resume the latest repository session with
+`noah --continue .`, or reopen an exact session with `noah --session SESSION_ID .`. Inside the TUI,
+use `Ctrl+O`, `/sessions`, or `/continue`.
+
+Noah stores conversational history and host runtime state separately. If the process stops during
+an active run, the next launch restores pending steering, usage and budget counters, durable job
+logs, and the original request. Incomplete workspace-tool writes are rolled back, verified orphan
+process groups are cleaned up, and non-interactive runs continue automatically. A request that was
+waiting for user input remains paused for the next user message.
+
+By default, only one Noah process may own a checkout at a time. Use `/worktree create` when
+independent agents need to work concurrently. See
+[Reliability and long-running sessions](docs/reliability.md) for the recovery model, provider retry
+controls, quotas, and operational limits.
 
 ## Models and providers
 
@@ -160,7 +184,8 @@ noah --model openai/MODEL --reasoning-effort high .
 ```
 
 See the [provider configuration guide](docs/configuration.md#bring-your-own-api-provider) for
-gateway-specific setup.
+gateway-specific setup. Provider request deadlines, exponential retry, and ordered fallback models
+are configured under `[reliability.retries]`.
 
 ## Updates
 
@@ -177,6 +202,7 @@ noah update
 
 - [Interactive interface and sessions](docs/interactive-reference.md)
 - [Configuration, modes, permissions, and updates](docs/configuration.md)
+- [Reliability and long-running sessions](docs/reliability.md)
 - [Generated-code security](docs/security.md)
 - [Custom commands, skills, MCP, and tracing](docs/extensions.md)
 - [Development, CI, and releases](docs/development.md)

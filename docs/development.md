@@ -61,8 +61,9 @@ when it exists and otherwise falls back to generated notes. Commit and push the 
 a matching annotated tag. For example:
 
 ```bash
-git tag -a v0.2.0 -m "Noah Code v0.2.0"
-git push origin v0.2.0
+VERSION=v0.2.3
+git tag -a "$VERSION" -m "Noah Code $VERSION"
+git push origin "$VERSION"
 ```
 
 Once PyPI publishes the version, existing uv-tool installations discover it through the built-in
