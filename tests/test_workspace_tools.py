@@ -133,7 +133,7 @@ async def test_auto_interpreter_cannot_read_dotenv(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_build_edit_asks_without_auto(tmp_path: Path) -> None:
+async def test_build_edit_is_allowed_without_individual_approval(tmp_path: Path) -> None:
     (tmp_path / "a.py").write_text("x = 1\n")
     workspace = Workspace(root=tmp_path.resolve())
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="build", auto_approve=False)
@@ -148,9 +148,12 @@ async def test_build_edit_asks_without_auto(tmp_path: Path) -> None:
     journal.begin_turn()
     shell = ShellTools(cwd=str(workspace.root))
     ws = WorkspaceTools(workspace, shell, engine, approvals, journal)
-    with pytest.raises(PermissionError):
+    try:
         await ws.write_file("a.py", "x = 2\n")
-    assert rejected and rejected[0].decision.action == "ask"
+        assert (tmp_path / "a.py").read_text() == "x = 2\n"
+        assert rejected == []
+    finally:
+        await ws.close()
 
 
 @pytest.mark.asyncio

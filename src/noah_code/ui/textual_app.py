@@ -25,6 +25,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.selection import Selection
 from textual.timer import Timer
 from textual.widgets import Button, Input, Label, OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
@@ -73,6 +74,27 @@ WIDE_MIN_COLUMNS = 110
 COMPACT_MAX_ROWS = 25
 UPDATE_BANNER_SECONDS = 12.0
 
+# A traveling signal reads as ongoing work without pretending an indeterminate
+# task has a measurable percentage. The bounce makes the loop obvious at a
+# glance, while completed and pending waypoints suggest forward motion.
+WORKING_PATH_FRAMES = (
+    "◉ · · ·",
+    "━ ◉ · ·",
+    "━ ━ ◉ ·",
+    "━ ━ ━ ◉",
+    "━ ━ ◉ ·",
+    "━ ◉ · ·",
+)
+
+NOAH_WORDMARK = (
+    "███╗   ██╗ ██████╗  █████╗ ██╗  ██╗",
+    "████╗  ██║██╔═══██╗██╔══██╗██║  ██║",
+    "██╔██╗ ██║██║   ██║███████║███████║",
+    "██║╚██╗██║██║   ██║██╔══██║██╔══██║",
+    "██║ ╚████║╚██████╔╝██║  ██║██║  ██║",
+    "╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝",
+)
+
 
 class HostEventsReady(Message):
     """One or more host events are waiting in the UI queue."""
@@ -80,6 +102,16 @@ class HostEventsReady(Message):
 
 class UIStateChanged(Message):
     """Busy/status state changed outside the widget tree."""
+
+
+class SelectableRichLog(RichLog):
+    """A RichLog whose rendered lines participate in Textual text selection."""
+
+    def get_selection(self, selection: Selection) -> tuple[str, str]:
+        # RichLog stores rendered strips rather than a single Text visual, so
+        # Widget.get_selection cannot extract its contents automatically.
+        text = "\n".join(line.text.rstrip() for line in self.lines)
+        return selection.extract(text), "\n"
 
 
 @dataclass(frozen=True)
@@ -351,11 +383,12 @@ def _coalesce_activity_text(previous: str, current: str) -> str | None:
 
 
 def _welcome_renderable(theme: ThemePalette) -> Group:
-    """Render the quiet Noah mark shown until a session has user content."""
+    """Render the terminal-scale Noah mark shown before the first prompt."""
 
     return Group(
-        Text("NOAH", style=f"bold {theme.text}", justify="center"),
-        Text("CODE", style=f"bold {theme.accent}", justify="center"),
+        *(Text(line, style=f"bold {theme.text}", justify="center") for line in NOAH_WORDMARK),
+        Text("NOAH  /  C  O  D  E", style=f"bold {theme.accent}", justify="center"),
+        Text("───  agent at work  ───", style=theme.muted, justify="center"),
     )
 
 
@@ -784,7 +817,7 @@ class ActivityHistoryScreen(ModalScreen[None]):
             yield Label("ACTIVITY INSPECTOR", id="detail-title")
             with Horizontal(id="detail-body"):
                 yield OptionList(id="activity-list", compact=True)
-                yield RichLog(
+                yield SelectableRichLog(
                     id="activity-detail",
                     markup=False,
                     highlight=False,
@@ -944,7 +977,7 @@ class ConversationHistoryScreen(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="history-dialog"):
             yield Label("CONVERSATION HISTORY", id="detail-title")
-            yield RichLog(
+            yield SelectableRichLog(
                 id="history-log",
                 markup=False,
                 highlight=False,
@@ -1025,7 +1058,7 @@ class DiffReviewScreen(ModalScreen[None]):
                 yield OptionList(id="diff-files", compact=True)
                 with Vertical(id="diff-inspector"):
                     yield Static("", id="diff-file-header")
-                    yield RichLog(
+                    yield SelectableRichLog(
                         id="diff-patch",
                         markup=False,
                         highlight=False,
@@ -1285,6 +1318,7 @@ class NoahCodeApp(App[None]):
     BINDINGS = [
         Binding("ctrl+q", "quit_app", "Quit", show=True),
         Binding("ctrl+c", "cancel_or_quit", "Cancel", show=True),
+        Binding("ctrl+shift+c,super+c", "copy_selection", "Copy", show=True, priority=True),
         Binding("ctrl+p", "palette", "Commands", show=True),
         Binding("ctrl+k", "skills", "Skills", show=True, priority=True),
         Binding("ctrl+o", "sessions", "Sessions", show=True),
@@ -1368,7 +1402,7 @@ class NoahCodeApp(App[None]):
                     _welcome_renderable(self.theme_palette),
                     id="welcome",
                 )
-                yield RichLog(
+                yield SelectableRichLog(
                     id="conversation",
                     markup=False,
                     highlight=False,
@@ -1380,7 +1414,7 @@ class NoahCodeApp(App[None]):
                 yield Static("", id="working-banner")
                 with Vertical(id="live-activity"):
                     yield Static("", id="activity-title")
-                    yield RichLog(
+                    yield SelectableRichLog(
                         id="activity-output",
                         markup=False,
                         highlight=False,
@@ -1409,7 +1443,7 @@ class NoahCodeApp(App[None]):
         composer.theme = self._theme_name
         composer.focus()
         self._spinner_timer = self.set_interval(
-            0.25,
+            0.20,
             self._tick_busy,
             pause=not self.ui.busy and self._agent_ready,
         )
@@ -1528,7 +1562,7 @@ class NoahCodeApp(App[None]):
     def _tick_busy(self) -> None:
         if not self.ui.busy:
             return
-        self._spinner_index = (self._spinner_index + 1) % 4
+        self._spinner_index = (self._spinner_index + 1) % len(WORKING_PATH_FRAMES)
         # The spinner only changes the header and working banner. Rebuilding the
         # context rail here would repeatedly read plan/todo state from disk.
         self.update_chrome()
@@ -1564,8 +1598,9 @@ class NoahCodeApp(App[None]):
                     elapsed = f"  {seconds}s"
             elif self._phase not in {"ready", "thinking"}:
                 label = self._phase.replace("_", " ").strip().capitalize()
-            frame = "◐◓◑◒"[self._spinner_index]
+            frame = WORKING_PATH_FRAMES[self._spinner_index]
             parts: list[tuple[str, str]] = [
+                ("NOAH  ", "bold #8bd5ca"),
                 (f"{frame}  ", "bold #e6b673"),
                 (label, "#d1d1d6"),
                 (elapsed, "#777781"),
@@ -1574,8 +1609,7 @@ class NoahCodeApp(App[None]):
             if thought:
                 if len(thought) > 60:
                     thought = thought[:57] + "…"
-                parts.append(("\n", ""))
-                parts.append((f"   ✎ {thought}", "#777781"))
+                parts.append((f"  ↳  {thought}", "#777781"))
             banner.update(Text.assemble(*parts), layout=False)
             banner.styles.display = "block"
             with contextlib.suppress(Exception):
@@ -1604,7 +1638,7 @@ class NoahCodeApp(App[None]):
         state = self._phase
         if self.ui.busy:
             verb = "starting" if not self._agent_ready else "working"
-            state = f"{verb} {'◐◓◑◒'[self._spinner_index]}"
+            state = verb
         unread = f"  {self._unread_count} new" if self._unread_count else ""
         queued = self._steer_queued_label()
         queued_bit = f"  {queued}" if queued else ""
@@ -1636,9 +1670,9 @@ class NoahCodeApp(App[None]):
                 self.query_one("#header", Static).update(header, layout=False)
 
         hint = (
-            "Enter queue follow-up · Ctrl+C cancel · F2 activity"
+            "Enter queue follow-up · Ctrl+C cancel · drag select · Ctrl+Shift+C copy · F2 activity"
             if self.ui.busy and self._agent_ready
-            else "Enter send · Shift+Enter newline · Tab build/plan · / commands"
+            else "Enter send · Shift+Enter newline · drag select · Ctrl+Shift+C copy · / commands"
         )
         if force or hint != self._hint_text:
             self._hint_text = hint
@@ -1978,7 +2012,7 @@ class NoahCodeApp(App[None]):
         self._phase = record.label
         output = self.query_one("#activity-output", RichLog)
         output.clear()
-        frame = "◐◓◑◒"[self._spinner_index]
+        frame = WORKING_PATH_FRAMES[self._spinner_index]
         self.query_one("#activity-title", Static).update(
             Text.assemble((f"{frame}  ", "bold #e6b673"), (record.label, "#d1d1d6")),
             layout=False,
@@ -1995,7 +2029,7 @@ class NoahCodeApp(App[None]):
             record = ActivityRecord(activity_id=activity_id, label="shell output", tool="shell")
             self._activities[activity_id] = record
             self._active_activity_id = activity_id
-        frame = "◐◓◑◒"[self._spinner_index]
+        frame = WORKING_PATH_FRAMES[self._spinner_index]
         self.query_one("#activity-title", Static).update(
             Text.assemble((f"{frame}  ", "bold #e6b673"), (record.label, "#d1d1d6")),
             layout=False,
@@ -2900,7 +2934,30 @@ class NoahCodeApp(App[None]):
     def action_quit_app(self) -> None:
         self.exit()
 
+    def action_copy_selection(self) -> None:
+        """Copy selected text, or the latest Noah reply when nothing is selected."""
+
+        selected = self.screen.get_selected_text()
+        if selected:
+            self.copy_to_clipboard(selected)
+            self._show_notice("Copied selected text", temporary=True)
+            return
+        latest_reply = next(
+            (entry.text for entry in reversed(self._transcript_entries) if entry.role == "NOAH"),
+            "",
+        )
+        if latest_reply:
+            self.copy_to_clipboard(latest_reply)
+            self._show_notice("Copied latest Noah reply", temporary=True)
+            return
+        self._show_notice("Select text or wait for a Noah reply to copy", temporary=True)
+
     def action_cancel_or_quit(self) -> None:
+        # Ctrl+C follows terminal muscle memory: copy an active mouse selection;
+        # otherwise retain Noah's cancel / double-press-to-quit behavior.
+        if self.screen.get_selected_text():
+            self.action_copy_selection()
+            return
         if self.ui.busy and self._turn_task and not self._turn_task.done():
             self.host.cancel_active_turn()
             self.ui.set_busy(False)

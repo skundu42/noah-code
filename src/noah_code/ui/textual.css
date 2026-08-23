@@ -3,6 +3,12 @@ Screen {
     color: $nc-text;
 }
 
+Screen > .screen--selection {
+    background: $nc-accent;
+    color: $nc-canvas;
+    text-style: bold;
+}
+
 #header {
     dock: top;
     height: 1;
@@ -45,7 +51,7 @@ Screen {
     display: block;
     width: 1fr;
     height: 1fr;
-    padding: 2 4;
+    padding: 1 4;
     content-align: center middle;
     background: $nc-canvas;
 }

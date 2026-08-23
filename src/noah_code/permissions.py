@@ -307,6 +307,22 @@ class PermissionEngine:
             action = matching.action
             reason = matching.reason or f"matched {matching.pattern}"
 
+        # The built-in balanced policy asks for arbitrary shell execution, but
+        # does not interrupt users for commands the parser can prove are
+        # read-only and confined to the workspace. A remembered session rule
+        # remains authoritative, including an explicit ask.
+        if (
+            category == PermissionCategory.BASH
+            and action == "ask"
+            and matching is not None
+            and matching.reason == "non-read-only shell commands require approval"
+            and not any(rule is matching for rule in self._session_rules)
+            and self.is_readonly_command(normalized)
+            and not _command_has_external_path(normalized)
+        ):
+            action = "allow"
+            reason = "read-only workspace shell command allowed"
+
         if action == "ask" and self.auto_approve:
             # --auto never overrides explicit deny; only ask → allow.
             action = "allow"

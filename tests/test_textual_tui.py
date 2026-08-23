@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from rich.console import Console
+from textual.selection import SELECT_ALL
 
 from noah_code.approvals import ApprovalChoice, ApprovalRequest
 from noah_code.config import NoahCodeConfig
@@ -19,6 +20,7 @@ from noah_code.sessions import SessionEventRecord
 from noah_code.steer import SteerQueue
 from noah_code.ui.textual_app import (
     MAX_TRANSCRIPT_LINES,
+    WORKING_PATH_FRAMES,
     ActivityHistoryScreen,
     ApprovalModal,
     ConversationHistoryScreen,
@@ -166,6 +168,30 @@ async def test_tui_renders_host_events_and_header(tmp_path: Path) -> None:
         assert "hello from agent" in _log_text(app.query_one("#conversation"))
         assert "fake-model" in _rendered_text(app.query_one("#header").content)
         assert app.query_one("#conversation").max_lines == MAX_TRANSCRIPT_LINES
+
+
+@pytest.mark.asyncio
+async def test_transcript_selection_and_copy_shortcuts_are_useful(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.render(HostEvent(HostEventKind.MESSAGE, "select this answer"))
+        await pilot.pause()
+
+        transcript = app.query_one("#conversation")
+        app.screen.selections = {transcript: SELECT_ALL}
+        assert "select this answer" in (app.screen.get_selected_text() or "")
+
+        app.action_cancel_or_quit()
+        assert "select this answer" in app.clipboard
+        assert app._interrupt_count == 0
+
+        app.screen.clear_selection()
+        ui.render(HostEvent(HostEventKind.MESSAGE, "latest answer"))
+        await pilot.pause()
+        await pilot.press("ctrl+shift+c")
+        assert app.clipboard == "latest answer"
 
 
 @pytest.mark.asyncio
@@ -331,7 +357,8 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
         banner_text = _rendered_text(banner.content)
         assert "WORKING" not in banner_text
         assert "Inspecting repository" in banner_text
-        assert any(frame in banner_text for frame in "◐◓◑◒")
+        assert any(frame in banner_text for frame in WORKING_PATH_FRAMES)
+        assert "NOAH" in banner_text
         assert banner.styles.height.value == 1
         live = app.query_one("#live-activity")
         assert live.styles.display == "block"
@@ -345,8 +372,12 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
                 meta={"activity_id": "tool-1", "result_status": "complete"},
             )
         )
-        await pilot.pause()
-        transcript = _log_text(app.query_one("#conversation"))
+        transcript = ""
+        for _ in range(10):
+            await pilot.pause()
+            transcript = _log_text(app.query_one("#conversation"))
+            if "✓ Inspect" in transcript:
+                break
         assert "✓ Inspect" in transcript
         assert "execute_python" not in transcript
         assert "Activity" not in transcript
@@ -421,6 +452,8 @@ async def test_tui_paints_before_host_start_and_queues_first_prompt(tmp_path: Pa
         await pilot.pause()
         welcome = _rendered_text(app.query_one("#welcome").content)
         assert "NOAH" in welcome
+        assert "agent at work" in welcome
+        assert len(welcome.splitlines()) >= 8
         assert "Starting agent" not in welcome
         assert "Starting" in _rendered_text(app.query_one("#context-rail").content)
         host.start.assert_awaited_once()
@@ -1279,7 +1312,7 @@ async def test_reasoning_attaches_to_activity_and_banner_shows_thought(tmp_path:
         assert "export path" in record.thought
         assert app._last_thought == "Check the export path first"
         banner_text = _rendered_text(app.query_one("#working-banner").content)
-        assert "✎" in banner_text
+        assert "↳" in banner_text
         # Reasoning stays out of the transcript when show_reasoning is off.
         transcript = _log_text(app.query_one("#conversation"))
         assert "Thinking:" not in transcript

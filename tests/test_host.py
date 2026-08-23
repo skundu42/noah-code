@@ -155,7 +155,7 @@ async def test_session_approval_rules_do_not_leak(tmp_path: Path) -> None:
     host1 = AgentHost(workspace, config, llm=FakeLLMClient(), store=store)
     await host1.start()
     host1.agent.engine.add_session_rule(
-        PermissionRule(category="edit", pattern="*", action="allow", reason="s1")
+        PermissionRule(category="edit", pattern="x.py", action="deny", reason="s1")
     )
     host1._persist()
     sid1 = host1.meta.session_id
@@ -166,14 +166,15 @@ async def test_session_approval_rules_do_not_leak(tmp_path: Path) -> None:
     # Fresh session should not have session-1 rules.
     assert host2.agent.engine.snapshot_session_rules() == []
     d = host2.agent.engine.decide("edit", "x.py")
-    assert d.action == "ask"
+    assert d.action == "allow"
     await host2.close()
 
     # Resuming session 1 restores its rules.
     meta1 = store.load_meta(sid1)
     host3 = AgentHost(workspace, config, llm=FakeLLMClient(), session_meta=meta1, store=store)
     await host3.start()
-    assert any(r["pattern"] == "*" for r in host3.agent.engine.snapshot_session_rules())
+    assert any(r["pattern"] == "x.py" for r in host3.agent.engine.snapshot_session_rules())
+    assert host3.agent.engine.decide("edit", "x.py").action == "deny"
     await host3.close()
 
 

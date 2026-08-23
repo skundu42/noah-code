@@ -229,7 +229,7 @@ def test_plan_mode_denies_edit_and_mutating_bash() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan")
     assert engine.decide("edit", "a.py").action == "deny"
     assert engine.decide("bash", "rm file.txt").action == "deny"
-    assert engine.decide("bash", "git status").action == "ask"
+    assert engine.decide("bash", "git status").action == "allow"
     assert engine.decide("read", "a.py").action == "allow"
 
 
@@ -297,9 +297,12 @@ def test_read_commands_are_not_implicitly_allowed_outside_workspace() -> None:
     assert engine.decide("bash", "grep -R password /tmp").action == "ask"
 
 
-def test_build_edit_asks_by_default() -> None:
+def test_build_edit_and_readonly_shell_are_allowed_by_default() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="build", auto_approve=False)
-    assert engine.decide("edit", "src/x.py").action == "ask"
+    assert engine.decide("edit", "src/x.py").action == "allow"
+    assert engine.decide("bash", "git status").action == "allow"
+    assert engine.decide("bash", "rg TODO src").action == "allow"
+    assert engine.decide("bash", "pytest -q").action == "ask"
 
 
 def test_session_remember_keeps_exact_bash_command() -> None:
@@ -511,20 +514,21 @@ def test_background_ampersand_is_uncertain_shell() -> None:
 
 def test_web_and_question_defaults() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=False)
-    assert engine.decide("webfetch", "https://example.com").action == "ask"
-    assert engine.decide("websearch", "asyncio").action == "ask"
+    assert engine.decide("webfetch", "https://example.com").action == "allow"
+    assert engine.decide("websearch", "asyncio").action == "allow"
     assert engine.decide("question", "Approach").action == "allow"
-    assert engine.decide("task", "explore").action == "ask"
+    assert engine.decide("task", "explore").action == "allow"
+    assert engine.decide("skill", "review").action == "allow"
     assert engine.decide("github", "list").action == "allow"
     assert engine.decide("github", "view").action == "allow"
     assert engine.decide("github", "create").action == "ask"
     assert engine.decide("github", "push").action == "ask"
 
 
-def test_plan_mode_allows_questions_and_web_asks() -> None:
+def test_plan_mode_allows_questions_and_readonly_web() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=False)
     assert engine.decide("question", "Approach").action == "allow"
-    assert engine.decide("webfetch", "https://example.com").action == "ask"
+    assert engine.decide("webfetch", "https://example.com").action == "allow"
     assert engine.decide("edit", "a.py").action == "deny"
     assert engine.decide("github", "list").action == "allow"
     assert engine.decide("github", "create").action == "deny"

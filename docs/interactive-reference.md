@@ -33,11 +33,16 @@ continuously. Use `Up`/`Down` to highlight a command, `Enter` or `Tab` to comple
 close the list. Press `Enter` again to run the completed command. Typing `/config` expands the list
 to every resolved configuration path and its current redacted value.
 
-Until a session has its first user prompt, the main pane keeps the Noah mark centered. Startup,
+Until a session has its first user prompt, the main pane keeps the large Noah wordmark centered. Startup,
 repository changes, model, mode, usage, and update state live in the context rail on wide
-terminals. Git status is collected in a background worker at startup and turn boundaries; spinner
-frames update only the header and working banner. Existing sessions with user history restore
+terminals. Git status is collected in a background worker at startup and turn boundaries; the
+animated Noah path updates only the working banner and live activity. Existing sessions with user history restore
 their transcript normally.
+
+Drag across transcript, activity, diff, or history text to select it. `Cmd+C` on macOS or
+`Ctrl+Shift+C` in other terminals copies the selection; when there is no selection, the same
+shortcut copies Noah's latest reply. `Ctrl+C` also copies an active selection before falling back
+to cancel-turn behavior. Selection uses a high-contrast highlight in every Noah theme.
 
 ### Mid-turn follow-ups
 
@@ -59,8 +64,8 @@ the turn (and the queue) then leaves. Mutating commands wait until the turn fini
 `/undo`, `/redo`, `/mode`, `/model`, `/diff`, `/new`, `/sessions`, `/worktree`, `/pr`, `/plan`, `/memory`, and `/compact`.
 
 Tool and shell output is batched into a live execution panel instead of forcing one full-screen
-redraw for every chunk. While a turn is running, a spinner names the current action the way
-OpenCode does (`Read src/parser.py`, `Bash pytest -q`, `Git status`). When the tool finishes, the
+redraw for every chunk. While a turn is running, a traveling four-waypoint Noah path names the
+current action (`Read src/parser.py`, `Bash pytest -q`, `Git status`) and shows elapsed time. When the tool finishes, the
 panel collapses to one transcript line such as `✓ Read src/parser.py`. Consecutive reads or writes
 merge into a single line (`✓ Read a.py, b.py +1`) so the chat stays compact. `F2` retains the
 latest 100 activity records, bounded by the configured `max_output_chars` per activity.

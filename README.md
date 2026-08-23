@@ -116,6 +116,8 @@ Type `/` to search the full command and configuration reference. The most common
 | --- | --- |
 | `Enter` | Send the current prompt or accept a selected suggestion |
 | `Shift+Enter` | Insert a newline |
+| Drag, then `Cmd+C` / `Ctrl+Shift+C` | Select and copy TUI text |
+| `Ctrl+Shift+C` with no selection | Copy the latest Noah reply |
 | `Tab` | Switch between build and plan mode |
 | `F2` | Open execution activity |
 | `F3` | Open paginated conversation history |
@@ -129,7 +131,7 @@ Type `/` to search the full command and configuration reference. The most common
 On wide terminals, the side rail prioritizes the active operation, Git branch and change counts,
 session, model usage, update state, and plan. Git status is refreshed in the background at turn
 boundaries, so the animated working state stays responsive. The main pane remains centered on the
-Noah mark until the first prompt, then becomes the conversation and execution timeline.
+large Noah wordmark until the first prompt, then becomes the conversation and execution timeline.
 
 ## Models and providers
 

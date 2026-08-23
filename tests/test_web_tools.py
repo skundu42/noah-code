@@ -139,11 +139,13 @@ def test_public_transport_revalidates_redirect_targets(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_asks_then_denies_without_handler() -> None:
+async def test_default_fetch_does_not_need_an_approval_handler() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=False)
-    web = WebTools(engine, ApprovalBroker(engine), transport=_FakeTransport({}))
-    with pytest.raises(PermissionError):
-        await web.fetch("https://example.com")
+    transport = _FakeTransport({"https://example.com": ("text/plain", "hello")})
+    web = WebTools(engine, ApprovalBroker(engine), transport=transport)
+
+    assert "hello" in await web.fetch("https://example.com")
+    assert transport.calls == ["https://example.com"]
 
 
 @pytest.mark.asyncio

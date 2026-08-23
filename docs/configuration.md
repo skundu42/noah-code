@@ -233,7 +233,7 @@ objective, decisions, files, validation, blockers, and next steps.
 
 | Mode | Behavior |
 |------|----------|
-| `build` | Reads are allowed; edits and shell commands follow permission rules and ask by default |
+| `build` | Routine workspace reads, edits, inspection, web research, skills, and delegation proceed automatically; higher-risk operations ask |
 | `plan` | Reads are allowed; file edits and mutating shell commands are denied. `self.plan.write` may pin `.noah-code/plan.md` |
 
 Switch modes with `--mode`, `/mode build`, or `/mode plan`. The agent can propose a switch with
@@ -245,14 +245,16 @@ Permission rules are evaluated in order, and the last matching rule wins. The de
 - Allows ordinary reads.
 - Denies likely secrets, including `.env` variants, private keys, `.git` internals, and session
   databases. `.env.example` remains readable.
-- Asks before workspace edits, shell commands, web fetches, web searches, and subagents.
+- Allows workspace edits, read-only in-workspace shell inspection, web reads, skills, and
+  delegated tasks without interrupting the turn.
+- Asks before arbitrary shell execution, external paths, MCP access, and remote mutations.
 - Allows the question tool so the agent can pause for a structured choice.
 - Denies `git push`, `git clean`, `git reset --hard`, and mutating `gh pr`
   (`create`, `checkout`, `merge`, `close`, `ready`, `review`). Push and PR
   mutations go through `/pr` / `self.github` instead.
 - Allows listing and viewing pull requests; asks before create, push, checkout,
   or comment.
-- Keeps file tools inside the active workspace and asks before skill or MCP access.
+- Keeps file tools inside the active workspace and asks before MCP access.
 - Denies plan-mode mutations regardless of broader allow rules. Plan mode may still run
   read-only subagents. Its shell allowlist accepts only literal, unqualified read-only programs;
   test collection and interpreter execution are not treated as read-only because they can load
