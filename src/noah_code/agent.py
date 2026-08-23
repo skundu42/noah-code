@@ -347,6 +347,9 @@ class CodingAgent(InteractiveAgent):
         nested_prompt: str | None = None,
         **kwargs: Any,
     ) -> None:
+        from noah_code.llm_replies import wrap_conversational_replies
+
+        llm = wrap_conversational_replies(llm)
         super().__init__(llm=llm, storage=storage, **kwargs)
         self._lightweight_llm = lightweight_llm or self._llm
         self.workspace_root = str(workspace.root)
@@ -545,6 +548,9 @@ class CodingAgent(InteractiveAgent):
     def set_main_llm(self, llm: Any, *, lightweight_follows_main: bool) -> None:
         """Switch the primary model and keep compaction routing coherent."""
 
+        from noah_code.llm_replies import wrap_conversational_replies
+
+        llm = wrap_conversational_replies(llm)
         self._llm = llm
         if lightweight_follows_main:
             self._lightweight_llm = llm
@@ -713,7 +719,9 @@ class CodingAgent(InteractiveAgent):
         """Handle one conversational turn for a coding task.
 
         Read all user messages, slash-command results, and system messages
-        in the notification. Understand the requested end state before editing.
+        in the notification. Understand the requested end state before acting.
+        Conversational questions are first-class: answer them with
+        ``self.message(...)`` then return DONE. Do not emit bare assistant prose.
 
         Minimal tool cookbook:
         - ``await self.ws.list("**/*.py")`` lists files.
@@ -755,6 +763,8 @@ class CodingAgent(InteractiveAgent):
 
         Workflow:
         - If the user attached images, show them first.
+        - If the user asked a question, explain a concept, or asked what you can do,
+          answer with ``self.message`` and return DONE. Skip file edits unless asked.
         - Inspect relevant repository instructions and nearby code first.
         - Prefer ``self.ws.search`` / focused ``self.ws.read`` over dumping large files.
         - Delegate bounded research or parallel units with ``self.task.run``.

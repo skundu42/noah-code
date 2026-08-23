@@ -295,6 +295,8 @@ def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> 
 
     def on_error(event: Any) -> None:
         content = str(getattr(event, "content", event) or "")
+        if _is_protocol_nudge(content):
+            return
         if content:
             emit(HostEvent(HostEventKind.ERROR, _truncate(content, 1200)))
 
@@ -372,6 +374,13 @@ def _action_detail(name: str, args: dict[str, Any], *, limit: int = 1200) -> str
         rendered = " ".join(str(value).split())
         rows.append(f"{key}: {rendered[:200]}")
     return "\n".join(rows)[:limit]
+
+
+def _is_protocol_nudge(text: str) -> bool:
+    """Hide CodeAct self-corrections that are not user-facing failures."""
+
+    lowered = text.lower()
+    return "plain text with no tool call" in lowered or "bare message cannot end the turn" in lowered
 
 
 def _truncate(text: str, limit: int) -> str:

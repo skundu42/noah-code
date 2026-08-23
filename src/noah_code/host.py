@@ -339,7 +339,10 @@ class AgentHost:
 
         from noah_code.budget import SharedBudgetLLM, _PrefixObserverOnly, wrap_with_budget
         from noah_code.llm_cache import resolve_cache_settings, wrap_with_cache
+        from noah_code.llm_replies import wrap_conversational_replies
 
+        llm = wrap_conversational_replies(llm)
+        lightweight_llm = wrap_conversational_replies(lightweight_llm)
         llm, self._budget_guard = wrap_with_budget(
             llm, self.config.budget, prefix_observer=self._usage
         )
@@ -1710,7 +1713,9 @@ class AgentHost:
 
         from noah_code.budget import SharedBudgetLLM
         from noah_code.llm_cache import resolve_cache_settings, wrap_with_cache
+        from noah_code.llm_replies import wrap_conversational_replies
 
+        llm = wrap_conversational_replies(llm)
         guard = getattr(self, "_budget_guard", None)
         if guard is not None and guard.active:
             llm = SharedBudgetLLM(llm, guard)
