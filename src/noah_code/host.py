@@ -26,6 +26,7 @@ from noah_code.custom_commands import CustomCommand, discover_custom_commands
 from noah_code.event_bridge import install_event_bridge
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.sessions import SessionEventRecord, SessionMeta, SessionStore
+from noah_code.steer import SAFE_SLASH_WHILE_BUSY, SteerQueue, expansion_failed
 from noah_code.themes import THEME_NAMES, get_theme
 from noah_code.ui.console import ConsoleUI
 from noah_code.ui.protocol import HostUI
@@ -249,6 +250,8 @@ class AgentHost:
         self._mcp_attached: set[str] = set()
         self._mcp_errors: dict[str, str] = {}
         self._usage = UsageTracker()
+        self.steer_queue = SteerQueue()
+        self._pending_attach_paths: list[Path] = []
         self.on_session_changed: Any = None  # optional UI callback
 
     @property
@@ -311,13 +314,19 @@ class AgentHost:
                 **client_kwargs,
             )
 
-        from noah_code.budget import SharedBudgetLLM, wrap_with_budget
+        from noah_code.budget import SharedBudgetLLM, _PrefixObserverOnly, wrap_with_budget
         from noah_code.llm_cache import resolve_cache_settings, wrap_with_cache
 
-        llm, self._budget_guard = wrap_with_budget(llm, self.config.budget)
+        llm, self._budget_guard = wrap_with_budget(
+            llm, self.config.budget, prefix_observer=self._usage
+        )
         if isinstance(llm, SharedBudgetLLM):
             # Both routes draw from one guard so caps span the whole session.
-            lightweight_llm = SharedBudgetLLM(lightweight_llm, self._budget_guard)
+            lightweight_llm = SharedBudgetLLM(
+                lightweight_llm, self._budget_guard, prefix_observer=self._usage
+            )
+        elif isinstance(llm, _PrefixObserverOnly):
+            lightweight_llm = _PrefixObserverOnly(lightweight_llm, self._usage)
         cache_mode, cache_dir = resolve_cache_settings()
         llm = wrap_with_cache(llm, cache_dir, cache_mode)
         lightweight_llm = wrap_with_cache(lightweight_llm, cache_dir, cache_mode)
@@ -339,9 +348,7 @@ class AgentHost:
             # Re-bind host-owned nosnapshot infrastructure after restore.
             agent._engine.mode = agent.mode
             agent._engine.load_session_rules(self.meta.permission_rules)
-            journal_data = await asyncio.to_thread(
-                self.store.load_journal, self.meta.session_id
-            )
+            journal_data = await asyncio.to_thread(self.store.load_journal, self.meta.session_id)
             agent.journal.load_dict(journal_data or self.meta.journal)
             if self.meta.todos:
                 agent.todos.from_dict(self.meta.todos)
@@ -364,9 +371,7 @@ class AgentHost:
             runner = self._hooks
 
             async def _pre_tool_guard(decision: Any) -> None:
-                tool = str(getattr(decision, "tool", "") or "").strip() or str(
-                    decision.category
-                )
+                tool = str(getattr(decision, "tool", "") or "").strip() or str(decision.category)
                 outcome = await runner.run_pre(
                     tool=tool[:80],
                     category=str(decision.category),
@@ -599,7 +604,9 @@ class AgentHost:
             title = f"|{self.meta.title[:20]}"
         effort = self.meta.reasoning_effort if self.meta else self.config.reasoning_effort
         effort_label = "auto" if effort == "default" else effort
-        return f"noah [{mode}|{model}|r:{effort_label}|{sid}{title}]"
+        queued = self.steer_queue.snapshot()["count"]
+        suffix = f" queued · {queued}" if queued else ""
+        return f"noah [{mode}|{model}|r:{effort_label}|{sid}{title}]{suffix}"
 
     def usage_snapshot(self) -> UsageSnapshot:
         return self._usage.snapshot()
@@ -665,6 +672,7 @@ class AgentHost:
     async def start_new_session(self) -> SessionMeta:
         """Persist current session and open a fresh one in-process."""
         self._require_idle_turn()
+        self._clear_steer_state()
         await self._persist_async()
         self._teardown_event_bridge()
         self._cancel_title_task()
@@ -683,6 +691,7 @@ class AgentHost:
     async def switch_session(self, session_id: str) -> SessionMeta:
         """Persist current session and resume another."""
         self._require_idle_turn()
+        self._clear_steer_state()
         await self._persist_async()
         self._teardown_event_bridge()
         self._cancel_title_task()
@@ -878,11 +887,34 @@ class AgentHost:
 
     def cancel_active_turn(self) -> None:
         """Cancel the in-flight turn and pending approvals (Ctrl-C)."""
+        self._clear_steer_state()
         if self._agent is not None:
             self._agent.approvals.cancel_all()
         task = self._active_turn
         if task is not None and not task.done():
             task.cancel()
+
+    def _turn_running(self) -> bool:
+        task = self._active_turn
+        return task is not None and not task.done()
+
+    def _clear_steer_state(self) -> None:
+        self.steer_queue.clear()
+        self._pending_attach_paths.clear()
+
+    def take_pending_attaches(self) -> list[Path]:
+        paths, self._pending_attach_paths = self._pending_attach_paths, []
+        return paths
+
+    def enqueue_steer(self, text: str, attach_paths: list[Path] | None = None) -> bool:
+        """Queue a follow-up for the current turn. Returns True if oldest dropped."""
+
+        paths = list(attach_paths or []) + self.take_pending_attaches()
+        dropped = self.steer_queue.push(text, attach_paths=paths or None)
+        if dropped:
+            self.ui.render(HostEvent(HostEventKind.STATUS, "steer dropped oldest"))
+        self.ui.set_status(self.status_prompt())
+        return dropped
 
     async def handle_line(self, line: str) -> Literal["continue", "exit", "handled"]:
         slash = parse_slash(line)
@@ -935,7 +967,35 @@ class AgentHost:
             approved.add(attr)
         return f"Use the ${info.name} skill instructions for this task:\n\n{task.strip()}"
 
+    def _handle_slash_while_busy(
+        self, name: str, args: str
+    ) -> Literal["continue", "exit", "handled"] | None:
+        """Allow read-only slash commands during a turn; block mutating ones."""
+
+        if not self._turn_running() or name in SAFE_SLASH_WHILE_BUSY:
+            return None
+        if name in {"exit", "quit"}:
+            return None
+        if name == "attach":
+            raw = args.strip().strip("\"'")
+            if not raw:
+                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /attach PATH"))
+                return "handled"
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                path = self.workspace.root / path
+            self._pending_attach_paths.append(path)
+            self.ui.render(HostEvent(HostEventKind.STATUS, f"attach queued · {path}"))
+            return "handled"
+        self.ui.render(
+            HostEvent(HostEventKind.STATUS, f"/{name} is blocked while a turn is running")
+        )
+        return "handled"
+
     async def _handle_slash(self, name: str, args: str) -> Literal["continue", "exit", "handled"]:
+        busy = self._handle_slash_while_busy(name, args)
+        if busy is not None:
+            return busy
         agent = self.agent
         if name == "help":
             self.ui.render(_command_output(help_text(self._custom_commands)))
@@ -982,6 +1042,7 @@ class AgentHost:
         if name in self._custom_commands:
             return await self._run_custom_command(name, args)
         if name == "exit" or name == "quit":
+            self.cancel_active_turn()
             self._exit_requested = True
             return "exit"
         if name == "new":
@@ -1215,6 +1276,11 @@ class AgentHost:
             return "handled"
         if name == "tokens":
             self.ui.render(_command_output(self.usage_snapshot().format()))
+            evicted = nooa_compat.evicted_output_chars(self.agent)
+            if evicted:
+                self.ui.render(
+                    _command_output(f"  compaction savings {evicted:,} chars (pointer eviction)")
+                )
             return "handled"
         if name == "efficiency":
             profile = args.strip().lower()
@@ -1395,22 +1461,12 @@ class AgentHost:
         )
         self.ui.set_status(self.status_prompt())
 
-    async def _run_user_turn(
-        self,
-        text: str,
-        *,
-        attach_paths: list[Path] | None = None,
-    ) -> HostResult:
-        from nooa.interactive import RespondReason
-
+    def _expand_user_text(self, text: str, attach_paths: list[Path] | None) -> Any:
         from noah_code.composer import expand_turn
 
-        agent = self.agent
-        # git status + instruction-file reads are subprocess/file work; keep
-        # them off the UI event loop.
-        await asyncio.to_thread(agent.refresh_context_sources)
-        agent.journal.begin_turn()
-        expanded = expand_turn(text, self.workspace.root, attach_paths=attach_paths)
+        return expand_turn(text, self.workspace.root, attach_paths=attach_paths)
+
+    def _deliver_expanded(self, agent: Any, expanded: Any) -> None:
         if expanded.images:
             agent.media.queue(expanded.images)
             self.ui.render(
@@ -1420,6 +1476,39 @@ class AgentHost:
                 )
             )
         nooa_compat.queue_user_message(agent, expanded.text)
+
+    def _apply_next_steer(self, agent: Any) -> bool:
+        """Pop until one follow-up is queued. Returns False when the queue is empty."""
+
+        while True:
+            item = self.steer_queue.pop()
+            if item is None:
+                return False
+            expanded = self._expand_user_text(item.text, list(item.attach_paths))
+            if expansion_failed(item, expanded):
+                self.ui.render(HostEvent(HostEventKind.STATUS, "steer dropped · could not expand"))
+                continue
+            self._deliver_expanded(agent, expanded)
+            preview = " ".join(item.text.split())[:60]
+            self.ui.render(HostEvent(HostEventKind.STATUS, f"steer applied · {preview}"))
+            self.ui.set_status(self.status_prompt())
+            return True
+
+    async def _run_user_turn(
+        self,
+        text: str,
+        *,
+        attach_paths: list[Path] | None = None,
+    ) -> HostResult:
+        from nooa.interactive import RespondReason
+
+        agent = self.agent
+        # git status + instruction-file reads are subprocess/file work; keep
+        # them off the UI event loop.
+        await asyncio.to_thread(agent.refresh_context_sources)
+        agent.inject_status_snapshot()
+        agent.journal.begin_turn()
+        self._deliver_expanded(agent, self._expand_user_text(text, attach_paths))
 
         if self.meta and self.meta.title == "untitled":
             if self.config.efficiency.deterministic_titles:
@@ -1431,41 +1520,53 @@ class AgentHost:
         exit_code = 0
         explanation = ""
         try:
-            wins = await agent.queue_manager.race()
-            notification: dict[str, list] = {}
-            for name, item in wins:
-                notification.setdefault(name, []).append(item)
-            result = await _handle_with_overflow_recovery(
-                agent, notification, render=self.ui.render
-            )
-            explanation = getattr(result, "explanation", "") or ""
-            kind = getattr(result, "kind", None)
-            self._sync_budget_cost()
-            self.ui.render(HostEvent(HostEventKind.STOP, _stop_text(kind, explanation)))
-            if kind == RespondReason.NEED_INPUT:
-                exit_code = 0
-            if kind == RespondReason.WAIT and not agent.processes.has_running():
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.ERROR,
-                        "Agent returned WAIT without a running background job; "
-                        "start one with self.processes.start() or finish with DONE.",
+            while True:
+                try:
+                    wins = await agent.queue_manager.race()
+                    notification: dict[str, list] = {}
+                    for name, item in wins:
+                        notification.setdefault(name, []).append(item)
+                    result = await _handle_with_overflow_recovery(
+                        agent, notification, render=self.ui.render
                     )
-                )
-        except PermissionError as exc:
-            exit_code = 3
-            explanation = str(exc)
-            self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
-        except asyncio.CancelledError:
-            exit_code = 130
-            explanation = "cancelled"
-            self.ui.render(HostEvent(HostEventKind.STATUS, "turn cancelled"))
-            raise
-        except Exception as exc:
-            exit_code = 1
-            explanation = _friendly_agent_error(exc)
-            self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
-            logger.debug("handle() failed", exc_info=True)
+                    explanation = getattr(result, "explanation", "") or ""
+                    kind = getattr(result, "kind", None)
+                    self._sync_budget_cost()
+                    self.ui.render(HostEvent(HostEventKind.STOP, _stop_text(kind, explanation)))
+                    if kind == RespondReason.NEED_INPUT:
+                        exit_code = 0
+                    elif kind == RespondReason.WAIT and not agent.processes.has_running():
+                        self.ui.render(
+                            HostEvent(
+                                HostEventKind.ERROR,
+                                "Agent returned WAIT without a running background job; "
+                                "start one with self.processes.start() or finish with DONE.",
+                            )
+                        )
+                    else:
+                        exit_code = 0
+                except PermissionError as exc:
+                    exit_code = 3
+                    explanation = str(exc)
+                    self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
+                except asyncio.CancelledError:
+                    exit_code = 130
+                    explanation = "cancelled"
+                    self.steer_queue.clear()
+                    self.ui.render(HostEvent(HostEventKind.STATUS, "turn cancelled"))
+                    raise
+                except Exception as exc:
+                    exit_code = 1
+                    explanation = _friendly_agent_error(exc)
+                    self.steer_queue.clear()
+                    self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
+                    logger.debug("handle() failed", exc_info=True)
+                    break
+
+                if exit_code == 1:
+                    break
+                if not self._apply_next_steer(agent):
+                    break
         finally:
             agent.journal.end_turn()
             latest = agent.journal.latest_turn()

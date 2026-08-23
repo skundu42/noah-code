@@ -53,6 +53,9 @@ configuration or session history.
   file edits even after restarting Noah.
 - **Persistent sessions.** Resume repository-scoped conversations, todos, model choices, and
   automatically compacted context without losing the full underlying tool results.
+- **Token-efficient by construction.** Lean tool-output bounds with disk-backed recall, condensed
+  subagent results, cache-stable request prefixes (volatile status arrives as appended events),
+  and pointer-eviction compaction — measured live in `/tokens` and `noah exec` summaries.
 - **Explicit control.** Switch between implementation-focused **build** mode and read-only
   **plan** mode, with ordered `allow`, `ask`, and `deny` permission rules.
 - **Extensible workflows.** Add slash commands, opt-in skills, MCP servers, or markdown subagents;
@@ -103,6 +106,13 @@ noah update --check
 noah benchmark .
 ```
 
+Score real task success with the benchmark harness:
+
+```bash
+noah bench run swebench-verified-smoke .   # SWE-bench-Verified subset, end to end
+noah bench compare <baseline-run> <candidate-run>
+```
+
 The package also installs `noah-code` and `nc` as equivalent entry points. Because `nc` commonly
 means netcat, `noah` or `noah-code` is recommended.
 
@@ -121,7 +131,7 @@ Type `/` to search the full command and configuration reference. The most common
 | `/theme` | Choose Atom One Dark, Noah Ocean, Graphite, or High Contrast |
 | `/diff` | Review staged and unstaged changes |
 | `/undo` / `/redo` | Traverse the persistent edit journal |
-| `/tokens` | Inspect tokens, cache usage, model wait, and tool output |
+| `/tokens` | Inspect tokens, cache usage, prefix stability, model wait, and tool output |
 | `/efficiency` | Switch between `fast`, `balanced`, and `deep` budgets |
 
 On wide terminals, the side rail keeps the active workspace, session, model, tokens, update state,

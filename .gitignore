@@ -11,3 +11,5 @@ build/
 htmlcov/
 traces/
 .DS_Store
+docs/superpowers/plans/
+.noah-code/

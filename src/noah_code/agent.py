@@ -67,6 +67,7 @@ def _codeact_config(config: NoahCodeConfig) -> CodeActConfig:
     unsafe = config.unsafe_inprocess_code_execution
     restricted_imports = RESTRICTED_MODULES | frozenset({"nooa", "nooa_cli", "noah_code"})
     return CodeActConfig(
+        # None = no iteration cap; budgets (tokens/cost/time) remain the brakes.
         max_iterations=config.max_iterations,
         cell_timeout=config.cell_timeout,
         execution_backend="inprocess" if unsafe else "sandbox",
@@ -218,6 +219,18 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
         self._proc = proc
 
 
+def _cache_first_block_order(base: list[str] | None) -> list[str]:
+    """Stable-prefix-first ordering: static instructions before volatile blocks."""
+
+    return [
+        *(base or []),
+        "repo_instructions",
+        "agents",
+        "subagent",
+        "workspace",
+    ]
+
+
 class _PermissionCodeActStrategy(CodeActStrategy):
     def _build_builtins(self, runtime: Any, call: Any) -> dict[str, Any]:
         builtins = super()._build_builtins(runtime, call)
@@ -225,6 +238,11 @@ class _PermissionCodeActStrategy(CodeActStrategy):
         # enum explicit in case module-context filtering changes upstream.
         builtins["RespondReason"] = RespondReason
         return builtins
+
+    def get_block_order(self) -> list[str]:
+        """NOOA consults whichever strategy instance renders a request."""
+
+        return _cache_first_block_order(super().get_block_order())
 
     def _create_sandbox_executor(self, runtime: Any, call: Any, builtins: dict[str, Any]) -> Any:
         framework_builtins = {**builtins, "_call": call}
@@ -249,13 +267,14 @@ class _LeanPermissionCodeActStrategy(_PermissionCodeActStrategy):
     def name(self) -> str:
         return "NOAH_LEAN_CODEACT"
 
+    def get_block_order(self) -> list[str]:
+        return _cache_first_block_order(super().get_block_order())
+
     async def execute(self, runtime: Any, call: Any) -> Any:
         original = runtime.agent.render_config
         event_format = nooa_compat.truncation_event_format(runtime.agent)
         runtime.agent.render_config = original.model_copy(
-            update={
-                "block_formatter": PlainCodeActBlockFormatter(event_format=event_format)
-            }
+            update={"block_formatter": PlainCodeActBlockFormatter(event_format=event_format)}
         )
         try:
             return await super().execute(runtime, call)
@@ -269,6 +288,9 @@ class _AdaptivePermissionCodeActStrategy(_PermissionCodeActStrategy):
     @property
     def name(self) -> str:
         return "NOAH_ADAPTIVE_CODEACT"
+
+    def get_block_order(self) -> list[str]:
+        return _cache_first_block_order(super().get_block_order())
 
     async def execute(self, runtime: Any, call: Any) -> Any:
         config = runtime.agent._config
@@ -377,13 +399,16 @@ class CodingAgent(InteractiveAgent):
         self._skills_status = "" if nested else install_skills(self, workspace.root, config)
 
         # Bounded live context - not full trees/diffs.
+        #
+        # Only cache-stable content lives in the system prompt. Volatile state
+        # (todos, git, background jobs) is injected as append-only events at
+        # each user-turn boundary via inject_status_snapshot(); mutating a
+        # mid-prefix block would invalidate provider prompt-cache for the
+        # entire conversation on every change.
         self.context["workspace"] = Context(
             expr="f'workspace={self.workspace_root}\\nmode={self.mode}'"
         )
-        self.context["todos"] = Context(expr="self.todos.status()")
         self._git_summary_value = self._git_summary()
-        self.context["git"] = Context(expr="self._git_summary_value")
-        self.context["background_jobs"] = Context(expr="self.processes.summary()")
         if nested_prompt:
             self.context["subagent"] = Context(nested_prompt, prefix=True)
         if not nested:
@@ -424,6 +449,39 @@ class CodingAgent(InteractiveAgent):
         if current != self._repo_instructions_value:
             self._repo_instructions_value = current
             self.context["repo_instructions"] = Context(current, prefix=True)
+
+    @hidden
+    def inject_status_snapshot(self, *, force: bool = False) -> bool:
+        """Append volatile workspace state to the event stream.
+
+        Appending keeps the request prefix byte-stable: providers cache the
+        unchanged head and only process the new tail. Returns True when a
+        snapshot was injected. ``force`` injects even when nothing changed
+        since the last snapshot (used at turn starts after resume).
+        """
+
+        from nooa.events import Feedback
+
+        sections: list[str] = []
+        git_summary = self._git_summary_value
+        if git_summary and not git_summary.startswith("(not a git repo"):
+            sections.append(f"[git]\n{git_summary}")
+        todos_status = self.todos.status()
+        if todos_status and todos_status != "(no todos)":
+            sections.append(f"[todos]\n{todos_status}")
+        jobs_summary = self.processes.summary()
+        if jobs_summary and jobs_summary != "(no background jobs)":
+            sections.append(f"[background_jobs]\n{jobs_summary}")
+        snapshot = "\n\n".join(sections)
+        if len(snapshot) > 2000:
+            snapshot = snapshot[:1990] + "\n…"
+        if not snapshot:
+            return False
+        if not force and snapshot == getattr(self, "_last_status_snapshot", None):
+            return False
+        self._last_status_snapshot = snapshot
+        self.event_manager.add(Feedback(content=f"[workspace status]\n{snapshot}"))
+        return True
 
     @hidden
     def sync_model_limits(self) -> None:
@@ -484,9 +542,34 @@ class CodingAgent(InteractiveAgent):
         ...
 
     @hidden
+    @strategy(
+        PredictStrategy(PredictConfig(output_serialization="tool_call")),
+        llm=lambda agent: agent._lightweight_llm,
+    )
+    async def distill_result(self, transcript: str) -> str:
+        """Compress one subagent work transcript into a compact report for its parent.
+
+        Transcript begins: {transcript}
+
+        Return only these sections when they contain real information, as short
+        plain lines without markdown headers:
+        Findings - concrete answers with file paths and symbol names.
+        Changes - files edited and what changed in each.
+        Validation - commands run and their exact observed outcomes.
+        Open - unresolved problems or questions that need the user.
+
+        Preserve exact paths, identifiers, commands, and numbers. Omit chatter,
+        raw tool output, and superseded attempts. Never claim success that the
+        transcript does not show. Stay under 1200 characters.
+        """
+
+        ...
+
+    @hidden
     def _git_summary(self) -> str:
         import subprocess
 
+        unavailable = "(not a git repo or empty status)"
         try:
             status = subprocess.run(
                 ["git", "status", "--short", "--branch"],
@@ -496,13 +579,11 @@ class CodingAgent(InteractiveAgent):
                 timeout=5,
                 check=False,
             )
-            out = (status.stdout or status.stderr or "").strip()
-            lines = out.splitlines()
-            if len(lines) > 30:
-                return "\n".join(lines[:30]) + f"\n...[{len(lines) - 30} more]"
-            return out or "(not a git repo or empty status)"
+            if status.returncode != 0:
+                return unavailable
+            return (status.stdout or "").strip() or unavailable
         except (OSError, subprocess.SubprocessError):
-            return "(git status unavailable)"
+            return unavailable
 
     @hidden
     def _repo_instructions(self) -> str:
@@ -572,7 +653,10 @@ class CodingAgent(InteractiveAgent):
           searches the public web. Both ask for approval by default.
         - ``await self.ask.question(header, prompt, options)`` pauses for a user choice.
         - ``await self.task.run("explore", "...")`` or ``"general"`` runs a nested
-          NOOA subagent with isolated history. ``self.task.list()`` shows markdown agents.
+          NOOA subagent with isolated history; results arrive condensed. Use
+          ``await self.task.run_many([("explore", "..."), ...])`` to fan out
+          bounded independent units concurrently.
+        - ``self.task.list()`` shows markdown agents.
         - If ``self.media.pending()`` is non-empty, ``show()`` each ``self.media.consume()``
           image before reasoning. ``show`` is a CodeAct builtin; do not import ``nooa``.
 

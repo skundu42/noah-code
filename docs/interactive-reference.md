@@ -4,14 +4,14 @@
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Send the current message |
+| `Enter` | Send the current message, or queue a follow-up while a turn is running |
 | `Shift+Enter` | Insert a newline without sending |
 | `Tab` | Toggle `build`/`plan` mode; accept the highlighted slash option while suggestions are open |
 | `Ctrl+P` | Open the command palette |
 | `Ctrl+K` | Open the searchable skills picker |
 | `Ctrl+O` | Open the session picker |
 | `Ctrl+N` | Start a new session |
-| `Ctrl+C` | Cancel the active turn; press twice while idle to quit |
+| `Ctrl+C` | Cancel the active turn and clear queued follow-ups; press twice while idle to quit |
 | `Ctrl+Q` | Quit |
 | `F1` or `?` | Show help |
 | `F2` | Open recent activity and full captured output |
@@ -35,6 +35,25 @@ to every resolved configuration path and its current redacted value.
 Until a session has its first user prompt, the main pane keeps the Noah mark centered. Startup,
 workspace, model, mode, and update state live in the context rail on wide terminals. Existing
 sessions with user history restore their transcript normally.
+
+### Mid-turn follow-ups
+
+While Noah is working, the composer stays open. `Enter` queues the current text instead of starting
+a second turn. Chrome shows `queued · n`. When the in-flight `handle()` returns (`DONE`,
+`NEED_INPUT`, or `WAIT`), the host injects the next item in the same journaled turn — one persist
+and one checkpoint for the whole steered run. `/undo` therefore reverts every follow-up together.
+
+The queue holds at most 5 items. A sixth `Enter` drops the oldest and status-prints
+`steer dropped oldest`. `@path` mentions and `/attach` paths expand when the item is injected, not
+when it is queued. A follow-up that names files Noah cannot resolve is dropped; later items stay.
+`Ctrl+C` cancels the turn and clears the queue. Switching or starting a session also clears it.
+
+Approval and `ask.question` modals keep the composer. Queueing resumes after the modal closes.
+
+These slash commands still run while a turn is in progress: `/status`, `/tokens`, `/todos`,
+`/help`, `/trace`. `/attach PATH` remembers the file for the next queued follow-up. `/exit` cancels
+the turn (and the queue) then leaves. Mutating commands wait until the turn finishes, including
+`/undo`, `/redo`, `/mode`, `/model`, `/diff`, `/new`, `/sessions`, and `/compact`.
 
 Tool and shell output is batched into a live execution panel instead of forcing one full-screen
 redraw for every chunk. While a turn is running, a spinner names the current action the way

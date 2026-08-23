@@ -58,3 +58,12 @@ def truncation_event_format(agent: Any) -> str:
     """Event format string the agent's truncation policy was built with."""
 
     return agent._truncation.event_format
+
+
+def evicted_output_chars(agent: Any) -> int:
+    """Total chars reclaimed by pointer eviction across installed summarizers."""
+
+    total = 0
+    for summarizer in summarizers(agent):
+        total += int(getattr(summarizer, "evicted_output_chars", 0) or 0)
+    return total

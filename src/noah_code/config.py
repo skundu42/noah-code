@@ -61,6 +61,8 @@ class EfficiencyConfig(BaseModel):
     max_search_results: int = Field(default=100, ge=10, le=1000)
     max_file_results: int = Field(default=500, ge=50, le=5000)
     tool_output_retention_hours: int = Field(default=24, ge=1, le=24 * 30)
+    subagent_result_max_chars: int = Field(default=4000, ge=500, le=100_000)
+    max_concurrent_subagents: int = Field(default=3, ge=1, le=8)
 
 
 class UIConfig(BaseModel):
@@ -103,7 +105,9 @@ class SamplingConfig(BaseModel):
     seed: int | None = Field(default=None, ge=0)
 
     def overrides(self) -> dict[str, Any]:
-        return {k: v for k in ("temperature", "top_p", "seed") if (v := getattr(self, k)) is not None}
+        return {
+            k: v for k in ("temperature", "top_p", "seed") if (v := getattr(self, k)) is not None
+        }
 
 
 class BudgetConfig(BaseModel):
@@ -140,7 +144,7 @@ class NoahCodeConfig(BaseModel):
     model: str = "gpt-4o-mini"
     reasoning_effort: ReasoningEffort = "default"
     lightweight_model: str | None = None
-    max_iterations: int = 40
+    max_iterations: int | None = 40
     cell_timeout: float = 120.0
     command_timeout: float = 60.0
     summarization: SummarizationPolicy = Field(default_factory=SummarizationPolicy)
@@ -419,7 +423,9 @@ def save_user_theme(theme: str) -> Path:
         theme_line = next(
             (
                 index
-                for index, line in enumerate(lines[table_start + 1 : table_end], start=table_start + 1)
+                for index, line in enumerate(
+                    lines[table_start + 1 : table_end], start=table_start + 1
+                )
                 if re.match(r"^\s*theme\s*=", line)
             ),
             None,

@@ -25,8 +25,13 @@ through `$9`. Front matter may also select a mode or model.
 ## Subagents
 
 The parent agent invokes nested NOOA agents with `self.task.run("explore", prompt)` or
-`self.task.run("general", prompt)`. Each child gets isolated in-memory session storage and the
-same permission broker. Add project or user markdown agents:
+`self.task.run("general", prompt)`, and fans out independent units concurrently with
+`self.task.run_many([("explore", "..."), ("general", "...")])`. Each child gets isolated
+in-memory session storage, its own permission-engine clone (so concurrent children never race
+on mode), and the same approval broker. Results are bounded: oversized transcripts are
+condensed by the lightweight model (fallback: truncation with a recall pointer) before they
+enter the parent's context. Tune with `subagent_result_max_chars` and
+`max_concurrent_subagents` under `[efficiency]`. Add project or user markdown agents:
 
 - `~/.config/noah-code/agents/*.md`
 - `.noah-code/agents/*.md`

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
+from pathlib import Path
 from typing import Any, Literal
 
 import click
@@ -31,7 +33,18 @@ EXIT_DENIED = 3
 EXIT_SIGINT = 130
 
 SUBCOMMANDS = frozenset(
-    {"run", "exec", "checkpoints", "sessions", "doctor", "config", "providers", "update", "benchmark"}
+    {
+        "run",
+        "exec",
+        "bench",
+        "checkpoints",
+        "sessions",
+        "doctor",
+        "config",
+        "providers",
+        "update",
+        "benchmark",
+    }
 )
 
 _AUTO_UPDATE_CHECKED = False
@@ -126,7 +139,10 @@ def _apply_eval_overrides(
 ) -> None:
     """Fold automation flags into ``overrides`` in place."""
 
-    permission_extra = [*_parse_rule_specs(allow_rules, "allow"), *_parse_rule_specs(deny_rules, "deny")]
+    permission_extra = [
+        *_parse_rule_specs(allow_rules, "allow"),
+        *_parse_rule_specs(deny_rules, "deny"),
+    ]
     if permission_extra:
         overrides["extra_permission_rules"] = permission_extra
     budget: dict[str, Any] = {}
@@ -170,9 +186,9 @@ def _common_options(fn):  # noqa: ANN001
     fn = click.option(
         "--auto", is_flag=True, help="Auto-approve ask decisions (never overrides deny)"
     )(fn)
-    fn = click.option(
-        "--model", "model", default=None, help="Override the model for this launch"
-    )(fn)
+    fn = click.option("--model", "model", default=None, help="Override the model for this launch")(
+        fn
+    )
     fn = click.option(
         "--reasoning-effort",
         type=click.Choice(["default", "none", "minimal", "low", "medium", "high", "xhigh"]),
@@ -550,6 +566,176 @@ def benchmark_cmd(path: str | None, as_json: bool) -> None:
         click.echo(json.dumps(result.to_dict(), indent=2, sort_keys=True))
     else:
         click.echo(result.format())
+
+
+@cli_group.group("bench")
+def bench_group() -> None:
+    """Run task-success benchmarks (SWE-bench-Verified subsets) end to end."""
+
+
+@bench_group.command("run")
+@click.argument("suite")
+@click.option("--model", default=None, help="Model override for every task")
+@click.option(
+    "--reasoning-effort",
+    type=click.Choice(["default", "none", "minimal", "low", "medium", "high", "xhigh"]),
+    default=None,
+)
+@click.option("--limit", type=int, default=None, help="Only run the first N tasks")
+@click.option("--budget-tokens", type=int, default=None, help="Per-task total token cap")
+@click.option("--budget-cost-usd", type=float, default=None, help="Per-task cost cap in USD")
+@click.option(
+    "--time-limit",
+    type=float,
+    default=1800.0,
+    show_default=True,
+    metavar="SECONDS",
+    help="Per-task agent wall-clock limit",
+)
+@click.option(
+    "--eval-timeout",
+    type=float,
+    default=1200.0,
+    show_default=True,
+    metavar="SECONDS",
+    help="Per-suite pytest timeout during scoring",
+)
+@click.option(
+    "--setup",
+    "setup_command",
+    default=None,
+    help="Shell command run per task before the agent; overrides the suite and env hook",
+)
+@click.option(
+    "--max-iterations",
+    type=int,
+    default=None,
+    metavar="N",
+    help="Agent iteration cap per task; 0 removes the cap (default: config max_iterations)",
+)
+@click.option("--keep-worktrees", is_flag=True, help="Keep repo worktrees even on failure")
+@click.option(
+    "--output-root",
+    type=click.Path(),
+    default=None,
+    help="Directory for run artifacts (default .noah-code/bench-runs)",
+)
+def bench_run(
+    suite: str,
+    model: str | None,
+    reasoning_effort: str | None,
+    limit: int | None,
+    budget_tokens: int | None,
+    budget_cost_usd: float | None,
+    time_limit: float,
+    eval_timeout: float,
+    setup_command: str | None,
+    max_iterations: int | None,
+    keep_worktrees: bool,
+    output_root: str | None,
+) -> None:
+    """Run SUITE (builtin name or path to suite .json/.jsonl) and print a report."""
+
+    from noah_code.bench.runner import BenchOptions, BenchRunner
+    from noah_code.bench.suites import SuiteError, load_suite
+    from noah_code.config import NoahCodeConfig
+
+    try:
+        loaded = load_suite(suite)
+    except SuiteError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    options = BenchOptions(
+        output_root=Path(output_root) if output_root else Path(".noah-code") / "bench-runs",
+        model=model or user_default_model(),
+        reasoning_effort=reasoning_effort,
+        budget_tokens=budget_tokens,
+        budget_cost_usd=budget_cost_usd,
+        agent_time_limit_seconds=time_limit if time_limit and time_limit > 0 else None,
+        eval_timeout_seconds=eval_timeout,
+        setup_command=setup_command,
+        max_iterations=max_iterations,
+        keep_worktrees=keep_worktrees,
+        limit=limit,
+    )
+    resolved_model = options.model or NoahCodeConfig().model
+
+    async def _execute():
+        runner = BenchRunner(options)
+        return await runner.run(loaded, model=resolved_model)
+
+    report = _run_async(_execute())
+    click.echo()
+    from noah_code.bench.score import format_report
+
+    click.echo(format_report(report))
+    click.echo(f"artifacts: {(options.output_root / report.run_id).resolve()}")
+
+
+@bench_group.command("report")
+@click.argument("run_dir", type=click.Path(exists=True))
+def bench_report(run_dir: str) -> None:
+    """Print the saved report for RUN_DIR."""
+
+    from noah_code.bench.score import format_report, load_report
+
+    try:
+        report = load_report(Path(run_dir))
+    except FileNotFoundError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    click.echo(format_report(report))
+
+
+@bench_group.command("compare")
+@click.argument("baseline_dir", type=click.Path(exists=True))
+@click.argument("candidate_dir", type=click.Path(exists=True))
+def bench_compare(baseline_dir: str, candidate_dir: str) -> None:
+    """Diff two benchmark run directories over their shared tasks."""
+
+    from noah_code.bench.score import compare_reports, format_comparison, load_report
+
+    try:
+        baseline = load_report(Path(baseline_dir))
+        candidate = load_report(Path(candidate_dir))
+    except FileNotFoundError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    delta = compare_reports(baseline, candidate)
+    click.echo(format_comparison(baseline, candidate, delta))
+
+
+@bench_group.command("pull")
+@click.option("--ids", required=True, help="Comma-separated SWE-bench Verified instance ids")
+@click.option("--out", required=True, type=click.Path(), help="Output suite .json path")
+def bench_pull(ids: str, out: str) -> None:
+    """Fetch Verified records for IDS and write a local suite file."""
+
+    from noah_code.bench.suites import (
+        SWEBENCH_DATASET,
+        SuiteError,
+        fetch_swebench_verified,
+        suite_from_swebench_ids,
+    )
+
+    cache = Path.home() / ".cache" / "noah-code" / "bench" / "swebench_verified.jsonl"
+    try:
+        fetch_swebench_verified(cache)
+        instance_ids = [item.strip() for item in ids.split(",") if item.strip()]
+        built = suite_from_swebench_ids(Path(out).stem or "pulled-suite", instance_ids, cache)
+    except SuiteError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    document = {
+        "name": built.name,
+        "description": built.description,
+        "source": SWEBENCH_DATASET,
+        "environment_setup": None,
+        "tasks": [task.to_dict() for task in built.tasks],
+    }
+    destination = Path(out).expanduser()
+    destination.write_text(json.dumps(document, indent=2))
+    click.echo(f"wrote {len(built.tasks)} tasks to {destination}")
 
 
 @cli_group.command("doctor")

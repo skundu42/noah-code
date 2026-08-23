@@ -35,11 +35,13 @@ from noah_code.commands import (
     all_command_suggestions,
     config_command_suggestions,
     help_text,
+    parse_slash,
 )
 from noah_code.composer import mention_suggestions
 from noah_code.event_bridge import _describe_code_activity
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.sessions import SessionEventRecord
+from noah_code.steer import SAFE_SLASH_WHILE_BUSY
 from noah_code.themes import THEMES, ThemePalette, get_theme
 from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt
 from noah_code.updates import UpdateStatus, maybe_check_for_update
@@ -1493,13 +1495,15 @@ class NoahCodeApp(App[None]):
             verb = "starting" if not self._agent_ready else "working"
             state = f"{verb} {'◐◓◑◒'[self._spinner_index]}"
         unread = f"  {self._unread_count} new" if self._unread_count else ""
+        queued = self._steer_queued_label()
+        queued_bit = f"  {queued}" if queued else ""
         if self._session_has_prompt:
             header = (
                 f" noah   {repository}   {mode.upper()}   {model} · r:{effort_label}   "
-                f"{session_id}   {state}{unread} "
+                f"{session_id}   {state}{queued_bit}{unread} "
             )
         else:
-            header = f" noah   {state}{unread} "
+            header = f" noah   {state}{queued_bit}{unread} "
         if force or header != self._header_text:
             self._header_text = header
             with contextlib.suppress(Exception):
@@ -1542,6 +1546,9 @@ class NoahCodeApp(App[None]):
         )
         if meta:
             text.append(f"{meta.session_id[:8]}\n", style=palette.muted)
+        queued = self._steer_queued_label()
+        if queued:
+            text.append(f"{queued}\n", style=palette.warning)
         text.append("\nCURRENT\n", style=f"bold {palette.accent}")
         if self._active_activity_id and self._active_activity_id in self._activities:
             record = self._activities[self._active_activity_id]
@@ -2729,10 +2736,59 @@ class NoahCodeApp(App[None]):
             self.update_chrome(force=True)
             self.query_one("#composer", ComposerTextArea).focus()
 
+    def _steer_queued_label(self) -> str:
+        queue = getattr(self.host, "steer_queue", None)
+        if queue is None:
+            return ""
+        count = queue.snapshot().get("count") or 0
+        return f"queued · {count}" if count else ""
+
+    def _submit_while_busy(self, composer: ComposerTextArea, text: str) -> None:
+        slash = parse_slash(text)
+        if slash:
+            name = slash[0]
+            if name in SAFE_SLASH_WHILE_BUSY or name == "attach":
+                composer.text = ""
+                self.close_suggestions()
+                self._append_entry(TranscriptEntry("YOU", text))
+                self._run_host_command(text)
+                return
+            if name in {"exit", "quit"}:
+                composer.text = ""
+                self.close_suggestions()
+                self.host.cancel_active_turn()
+                self.exit()
+                return
+            composer.text = ""
+            self.close_suggestions()
+            self._append_entry(
+                TranscriptEntry("STATUS", f"/{name} is blocked while a turn is running")
+            )
+            return
+        composer.text = ""
+        self.close_suggestions()
+        self._append_entry(TranscriptEntry("YOU", text))
+        self.host.enqueue_steer(text)
+        self.update_chrome(force=True)
+
+    @work(group="host-cmd")
+    async def _run_host_command(self, text: str) -> None:
+        try:
+            action = await self.host.handle_line(text)
+            if action == "exit":
+                self.exit()
+        except Exception as exc:  # noqa: BLE001
+            self._append_entry(TranscriptEntry("ERROR", str(exc)))
+
     def action_submit(self) -> None:
         composer = self.query_one("#composer", ComposerTextArea)
         text = composer.text.strip()
-        if not text or (self.ui.busy and self._agent_ready) or self._pending_submit is not None:
+        if not text or self._pending_submit is not None:
+            return
+        if isinstance(self.screen, (ApprovalModal, QuestionModal)):
+            return
+        if self.ui.busy and self._agent_ready:
+            self._submit_while_busy(composer, text)
             return
         if self._agent_ready and text == "/skills":
             composer.text = ""

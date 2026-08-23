@@ -153,3 +153,39 @@ noah exec "..." . --top-p 0.9 --seed 7
 ```
 
 Unset values are omitted entirely so providers keep their defaults.
+
+## Task-success benchmark (`noah bench`)
+
+`noah bench` runs curated SWE-bench-Verified tasks through the real agent host and scores
+resolved rate alongside token, turn, and cost efficiency.
+
+```bash
+# Run the shipped smoke suite (8 pytest-based tasks across flask/pylint/pytest/seaborn)
+noah bench run swebench-verified-smoke --model openai/gpt-4o --budget-tokens 400000
+
+# Run only the first three tasks of any suite
+noah bench run path/to/suite.json --limit 3 --setup "pip install -e ."
+
+# Build a custom suite from Verified instance ids (fetched once, then cached)
+noah bench pull --ids sympy__sympy-22914,pytest-dev__pytest-7982 --out my-suite.json
+
+# Report and compare runs
+noah bench report .noah-code/bench-runs/<run-id>
+noah bench compare <baseline-run-dir> <candidate-run-dir>
+```
+
+How one task executes:
+
+1. The repo mirror is cloned once into `~/.cache/noah-code/bench/repos/`, then each task gets a
+   worktree checked out at its `base_commit`.
+2. The optional setup command (suite `environment_setup`, `--setup`, or
+   `NOAH_CODE_BENCH_SETUP`, in that order) runs **outside** the agent sandbox with network
+   access — dependency installs belong there.
+3. The agent receives the problem statement only (never the gold patch or hints) with auto
+   approvals and the configured budget caps.
+4. The `test_patch` is applied and `FAIL_TO_PASS` plus `PASS_TO_PASS` suites run under
+   `python -m pytest`; resolved requires both green.
+
+Artifacts land in `.noah-code/bench-runs/<run-id>/`: per-task `trace.jsonl` event streams,
+test logs, `result.json`, and a top-level `result.json` report. Failed tasks clean their
+worktrees automatically; pass `--keep-worktrees` to inspect fixes.

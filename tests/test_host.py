@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -747,4 +748,326 @@ async def test_agents_command_lists_builtins(tmp_path: Path) -> None:
     rendered = host.ui.render.call_args.args[0].text
     assert "explore" in rendered
     assert "general" in rendered
+    await host.close()
+
+
+async def _host_for_steer(tmp_path: Path, monkeypatch, **cli_overrides):
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions"), **cli_overrides},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    queued: list[str] = []
+    races = {"n": 0}
+
+    async def instant_race():
+        races["n"] += 1
+        return []
+
+    host.agent.queue_manager.race = instant_race
+    monkeypatch.setattr(
+        "noah_code.host.nooa_compat.queue_user_message",
+        lambda _agent, text: queued.append(text),
+    )
+    return host, queued, races
+
+
+@pytest.mark.asyncio
+async def test_steer_drain_runs_second_handle_in_same_journal_turn(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from types import SimpleNamespace
+
+    host, queued, races = await _host_for_steer(tmp_path, monkeypatch)
+    handles = {"n": 0}
+    begins = {"n": 0}
+    ends = {"n": 0}
+    orig_begin = host.agent.journal.begin_turn
+    orig_end = host.agent.journal.end_turn
+    host.agent.journal.begin_turn = lambda: (begins.__setitem__("n", begins["n"] + 1), orig_begin())[
+        1
+    ]
+    host.agent.journal.end_turn = lambda: (ends.__setitem__("n", ends["n"] + 1), orig_end())[1]
+
+    async def handle(_agent, _notification, render=None):  # noqa: ANN001
+        handles["n"] += 1
+        if handles["n"] == 1:
+            host.steer_queue.push("also run pytest")
+        return SimpleNamespace(kind="DONE", explanation="ok")
+
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    result = await host._run_user_turn("edit the file")
+
+    assert result.exit_code == 0
+    assert handles["n"] == 2
+    assert races["n"] == 2
+    assert queued == ["edit the file", "also run pytest"]
+    assert begins["n"] == 1
+    assert ends["n"] == 1
+    assert len(host.steer_queue) == 0
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_need_input_with_queued_steer_continues(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from nooa.interactive import RespondReason
+
+    host, queued, races = await _host_for_steer(tmp_path, monkeypatch)
+    handles = {"n": 0}
+
+    async def handle(_agent, _notification, render=None):  # noqa: ANN001
+        handles["n"] += 1
+        if handles["n"] == 1:
+            host.steer_queue.push("use option two")
+            return SimpleNamespace(kind=RespondReason.NEED_INPUT, explanation="choose")
+        return SimpleNamespace(kind="DONE", explanation="ok")
+
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    result = await host._run_user_turn("ask me")
+
+    assert result.exit_code == 0
+    assert handles["n"] == 2
+    assert races["n"] == 2
+    assert queued[-1] == "use option two"
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_need_input_stops_without_another_handle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from types import SimpleNamespace
+
+    from nooa.interactive import RespondReason
+
+    host, _queued, races = await _host_for_steer(tmp_path, monkeypatch)
+    handles = {"n": 0}
+
+    async def handle(_agent, _notification, render=None):  # noqa: ANN001
+        handles["n"] += 1
+        return SimpleNamespace(kind=RespondReason.NEED_INPUT, explanation="choose")
+
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    result = await host._run_user_turn("ask me")
+
+    assert result.exit_code == 0
+    assert handles["n"] == 1
+    assert races["n"] == 1
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_clears_steer_queue(tmp_path: Path, monkeypatch) -> None:
+    host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+    host.steer_queue.push("follow-up")
+    started = asyncio.Event()
+
+    async def race_forever():
+        started.set()
+        await asyncio.Event().wait()
+
+    host.agent.queue_manager.race = race_forever
+    turn = asyncio.create_task(host._run_user_turn("long edit"))
+    await started.wait()
+    host.cancel_active_turn()
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+
+    assert len(host.steer_queue) == 0
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_mention_drops_only_that_steer_item(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    host, queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+    statuses: list[str] = []
+    orig_render = host.ui.render
+
+    def capture(event) -> None:  # noqa: ANN001
+        statuses.append(getattr(event, "text", ""))
+        orig_render(event)
+
+    host.ui.render = capture
+    handles = {"n": 0}
+
+    async def handle(_agent, _notification, render=None):  # noqa: ANN001
+        handles["n"] += 1
+        if handles["n"] == 1:
+            host.steer_queue.push("please read @definitely-missing-xyz.py")
+            host.steer_queue.push("also run pytest")
+        return SimpleNamespace(kind="DONE", explanation="ok")
+
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    result = await host._run_user_turn("edit the file")
+
+    assert result.exit_code == 0
+    assert handles["n"] == 2
+    assert queued == ["edit the file", "also run pytest"]
+    assert any("steer dropped" in text for text in statuses)
+    assert any("steer applied · also run pytest" in text for text in statuses)
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_error_still_drains_remaining_steer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from types import SimpleNamespace
+
+    host, queued, races = await _host_for_steer(tmp_path, monkeypatch)
+    handles = {"n": 0}
+
+    async def handle(_agent, _notification, render=None):  # noqa: ANN001
+        handles["n"] += 1
+        if handles["n"] == 1:
+            host.steer_queue.push("try a narrower edit")
+            raise PermissionError("edit denied")
+        return SimpleNamespace(kind="DONE", explanation="ok")
+
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    result = await host._run_user_turn("touch secrets")
+
+    assert result.exit_code == 0
+    assert handles["n"] == 2
+    assert races["n"] == 2
+    assert queued[-1] == "try a narrower edit"
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_crash_clears_queue_and_stops(tmp_path: Path, monkeypatch) -> None:
+    host, _queued, races = await _host_for_steer(tmp_path, monkeypatch)
+    host.steer_queue.push("should not run")
+
+    async def handle(_agent, _notification, render=None):  # noqa: ANN001
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    result = await host._run_user_turn("do the work")
+
+    assert result.exit_code == 1
+    assert races["n"] == 1
+    assert len(host.steer_queue) == 0
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_steered_run_captures_one_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+    from types import SimpleNamespace
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "eval@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Eval"], cwd=tmp_path, check=True)
+    (tmp_path / "base.txt").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path, check=True)
+
+    host, _queued, _races = await _host_for_steer(
+        tmp_path, monkeypatch, checkpoints={"enabled": True}
+    )
+    captures = {"n": 0}
+    orig = host._capture_checkpoint
+
+    async def counted(label: str) -> None:
+        captures["n"] += 1
+        await orig(label)
+
+    host._capture_checkpoint = counted
+
+    handles = {"n": 0}
+
+    async def handle(_agent, _notification, render=None):  # noqa: ANN001
+        handles["n"] += 1
+        if handles["n"] == 1:
+            host.steer_queue.push("also run pytest")
+        return SimpleNamespace(kind="DONE", explanation="ok")
+
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    result = await host._run_user_turn("do the work")
+
+    assert result.exit_code == 0
+    assert captures["n"] == 1
+    assert host.last_checkpoint is not None
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_session_switch_clears_steer_queue(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.steer_queue.push("stale follow-up")
+    await host.start_new_session()
+    assert len(host.steer_queue) == 0
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_slash_blocked_while_turn_running(tmp_path: Path, monkeypatch) -> None:
+    host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+    host.ui.render = MagicMock()
+    host.undo_last_turn_async = AsyncMock(side_effect=AssertionError("must not undo"))
+
+    async def forever() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(forever())
+    host._active_turn = task
+    try:
+        action = await host.handle_line("/undo")
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert action == "handled"
+    host.undo_last_turn_async.assert_not_awaited()
+    assert "blocked" in host.ui.render.call_args.args[0].text
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_tokens_slash_allowed_while_turn_running(tmp_path: Path, monkeypatch) -> None:
+    host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+    host.ui.render = MagicMock()
+
+    async def forever() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(forever())
+    host._active_turn = task
+    try:
+        action = await host.handle_line("/tokens")
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert action == "handled"
+    host.ui.render.assert_called()
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_status_prompt_includes_queued_count(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    host.steer_queue.push("also run pytest")
+    assert "queued · 1" in host.status_prompt()
     await host.close()

@@ -16,6 +16,7 @@ from noah_code.config import NoahCodeConfig
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.permissions import PermissionDecision
 from noah_code.sessions import SessionEventRecord
+from noah_code.steer import SteerQueue
 from noah_code.ui.textual_app import (
     MAX_TRANSCRIPT_LINES,
     ActivityHistoryScreen,
@@ -52,6 +53,19 @@ def _fake_host(tmp_path: Path):
     host.set_provider_api_key = AsyncMock()
     host.configure_provider = AsyncMock(return_value="provider configured")
     host._mcp_attached = set()
+    host.steer_queue = SteerQueue()
+    host._pending_attach_paths = []
+
+    def take_pending_attaches():
+        paths, host._pending_attach_paths = host._pending_attach_paths, []
+        return paths
+
+    def enqueue_steer(text, attach_paths=None):
+        paths = list(attach_paths or []) + take_pending_attaches()
+        return host.steer_queue.push(text, attach_paths=paths or None)
+
+    host.take_pending_attaches = take_pending_attaches
+    host.enqueue_steer = enqueue_steer
     return host
 
 
@@ -1300,3 +1314,104 @@ async def test_enter_with_args_beyond_placeholder_submits(tmp_path: Path) -> Non
                 break
             await pilot.pause()
         host.handle_line.assert_awaited_once_with("/config model")
+
+
+@pytest.mark.asyncio
+async def test_busy_enter_queues_follow_up_without_starting_a_turn(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.set_busy(True)
+        composer = app.query_one("#composer")
+        composer.text = "also run pytest"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        host.handle_line.assert_not_awaited()
+        assert host.steer_queue.snapshot()["count"] == 1
+        assert "queued · 1" in _rendered_text(app.query_one("#header").content)
+        item = host.steer_queue.pop()
+        assert item is not None and item.text == "also run pytest"
+        assert "also run pytest" in _log_text(app.query_one("#conversation"))
+
+
+@pytest.mark.asyncio
+async def test_chrome_shows_queued_count(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test(size=(120, 30)) as pilot:
+        host.steer_queue.push("one")
+        host.steer_queue.push("two")
+        app.update_chrome(force=True)
+        await pilot.pause()
+        header = _rendered_text(app.query_one("#header").content)
+        rail = _rendered_text(app.query_one("#context-rail").content)
+        assert "queued · 2" in header
+        assert "queued · 2" in rail
+
+
+@pytest.mark.asyncio
+async def test_approval_modal_does_not_queue_composer_text(tmp_path: Path) -> None:
+    request = ApprovalRequest(
+        id="req-1",
+        decision=PermissionDecision(
+            category="edit",
+            target="a.py",
+            action="ask",
+            matching_rule=None,
+            reason="needs approval",
+            remember_pattern="a.py",
+        ),
+        created_at=0.0,
+        future=MagicMock(),
+    )
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.set_busy(True)
+        app.run_worker(app.push_screen_wait(ApprovalModal(request)))
+        await pilot.pause()
+        composer = app.query_one("#composer")
+        composer.text = "do not queue this"
+        app.action_submit()
+        await pilot.pause()
+        assert len(host.steer_queue) == 0
+        assert composer.text == "do not queue this"
+        host.handle_line.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tokens_slash_runs_while_busy(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.set_busy(True)
+        composer = app.query_one("#composer")
+        composer.text = "/tokens"
+        await pilot.press("enter")
+        for _ in range(40):
+            if host.handle_line.await_count:
+                break
+            await pilot.pause()
+        host.handle_line.assert_awaited_once_with("/tokens")
+        assert len(host.steer_queue) == 0
+
+
+@pytest.mark.asyncio
+async def test_undo_slash_is_blocked_while_busy(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.set_busy(True)
+        composer = app.query_one("#composer")
+        composer.text = "/undo"
+        await pilot.press("enter")
+        await pilot.pause()
+        host.handle_line.assert_not_awaited()
+        assert "blocked" in _log_text(app.query_one("#conversation"))
+        assert len(host.steer_queue) == 0

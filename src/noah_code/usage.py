@@ -19,6 +19,8 @@ class UsageSnapshot:
     cost_usd: float
     llm_seconds: float
     tool_output_chars: int
+    prefix_calls: int = 0
+    prefix_append_only: int = 0
 
     @property
     def uncached_tokens(self) -> int:
@@ -27,6 +29,12 @@ class UsageSnapshot:
     @property
     def cache_hit_ratio(self) -> float:
         return self.cached_tokens / self.prompt_tokens if self.prompt_tokens else 0.0
+
+    @property
+    def prefix_stability_ratio(self) -> float:
+        """Share of consecutive LLM calls whose request prefix was append-only."""
+
+        return self.prefix_append_only / self.prefix_calls if self.prefix_calls else 0.0
 
     @property
     def average_llm_seconds(self) -> float:
@@ -44,6 +52,8 @@ class UsageSnapshot:
                 f"  reasoning tokens  {self.reasoning_tokens:,}",
                 f"  model wait        {self.llm_seconds:.2f}s ({self.average_llm_seconds:.2f}s/call)",
                 f"  tool output       {self.tool_output_chars:,} chars",
+                f"  prefix stability  {self.prefix_append_only}/{self.prefix_calls}"
+                f" ({self.prefix_stability_ratio:.0%})",
                 f"  estimated cost    ${self.cost_usd:.6f}",
             ]
         )
@@ -62,6 +72,9 @@ class UsageTracker:
         self._cost = 0.0
         self._seconds = 0.0
         self._tool_chars = 0
+        self._prefix_calls = 0
+        self._prefix_append_only = 0
+        self._last_serialization: str | None = None
 
     def llm_start(self, event: Any) -> None:
         key = (str(getattr(event, "generation_id", "")), int(getattr(event, "turn_number", 0)))
@@ -92,6 +105,26 @@ class UsageTracker:
         with self._lock:
             self._tool_chars += size
 
+    def observe_prefix(self, messages: Any) -> None:
+        """Record whether this request's serialization extends the previous one.
+
+        Append-only growth is what provider prompt caches reward: the unchanged
+        head is a cache hit and only the tail is processed fresh.
+        """
+
+        try:
+            serialized = "\n\x1e\n".join(
+                str(getattr(message, "content", None) or message) for message in messages
+            )
+        except TypeError:
+            return
+        with self._lock:
+            self._prefix_calls += 1
+            previous = self._last_serialization
+            self._last_serialization = serialized
+            if previous is not None and serialized.startswith(previous):
+                self._prefix_append_only += 1
+
     def snapshot(self) -> UsageSnapshot:
         with self._lock:
             return UsageSnapshot(
@@ -104,4 +137,6 @@ class UsageTracker:
                 cost_usd=self._cost,
                 llm_seconds=self._seconds,
                 tool_output_chars=self._tool_chars,
+                prefix_calls=self._prefix_calls,
+                prefix_append_only=self._prefix_append_only,
             )

@@ -76,18 +76,9 @@ class BudgetGuard:
         ):
             return f"time limit exceeded ({self.elapsed_seconds():.1f}s > {self._config.max_seconds:g}s)"
         if self._config.max_tokens is not None and self.total_tokens > self._config.max_tokens:
-            return (
-                f"token limit exceeded ({self.total_tokens:,} > "
-                f"{self._config.max_tokens:,})"
-            )
-        if (
-            self._config.max_cost_usd is not None
-            and self._cost_usd > self._config.max_cost_usd
-        ):
-            return (
-                f"cost limit exceeded (${self._cost_usd:.4f} > "
-                f"${self._config.max_cost_usd:.4f})"
-            )
+            return f"token limit exceeded ({self.total_tokens:,} > {self._config.max_tokens:,})"
+        if self._config.max_cost_usd is not None and self._cost_usd > self._config.max_cost_usd:
+            return f"cost limit exceeded (${self._cost_usd:.4f} > ${self._config.max_cost_usd:.4f})"
         return None
 
     def status(self) -> dict[str, Any]:
@@ -116,9 +107,10 @@ def _usage_from_response(response: Any) -> tuple[int, int]:
 class BudgetedLLM:
     """Transparent UnifiedLLM wrapper enforcing caps around every model call."""
 
-    def __init__(self, inner: Any, guard: BudgetGuard) -> None:
+    def __init__(self, inner: Any, guard: BudgetGuard, *, prefix_observer: Any = None) -> None:
         self._inner = inner
         self._guard = guard
+        self._prefix_observer = prefix_observer
 
     @property
     def model(self) -> Any:
@@ -128,9 +120,16 @@ class BudgetedLLM:
     def context_window(self) -> Any:
         return getattr(self._inner, "context_window", None)
 
+    def _observe_prefix(self, messages: list[dict]) -> None:
+        if self._prefix_observer is not None:
+            self._prefix_observer.observe_prefix(messages)
+
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
         self._guard.enforce()
-        response = await self._inner.acall(messages, tools=tools, output_model=output_model, **kwargs)
+        self._observe_prefix(messages)
+        response = await self._inner.acall(
+            messages, tools=tools, output_model=output_model, **kwargs
+        )
         prompt, completion = _usage_from_response(response)
         self._guard.add_usage(prompt_tokens=prompt, completion_tokens=completion)
         self._guard.enforce()
@@ -138,6 +137,7 @@ class BudgetedLLM:
 
     def call(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
         self._guard.enforce()
+        self._observe_prefix(messages)
         response = self._inner.call(messages, tools=tools, output_model=output_model, **kwargs)
         prompt, completion = _usage_from_response(response)
         self._guard.add_usage(prompt_tokens=prompt, completion_tokens=completion)
@@ -158,10 +158,43 @@ class SharedBudgetLLM(BudgetedLLM):
     """Alias of :class:`BudgetedLLM`; several clients may share one guard."""
 
 
-def wrap_with_budget(client: Any, config: BudgetConfig) -> tuple[Any, BudgetGuard]:
-    """Return ``(client, guard)``; identity pair when no caps are configured."""
+def wrap_with_budget(
+    client: Any,
+    config: BudgetConfig,
+    *,
+    prefix_observer: Any = None,
+) -> tuple[Any, BudgetGuard]:
+    """Return ``(client, guard)``; identity pair when no caps are configured.
+
+    ``prefix_observer`` (a :class:`UsageTracker`) records request-prefix
+    stability for cache diagnostics even when no caps are active.
+    """
 
     guard = BudgetGuard(config)
-    if not guard.active:
+    if not guard.active and prefix_observer is None:
         return client, guard
-    return SharedBudgetLLM(client, guard), guard
+    if not guard.active:
+        return _PrefixObserverOnly(client, prefix_observer), guard
+    return SharedBudgetLLM(client, guard, prefix_observer=prefix_observer), guard
+
+
+class _PrefixObserverOnly:
+    """No budget caps; only observe request prefixes."""
+
+    def __init__(self, inner: Any, observer: Any) -> None:
+        self._inner = inner
+        self._observer = observer
+
+    async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
+        self._observer.observe_prefix(messages)
+        return await self._inner.acall(messages, tools=tools, output_model=output_model, **kwargs)
+
+    def call(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
+        self._observer.observe_prefix(messages)
+        return self._inner.call(messages, tools=tools, output_model=output_model, **kwargs)
+
+    def count_tokens(self, text: str) -> int:
+        return self._inner.count_tokens(text)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
