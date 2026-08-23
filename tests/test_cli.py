@@ -226,3 +226,31 @@ def test_worktree_cli_create_requires_git(tmp_path: Path, monkeypatch) -> None:
     result = CliRunner().invoke(cli_group, ["worktree", "create", "isol", "-C", str(tmp_path)])
     assert result.exit_code == 2
     assert "git repo" in result.output
+
+
+def test_pr_cli_list_and_create(tmp_path: Path, monkeypatch) -> None:
+    from noah_code.github import PullRequestInfo
+
+    class FakeManager:
+        def list(self):
+            return [PullRequestInfo(4, "Fix", "https://example.com/4")]
+
+        def create(self, title=None, body="", base=None):
+            return PullRequestInfo(5, title or "Fix", "https://example.com/5")
+
+        def checkout(self, number):
+            return f"pr/{number}"
+
+    monkeypatch.setattr("noah_code.cli._github_manager", lambda path=None: FakeManager())
+    runner = CliRunner()
+    listed = runner.invoke(cli_group, ["pr", "list", "-C", str(tmp_path)])
+    assert listed.exit_code == 0
+    assert "#4" in listed.output
+
+    created = runner.invoke(cli_group, ["pr", "create", "Ship it", "-C", str(tmp_path)])
+    assert created.exit_code == 0
+    assert created.output.startswith("#5\tShip it\t")
+
+    checked = runner.invoke(cli_group, ["pr", "checkout", "4", "-C", str(tmp_path)])
+    assert checked.exit_code == 0
+    assert "pr/4" in checked.output

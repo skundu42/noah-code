@@ -27,6 +27,7 @@ class PermissionCategory(StrEnum):
     WEBFETCH = "webfetch"
     WEBSEARCH = "websearch"
     QUESTION = "question"
+    GITHUB = "github"
 
 
 # Patterns that are always denied regardless of mode / auto.
@@ -40,6 +41,7 @@ _ALWAYS_DENY_BASH = tuple(
         r"\bgit\s+push\b",
         r"\bgit\s+clean\b",
         r"\bgit\s+reset\s+--hard\b",
+        r"\bgh\s+pr\s+(create|checkout|merge|close|ready|review)\b",
         r"\bgit\s+filter-branch\b",
         r"\bexport\s+-p\b",
         r"\bcat\s+.*\.pem\b",
@@ -391,6 +393,17 @@ class PermissionEngine:
                 reason="plan mode forbids file edits",
                 remember_pattern=target,
             )
+        if category == PermissionCategory.GITHUB:
+            operation = target.split(":", 1)[0].strip().lower()
+            if operation in {"create", "push", "checkout", "comment"}:
+                return PermissionDecision(
+                    category=category,
+                    target=target,
+                    action="deny",
+                    matching_rule=None,
+                    reason="plan mode forbids GitHub mutations",
+                    remember_pattern=target,
+                )
         if category == PermissionCategory.BASH:
             if not self.is_readonly_command(target):
                 return PermissionDecision(

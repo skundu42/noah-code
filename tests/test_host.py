@@ -1166,3 +1166,118 @@ async def test_worktree_create_fails_outside_git(tmp_path: Path) -> None:
     assert host.meta.session_id == first_id
     assert "git repo" in host.ui.render.call_args.args[0].text
     await host.close()
+
+
+@pytest.mark.asyncio
+async def test_pr_slash_lists_creates_and_checkouts(tmp_path: Path, monkeypatch) -> None:
+    from noah_code.github import PullRequestInfo
+
+    class FakeManager:
+        def list(self):
+            return [PullRequestInfo(12, "Add worktrees", "https://example.com/12")]
+
+        def view(self, number=None):
+            return f"PR #{number or 12}"
+
+        def create(self, title=None, body="", base=None):
+            return PullRequestInfo(13, title or "untitled", "https://example.com/13")
+
+        def checkout(self, number):
+            return f"pr/{number}"
+
+    monkeypatch.setattr(AgentHost, "github_manager", lambda self: FakeManager())
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(workspace.root, cli_overrides={"session_dir": str(tmp_path / "sessions")})
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+
+    assert await host.handle_line("/pr") == "handled"
+    assert "#12" in host.ui.render.call_args.args[0].text
+
+    assert await host.handle_line("/pr 12") == "handled"
+    assert "PR #12" in host.ui.render.call_args.args[0].text
+
+    assert await host.handle_line("/pr create Ship it") == "handled"
+    assert "created #13" in host.ui.render.call_args.args[0].text
+
+    assert await host.handle_line("/pr checkout 12") == "handled"
+    assert "pr/12" in host.ui.render.call_args.args[0].text
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_pr_slash_blocked_while_turn_running(tmp_path: Path, monkeypatch) -> None:
+    host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+    host.ui.render = MagicMock()
+    host.create_pull_request = AsyncMock(side_effect=AssertionError("must not create"))
+
+    async def forever() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(forever())
+    host._active_turn = task
+    try:
+        action = await host.handle_line("/pr create Ship it")
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert action == "handled"
+    host.create_pull_request.assert_not_awaited()
+    assert "blocked" in host.ui.render.call_args.args[0].text
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_plan_and_memory_slash_round_trip(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(workspace.root, cli_overrides={"session_dir": str(tmp_path / "sessions")})
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+
+    assert await host.handle_line("/plan") == "handled"
+    assert "no active plan" in host.ui.render.call_args.args[0].text
+
+    notes = tmp_path / ".noah-code"
+    notes.mkdir(exist_ok=True)
+    (notes / "plan.md").write_text("- implement handoff\n")
+    host.agent.refresh_context_sources()
+    assert "|plan" in host.status_prompt()
+    assert await host.handle_line("/plan") == "handled"
+    assert "implement handoff" in host.ui.render.call_args.args[0].text
+
+    assert await host.handle_line("/memory save Use uv for installs") == "handled"
+    assert "Use uv" in (tmp_path / ".noah-code" / "memory.md").read_text()
+    assert await host.handle_line("/memory") == "handled"
+    assert "Use uv" in host.ui.render.call_args.args[0].text
+
+    assert await host.handle_line("/plan clear") == "handled"
+    assert "|plan" not in host.status_prompt()
+    assert await host.handle_line("/memory clear") == "handled"
+    assert not (tmp_path / ".noah-code" / "memory.md").exists()
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_plan_slash_blocked_while_turn_running(tmp_path: Path, monkeypatch) -> None:
+    host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+    host.ui.render = MagicMock()
+
+    async def forever() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(forever())
+    host._active_turn = task
+    try:
+        action = await host.handle_line("/plan clear")
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert action == "handled"
+    assert "blocked" in host.ui.render.call_args.args[0].text
+    await host.close()

@@ -53,7 +53,7 @@ Approval and `ask.question` modals keep the composer. Queueing resumes after the
 These slash commands still run while a turn is in progress: `/status`, `/tokens`, `/todos`,
 `/help`, `/trace`. `/attach PATH` remembers the file for the next queued follow-up. `/exit` cancels
 the turn (and the queue) then leaves. Mutating commands wait until the turn finishes, including
-`/undo`, `/redo`, `/mode`, `/model`, `/diff`, `/new`, `/sessions`, `/worktree`, and `/compact`.
+`/undo`, `/redo`, `/mode`, `/model`, `/diff`, `/new`, `/sessions`, `/worktree`, `/pr`, `/plan`, `/memory`, and `/compact`.
 
 Tool and shell output is batched into a live execution panel instead of forcing one full-screen
 redraw for every chunk. While a turn is running, a spinner names the current action the way
@@ -78,6 +78,9 @@ latest 100 activity records, bounded by the configured `max_output_chars` per ac
 | `/providers [use PROVIDER MODEL]` | Search and securely configure API providers |
 | `/session`, `/sessions`, `/new`, `/continue` | Inspect, switch, create, and resume sessions. `/sessions` lists the whole git-repo family (primary checkout plus isolated copies) |
 | `/worktree` | Opt-in isolation: create a linked git worktree and start a new session there. Subcommands: `create [NAME]`, `list`, `remove NAME`. `/new` stays on the current directory. CLI: `noah worktree create` prints a path and does not start a session |
+| `/pr` | First-class GitHub pull-request loop. Subcommands: `list`, `view [N]`, `create [TITLE]`, `push`, `checkout N`, `comment N TEXT`. `/pr 12` views PR 12. Create pushes HEAD through the host (never via bash) then opens the PR. CLI: `noah pr` |
+| `/plan` | Show the pinned `.noah-code/plan.md`. `/plan clear` dismisses it. In plan mode the agent writes this file with `self.plan.write`, then `self.plan.exit_to_build` asks to switch to build and follow it |
+| `/memory` | Show project conventions in `.noah-code/memory.md`. `/memory save FACT`, `/memory forget TEXT`, `/memory clear`. The agent can `self.memory.save`; successful turns may auto-extract tagged conventions |
 | `/compact` | Apply a coding checkpoint to eligible older context |
 | `/tokens` | Show tokens, cache hits, cost, model wait, and tool-output volume |
 | `/efficiency [fast|balanced|deep]` | Show or switch live tool-output budgets |
@@ -118,6 +121,12 @@ noah sessions delete SESSION_ID
 noah worktree create [NAME]
 noah worktree list
 noah worktree remove NAME
+noah pr list
+noah pr view [N]
+noah pr create [TITLE]
+noah pr push
+noah pr checkout N
+noah pr comment N TEXT
 ```
 
 Each session has a NOOA-backed SQLite database plus metadata for its workspace identity, model,

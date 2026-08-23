@@ -122,6 +122,8 @@ def test_destructive_and_env_dump_denied() -> None:
     assert engine.decide("bash", "git push origin main").action == "deny"
     assert engine.decide("bash", "git clean -fd").action == "deny"
     assert engine.decide("bash", "git -c core.pager=cat push origin main").action == "deny"
+    assert engine.decide("bash", "gh pr create --title x").action == "deny"
+    assert engine.decide("bash", "gh pr checkout 12").action == "deny"
 
 
 def test_read_commands_are_not_implicitly_allowed_outside_workspace() -> None:
@@ -196,6 +198,10 @@ def test_web_and_question_defaults() -> None:
     assert engine.decide("websearch", "asyncio").action == "ask"
     assert engine.decide("question", "Approach").action == "allow"
     assert engine.decide("task", "explore").action == "ask"
+    assert engine.decide("github", "list").action == "allow"
+    assert engine.decide("github", "view").action == "allow"
+    assert engine.decide("github", "create").action == "ask"
+    assert engine.decide("github", "push").action == "ask"
 
 
 def test_plan_mode_allows_questions_and_web_asks() -> None:
@@ -203,6 +209,8 @@ def test_plan_mode_allows_questions_and_web_asks() -> None:
     assert engine.decide("question", "Approach").action == "allow"
     assert engine.decide("webfetch", "https://example.com").action == "ask"
     assert engine.decide("edit", "a.py").action == "deny"
+    assert engine.decide("github", "list").action == "allow"
+    assert engine.decide("github", "create").action == "deny"
 
 
 def test_permission_pattern_does_not_match_foreign_basenames() -> None:

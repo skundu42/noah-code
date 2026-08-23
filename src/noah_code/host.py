@@ -236,6 +236,7 @@ class AgentHost:
         self.meta = session_meta
         self._exit_requested = False
         self._title_task: asyncio.Task[Any] | None = None
+        self._memory_task: asyncio.Task[Any] | None = None
         self._budget_guard: Any = None
         self._llm_cache: Any = None
         self._hooks: Any = None
@@ -631,7 +632,13 @@ class AgentHost:
         worktree = ""
         if self.meta and self.meta.worktree_name:
             worktree = f"|wt:{self.meta.worktree_name}"
-        return f"noah [{mode}|{model}|r:{effort_label}|{sid}{title}{worktree}]{suffix}"
+        plan = ""
+        if self._agent is not None:
+            from noah_code.project_notes import PlanStore
+
+            if PlanStore(self.workspace.root).exists():
+                plan = "|plan"
+        return f"noah [{mode}|{model}|r:{effort_label}|{sid}{title}{worktree}{plan}]{suffix}"
 
     def usage_snapshot(self) -> UsageSnapshot:
         return self._usage.snapshot()
@@ -708,7 +715,7 @@ class AgentHost:
             self.workspace = workspace
         self._pending_worktree_name = worktree_name
         self._teardown_event_bridge()
-        self._cancel_title_task()
+        self._cancel_background_tasks()
         if self._agent is not None:
             with contextlib.suppress(Exception):
                 await self._agent.close_tools()
@@ -727,7 +734,7 @@ class AgentHost:
         self._clear_steer_state()
         await self._persist_async()
         self._teardown_event_bridge()
-        self._cancel_title_task()
+        self._cancel_background_tasks()
         if self._agent is not None:
             with contextlib.suppress(Exception):
                 await self._agent.close_tools()
@@ -822,6 +829,162 @@ class AgentHost:
                 HostEventKind.ERROR,
                 "usage: /worktree [create [NAME]|list|remove NAME]",
             )
+        )
+        return "handled"
+
+    def github_manager(self) -> Any:
+        from noah_code.github import GithubManager
+
+        return GithubManager(self.workspace.root)
+
+    async def create_pull_request(
+        self,
+        title: str | None = None,
+        body: str = "",
+        base: str | None = None,
+    ) -> Any:
+        self._require_idle_turn()
+        return await asyncio.to_thread(self.github_manager().create, title, body, base)
+
+    async def push_pull_request_branch(self) -> str:
+        self._require_idle_turn()
+        return await asyncio.to_thread(self.github_manager().push)
+
+    async def checkout_pull_request(self, number: int) -> str:
+        self._require_idle_turn()
+        return await asyncio.to_thread(self.github_manager().checkout, number)
+
+    async def _handle_pr(self, args: str) -> Literal["handled"]:
+        from noah_code.github import GithubError
+
+        parts = shlex.split(args) if args.strip() else []
+        if not parts:
+            action, rest = "list", []
+        elif parts[0].isdigit():
+            action, rest = "view", parts[:1]
+        else:
+            action, rest = parts[0], parts[1:]
+        try:
+            if action == "list":
+                rows = await asyncio.to_thread(self.github_manager().list)
+                text = "\n".join(item.format_row() for item in rows) or "(none)"
+                self.ui.render(_command_output(text))
+                return "handled"
+            if action == "view":
+                number = int(rest[0]) if rest else None
+                text = await asyncio.to_thread(self.github_manager().view, number)
+                self.ui.render(_command_output(text or "(none)"))
+                return "handled"
+            if action == "create":
+                title = " ".join(rest) or None
+                info = await self.create_pull_request(title)
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.STATUS,
+                        f"created #{info.number}  {info.title}  {info.url}",
+                    )
+                )
+                return "handled"
+            if action == "push":
+                text = await self.push_pull_request_branch()
+                self.ui.render(HostEvent(HostEventKind.STATUS, text))
+                return "handled"
+            if action == "checkout":
+                if not rest or not rest[0].isdigit():
+                    self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /pr checkout N"))
+                    return "handled"
+                branch = await self.checkout_pull_request(int(rest[0]))
+                self.ui.render(
+                    HostEvent(HostEventKind.STATUS, f"checked out #{rest[0]} as {branch}")
+                )
+                return "handled"
+            if action == "comment":
+                if len(rest) < 2 or not rest[0].isdigit():
+                    self.ui.render(
+                        HostEvent(HostEventKind.ERROR, "usage: /pr comment N TEXT")
+                    )
+                    return "handled"
+                text = await asyncio.to_thread(
+                    self.github_manager().comment, int(rest[0]), " ".join(rest[1:])
+                )
+                self.ui.render(HostEvent(HostEventKind.STATUS, text))
+                return "handled"
+        except (GithubError, RuntimeError, OSError, ValueError) as exc:
+            self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
+            return "handled"
+        self.ui.render(
+            HostEvent(
+                HostEventKind.ERROR,
+                "usage: /pr [list|view [N]|create [TITLE]|push|checkout N|comment N TEXT]",
+            )
+        )
+        return "handled"
+
+    async def _handle_plan(self, args: str) -> Literal["handled"]:
+        from noah_code.project_notes import PlanStore
+
+        store = PlanStore(self.workspace.root)
+        verb = args.strip().split(None, 1)[0].lower() if args.strip() else "show"
+        if verb in {"show", "read"}:
+            self.ui.render(_command_output(store.read().strip() or "(no active plan)"))
+            return "handled"
+        if verb == "clear":
+            store.clear()
+            if self._agent is not None:
+                self.agent.refresh_context_sources()
+            self.ui.render(HostEvent(HostEventKind.STATUS, "plan cleared"))
+            self.ui.set_status(self.status_prompt())
+            return "handled"
+        self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /plan [clear]"))
+        return "handled"
+
+    async def _handle_memory(self, args: str) -> Literal["handled"]:
+        from noah_code.project_notes import MemoryStore, parse_memory_facts
+
+        store = MemoryStore(self.workspace.root)
+        parts = args.split(None, 1)
+        verb = parts[0].lower() if parts and parts[0] else "show"
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if verb in {"show", "list", "read"}:
+            self.ui.render(_command_output(store.read().strip() or "(no project memory yet)"))
+            return "handled"
+        if verb == "save":
+            facts = parse_memory_facts(f"- {rest}" if rest else "")
+            if not facts:
+                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /memory save FACT"))
+                return "handled"
+            added = store.merge(facts)
+            if self._agent is not None:
+                self.agent.refresh_context_sources()
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    f"remembered {added[0]}" if added else "already remembered",
+                )
+            )
+            return "handled"
+        if verb == "forget":
+            if not rest:
+                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /memory forget TEXT"))
+                return "handled"
+            forgotten = store.forget(rest)
+            if self._agent is not None:
+                self.agent.refresh_context_sources()
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    f"forgot {rest}" if forgotten else "no matching memory",
+                )
+            )
+            return "handled"
+        if verb == "clear":
+            store.clear()
+            if self._agent is not None:
+                self.agent.refresh_context_sources()
+            self.ui.render(HostEvent(HostEventKind.STATUS, "memory cleared"))
+            return "handled"
+        self.ui.render(
+            HostEvent(HostEventKind.ERROR, "usage: /memory [save FACT|forget TEXT|clear]")
         )
         return "handled"
 
@@ -1166,6 +1329,12 @@ class AgentHost:
             return "handled"
         if name == "worktree":
             return await self._handle_worktree(args)
+        if name == "pr":
+            return await self._handle_pr(args)
+        if name == "plan":
+            return await self._handle_plan(args)
+        if name == "memory":
+            return await self._handle_memory(args)
         if name == "skills":
             skills = getattr(agent, "skills", None)
             if skills is None:
@@ -1705,6 +1874,8 @@ class AgentHost:
                 await self._persist_async()
                 label = " ".join(text.split())[:80] or "turn"
                 await self._capture_checkpoint(label)
+                if exit_code == 0:
+                    self._memory_task = asyncio.create_task(self._maybe_remember(text))
         return HostResult(
             exit_code=exit_code,
             explanation=explanation,
@@ -1729,6 +1900,47 @@ class AgentHost:
         if self._title_task is not None and not self._title_task.done():
             self._title_task.cancel()
         self._title_task = None
+
+    def _cancel_memory_task(self) -> None:
+        if self._memory_task is not None and not self._memory_task.done():
+            self._memory_task.cancel()
+        self._memory_task = None
+
+    def _cancel_background_tasks(self) -> None:
+        self._cancel_title_task()
+        self._cancel_memory_task()
+
+    def _can_distill_memories(self) -> bool:
+        if self._agent is None:
+            return False
+        llm: Any = self.agent._lightweight_llm
+        seen: set[int] = set()
+        while hasattr(llm, "_inner") and id(llm) not in seen:
+            seen.add(id(llm))
+            llm = llm._inner
+        return type(llm).__name__ != "FakeLLMClient"
+
+    async def _maybe_remember(self, text: str) -> None:
+        if len(text.strip()) < 40 or not self._can_distill_memories():
+            return
+        session_id = self.meta.session_id if self.meta else None
+        try:
+            raw = await self.agent.distill_memories(text[:4000])
+            added = self.agent.absorb_memories(raw or "")
+        except Exception:  # noqa: BLE001 - never fail the main task
+            logger.debug("memory distillation failed", exc_info=True)
+            return
+        if session_id and (self.meta is None or self.meta.session_id != session_id):
+            return
+        if not added:
+            return
+        self.agent.refresh_context_sources()
+        self.ui.render(
+            HostEvent(
+                HostEventKind.STATUS,
+                f"remembered {len(added)} project convention(s)",
+            )
+        )
 
     def _set_session_title(self, title: str) -> None:
         selected = (title or "").strip().strip('"')[:60]

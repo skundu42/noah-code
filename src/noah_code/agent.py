@@ -30,8 +30,11 @@ from noah_code.macos_sandbox import build_macos_profile, macos_worker_main
 from noah_code.permissions import PermissionEngine
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tools.git_tools import GitTools
+from noah_code.tools.github_tools import GithubTools
 from noah_code.tools.lsp_tools import LSPTools
 from noah_code.tools.media_tools import MediaTools
+from noah_code.tools.memory_tools import MemoryTools
+from noah_code.tools.plan_tools import PlanTools
 from noah_code.tools.process_tools import ProcessTools
 from noah_code.tools.question_tools import QuestionTools
 from noah_code.tools.task_tools import TaskTools
@@ -93,6 +96,19 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("git", "diff"),
             ("git", "log"),
             ("git", "status"),
+            ("github", "list"),
+            ("github", "view"),
+            ("github", "create"),
+            ("github", "push"),
+            ("github", "checkout"),
+            ("github", "comment"),
+            ("plan", "read"),
+            ("plan", "write"),
+            ("plan", "enter"),
+            ("plan", "exit_to_build"),
+            ("memory", "list"),
+            ("memory", "save"),
+            ("memory", "forget"),
             ("message",),
             ("mode",),
             ("workspace_root",),
@@ -228,6 +244,8 @@ def _cache_first_block_order(base: list[str] | None) -> list[str]:
         "agents",
         "subagent",
         "workspace",
+        "active_plan",
+        "project_memory",
     ]
 
 
@@ -382,8 +400,16 @@ class CodingAgent(InteractiveAgent):
         )
         self.todos = TodoManager()
         self.git = GitTools(self.ws)
+        self.github = GithubTools(workspace.root, self._engine, self._approvals)
         self.web = WebTools(self._engine, self._approvals)
         self.ask = QuestionTools(self._engine, self._approvals)
+        self.plan = PlanTools(workspace.root, self, self.ask, self._engine, self._approvals)
+        self.memory = MemoryTools(
+            workspace.root,
+            self._engine,
+            self._approvals,
+            on_change=self.refresh_context_sources,
+        )
         self.media = MediaTools()
         self._sandbox_approved_roots: set[str] = set()
         if not nested:
@@ -439,6 +465,10 @@ class CodingAgent(InteractiveAgent):
             self._repo_instructions_value,
             prefix=True,
         )
+        self._active_plan_value = self._active_plan()
+        self.context["active_plan"] = Context(self._active_plan_value, prefix=True)
+        self._project_memory_value = self._project_memory()
+        self.context["project_memory"] = Context(self._project_memory_value, prefix=True)
 
     @hidden
     def refresh_context_sources(self) -> None:
@@ -449,6 +479,14 @@ class CodingAgent(InteractiveAgent):
         if current != self._repo_instructions_value:
             self._repo_instructions_value = current
             self.context["repo_instructions"] = Context(current, prefix=True)
+        plan = self._active_plan()
+        if plan != getattr(self, "_active_plan_value", None):
+            self._active_plan_value = plan
+            self.context["active_plan"] = Context(plan, prefix=True)
+        memory = self._project_memory()
+        if memory != getattr(self, "_project_memory_value", None):
+            self._project_memory_value = memory
+            self.context["project_memory"] = Context(memory, prefix=True)
 
     @hidden
     def inject_status_snapshot(self, *, force: bool = False) -> bool:
@@ -599,6 +637,52 @@ class CodingAgent(InteractiveAgent):
         return "\n\n".join(chunks) if chunks else "(no repository instruction files found)"
 
     @hidden
+    def _active_plan(self) -> str:
+        from noah_code.project_notes import PlanStore
+
+        text = PlanStore(Path(self.workspace_root)).read().strip()
+        if not text:
+            return "(no active plan)"
+        if len(text) > 4000:
+            text = text[:4000] + "\n...(truncated)..."
+        return f"## Active plan (.noah-code/plan.md)\n{text}\n\nFollow this plan in build mode. Do not expand scope."
+
+    @hidden
+    def _project_memory(self) -> str:
+        from noah_code.project_notes import MemoryStore
+
+        text = MemoryStore(Path(self.workspace_root)).read().strip()
+        if not text:
+            return "(no project memory yet)"
+        if len(text) > 4000:
+            text = text[:4000] + "\n...(truncated)..."
+        return f"## Project memory (.noah-code/memory.md)\n{text}"
+
+    @hidden
+    def absorb_memories(self, raw: str) -> list[str]:
+        from noah_code.project_notes import MemoryStore, parse_distilled_memories
+
+        return MemoryStore(Path(self.workspace_root)).merge(parse_distilled_memories(raw))
+
+    @hidden
+    @strategy(
+        PredictStrategy(PredictConfig(output_serialization="tool_call")),
+        llm=lambda agent: agent._lightweight_llm,
+    )
+    async def distill_memories(self, turn: str) -> str:
+        """Extract standing project conventions from this turn.
+
+        Turn begins: {turn}
+
+        Return EMPTY if nothing should persist across sessions.
+        Otherwise return one MEMORY: line per standing convention such as
+        package manager, forbidden paths, or PR title style.
+        Never include secrets, task status, or one-off bugs. At most 8 lines.
+        """
+
+        ...
+
+    @hidden
     @property
     def engine(self) -> PermissionEngine:
         return self._engine
@@ -651,7 +735,16 @@ class CodingAgent(InteractiveAgent):
           ``result.returncode``, ``result.stdout``, and ``result.stderr``.
         - ``await self.web.fetch(url)`` reads a page; ``await self.web.search(query)``
           searches the public web. Both ask for approval by default.
+        - ``await self.github.list()`` / ``view(number)`` inspect pull requests.
+        - ``await self.github.create(title, body)`` pushes HEAD and opens a PR.
+        - ``await self.github.push()`` updates the remote branch.
+        - ``await self.github.checkout(number)`` checks out ``pr/<number>``.
+        - ``await self.github.comment(number, text)`` comments on a PR.
         - ``await self.ask.question(header, prompt, options)`` pauses for a user choice.
+        - ``await self.plan.write(markdown)`` pins ``.noah-code/plan.md`` (allowed in plan mode).
+        - ``await self.plan.exit_to_build()`` asks to switch to build after a plan exists.
+        - ``await self.plan.enter()`` asks to switch to plan mode. Do not call ``set_mode``.
+        - ``await self.memory.save(fact)`` remembers a standing project convention.
         - ``await self.task.run("explore", "...")`` or ``"general"`` runs a nested
           NOOA subagent with isolated history; results arrive condensed. Use
           ``await self.task.run_many([("explore", "..."), ...])`` to fan out
@@ -671,9 +764,12 @@ class CodingAgent(InteractiveAgent):
         - Run validation proportional to risk (focused tests, not entire suites).
         - Never claim a command or test passed unless its successful result was observed.
         - Report blockers concretely via ``self.message(...)``.
-        - In plan mode (see ``self.mode``), do not modify files or run mutating commands;
-          return an evidence-based plan with file references.
+        - In plan mode (see ``self.mode``), do not modify files or run mutating commands.
+          Write the checklist with ``self.plan.write`` then ``self.plan.exit_to_build``.
+        - If an active plan is loaded, implement that plan; do not expand scope.
         - Do not commit, push, publish, or create external resources unless explicitly asked.
+          When asked to open or update a pull request, use ``self.github`` — never ``git push``
+          or mutating ``gh pr`` through the shell.
         - Do not read secrets or expose sensitive environment values.
 
         Return exactly one valid RespondResult:

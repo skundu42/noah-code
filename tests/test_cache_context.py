@@ -116,9 +116,31 @@ def test_all_strategy_levels_order_blocks_cache_first(strategy_cls) -> None:
 
     base_tail = order.index("self") if "self" in order else -1
     assert base_tail >= 0
-    for stable_key in ("repo_instructions", "agents", "workspace"):
+    for stable_key in (
+        "repo_instructions",
+        "agents",
+        "workspace",
+        "active_plan",
+        "project_memory",
+    ):
         assert stable_key in order
         assert order.index(stable_key) > base_tail
+
+
+def test_plan_and_memory_refresh_into_prefix_context(tmp_path: Path) -> None:
+    agent = _agent(tmp_path)
+    assert "(no active plan)" in str(agent.context["active_plan"])
+    notes = tmp_path / ".noah-code"
+    notes.mkdir()
+    (notes / "plan.md").write_text("- implement handoff\n")
+    (notes / "memory.md").write_text("- Use uv\n")
+    agent.refresh_context_sources()
+    assert "implement handoff" in str(agent.context["active_plan"])
+    assert "Use uv" in str(agent.context["project_memory"])
+    added = agent.absorb_memories("MEMORY: Prefer conventional PR titles")
+    assert added == ["Prefer conventional PR titles"]
+    agent.refresh_context_sources()
+    assert "conventional PR titles" in str(agent.context["project_memory"])
 
 
 def test_volatile_blocks_are_not_registered_in_system_prompt(tmp_path: Path) -> None:

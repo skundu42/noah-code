@@ -328,6 +328,7 @@ def parse_rule_spec(spec: str, action: str) -> tuple[str, str, str]:
         "webfetch",
         "websearch",
         "question",
+        "github",
     }
     if category not in valid_categories | {"*"}:
         raise ValueError(f"unknown permission category in {spec!r}")

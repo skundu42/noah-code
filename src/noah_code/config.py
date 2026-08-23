@@ -273,6 +273,24 @@ DEFAULT_PERMISSION_RULES: list[PermissionRule] = [
         action="allow",
         reason="asking the user is allowed",
     ),
+    PermissionRule(
+        category="github",
+        pattern="*",
+        action="ask",
+        reason="GitHub mutations require approval",
+    ),
+    PermissionRule(
+        category="github",
+        pattern="list",
+        action="allow",
+        reason="listing pull requests is read-only",
+    ),
+    PermissionRule(
+        category="github",
+        pattern="view",
+        action="allow",
+        reason="viewing a pull request is read-only",
+    ),
 ]
 
 

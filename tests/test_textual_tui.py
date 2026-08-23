@@ -597,13 +597,13 @@ async def test_slash_suggestion_selection_remains_visible_after_first_page(
         await pilot.pause()
 
         rendered = _rendered_text(suggestions.content)
-        assert "1–5 of 28" in rendered
+        assert "1–5 of 31" in rendered
         assert "› /help" in rendered
 
         await pilot.press("down", "down", "down", "down", "down")
         rendered = _rendered_text(suggestions.content)
 
-        assert "2–6 of 28" in rendered
+        assert "2–6 of 31" in rendered
         assert "› /reasoning" in rendered
         assert "/help" not in rendered
 

@@ -1593,8 +1593,17 @@ class NoahCodeApp(App[None]):
                 if isinstance(candidate, list):
                     todos = candidate
         text.append("\n\nPLAN\n", style=f"bold {palette.accent}")
+        plan_text = ""
+        with contextlib.suppress(Exception):
+            from noah_code.project_notes import PlanStore
+
+            plan_text = PlanStore(self.host.workspace.root).read().strip()
+        if plan_text:
+            first = plan_text.lstrip("# ").splitlines()[0].strip()[:40]
+            text.append(f"pinned · {first}\n", style=palette.text)
         if not todos:
-            text.append("No active plan", style=palette.muted)
+            if not plan_text:
+                text.append("No active plan", style=palette.muted)
             return text
         done = sum(1 for todo in todos if getattr(todo, "status", "") == "done")
         text.append(f"{done}/{len(todos)} complete\n", style=palette.muted)
@@ -1937,6 +1946,26 @@ class NoahCodeApp(App[None]):
                 for item in mode_options
                 if item.invocation.rsplit(" ", 1)[-1].startswith(mode_query)
             ]
+        if raw_lowered.startswith("/plan "):
+            plan_query = raw_lowered.removeprefix("/plan ").strip()
+            plan_options = [
+                CommandSuggestion("/plan", "Show the pinned plan"),
+                CommandSuggestion("/plan clear", "Clear the pinned plan"),
+            ]
+            if not plan_query:
+                return plan_options
+            return [item for item in plan_options if plan_query in item.invocation]
+        if raw_lowered.startswith("/memory "):
+            memory_query = raw_lowered.removeprefix("/memory ").strip()
+            memory_options = [
+                CommandSuggestion("/memory", "Show project memory"),
+                CommandSuggestion("/memory save ", "Remember a convention"),
+                CommandSuggestion("/memory forget ", "Drop a convention"),
+                CommandSuggestion("/memory clear", "Clear project memory"),
+            ]
+            if not memory_query:
+                return memory_options
+            return [item for item in memory_options if memory_query in item.invocation]
         if raw_lowered.startswith("/theme "):
             theme_query = raw_lowered.removeprefix("/theme ").strip()
             theme_options = [

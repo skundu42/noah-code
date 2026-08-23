@@ -40,6 +40,7 @@ SUBCOMMANDS = frozenset(
         "checkpoints",
         "sessions",
         "worktree",
+        "pr",
         "doctor",
         "config",
         "providers",
@@ -615,6 +616,108 @@ def worktree_remove(name: str, path: str | None) -> None:
     click.echo(f"removed {info.name}")
 
 
+def _github_manager(path: str | None):
+    from noah_code.github import GithubManager
+
+    workspace = open_workspace(path)
+    return GithubManager(workspace.root)
+
+
+@cli_group.group("pr")
+def pr_group() -> None:
+    """List, view, create, push, checkout, or comment on GitHub pull requests."""
+
+
+@pr_group.command("list")
+@click.option("-C", "--path", "path", type=click.Path(), default=None)
+def pr_list(path: str | None) -> None:
+    from noah_code.github import GithubError
+
+    try:
+        rows = _github_manager(path).list()
+    except (WorkspaceError, GithubError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    if not rows:
+        click.echo("(none)")
+        return
+    for item in rows:
+        click.echo(item.format_row())
+
+
+@pr_group.command("view")
+@click.argument("number", required=False, type=int)
+@click.option("-C", "--path", "path", type=click.Path(), default=None)
+def pr_view(number: int | None, path: str | None) -> None:
+    from noah_code.github import GithubError
+
+    try:
+        click.echo(_github_manager(path).view(number))
+    except (WorkspaceError, GithubError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+
+
+@pr_group.command("create")
+@click.argument("title", required=False)
+@click.option("--body", default="", help="Pull request body")
+@click.option("--base", default=None, help="Base branch")
+@click.option("-C", "--path", "path", type=click.Path(), default=None)
+def pr_create(title: str | None, body: str, base: str | None, path: str | None) -> None:
+    """Push HEAD and open a pull request. Does not start a session."""
+
+    from noah_code.github import GithubError
+
+    try:
+        info = _github_manager(path).create(title, body, base)
+    except (WorkspaceError, GithubError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    click.echo(f"#{info.number}\t{info.title}\t{info.url}")
+
+
+@pr_group.command("push")
+@click.option("-C", "--path", "path", type=click.Path(), default=None)
+def pr_push(path: str | None) -> None:
+    from noah_code.github import GithubError
+
+    try:
+        click.echo(_github_manager(path).push())
+    except (WorkspaceError, GithubError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+
+
+@pr_group.command("checkout")
+@click.argument("number", type=int)
+@click.option("-C", "--path", "path", type=click.Path(), default=None)
+def pr_checkout(number: int, path: str | None) -> None:
+    """Fetch a pull request as pr/N. Does not start a session."""
+
+    from noah_code.github import GithubError
+
+    try:
+        branch = _github_manager(path).checkout(number)
+    except (WorkspaceError, GithubError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    click.echo(f"checked out #{number} as {branch}")
+
+
+@pr_group.command("comment")
+@click.argument("number", type=int)
+@click.argument("body")
+@click.option("-C", "--path", "path", type=click.Path(), default=None)
+def pr_comment(number: int, body: str, path: str | None) -> None:
+    from noah_code.github import GithubError
+
+    try:
+        click.echo(_github_manager(path).comment(number, body))
+    except (WorkspaceError, GithubError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+
+
 @cli_group.command("benchmark")
 @click.argument("path", required=False, type=click.Path())
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
@@ -852,6 +955,13 @@ def doctor(path: str | None) -> None:
     except ImportError as exc:
         click.echo(f"textual: FAIL ({exc})", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
+    try:
+        from noah_code.github import GithubError, GithubManager
+
+        GithubManager(workspace.root).check()
+        click.echo("github: gh authenticated")
+    except GithubError as exc:
+        click.echo(f"github: {exc}")
     click.echo("doctor: ok")
 
 
