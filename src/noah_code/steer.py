@@ -11,22 +11,6 @@ from typing import Any
 STEER_QUEUE_CAP = 5
 
 SAFE_SLASH_WHILE_BUSY = frozenset({"status", "tokens", "todos", "help", "trace"})
-BLOCKED_SLASH_WHILE_BUSY = frozenset(
-            {
-                "undo",
-                "redo",
-                "mode",
-                "model",
-                "diff",
-                "new",
-                "sessions",
-                "compact",
-                "worktree",
-                "pr",
-                "plan",
-                "memory",
-            }
-)
 
 
 @dataclass(frozen=True)

@@ -272,13 +272,6 @@ def help_text(custom: dict[str, CustomCommand] | None = None) -> str:
     return "\n".join(lines)
 
 
-def all_command_names(custom: dict[str, CustomCommand] | None = None) -> list[str]:
-    names = [f"/{c.name}" for c in BUILTIN_COMMANDS]
-    if custom:
-        names.extend(f"/{n}" for n in sorted(custom))
-    return names
-
-
 def parse_slash(text: str) -> tuple[str, str] | None:
     stripped = text.strip()
     if not stripped.startswith("/"):

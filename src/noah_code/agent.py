@@ -239,14 +239,17 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
 def _cache_first_block_order(base: list[str] | None) -> list[str]:
     """Stable-prefix-first ordering: static instructions before volatile blocks."""
 
-    return [
-        *(base or []),
+    stable_blocks = (
         "repo_instructions",
         "agents",
         "subagent",
         "workspace",
         "active_plan",
         "project_memory",
+    )
+    return [
+        *(block for block in (base or []) if block not in stable_blocks),
+        *stable_blocks,
     ]
 
 
@@ -286,9 +289,6 @@ class _LeanPermissionCodeActStrategy(_PermissionCodeActStrategy):
     def name(self) -> str:
         return "NOAH_LEAN_CODEACT"
 
-    def get_block_order(self) -> list[str]:
-        return _cache_first_block_order(super().get_block_order())
-
     async def execute(self, runtime: Any, call: Any) -> Any:
         original = runtime.agent.render_config
         event_format = nooa_compat.truncation_event_format(runtime.agent)
@@ -307,9 +307,6 @@ class _AdaptivePermissionCodeActStrategy(_PermissionCodeActStrategy):
     @property
     def name(self) -> str:
         return "NOAH_ADAPTIVE_CODEACT"
-
-    def get_block_order(self) -> list[str]:
-        return _cache_first_block_order(super().get_block_order())
 
     async def execute(self, runtime: Any, call: Any) -> Any:
         config = runtime.agent._config
@@ -407,11 +404,9 @@ class CodingAgent(InteractiveAgent):
         self.github = GithubTools(workspace.root, self._engine, self._approvals)
         self.web = WebTools(self._engine, self._approvals)
         self.ask = QuestionTools(self._engine, self._approvals)
-        self.plan = PlanTools(workspace.root, self, self.ask, self._engine, self._approvals)
+        self.plan = PlanTools(workspace.root, self, self.ask, self._engine)
         self.memory = MemoryTools(
             workspace.root,
-            self._engine,
-            self._approvals,
             on_change=self.refresh_context_sources,
         )
         self.media = MediaTools()

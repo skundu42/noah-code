@@ -24,6 +24,7 @@ Semantics:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fnmatch
 import os
 from dataclasses import dataclass
@@ -82,6 +83,12 @@ class HookRunner:
             return 127, f"hook failed to launch: {exc}"
         try:
             stdout, _ = await asyncio.wait_for(process.communicate(), timeout=spec.timeout_seconds)
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
+            raise
         except TimeoutError:
             process.kill()
             await process.wait()

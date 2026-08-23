@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from nooa.unifiedllm import FakeLLMClient
 
 from noah_code.approvals import ApprovalBroker
 from noah_code.config import HooksConfig, HookSpec, NoahCodeConfig, PermissionRule
+from noah_code.events import HostEvent, HostEventKind
 from noah_code.hooks import HookRunner
 from noah_code.host import AgentHost
 from noah_code.permissions import PermissionCategory, PermissionEngine
@@ -45,6 +47,44 @@ async def test_pre_hook_timeout_vetoes_fail_closed() -> None:
     outcome = await runner.run_pre(tool="execute_python", category="bash", target="print(1)")
     assert not outcome.allowed
     assert "timed out" in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_cancelled_hook_terminates_its_subprocess(tmp_path: Path, monkeypatch) -> None:
+    communicate_started = asyncio.Event()
+
+    class FakeProcess:
+        returncode: int | None = None
+        killed = False
+
+        async def communicate(self):  # noqa: ANN201
+            communicate_started.set()
+            await asyncio.Event().wait()
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return self.returncode or 0
+
+    process = FakeProcess()
+
+    async def create_process(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    runner = _runner(tmp_path, post=[HookSpec(match="*", command="ignored")])
+    task = asyncio.create_task(
+        runner.run_post(tool="ws_run", category="tool", target="pytest", status="ok")
+    )
+    await communicate_started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert process.killed
 
 
 @pytest.mark.asyncio
@@ -115,6 +155,40 @@ async def test_host_pre_tool_hook_matches_framework_tool_name(tmp_path: Path) ->
         assert "write_file" in log.read_text()
     finally:
         await host.close()
+
+
+@pytest.mark.asyncio
+async def test_host_close_waits_for_scheduled_post_hooks(tmp_path: Path) -> None:
+    log = tmp_path / "post-hook.log"
+    workspace = Workspace(root=tmp_path.resolve())
+    config = NoahCodeConfig(
+        session_dir=tmp_path / "sessions",
+        auto_approve=True,
+        hooks=HooksConfig(
+            post_tool=[
+                HookSpec(
+                    match="ws_run",
+                    command=f'sleep 0.05; echo "$NOAH_HOOK_TOOL" >> {log}',
+                )
+            ]
+        ),
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    try:
+        host._emit_with_hooks(  # noqa: SLF001 - verifies host task ownership
+            HostEvent(
+                HostEventKind.TOOL_FINISH,
+                "pytest -q",
+                meta={"tool": "ws_run", "result_status": "ok"},
+            )
+        )
+        assert host._post_hook_tasks  # noqa: SLF001
+    finally:
+        await host.close()
+
+    assert host._post_hook_tasks == []  # noqa: SLF001
+    assert log.read_text().strip() == "ws_run"
 
 
 @pytest.mark.asyncio

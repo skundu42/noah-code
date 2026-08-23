@@ -8,8 +8,6 @@ from typing import Annotated
 
 from nooa import Skill, spec
 
-from noah_code.approvals import ApprovalBroker
-from noah_code.permissions import PermissionEngine
 from noah_code.project_notes import MEMORY_RELATIVE, MemoryStore, parse_memory_facts
 
 
@@ -19,16 +17,12 @@ class MemoryTools(Skill):
     def __init__(
         self,
         root: Path,
-        engine: PermissionEngine,
-        approvals: ApprovalBroker,
         *,
         store: MemoryStore | None = None,
         on_change: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self._store = store or MemoryStore(root)
-        self._engine = engine
-        self._approvals = approvals
         self._on_change = on_change
 
     async def list(self) -> str:

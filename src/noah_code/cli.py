@@ -1378,12 +1378,6 @@ async def _exec_session(
         return EXIT_SIGINT
 
 
-def _launched_as_nc() -> bool:
-    """Detect whether the process was launched as `nc` or `noah`."""
-    name = os.path.basename(sys.argv[0]) if sys.argv else ""
-    return name in {"nc", "nc.exe", "noah", "noah.exe"}
-
-
 def main(argv: list[str] | None = None) -> None:
     """Dispatch: subcommands via group; otherwise interactive with optional PATH."""
     args = list(sys.argv[1:] if argv is None else argv)

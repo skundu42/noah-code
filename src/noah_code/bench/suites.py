@@ -33,10 +33,6 @@ class BenchTask:
     version: str = ""
     setup: str | None = None
 
-    @property
-    def repo_name(self) -> str:
-        return self.repo.rsplit("/", 1)[-1]
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "instance_id": self.instance_id,

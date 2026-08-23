@@ -6,7 +6,6 @@ from pathlib import Path
 
 from noah_code.composer import ExpandedTurn
 from noah_code.steer import (
-    BLOCKED_SLASH_WHILE_BUSY,
     SAFE_SLASH_WHILE_BUSY,
     STEER_QUEUE_CAP,
     SteerItem,
@@ -61,14 +60,8 @@ def test_push_keeps_attach_paths() -> None:
     assert item.attach_paths == (Path("shot.png"),)
 
 
-def test_slash_allowlists_match_spec() -> None:
+def test_safe_slash_allowlist_matches_spec() -> None:
     assert frozenset({"status", "tokens", "todos", "help", "trace"}) == SAFE_SLASH_WHILE_BUSY
-    assert "undo" in BLOCKED_SLASH_WHILE_BUSY
-    assert "compact" in BLOCKED_SLASH_WHILE_BUSY
-    assert "worktree" in BLOCKED_SLASH_WHILE_BUSY
-    assert "pr" in BLOCKED_SLASH_WHILE_BUSY
-    assert "plan" in BLOCKED_SLASH_WHILE_BUSY
-    assert "memory" in BLOCKED_SLASH_WHILE_BUSY
 
 
 def test_expansion_failed_only_when_mentions_or_attaches_resolve_nothing() -> None:

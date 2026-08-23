@@ -120,11 +120,13 @@ def test_all_strategy_levels_order_blocks_cache_first(strategy_cls) -> None:
     for stable_key in (
         "repo_instructions",
         "agents",
+        "subagent",
         "workspace",
         "active_plan",
         "project_memory",
     ):
         assert stable_key in order
+        assert order.count(stable_key) == 1
         assert order.index(stable_key) > base_tail
 
 

@@ -7,7 +7,6 @@ from typing import Annotated, Any
 
 from nooa import Skill, spec
 
-from noah_code.approvals import ApprovalBroker
 from noah_code.permissions import PermissionEngine
 from noah_code.project_notes import PLAN_RELATIVE, PlanStore
 from noah_code.tools.question_tools import QuestionTools
@@ -22,14 +21,12 @@ class PlanTools(Skill):
         mode_owner: Any,
         ask: QuestionTools | None,
         engine: PermissionEngine,
-        approvals: ApprovalBroker,
     ) -> None:
         super().__init__()
         self._store = PlanStore(root)
         self._owner = mode_owner
         self._ask = ask
         self._engine = engine
-        self._approvals = approvals
 
     async def read(self) -> str:
         """Return the active plan, or empty if none is pinned."""

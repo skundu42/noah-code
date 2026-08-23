@@ -28,7 +28,7 @@ def _engine(mode: str = "plan", auto: bool = False) -> PermissionEngine:
 async def test_plan_write_allowed_in_plan_mode(tmp_path: Path) -> None:
     engine = _engine("plan")
     owner = SimpleNamespace(mode="plan", set_mode=lambda mode: setattr(owner, "mode", mode))
-    tools = PlanTools(tmp_path, owner, ask=None, engine=engine, approvals=ApprovalBroker(engine))
+    tools = PlanTools(tmp_path, owner, ask=None, engine=engine)
     result = await tools.write("# Plan\n\n- implement handoff\n")
     assert "plan.md" in result
     assert "implement handoff" in PlanStore(tmp_path).read()
@@ -45,7 +45,7 @@ async def test_exit_to_build_requires_plan_and_switches(tmp_path: Path) -> None:
         engine.mode = mode
 
     owner.set_mode = set_mode
-    tools = PlanTools(tmp_path, owner, ask=None, engine=engine, approvals=ApprovalBroker(engine))
+    tools = PlanTools(tmp_path, owner, ask=None, engine=engine)
     with pytest.raises(RuntimeError, match="write a plan"):
         await tools.exit_to_build()
     await tools.write("- do the work\n")
@@ -65,7 +65,7 @@ async def test_exit_to_build_respects_user_staying(tmp_path: Path) -> None:
     from noah_code.tools.question_tools import QuestionTools
 
     ask = QuestionTools(engine, ApprovalBroker(engine, handler=_always_once), handler=stay)
-    tools = PlanTools(tmp_path, owner, ask=ask, engine=engine, approvals=ApprovalBroker(engine))
+    tools = PlanTools(tmp_path, owner, ask=ask, engine=engine)
     await tools.write("- step\n")
     text = await tools.exit_to_build()
     assert owner.mode == "plan"
@@ -74,8 +74,7 @@ async def test_exit_to_build_respects_user_staying(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_memory_save_and_forget(tmp_path: Path) -> None:
-    engine = _engine("build", auto=True)
-    tools = MemoryTools(tmp_path, engine, ApprovalBroker(engine))
+    tools = MemoryTools(tmp_path)
     assert "uv" in await tools.save("Use uv")
     assert "Use uv" in await tools.list()
     await tools.forget("uv")

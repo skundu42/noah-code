@@ -133,41 +133,6 @@ def _command_output(text: str) -> HostEvent:
     )
 
 
-def _format_skills_output(text: str) -> str:
-    """Convert NOOA's wide fixed-column status into a narrow, readable list."""
-
-    rendered: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
-        if line.startswith("Active Skills"):
-            rendered.extend(
-                [
-                    "Active skills",
-                    "Use with self.<name>; deactivate with self.skills.deactivate(['name']).",
-                ]
-            )
-            continue
-        if line.startswith("Available Skills"):
-            if rendered and rendered[-1]:
-                rendered.append("")
-            rendered.extend(
-                [
-                    "Available skills",
-                    "Activate with self.skills.activate(['name']).",
-                ]
-            )
-            continue
-        match = re.fullmatch(r"\s{2}(\S+)(?:\s{2,}(.*))?", line)
-        if match:
-            name, description = match.groups()
-            rendered.append(f"\n  {name}")
-            if description:
-                rendered.append(f"    {description.strip()}")
-            continue
-        rendered.append(line)
-    return "\n".join(rendered).strip()
-
-
 def _deterministic_title(text: str) -> str:
     """Create a useful title without spending an additional model call."""
 
@@ -507,8 +472,11 @@ class AgentHost:
         for failure in failures:
             self.ui.render(HostEvent(HostEventKind.STATUS, f"hook warning: {failure}"))
 
-    async def _flush_post_hooks(self) -> None:
+    async def _flush_post_hooks(self, *, cancel: bool = False) -> None:
         tasks, self._post_hook_tasks = self._post_hook_tasks, []
+        if cancel:
+            for task in tasks:
+                task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -610,6 +578,7 @@ class AgentHost:
 
     async def close(self) -> None:
         try:
+            await self._flush_post_hooks()
             await self._persist_async()
         finally:
             self._teardown_event_bridge()
@@ -1870,6 +1839,7 @@ class AgentHost:
                 if not self._apply_next_steer(agent):
                     break
         finally:
+            await self._flush_post_hooks(cancel=exit_code == 130)
             agent.journal.end_turn()
             latest = agent.journal.latest_turn()
             self._last_turn_shell_bypass = bool(latest and latest.shell_may_bypass)
@@ -1882,8 +1852,8 @@ class AgentHost:
                     )
                 )
             if exit_code == 130:
-                # The cancelled task cannot await, but the journal must be
-                # finalized before it is serialized to the undo sidecar.
+                # Persist synchronously so the journal is serialized before
+                # cancellation propagates out of the turn task.
                 with contextlib.suppress(Exception):
                     self._persist()
             else:
