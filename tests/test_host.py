@@ -22,7 +22,6 @@ from noah_code.host import (
     _is_context_overflow,
     _stop_text,
 )
-from noah_code.llm_cache import CachedLLM
 from noah_code.mcp_setup import MCPInstallResult
 from noah_code.permissions import PermissionEngine
 from noah_code.sessions import SessionStore
@@ -574,8 +573,8 @@ async def test_completed_turn_captures_checkpoint_when_enabled(
     from types import SimpleNamespace
 
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "eval@example.com"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "Eval"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
     (tmp_path / "base.txt").write_text("base\n")
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path, check=True)
@@ -608,14 +607,12 @@ async def test_completed_turn_captures_checkpoint_when_enabled(
 
 
 @pytest.mark.asyncio
-async def test_model_switch_keeps_budget_and_cache_wrappers(tmp_path: Path, monkeypatch) -> None:
+async def test_model_switch_keeps_budget_wrapper(tmp_path: Path, monkeypatch) -> None:
     workspace = Workspace(root=tmp_path.resolve())
     config = NoahCodeConfig(
         session_dir=tmp_path / "sessions",
         budget=BudgetConfig(max_tokens=1000),
     )
-    monkeypatch.setenv("NOAH_CODE_LLM_CACHE", "record")
-    monkeypatch.setenv("NOAH_CODE_LLM_CACHE_DIR", str(tmp_path / "llm-cache"))
     host = AgentHost(workspace, config, llm=FakeLLMClient())
     await host.start()
     guard = host._budget_guard
@@ -627,33 +624,8 @@ async def test_model_switch_keeps_budget_and_cache_wrappers(tmp_path: Path, monk
 
     llm = host.agent._llm
     assert isinstance(llm, SharedBudgetLLM)
-    assert isinstance(llm._inner, CachedLLM)
     assert llm._guard is guard
-    await host.close()
-
-
-@pytest.mark.asyncio
-async def test_cache_hits_cannot_bypass_an_exceeded_budget(tmp_path: Path, monkeypatch) -> None:
-    workspace = Workspace(root=tmp_path.resolve())
-    config = NoahCodeConfig(
-        session_dir=tmp_path / "sessions",
-        budget=BudgetConfig(max_tokens=100),
-    )
-    monkeypatch.setenv("NOAH_CODE_LLM_CACHE", "auto")
-    monkeypatch.setenv("NOAH_CODE_LLM_CACHE_DIR", str(tmp_path / "llm-cache"))
-    host = AgentHost(workspace, config, llm=FakeLLMClient())
-    await host.start()
-
-    llm = host.agent._llm
-    assert isinstance(llm, SharedBudgetLLM)
-    assert isinstance(llm._inner, CachedLLM)
-    await llm.acall([{"role": "user", "content": "cache me"}])
-    hits_before = llm._inner.stats()["hits"]
-    llm._guard.add_usage(prompt_tokens=101)
-
-    with pytest.raises(BudgetExceeded, match="token limit exceeded"):
-        await llm.acall([{"role": "user", "content": "cache me"}])
-    assert llm._inner.stats()["hits"] == hits_before
+    assert _unwrap_llm(llm) is switched_client
     await host.close()
 
 
@@ -1015,8 +987,8 @@ async def test_steered_run_captures_one_checkpoint(tmp_path: Path, monkeypatch) 
     from types import SimpleNamespace
 
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "eval@example.com"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.name", "Eval"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True)
     (tmp_path / "base.txt").write_text("base\n")
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path, check=True)
@@ -1298,8 +1270,8 @@ async def test_status_prompt_includes_queued_count(tmp_path: Path) -> None:
 def _init_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "eval@example.com"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.name", "Eval"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True)
     (path / "README.md").write_text("hello\n")
     subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True, capture_output=True)

@@ -27,8 +27,8 @@ def _git(cwd: Path, *args: str) -> None:
 def _init_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     _git(path, "init", "-q")
-    _git(path, "config", "user.email", "eval@example.com")
-    _git(path, "config", "user.name", "Eval")
+    _git(path, "config", "user.email", "test@example.com")
+    _git(path, "config", "user.name", "Test User")
     (path / "README.md").write_text("hello\n")
     _git(path, "add", ".")
     _git(path, "commit", "-q", "-m", "init")

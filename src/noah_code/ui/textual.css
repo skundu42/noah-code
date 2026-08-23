@@ -7,8 +7,8 @@ Screen {
     dock: top;
     height: 1;
     padding: 0 1;
-    background: $nc-canvas;
-    color: $nc-muted;
+    background: $nc-surface;
+    color: $nc-text;
 }
 
 #notice-banner {
@@ -66,10 +66,10 @@ Screen {
 
 #context-rail {
     display: none;
-    width: 32;
+    width: 36;
     height: 1fr;
-    padding: 1 1;
-    background: $nc-canvas;
+    padding: 1 2;
+    background: $nc-surface;
     color: $nc-text;
     border-left: solid $nc-border;
 }

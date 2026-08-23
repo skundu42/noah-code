@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import re
+import subprocess
 import threading
 import time
 from collections import deque
@@ -87,6 +88,84 @@ class TranscriptEntry:
     text: str
     markdown: bool = False
     event_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RepositorySnapshot:
+    """Small, presentation-ready view of the current Git worktree."""
+
+    branch: str
+    staged: int = 0
+    modified: int = 0
+    untracked: int = 0
+
+    @property
+    def is_clean(self) -> bool:
+        return not (self.staged or self.modified or self.untracked)
+
+
+def _parse_git_status(output: str) -> RepositorySnapshot | None:
+    """Parse porcelain v1 branch output without depending on GitPython."""
+
+    nul_delimited = "\0" in output
+    records = output.split("\0") if nul_delimited else output.splitlines()
+    if not records or not records[0].startswith("## "):
+        return None
+    branch_header = records[0][3:].strip()
+    if branch_header.startswith("No commits yet on "):
+        branch = branch_header.removeprefix("No commits yet on ")
+    elif branch_header.startswith("HEAD (no branch)"):
+        branch = "detached"
+    else:
+        branch = branch_header.split("...", 1)[0].split(" [", 1)[0].strip()
+    branch = branch or "detached"
+    staged = modified = untracked = 0
+    skip_rename_source = False
+    for record in records[1:]:
+        if skip_rename_source:
+            skip_rename_source = False
+            continue
+        if len(record) < 3 or record[2] != " ":
+            continue
+        index_state, worktree_state = record[0], record[1]
+        if index_state == "?" and worktree_state == "?":
+            untracked += 1
+            continue
+        if index_state not in {" ", "?"}:
+            staged += 1
+        if worktree_state not in {" ", "?"}:
+            modified += 1
+        skip_rename_source = nul_delimited and (
+            "R" in {index_state, worktree_state}
+            or "C" in {index_state, worktree_state}
+        )
+    return RepositorySnapshot(branch, staged, modified, untracked)
+
+
+def _read_repository_snapshot(root: Path) -> RepositorySnapshot | None:
+    """Read Git state with a short timeout; failures mean the root is not a worktree."""
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--branch",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_git_status(result.stdout)
 
 
 @dataclass
@@ -302,6 +381,17 @@ def _replace_active_mention(text: str, insertion: str) -> str:
     if match is None:
         return f"{text.rstrip()} {insertion}".strip()
     return text[: match.start()] + insertion
+
+
+def _truncate_middle(value: str, limit: int) -> str:
+    """Keep both the meaningful prefix and filename-like suffix in narrow UI areas."""
+
+    value = " ".join(value.split())
+    if len(value) <= limit:
+        return value
+    left = max((limit - 1) // 2, 1)
+    right = max(limit - left - 1, 1)
+    return f"{value[:left]}…{value[-right:]}"
 
 
 def _diff_renderable(patch: str) -> Group:
@@ -1227,7 +1317,11 @@ class NoahCodeApp(App[None]):
         self._session_id = host.meta.session_id if host.meta else None
         self._interrupt_count = 0
         self._header_text = ""
+        self._hint_text = ""
         self._rail_text: Text | str = ""
+        self._rail_dirty = True
+        self._repository_snapshot: RepositorySnapshot | None = None
+        self._repository_status_loaded = False
         self._phase = "ready"
         self._spinner_index = 0
         self._spinner_timer: Timer | None = None
@@ -1320,6 +1414,7 @@ class NoahCodeApp(App[None]):
             pause=not self.ui.busy and self._agent_ready,
         )
         self.update_chrome(force=True)
+        self._refresh_repository_snapshot()
         self._check_update_notice()
         if self._onboarding_required:
             self._phase = "setup required"
@@ -1434,7 +1529,21 @@ class NoahCodeApp(App[None]):
         if not self.ui.busy:
             return
         self._spinner_index = (self._spinner_index + 1) % 4
-        self._update_working_banner()
+        # The spinner only changes the header and working banner. Rebuilding the
+        # context rail here would repeatedly read plan/todo state from disk.
+        self.update_chrome()
+
+    @work(exclusive=True, group="repository-status")
+    async def _refresh_repository_snapshot(self) -> None:
+        snapshot = await asyncio.to_thread(
+            _read_repository_snapshot,
+            self.host.workspace.root,
+        )
+        was_loaded = self._repository_status_loaded
+        self._repository_status_loaded = True
+        if not was_loaded or snapshot != self._repository_snapshot:
+            self._repository_snapshot = snapshot
+            self._rail_dirty = True
         self.update_chrome()
 
     def _update_working_banner(self) -> None:
@@ -1482,13 +1591,13 @@ class NoahCodeApp(App[None]):
 
     def update_chrome(self, *, force: bool = False) -> None:
         meta = self.host.meta
+        palette = self.theme_palette
         mode = self.host.agent.mode if self.host._agent else self.host.config.mode
         model = meta.model if meta else self.host.config.model
         effort = getattr(meta, "reasoning_effort", None) if meta else None
         if not isinstance(effort, str):
             effort = self.host.config.reasoning_effort
         effort_label = "auto" if effort == "default" else effort
-        session_id = meta.session_id[:8] if meta else "new"
         repository = self.host.workspace.root.name or str(self.host.workspace.root)
         if meta and meta.worktree_name:
             repository = f"{repository} · {meta.worktree_name}"
@@ -1499,23 +1608,50 @@ class NoahCodeApp(App[None]):
         unread = f"  {self._unread_count} new" if self._unread_count else ""
         queued = self._steer_queued_label()
         queued_bit = f"  {queued}" if queued else ""
-        if self._session_has_prompt:
-            header = (
-                f" noah   {repository}   {mode.upper()}   {model} · r:{effort_label}   "
-                f"{session_id}   {state}{queued_bit}{unread} "
+        branch = self._repository_snapshot.branch if self._repository_snapshot else ""
+        location = f"{repository}  {branch}" if branch else repository
+        header_location = _truncate_middle(location, 22)
+        header_model = _truncate_middle(str(model), 26)
+        header_signature = "|".join(
+            (location, mode, str(model), effort_label, state, queued_bit, unread)
+        )
+        if force or header_signature != self._header_text:
+            self._header_text = header_signature
+            header = Text()
+            header.append(" NOAH ", style=f"bold {palette.accent}")
+            header.append(f" {header_location} ", style=palette.text)
+            header.append(f" {mode.upper()} ", style=f"bold {palette.canvas} on {palette.accent}")
+            header.append(f"  {header_model}", style=palette.text)
+            if effort_label != "auto":
+                header.append(f" · r:{effort_label}", style=palette.muted)
+            header.append(
+                f"   {state}",
+                style=palette.warning if self.ui.busy else palette.muted,
             )
-        else:
-            header = f" noah   {state}{queued_bit}{unread} "
-        if force or header != self._header_text:
-            self._header_text = header
+            if queued_bit:
+                header.append(queued_bit, style=palette.warning)
+            if unread:
+                header.append(unread, style=palette.accent)
             with contextlib.suppress(Exception):
                 self.query_one("#header", Static).update(header, layout=False)
 
-        rail = self._build_rail_text()
-        if force or rail != self._rail_text:
-            self._rail_text = rail
+        hint = (
+            "Enter queue follow-up · Ctrl+C cancel · F2 activity"
+            if self.ui.busy and self._agent_ready
+            else "Enter send · Shift+Enter newline · Tab build/plan · / commands"
+        )
+        if force or hint != self._hint_text:
+            self._hint_text = hint
             with contextlib.suppress(Exception):
-                self.query_one("#context-rail", Static).update(rail, layout=False)
+                self.query_one("#context-hint", Static).update(hint, layout=False)
+
+        if force or self._rail_dirty:
+            rail = self._build_rail_text()
+            if force or rail != self._rail_text:
+                self._rail_text = rail
+                with contextlib.suppress(Exception):
+                    self.query_one("#context-rail", Static).update(rail, layout=False)
+            self._rail_dirty = False
         self._update_working_banner()
 
     def update_status_bar(self) -> None:
@@ -1530,18 +1666,40 @@ class NoahCodeApp(App[None]):
         model = meta.model if meta else self.host.config.model
         effort = getattr(meta, "reasoning_effort", self.host.config.reasoning_effort)
         text = Text()
-        text.append("WORKSPACE\n", style=f"bold {palette.accent}")
-        text.append(
-            f"{self.host.workspace.root.name or self.host.workspace.root}\n",
-            style=palette.text,
-        )
-        if meta and meta.worktree_name:
-            text.append(f"worktree · {meta.worktree_name}\n", style=palette.muted)
-        text.append(f"{mode.upper()} · {model}\n", style=palette.muted)
-        text.append(
-            f"reasoning: {'auto' if effort == 'default' else effort}",
-            style=palette.muted,
-        )
+        text.append("NOW\n", style=f"bold {palette.accent}")
+        queued = self._steer_queued_label()
+        if self._active_activity_id and self._active_activity_id in self._activities:
+            record = self._activities[self._active_activity_id]
+            text.append("Running\n", style=palette.warning)
+            text.append(_truncate_middle(record.label, 31), style=palette.text)
+        elif not self._session_has_prompt and self._pre_prompt_status:
+            text.append(self._pre_prompt_status, style=palette.muted)
+        else:
+            text.append("Waiting for your next turn", style=palette.muted)
+        thought = " ".join(self._last_thought.split())
+        if self.ui.busy and thought:
+            text.append(f"\n{_truncate_middle(thought, 62)}", style=palette.muted)
+        if queued:
+            text.append(f"\n{queued}", style=palette.warning)
+
+        text.append("\n\nCHANGES\n", style=f"bold {palette.accent}")
+        snapshot = self._repository_snapshot
+        if snapshot is None:
+            message = "Not a Git worktree" if self._repository_status_loaded else "Reading Git status…"
+            text.append(message, style=palette.muted)
+        else:
+            text.append(f"{snapshot.branch}\n", style=palette.text)
+            if snapshot.is_clean:
+                text.append("Working tree clean", style=palette.success)
+            else:
+                change_counts = []
+                if snapshot.staged:
+                    change_counts.append(f"{snapshot.staged} staged")
+                if snapshot.modified:
+                    change_counts.append(f"{snapshot.modified} modified")
+                if snapshot.untracked:
+                    change_counts.append(f"{snapshot.untracked} new")
+                text.append(" · ".join(change_counts), style=palette.warning)
 
         text.append("\n\nSESSION\n", style=f"bold {palette.accent}")
         text.append(
@@ -1549,22 +1707,16 @@ class NoahCodeApp(App[None]):
             style=palette.text,
         )
         if meta:
-            text.append(f"{meta.session_id[:8]}\n", style=palette.muted)
-        queued = self._steer_queued_label()
-        if queued:
-            text.append(f"{queued}\n", style=palette.warning)
-        text.append("\nCURRENT\n", style=f"bold {palette.accent}")
-        if self._active_activity_id and self._active_activity_id in self._activities:
-            record = self._activities[self._active_activity_id]
-            text.append("Running\n", style=palette.warning)
-            label = record.label
-            if len(label) > 28:
-                label = "…" + label[-27:]
-            text.append(label, style=palette.text)
-        elif not self._session_has_prompt and self._pre_prompt_status:
-            text.append(self._pre_prompt_status, style=palette.muted)
-        else:
-            text.append("Waiting for your next turn", style=palette.muted)
+            text.append(f"{meta.session_id[:8]}", style=palette.muted)
+        if meta and meta.worktree_name:
+            text.append(f"\nworktree · {meta.worktree_name}", style=palette.muted)
+
+        text.append("\n\nMODEL\n", style=f"bold {palette.accent}")
+        text.append(f"{model}\n", style=palette.text)
+        text.append(
+            f"{mode.upper()} · reasoning {'auto' if effort == 'default' else effort}",
+            style=palette.muted,
+        )
 
         if self._available_update is not None:
             text.append("\n\nUPDATE\n", style=f"bold {palette.warning}")
@@ -1576,15 +1728,16 @@ class NoahCodeApp(App[None]):
 
         with contextlib.suppress(Exception):
             usage = self.host.usage_snapshot()
-            text.append("\n\nTOKENS\n", style=f"bold {palette.accent}")
+            text.append("\n\nUSAGE\n", style=f"bold {palette.accent}")
             text.append(
-                f"{usage.uncached_tokens:,} uncached · {usage.cache_hit_ratio:.0%} cache\n",
+                f"{usage.prompt_tokens:,} in · {usage.completion_tokens:,} out\n",
                 style=palette.text,
             )
             text.append(
-                f"{usage.calls} calls · {usage.llm_seconds:.1f}s model",
+                f"{usage.cache_hit_ratio:.0%} cached · {usage.llm_seconds:.1f}s model\n",
                 style=palette.muted,
             )
+            text.append(f"${usage.cost_usd:.4f} · {usage.calls} calls", style=palette.muted)
 
         todos: list[Any] = []
         if self.host._agent is not None:
@@ -1715,6 +1868,8 @@ class NoahCodeApp(App[None]):
             self._follow_batch = None
         if follow:
             self.query_one("#conversation", RichLog).scroll_end(animate=False)
+        if any(event.kind != HostEventKind.SHELL_CHUNK for event in events_to_process):
+            self._rail_dirty = True
         self.update_chrome()
 
     @on(UIStateChanged)
@@ -1724,7 +1879,8 @@ class NoahCodeApp(App[None]):
                 self._spinner_timer.resume()
             else:
                 self._spinner_timer.pause()
-        self.update_chrome(force=True)
+        self._rail_dirty = True
+        self.update_chrome()
 
     def _process_host_event(self, event: HostEvent) -> None:
         text = event.text.rstrip()
@@ -2705,6 +2861,8 @@ class NoahCodeApp(App[None]):
         self._pre_prompt_status = "Ready for your first prompt"
         self._config_commands = None
         self._base_commands = all_command_suggestions(self.host._custom_commands)
+        self._rail_dirty = True
+        self._refresh_repository_snapshot()
         if not changed_session:
             self._load_recent_history()
             self.update_chrome(force=True)
@@ -2816,6 +2974,8 @@ class NoahCodeApp(App[None]):
                 self.exit()
         except Exception as exc:  # noqa: BLE001
             self._append_entry(TranscriptEntry("ERROR", str(exc)))
+        finally:
+            self._refresh_repository_snapshot()
 
     def action_submit(self) -> None:
         composer = self.query_one("#composer", ComposerTextArea)
@@ -2886,5 +3046,7 @@ class NoahCodeApp(App[None]):
             self._append_entry(TranscriptEntry("ERROR", str(exc)))
         finally:
             self._turn_task = None
-            self.update_chrome(force=True)
+            self._rail_dirty = True
+            self.update_chrome()
+            self._refresh_repository_snapshot()
             self.query_one("#composer", ComposerTextArea).focus()

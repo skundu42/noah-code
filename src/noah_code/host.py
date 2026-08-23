@@ -214,7 +214,6 @@ class AgentHost:
         self._title_task: asyncio.Task[Any] | None = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._budget_guard: Any = None
-        self._llm_cache: Any = None
         self._hooks: Any = None
         self._checkpoints: Any = None
         self.last_checkpoint: dict[str, Any] | None = None
@@ -314,18 +313,12 @@ class AgentHost:
             )
 
         from noah_code.budget import SharedBudgetLLM, _PrefixObserverOnly, wrap_with_budget
-        from noah_code.llm_cache import resolve_cache_settings, wrap_with_cache
         from noah_code.llm_replies import wrap_conversational_replies
 
         llm = wrap_conversational_replies(llm)
         lightweight_llm = wrap_conversational_replies(lightweight_llm)
-        cache_mode, cache_dir = resolve_cache_settings()
-        llm = wrap_with_cache(llm, cache_dir, cache_mode)
-        lightweight_llm = wrap_with_cache(lightweight_llm, cache_dir, cache_mode)
-        self._llm_cache = llm if hasattr(llm, "stats") else None
 
-        # Budget and prefix observation must remain outside the cache so replay
-        # hits cannot bypass session caps or request accounting.
+        # Budget enforcement also observes prompt-prefix stability for usage reporting.
         llm, self._budget_guard = wrap_with_budget(
             llm, self.config.budget, prefix_observer=self._usage
         )
@@ -1699,17 +1692,12 @@ class AgentHost:
         return "continue"
 
     def _apply_runtime_llm_wrappers(self, llm: Any) -> Any:
-        """Re-apply session budget and record/replay wraps after a client swap."""
+        """Re-apply conversational and session-budget wrappers after a client swap."""
 
         from noah_code.budget import SharedBudgetLLM, _PrefixObserverOnly
-        from noah_code.llm_cache import resolve_cache_settings, wrap_with_cache
         from noah_code.llm_replies import wrap_conversational_replies
 
         llm = wrap_conversational_replies(llm)
-        cache_mode, cache_dir = resolve_cache_settings()
-        llm = wrap_with_cache(llm, cache_dir, cache_mode)
-        if hasattr(llm, "stats"):
-            self._llm_cache = llm
 
         guard = getattr(self, "_budget_guard", None)
         if guard is not None and guard.active:

@@ -51,7 +51,7 @@ class SummarizationPolicy(BaseModel):
 
 
 class EfficiencyConfig(BaseModel):
-    """Token and latency controls for the coding harness."""
+    """Token and latency controls for the coding agent."""
 
     profile: Literal["fast", "balanced", "deep"] = "fast"
     strategy: Literal["lean", "standard"] = "lean"

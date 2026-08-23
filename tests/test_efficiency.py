@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 
 from noah_code.agent import _codeact_config
-from noah_code.benchmark import run_efficiency_benchmark
 from noah_code.config import NoahCodeConfig
 from noah_code.tool_output import ToolOutputStore
 from noah_code.usage import UsageTracker
@@ -68,13 +67,6 @@ def test_live_profile_can_reduce_limits_after_deep(tmp_path: Path) -> None:
     assert (tools._max_output, tools._max_output_lines) == (80_000, 2_000)
     tools.set_efficiency_profile("fast")
     assert (tools._max_output, tools._max_output_lines) == (16_000, 250)
-
-
-def test_offline_benchmark_measures_managed_output_reduction() -> None:
-    result = run_efficiency_benchmark(NoahCodeConfig())
-    assert result.lean_trajectory_chars < result.standard_trajectory_chars
-    assert result.bounded_tool_output_chars < result.raw_tool_output_chars
-    assert result.tool_output_reduction_percent > 50
 
 
 def test_usage_tracker_counts_attempts_failures_tokens_and_output(monkeypatch) -> None:

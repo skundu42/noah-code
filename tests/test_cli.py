@@ -19,6 +19,21 @@ def test_help() -> None:
     assert "session" in result.output.lower() or "Usage" in result.output
 
 
+def test_product_cli_excludes_evaluation_commands_and_flags() -> None:
+    runner = CliRunner()
+
+    group_help = runner.invoke(cli_group, ["--help"])
+    run_help = runner.invoke(cli_group, ["run", "--help"])
+
+    assert group_help.exit_code == 0
+    assert run_help.exit_code == 0
+    for command in ("bench", "benchmark", "exec"):
+        assert command not in group_help.output.split("Commands:", 1)[-1].split()
+    assert "llm-cache" not in run_help.output
+    assert "record" not in run_help.output
+    assert "replay" not in run_help.output
+
+
 def test_nc_entry_point_declared() -> None:
     from importlib.metadata import entry_points
 
@@ -90,16 +105,6 @@ def test_config_show_redacts_mcp_secrets(monkeypatch, tmp_path: Path) -> None:
         assert secret not in result.output
 
 
-def test_benchmark_is_offline_and_machine_readable(tmp_path: Path) -> None:
-    runner = CliRunner()
-    result = runner.invoke(cli_group, ["benchmark", str(tmp_path), "--json"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["profile"] == "fast"
-    assert payload["bounded_tool_output_chars"] < payload["raw_tool_output_chars"]
-
-
 def test_doctor(tmp_path: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(cli_group, ["doctor", str(tmp_path)])
@@ -117,36 +122,6 @@ def test_main_dispatches_subcommand(tmp_path: Path) -> None:
             main()
         except SystemExit as exc:
             assert exc.code in {0, None}
-
-
-def test_run_applies_llm_cache_flags(monkeypatch, tmp_path: Path) -> None:
-    import os
-
-    captured: dict[str, str | None] = {}
-
-    async def fake_exec(**_kwargs):  # noqa: ANN003
-        captured["dir"] = os.environ.get("NOAH_CODE_LLM_CACHE_DIR")
-        captured["mode"] = os.environ.get("NOAH_CODE_LLM_CACHE")
-        return 0
-
-    monkeypatch.setattr("noah_code.cli._exec_session", fake_exec)
-    cache_dir = tmp_path / "eval-cache"
-    result = CliRunner().invoke(
-        cli_group,
-        [
-            "run",
-            "hello",
-            str(tmp_path),
-            "--llm-cache",
-            str(cache_dir),
-            "--llm-cache-mode",
-            "record",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert captured["dir"] == str(cache_dir)
-    assert captured["mode"] == "record"
 
 
 def test_first_run_prompts_and_saves_global_model(monkeypatch, tmp_path: Path) -> None:
@@ -232,8 +207,8 @@ def test_providers_add_saves_prefixed_default(monkeypatch, tmp_path: Path) -> No
 def _init_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "eval@example.com"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.name", "Eval"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True)
     (path / "README.md").write_text("hello\n")
     subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True, capture_output=True)

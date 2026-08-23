@@ -2,8 +2,8 @@
 
 Checkpoints are stored as commits under ``refs/noah-code/checkpoints/<session>/``
 built through a temporary index, so capturing never disturbs the user's
-index, HEAD, or working tree. Evals can diff any checkpoint against the base
-commit or restore explicitly with standard git plumbing.
+index, HEAD, or working tree. Sessions can diff any checkpoint against the
+base commit or restore explicitly with standard git plumbing.
 """
 
 from __future__ import annotations

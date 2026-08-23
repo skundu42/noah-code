@@ -25,19 +25,28 @@ from noah_code.ui.textual_app import (
     DiffReviewScreen,
     FilteredPicker,
     NoahCodeApp,
+    RepositorySnapshot,
     TextualUI,
     _coalesce_activity_text,
     _completed_activity_label,
     _normalize_markdown,
+    _parse_git_status,
     _record_to_entries,
 )
 from noah_code.updates import UpdateStatus
+from noah_code.usage import UsageSnapshot
 
 
 def _fake_host(tmp_path: Path):
     host = MagicMock()
     host.config = NoahCodeConfig(model="fake-model")
-    host.meta = MagicMock(session_id="abcd1234efgh", model="fake-model", title="t")
+    host.meta = MagicMock(
+        session_id="abcd1234efgh",
+        model="fake-model",
+        title="t",
+        worktree_name=None,
+        reasoning_effort="default",
+    )
     host.workspace.root = tmp_path
     host._custom_commands = {}
     host._agent = MagicMock(mode="build")
@@ -128,6 +137,23 @@ def test_persisted_python_activity_uses_human_label() -> None:
     assert "execute_python" not in entries[0].text
 
 
+def test_git_status_parser_reports_branch_and_each_change_scope() -> None:
+    snapshot = _parse_git_status(
+        "## feature/ui...origin/feature/ui [ahead 1]\n"
+        "M  staged.py\n"
+        " M modified.py\n"
+        "MM both.py\n"
+        "?? new.py\n"
+    )
+
+    assert snapshot == RepositorySnapshot(
+        branch="feature/ui",
+        staged=2,
+        modified=2,
+        untracked=1,
+    )
+
+
 @pytest.mark.asyncio
 async def test_tui_renders_host_events_and_header(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
@@ -210,6 +236,78 @@ async def test_active_context_rail_shows_semantic_tool_state_not_code(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_context_rail_prioritizes_changes_session_and_usage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    snapshot = RepositorySnapshot("feature/tui", 1, 2, 3)
+    monkeypatch.setattr(
+        "noah_code.ui.textual_app._read_repository_snapshot",
+        lambda _root: snapshot,
+    )
+    host = _fake_host(tmp_path)
+    host.usage_snapshot.return_value = UsageSnapshot(
+        calls=3,
+        failed_calls=0,
+        prompt_tokens=12_000,
+        cached_tokens=9_000,
+        completion_tokens=800,
+        reasoning_tokens=200,
+        cost_usd=0.1234,
+        llm_seconds=4.2,
+        tool_output_chars=1_024,
+    )
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        for _ in range(10):
+            if app._repository_snapshot == snapshot:
+                break
+            await pilot.pause()
+
+        rail = _rendered_text(app.query_one("#context-rail").content)
+        assert "NOW" in rail
+        assert "CHANGES\nfeature/tui\n1 staged · 2 modified · 3 new" in rail
+        assert "SESSION" in rail
+        assert "MODEL\nfake-model" in rail
+        assert "USAGE\n12,000 in · 800 out" in rail
+        assert "75% cached · 4.2s model" in rail
+        assert "$0.1234 · 3 calls" in rail
+
+
+@pytest.mark.asyncio
+async def test_context_rail_finishes_non_git_status_probe(tmp_path: Path) -> None:
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        for _ in range(10):
+            if app._repository_status_loaded:
+                break
+            await pilot.pause()
+
+        rail = _rendered_text(app.query_one("#context-rail").content)
+        assert "CHANGES\nNot a Git worktree" in rail
+        assert "Reading Git status" not in rail
+
+
+@pytest.mark.asyncio
+async def test_busy_spinner_does_not_rebuild_context_rail(tmp_path: Path) -> None:
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        original = app._build_rail_text
+        app._build_rail_text = MagicMock(wraps=original)
+        app._rail_dirty = False
+
+        app.ui.set_busy(True)
+        await pilot.pause()
+        app._build_rail_text.reset_mock()
+        app._tick_busy()
+        app._tick_busy()
+        app._tick_busy()
+
+        app._build_rail_text.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
     tmp_path: Path,
 ) -> None:
@@ -229,6 +327,7 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
 
         banner = app.query_one("#working-banner")
         assert banner.styles.display == "block"
+        assert "queue follow-up" in _rendered_text(app.query_one("#context-hint").content)
         banner_text = _rendered_text(banner.content)
         assert "WORKING" not in banner_text
         assert "Inspecting repository" in banner_text
@@ -255,6 +354,7 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
         ui.set_busy(False)
         await pilot.pause()
         assert banner.styles.display == "none"
+        assert "Shift+Enter newline" in _rendered_text(app.query_one("#context-hint").content)
 
 
 @pytest.mark.asyncio

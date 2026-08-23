@@ -25,26 +25,14 @@ Measure coverage (a 70% total gate runs in CI):
 uv run pytest tests --cov=noah_code --cov-report=term-missing
 ```
 
-The automation/eval interface (`noah exec`, permission overrides, budget
-caps, hooks, checkpoints, and LLM record/replay) is documented in
-[exec-and-evals.md](exec-and-evals.md).
-
 Optional git hooks mirror the lint gate:
 
 ```bash
 uvx pre-commit install
 ```
 
-Run the deterministic efficiency fixture without making provider calls:
-
-```bash
-uv run noah benchmark .
-uv run noah benchmark . --json
-```
-
-It compares standard and lean NOOA trajectory rendering, then measures the configured managed
-preview against a fixed high-volume tool result. The report uses a transparent four-characters-
-per-token estimate; use `/tokens` during a real session for provider-reported usage.
+Use `/tokens` during a real session to inspect provider-reported token use, cache hits, model wait,
+tool output, and estimated cost.
 
 ## CI
 

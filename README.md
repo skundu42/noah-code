@@ -2,7 +2,7 @@
 
 # Noah Code
 
-**A terminal coding harness built on NVIDIA's NOAA framework**
+**A terminal coding agent built on NVIDIA's NOAA framework**
 
 [![PyPI](https://img.shields.io/pypi/v/noah-code.svg)](https://pypi.org/project/noah-code/)
 [![CI](https://github.com/skundu42/noah-code/actions/workflows/ci.yml/badge.svg)](https://github.com/skundu42/noah-code/actions/workflows/ci.yml)
@@ -14,9 +14,9 @@
 
 <p align="center"><sub>The real Textual interface, captured from a deterministic Noah Code session.</sub></p>
 
-Noah keeps the conversation central while the context rail tracks the workspace, model, session,
-token usage, and current plan. Tool execution stays visible, completed work compacts into readable
-records, and every session remains scoped to its repository.
+Noah keeps the conversation central while the context rail tracks live work, Git changes, session,
+model usage, and the current plan. Tool execution stays visible, completed work compacts into
+readable records, and every session remains scoped to its repository.
 
 Built on the [NVIDIA OO Agents (NOOA)](https://github.com/NVIDIA-NeMo/labs-OO-Agents) runtime.
 
@@ -55,7 +55,7 @@ configuration or session history.
   automatically compacted context without losing the full underlying tool results.
 - **Token-efficient by construction.** Lean tool-output bounds with disk-backed recall, condensed
   subagent results, cache-stable request prefixes (volatile status arrives as appended events),
-  and pointer-eviction compaction — measured live in `/tokens` and `noah exec` summaries.
+  and pointer-eviction compaction — measured live with `/tokens`.
 - **Explicit control.** Switch between implementation-focused **build** mode and read-only
   **plan** mode, with ordered `allow`, `ask`, and `deny` permission rules.
 - **Extensible workflows.** Add slash commands, opt-in skills, MCP servers, or markdown subagents;
@@ -103,14 +103,6 @@ noah --version
 noah doctor .
 noah config show .
 noah update --check
-noah benchmark .
-```
-
-Score real task success with the benchmark harness:
-
-```bash
-noah bench run swebench-verified-smoke .   # SWE-bench-Verified subset, end to end
-noah bench compare <baseline-run> <candidate-run>
 ```
 
 The package also installs `noah-code` and `nc` as equivalent entry points. Because `nc` commonly
@@ -134,9 +126,10 @@ Type `/` to search the full command and configuration reference. The most common
 | `/tokens` | Inspect tokens, cache usage, prefix stability, model wait, and tool output |
 | `/efficiency` | Switch between `fast`, `balanced`, and `deep` budgets |
 
-On wide terminals, the side rail keeps the active workspace, session, model, tokens, update state,
-and plan in view. The main pane remains centered on the Noah mark until the first prompt, then
-becomes the conversation and execution timeline.
+On wide terminals, the side rail prioritizes the active operation, Git branch and change counts,
+session, model usage, update state, and plan. Git status is refreshed in the background at turn
+boundaries, so the animated working state stays responsive. The main pane remains centered on the
+Noah mark until the first prompt, then becomes the conversation and execution timeline.
 
 ## Models and providers
 
@@ -183,7 +176,6 @@ noah update
 - [Interactive interface and sessions](docs/interactive-reference.md)
 - [Configuration, modes, permissions, and updates](docs/configuration.md)
 - [Generated-code security](docs/security.md)
-- [Eval harness and automation (`noah exec`, hooks, budgets, caching)](docs/exec-and-evals.md)
 - [Custom commands, skills, MCP, and tracing](docs/extensions.md)
 - [Development, CI, and releases](docs/development.md)
 - [Release notes](docs/releases/)

@@ -19,8 +19,8 @@ def _git(cwd: Path, *args: str) -> None:
 @pytest.fixture()
 def git_repo(tmp_path: Path) -> Path:
     _git(tmp_path, "init", "-q")
-    _git(tmp_path, "config", "user.email", "eval@example.com")
-    _git(tmp_path, "config", "user.name", "Eval")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test User")
     (tmp_path / "base.txt").write_text("base\n")
     _git(tmp_path, "add", ".")
     _git(tmp_path, "commit", "-q", "-m", "init")

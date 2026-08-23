@@ -22,10 +22,11 @@ At an approval prompt, press `1` to approve once, `2` to remember the approval f
 session, or `3`/`Esc` to reject it.
 
 The TUI uses Atom One Dark by default and also includes Noah Ocean, Graphite, and High Contrast.
-Switch and persist the active palette with `/theme`. Its conversation-first layout adapts to terminal size. At
-110 columns or wider, a context rail shows the session, active tool, and up to six open or blocked
-todos. Narrow terminals retain the transcript, live activity, suggestions, and composer without
-the rail. Terminals 25 rows high or shorter use compact spacing.
+Switch and persist the active palette with `/theme`. Its conversation-first layout adapts to
+terminal size. At 110 columns or wider, a change-ledger rail prioritizes the current action, Git
+branch and staged/modified/new counts, session, model usage, and up to six open or blocked todos.
+Narrow terminals retain the transcript, live activity, suggestions, and composer without the rail.
+Terminals 25 rows high or shorter use compact spacing.
 
 Type `/` in the composer to open the inline command list; the list remains visible and filters
 continuously. Use `Up`/`Down` to highlight a command, `Enter` or `Tab` to complete it, and `Esc` to
@@ -33,8 +34,10 @@ close the list. Press `Enter` again to run the completed command. Typing `/confi
 to every resolved configuration path and its current redacted value.
 
 Until a session has its first user prompt, the main pane keeps the Noah mark centered. Startup,
-workspace, model, mode, and update state live in the context rail on wide terminals. Existing
-sessions with user history restore their transcript normally.
+repository changes, model, mode, usage, and update state live in the context rail on wide
+terminals. Git status is collected in a background worker at startup and turn boundaries; spinner
+frames update only the header and working banner. Existing sessions with user history restore
+their transcript normally.
 
 ### Mid-turn follow-ups
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 from pathlib import Path
@@ -29,14 +28,11 @@ from noah_code.workspace import WorkspaceError, open_workspace
 EXIT_OK = 0
 EXIT_AGENT = 1
 EXIT_CONFIG = 2
-EXIT_DENIED = 3
 EXIT_SIGINT = 130
 
 SUBCOMMANDS = frozenset(
     {
         "run",
-        "exec",
-        "bench",
         "checkpoints",
         "sessions",
         "worktree",
@@ -45,7 +41,6 @@ SUBCOMMANDS = frozenset(
         "config",
         "providers",
         "update",
-        "benchmark",
     }
 )
 
@@ -54,128 +49,6 @@ _AUTO_UPDATE_CHECKED = False
 
 def _run_async(coro):  # noqa: ANN001
     return asyncio.run(coro)
-
-
-def _parse_rule_specs(specs: tuple[str, ...], action: str) -> list[dict[str, str]]:
-    from noah_code.exec_mode import parse_rule_spec
-
-    rules: list[dict[str, str]] = []
-    for spec in specs:
-        category, pattern, resolved_action = parse_rule_spec(spec, action)
-        rules.append({"category": category, "pattern": pattern, "action": resolved_action})
-    return rules
-
-
-def _eval_options(fn):  # noqa: ANN001
-    """Options shared by automation-facing commands (run/exec)."""
-
-    fn = click.option(
-        "--allow",
-        "allow_rules",
-        multiple=True,
-        metavar="CATEGORY:PATTERN",
-        help="Append an allow rule for this run, e.g. --allow 'edit:*' or --allow 'bash:git status*'",
-    )(fn)
-    fn = click.option(
-        "--deny",
-        "deny_rules",
-        multiple=True,
-        metavar="CATEGORY:PATTERN",
-        help="Append a deny rule for this run; denies always win over allows",
-    )(fn)
-    fn = click.option(
-        "--max-tokens",
-        type=int,
-        default=None,
-        help="Hard cap on total prompt+completion tokens for the session",
-    )(fn)
-    fn = click.option(
-        "--max-cost-usd",
-        type=float,
-        default=None,
-        help="Hard cap on estimated provider cost in USD",
-    )(fn)
-    fn = click.option(
-        "--time-limit",
-        type=float,
-        default=None,
-        metavar="SECONDS",
-        help="Hard wall-clock limit for the session",
-    )(fn)
-    fn = click.option("--temperature", type=float, default=None, help="Sampling temperature")(fn)
-    fn = click.option("--top-p", type=float, default=None, help="Nucleus sampling cutoff")(fn)
-    fn = click.option("--seed", type=int, default=None, help="Provider-side sampling seed")(fn)
-    fn = click.option(
-        "--llm-cache",
-        type=click.Path(),
-        default=None,
-        help="Directory for record/replay of provider responses",
-    )(fn)
-    fn = click.option(
-        "--llm-cache-mode",
-        type=click.Choice(["record", "replay", "auto", "off"]),
-        default=None,
-        help="Cache behavior when --llm-cache is set (default: auto)",
-    )(fn)
-    fn = click.option(
-        "--checkpoint/--no-checkpoint",
-        "checkpoint",
-        default=None,
-        help="Capture git worktree checkpoints at turn boundaries",
-    )(fn)
-    return fn
-
-
-def _apply_eval_overrides(
-    overrides: dict[str, Any],
-    *,
-    allow_rules: tuple[str, ...],
-    deny_rules: tuple[str, ...],
-    max_tokens: int | None,
-    max_cost_usd: float | None,
-    time_limit: float | None,
-    temperature: float | None,
-    top_p: float | None,
-    seed: int | None,
-    checkpoint: bool | None,
-) -> None:
-    """Fold automation flags into ``overrides`` in place."""
-
-    permission_extra = [
-        *_parse_rule_specs(allow_rules, "allow"),
-        *_parse_rule_specs(deny_rules, "deny"),
-    ]
-    if permission_extra:
-        overrides["extra_permission_rules"] = permission_extra
-    budget: dict[str, Any] = {}
-    if max_tokens is not None:
-        budget["max_tokens"] = max_tokens
-    if max_cost_usd is not None:
-        budget["max_cost_usd"] = max_cost_usd
-    if time_limit is not None:
-        budget["max_seconds"] = time_limit
-    if budget:
-        overrides["budget"] = budget
-    sampling: dict[str, Any] = {}
-    if temperature is not None:
-        sampling["temperature"] = temperature
-    if top_p is not None:
-        sampling["top_p"] = top_p
-    if seed is not None:
-        sampling["seed"] = seed
-    if sampling:
-        overrides["sampling"] = sampling
-    if checkpoint is not None:
-        overrides["checkpoints"] = {"enabled": checkpoint}
-
-
-def _apply_llm_cache_env(llm_cache: str | None, llm_cache_mode: str | None) -> None:
-    """Export record/replay settings so host wrapping sees them."""
-
-    cache_dir = llm_cache or os.environ.get("NOAH_CODE_LLM_CACHE_DIR")
-    if cache_dir:
-        os.environ["NOAH_CODE_LLM_CACHE_DIR"] = str(cache_dir)
-        os.environ["NOAH_CODE_LLM_CACHE"] = llm_cache_mode or "auto"
 
 
 def _common_options(fn):  # noqa: ANN001
@@ -291,13 +164,12 @@ def interactive_cmd(
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, prog_name="noah-code")
 def cli_group() -> None:
-    """noah-code - terminal coding harness on NVIDIA OO Agents."""
+    """noah-code - terminal coding agent on NVIDIA OO Agents."""
 
 
 @cli_group.command("run")
 @click.argument("prompt")
 @click.argument("path", required=False, type=click.Path())
-@_eval_options
 @_common_options
 @click.option("--session", "session_id", default=None)
 def run_cmd(
@@ -309,23 +181,11 @@ def run_cmd(
     mode: str | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
-    allow_rules: tuple[str, ...],
-    deny_rules: tuple[str, ...],
-    max_tokens: int | None,
-    max_cost_usd: float | None,
-    time_limit: float | None,
-    temperature: float | None,
-    top_p: float | None,
-    seed: int | None,
-    llm_cache: str | None,
-    llm_cache_mode: str | None,
-    checkpoint: bool | None,
 ) -> None:
-    """Non-interactive one-shot execution."""
-    _apply_llm_cache_env(llm_cache, llm_cache_mode)
+    """Run one coding task without opening the interactive interface."""
     code = _run_async(
-        _exec_session(
-            prompts=[prompt],
+        _run_session(
+            prompt=prompt,
             path=path,
             model=model,
             reasoning_effort=reasoning_effort,
@@ -333,95 +193,6 @@ def run_cmd(
             mode=mode,
             session_id=session_id,
             unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
-            allow_rules=allow_rules,
-            deny_rules=deny_rules,
-            max_tokens=max_tokens,
-            max_cost_usd=max_cost_usd,
-            time_limit=time_limit,
-            temperature=temperature,
-            top_p=top_p,
-            seed=seed,
-            checkpoint=checkpoint,
-            output_format="text",
-        )
-    )
-    raise SystemExit(code)
-
-
-@cli_group.command("exec")
-@click.argument("prompt", required=False)
-@click.argument("path", required=False, type=click.Path())
-@_eval_options
-@_common_options
-@click.option("--session", "session_id", default=None, help="Resume a specific session id")
-@click.option(
-    "--output-format",
-    type=click.Choice(["text", "json", "stream-json"]),
-    default="text",
-    show_default=True,
-    help="text: human output · json: one final summary · stream-json: NDJSON event stream",
-)
-def exec_cmd(
-    prompt: str | None,
-    path: str | None,
-    model: str | None,
-    reasoning_effort: str | None,
-    auto: bool,
-    mode: str | None,
-    session_id: str | None,
-    unsafe_inprocess_code_execution: bool,
-    output_format: str,
-    allow_rules: tuple[str, ...],
-    deny_rules: tuple[str, ...],
-    max_tokens: int | None,
-    max_cost_usd: float | None,
-    time_limit: float | None,
-    temperature: float | None,
-    top_p: float | None,
-    seed: int | None,
-    llm_cache: str | None,
-    llm_cache_mode: str | None,
-    checkpoint: bool | None,
-) -> None:
-    """Scriptable multi-turn execution for evals and automation.
-
-    PROMPT runs as the first message. When stdin is not a TTY, each non-empty
-    stdin line becomes a follow-up message, enabling scripted multi-turn
-    sessions. Use --output-format stream-json for per-event NDJSON and json
-    for a single final summary document.
-    """
-    from noah_code.exec_mode import read_followup_prompts
-
-    prompts: list[str] = [prompt] if prompt else []
-    stdin = getattr(sys, "stdin", None)
-    if stdin is not None and not stdin.isatty():
-        prompts.extend(read_followup_prompts(stdin))
-    if not prompts:
-        click.echo("error: provide PROMPT or pipe messages on stdin", err=True)
-        raise SystemExit(EXIT_CONFIG)
-
-    _apply_llm_cache_env(llm_cache, llm_cache_mode)
-
-    code = _run_async(
-        _exec_session(
-            prompts=prompts,
-            path=path,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            auto=auto,
-            mode=mode,
-            session_id=session_id,
-            unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
-            allow_rules=allow_rules,
-            deny_rules=deny_rules,
-            max_tokens=max_tokens,
-            max_cost_usd=max_cost_usd,
-            time_limit=time_limit,
-            temperature=temperature,
-            top_p=top_p,
-            seed=seed,
-            checkpoint=checkpoint,
-            output_format=output_format,  # type: ignore[arg-type]
         )
     )
     raise SystemExit(code)
@@ -720,199 +491,6 @@ def pr_comment(number: int, body: str, path: str | None) -> None:
         raise SystemExit(EXIT_CONFIG) from exc
 
 
-@cli_group.command("benchmark")
-@click.argument("path", required=False, type=click.Path())
-@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON")
-def benchmark_cmd(path: str | None, as_json: bool) -> None:
-    """Run deterministic token-efficiency fixtures without making API calls."""
-
-    try:
-        workspace = open_workspace(path)
-        config = load_config(workspace.root)
-        from noah_code.benchmark import run_efficiency_benchmark
-
-        result = run_efficiency_benchmark(config)
-    except (WorkspaceError, ValueError) as exc:
-        click.echo(f"error: {exc}", err=True)
-        raise SystemExit(EXIT_CONFIG) from exc
-    if as_json:
-        import json
-
-        click.echo(json.dumps(result.to_dict(), indent=2, sort_keys=True))
-    else:
-        click.echo(result.format())
-
-
-@cli_group.group("bench")
-def bench_group() -> None:
-    """Run task-success benchmarks (SWE-bench-Verified subsets) end to end."""
-
-
-@bench_group.command("run")
-@click.argument("suite")
-@click.option("--model", default=None, help="Model override for every task")
-@click.option(
-    "--reasoning-effort",
-    type=click.Choice(["default", "none", "minimal", "low", "medium", "high", "xhigh"]),
-    default=None,
-)
-@click.option("--limit", type=int, default=None, help="Only run the first N tasks")
-@click.option("--budget-tokens", type=int, default=None, help="Per-task total token cap")
-@click.option("--budget-cost-usd", type=float, default=None, help="Per-task cost cap in USD")
-@click.option(
-    "--time-limit",
-    type=float,
-    default=1800.0,
-    show_default=True,
-    metavar="SECONDS",
-    help="Per-task agent wall-clock limit",
-)
-@click.option(
-    "--eval-timeout",
-    type=float,
-    default=1200.0,
-    show_default=True,
-    metavar="SECONDS",
-    help="Per-suite pytest timeout during scoring",
-)
-@click.option(
-    "--setup",
-    "setup_command",
-    default=None,
-    help="Shell command run per task before the agent; overrides the suite and env hook",
-)
-@click.option(
-    "--max-iterations",
-    type=int,
-    default=None,
-    metavar="N",
-    help="Agent iteration cap per task; 0 removes the cap (default: config max_iterations)",
-)
-@click.option("--keep-worktrees", is_flag=True, help="Keep repo worktrees even on failure")
-@click.option(
-    "--output-root",
-    type=click.Path(),
-    default=None,
-    help="Directory for run artifacts (default .noah-code/bench-runs)",
-)
-def bench_run(
-    suite: str,
-    model: str | None,
-    reasoning_effort: str | None,
-    limit: int | None,
-    budget_tokens: int | None,
-    budget_cost_usd: float | None,
-    time_limit: float,
-    eval_timeout: float,
-    setup_command: str | None,
-    max_iterations: int | None,
-    keep_worktrees: bool,
-    output_root: str | None,
-) -> None:
-    """Run SUITE (builtin name or path to suite .json/.jsonl) and print a report."""
-
-    from noah_code.bench.runner import BenchOptions, BenchRunner
-    from noah_code.bench.suites import SuiteError, load_suite
-    from noah_code.config import NoahCodeConfig
-
-    try:
-        loaded = load_suite(suite)
-    except SuiteError as exc:
-        click.echo(f"error: {exc}", err=True)
-        raise SystemExit(EXIT_CONFIG) from exc
-    options = BenchOptions(
-        output_root=Path(output_root) if output_root else Path(".noah-code") / "bench-runs",
-        model=model or user_default_model(),
-        reasoning_effort=reasoning_effort,
-        budget_tokens=budget_tokens,
-        budget_cost_usd=budget_cost_usd,
-        agent_time_limit_seconds=time_limit if time_limit and time_limit > 0 else None,
-        eval_timeout_seconds=eval_timeout,
-        setup_command=setup_command,
-        max_iterations=max_iterations,
-        keep_worktrees=keep_worktrees,
-        limit=limit,
-    )
-    resolved_model = options.model or NoahCodeConfig().model
-
-    async def _execute():
-        runner = BenchRunner(options)
-        return await runner.run(loaded, model=resolved_model)
-
-    report = _run_async(_execute())
-    click.echo()
-    from noah_code.bench.score import format_report
-
-    click.echo(format_report(report))
-    click.echo(f"artifacts: {(options.output_root / report.run_id).resolve()}")
-
-
-@bench_group.command("report")
-@click.argument("run_dir", type=click.Path(exists=True))
-def bench_report(run_dir: str) -> None:
-    """Print the saved report for RUN_DIR."""
-
-    from noah_code.bench.score import format_report, load_report
-
-    try:
-        report = load_report(Path(run_dir))
-    except FileNotFoundError as exc:
-        click.echo(f"error: {exc}", err=True)
-        raise SystemExit(EXIT_CONFIG) from exc
-    click.echo(format_report(report))
-
-
-@bench_group.command("compare")
-@click.argument("baseline_dir", type=click.Path(exists=True))
-@click.argument("candidate_dir", type=click.Path(exists=True))
-def bench_compare(baseline_dir: str, candidate_dir: str) -> None:
-    """Diff two benchmark run directories over their shared tasks."""
-
-    from noah_code.bench.score import compare_reports, format_comparison, load_report
-
-    try:
-        baseline = load_report(Path(baseline_dir))
-        candidate = load_report(Path(candidate_dir))
-    except FileNotFoundError as exc:
-        click.echo(f"error: {exc}", err=True)
-        raise SystemExit(EXIT_CONFIG) from exc
-    delta = compare_reports(baseline, candidate)
-    click.echo(format_comparison(baseline, candidate, delta))
-
-
-@bench_group.command("pull")
-@click.option("--ids", required=True, help="Comma-separated SWE-bench Verified instance ids")
-@click.option("--out", required=True, type=click.Path(), help="Output suite .json path")
-def bench_pull(ids: str, out: str) -> None:
-    """Fetch Verified records for IDS and write a local suite file."""
-
-    from noah_code.bench.suites import (
-        SWEBENCH_DATASET,
-        SuiteError,
-        fetch_swebench_verified,
-        suite_from_swebench_ids,
-    )
-
-    cache = Path.home() / ".cache" / "noah-code" / "bench" / "swebench_verified.jsonl"
-    try:
-        fetch_swebench_verified(cache)
-        instance_ids = [item.strip() for item in ids.split(",") if item.strip()]
-        built = suite_from_swebench_ids(Path(out).stem or "pulled-suite", instance_ids, cache)
-    except SuiteError as exc:
-        click.echo(f"error: {exc}", err=True)
-        raise SystemExit(EXIT_CONFIG) from exc
-    document = {
-        "name": built.name,
-        "description": built.description,
-        "source": SWEBENCH_DATASET,
-        "environment_setup": None,
-        "tasks": [task.to_dict() for task in built.tasks],
-    }
-    destination = Path(out).expanduser()
-    destination.write_text(json.dumps(document, indent=2))
-    click.echo(f"wrote {len(built.tasks)} tasks to {destination}")
-
-
 @cli_group.command("doctor")
 @click.argument("path", required=False, type=click.Path())
 def doctor(path: str | None) -> None:
@@ -1167,7 +745,6 @@ async def _prepare(
     session_id: str | None = None,
     frontend: Literal["tui", "console"] | None = None,
     unsafe_inprocess_code_execution: bool = False,
-    extra_overrides: dict[str, Any] | None = None,
 ):
     try:
         workspace = open_workspace(path)
@@ -1188,8 +765,6 @@ async def _prepare(
         overrides["ui"] = {"frontend": frontend}
     if unsafe_inprocess_code_execution:
         overrides["unsafe_inprocess_code_execution"] = True
-    if extra_overrides:
-        overrides.update(extra_overrides)
     config = load_config(workspace.root, cli_overrides=overrides)
     if await _maybe_auto_update(config):
         return None, EXIT_OK
@@ -1310,9 +885,9 @@ async def _interactive(
         return EXIT_SIGINT
 
 
-async def _exec_session(
+async def _run_session(
     *,
-    prompts: list[str],
+    prompt: str,
     path: str | None,
     model: str | None,
     reasoning_effort: str | None,
@@ -1320,34 +895,9 @@ async def _exec_session(
     mode: str | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
-    output_format: Literal["text", "json", "stream-json"],
-    allow_rules: tuple[str, ...] = (),
-    deny_rules: tuple[str, ...] = (),
-    max_tokens: int | None = None,
-    max_cost_usd: float | None = None,
-    time_limit: float | None = None,
-    temperature: float | None = None,
-    top_p: float | None = None,
-    seed: int | None = None,
-    checkpoint: bool | None = None,
 ) -> int:
-    """Shared driver behind ``noah run`` and ``noah exec``."""
+    """Run one task through the normal host without automation-only adapters."""
 
-    from noah_code.exec_mode import ExecDriver, JsonUI
-
-    eval_overrides: dict[str, Any] = {}
-    _apply_eval_overrides(
-        eval_overrides,
-        allow_rules=allow_rules,
-        deny_rules=deny_rules,
-        max_tokens=max_tokens,
-        max_cost_usd=max_cost_usd,
-        time_limit=time_limit,
-        temperature=temperature,
-        top_p=top_p,
-        seed=seed,
-        checkpoint=checkpoint,
-    )
     prepared, code = await _prepare(
         path=path,
         model=model,
@@ -1357,25 +907,28 @@ async def _exec_session(
         session_id=session_id,
         frontend="console",
         unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
-        extra_overrides=eval_overrides or None,
     )
     if prepared is None:
         return code
     workspace, config, store, meta = prepared
-    ui = JsonUI(stream=sys.stdout, mirror_text=output_format == "text")
     host = AgentHost(
         workspace,
         config,
         session_meta=meta,
         store=store,
-        ui=ui,
+        ui=ConsoleUI(markdown=config.ui.markdown),
     )
-    driver = ExecDriver(host, ui, output_format=output_format)
     try:
-        return await driver.run(prompts)
+        result = await host.run_once(prompt)
+        return result.exit_code
     except KeyboardInterrupt:
         host.cancel_active_turn()
         return EXIT_SIGINT
+    except Exception as exc:  # noqa: BLE001 - keep one-shot failures concise
+        from noah_code.redaction import safe_error_message
+
+        click.echo(f"error: {safe_error_message(exc)}", err=True)
+        return EXIT_AGENT
 
 
 def main(argv: list[str] | None = None) -> None:
