@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -96,15 +97,25 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
 ]
 
 
-_SECRET_CONFIG_PARTS = (
-    "api_key",
-    "authorization",
-    "credential",
-    "password",
-    "private_key",
-    "secret",
-    "token",
+_SECRET_CONFIG_KEYS = frozenset(
+    {
+        "access_key",
+        "api_key",
+        "auth",
+        "authorization",
+        "cookie",
+        "credential",
+        "credentials",
+        "password",
+        "passphrase",
+        "private_key",
+        "secret",
+        "secret_key",
+        "set_cookie",
+        "token",
+    }
 )
+_SECRET_CONFIG_CONTAINERS = frozenset({"env", "headers"})
 
 
 def _config_mapping(config: Any) -> dict[str, Any]:
@@ -119,11 +130,62 @@ def _config_mapping(config: Any) -> dict[str, Any]:
     return value
 
 
-def _redacted_config_value(path: str, value: Any) -> Any:
-    normalized = path.lower().replace("-", "_")
-    if any(part in normalized for part in _SECRET_CONFIG_PARTS):
-        return "***"
-    return value
+def _normalized_config_key(key: str) -> str:
+    # MCP/provider configuration is open-ended and commonly mixes snake_case,
+    # kebab-case, and camelCase. Normalize all three before classifying keys.
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+    value = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", value)
+    return "_".join(part for part in value.lower().replace("-", "_").split("_") if part)
+
+
+def _is_secret_config_path(path: tuple[str, ...]) -> bool:
+    normalized = tuple(_normalized_config_key(part) for part in path)
+    if any(part in _SECRET_CONFIG_CONTAINERS for part in normalized):
+        return True
+    for part in normalized:
+        if part.endswith("_env"):
+            # Configuration commonly stores an environment variable's name
+            # rather than its value (for example api_key_env).
+            continue
+        if part in _SECRET_CONFIG_KEYS or part.endswith(
+            (
+                "_api_key",
+                "_access_key",
+                "_authorization",
+                "_credential",
+                "_password",
+                "_private_key",
+                "_secret",
+                "_secret_key",
+                "_cookie",
+                "_set_cookie",
+                "_token",
+            )
+        ):
+            return True
+    return False
+
+
+def _redact_config(value: Any, path: tuple[str, ...] = ()) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _redact_config(child, (*path, str(key))) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_redact_config(child, path) for child in value]
+    if isinstance(value, tuple):
+        return [_redact_config(child, path) for child in value]
+    return "***" if _is_secret_config_path(path) else value
+
+
+def redacted_config(config: Any) -> dict[str, Any]:
+    """Return a JSON-safe config mapping with credentials recursively masked."""
+
+    return _redact_config(_config_mapping(config))
+
+
+def config_json(config: Any, *, indent: int = 2) -> str:
+    """Serialize resolved configuration without exposing credential values."""
+
+    return json.dumps(redacted_config(config), ensure_ascii=False, indent=indent)
 
 
 def _flatten_config(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
@@ -133,13 +195,13 @@ def _flatten_config(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
             path = f"{prefix}.{key}" if prefix else str(key)
             rows.extend(_flatten_config(child, path))
         return rows
-    return [(prefix, _redacted_config_value(prefix, value))]
+    return [(prefix, value)]
 
 
 def config_entries(config: Any, path: str = "") -> list[tuple[str, str]]:
     """Return redacted leaf settings, optionally scoped to a dotted path."""
 
-    rows = _flatten_config(_config_mapping(config))
+    rows = _flatten_config(redacted_config(config))
     query = path.strip().lower().strip(".")
     if query:
         rows = [

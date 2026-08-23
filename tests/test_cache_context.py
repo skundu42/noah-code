@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from nooa.unifiedllm import FakeLLMClient
 
+from noah_code import secure_files
 from noah_code.agent import (
     CodingAgent,
     _AdaptivePermissionCodeActStrategy,
@@ -141,6 +142,60 @@ def test_plan_and_memory_refresh_into_prefix_context(tmp_path: Path) -> None:
     assert added == ["Prefer conventional PR titles"]
     agent.refresh_context_sources()
     assert "conventional PR titles" in str(agent.context["project_memory"])
+
+
+def test_repo_instruction_context_rejects_external_symlink(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-external-agents.md"
+    outside.write_text("EXTERNAL_INSTRUCTION_SECRET\n")
+    (tmp_path / "AGENTS.md").symlink_to(outside)
+
+    agent = _agent(tmp_path)
+
+    instructions = str(agent.context["repo_instructions"])
+    assert "EXTERNAL_INSTRUCTION_SECRET" not in instructions
+    assert "no repository instruction files" in instructions
+
+
+def test_repo_instruction_context_rejects_external_hardlink(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-hardlinked-agents.md"
+    outside.write_text("EXTERNAL_HARDLINK_SECRET\n")
+    (tmp_path / "AGENTS.md").hardlink_to(outside)
+
+    agent = _agent(tmp_path)
+
+    instructions = str(agent.context["repo_instructions"])
+    assert "EXTERNAL_HARDLINK_SECRET" not in instructions
+    assert "no repository instruction files" in instructions
+
+
+def test_repo_instruction_context_rejects_parent_swap_after_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notes = tmp_path / ".noah-code"
+    notes.mkdir()
+    (notes / "instructions.md").write_text("TRUSTED_INSTRUCTIONS\n")
+    displaced = tmp_path / ".noah-code-displaced"
+    outside = tmp_path.parent / f"{tmp_path.name}-swapped-instructions"
+    outside.mkdir()
+    (outside / "instructions.md").write_text("EXTERNAL_SWAP_SECRET\n")
+
+    original = secure_files._open_parent_fd
+    swapped = False
+
+    def swap_after_open(root: Path, parts: tuple[str, ...], *, create: bool) -> int:
+        nonlocal swapped
+        descriptor = original(root, parts, create=create)
+        if parts == (".noah-code",) and not swapped:
+            swapped = True
+            notes.rename(displaced)
+            notes.symlink_to(outside, target_is_directory=True)
+        return descriptor
+
+    monkeypatch.setattr(secure_files, "_open_parent_fd", swap_after_open)
+
+    instructions = str(_agent(tmp_path).context["repo_instructions"])
+    assert "EXTERNAL_SWAP_SECRET" not in instructions
+    assert "TRUSTED_INSTRUCTIONS" not in instructions
 
 
 def test_volatile_blocks_are_not_registered_in_system_prompt(tmp_path: Path) -> None:

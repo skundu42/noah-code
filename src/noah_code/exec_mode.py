@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from noah_code.approvals import ApprovalChoice, ApprovalRequest
 from noah_code.budget import BudgetExceeded
 from noah_code.events import HostEvent
+from noah_code.redaction import safe_error_message
 from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt
 
 if TYPE_CHECKING:
@@ -195,6 +196,7 @@ class ExecDriver:
         started = time.monotonic()
 
         budget_reason: str | None = None
+        host_error: str | None = None
         try:
             if guard is not None:
                 guard.enforce()
@@ -202,7 +204,8 @@ class ExecDriver:
         except BudgetExceeded as exc:
             budget_reason = str(exc)
         except Exception as exc:  # noqa: BLE001 - surfaced per turn below
-            self._note_stderr(f"exec turn {index + 1} failed: {exc}")
+            host_error = safe_error_message(exc)
+            self._note_stderr(f"exec turn {index + 1} failed: {host_error}")
 
         turn_events = self._ui.events[started_events:]
         denied, agent_error = self._classify(turn_events)
@@ -222,7 +225,7 @@ class ExecDriver:
             exit_code = EXIT_BUDGET
         elif denied:
             exit_code = EXIT_DENIED
-        elif agent_error:
+        elif agent_error or host_error is not None:
             exit_code = EXIT_AGENT
         else:
             exit_code = EXIT_OK
@@ -238,8 +241,21 @@ class ExecDriver:
         }
         if budget_reason is not None:
             result["budget_exceeded"] = budget_reason
+        if host_error is not None:
+            result["error"] = host_error
         self.turn_results.append(result)
         return result
+
+    async def _close_host(self) -> str | None:
+        """Best-effort cleanup that preserves the primary exec result."""
+
+        try:
+            await self._host.close()
+        except Exception as exc:  # noqa: BLE001 - report cleanup without masking the run
+            message = safe_error_message(exc)
+            self._note_stderr(f"error: cleanup failed: {message}")
+            return message
+        return None
 
     async def run(self, prompts: list[str]) -> int:
         overall = EXIT_OK
@@ -247,28 +263,41 @@ class ExecDriver:
             await self._host.start()
         except BudgetExceeded:
             overall = EXIT_BUDGET
-            self._write_summary(overall)
-            await self._host.close()
+            cleanup_error = await self._close_host()
+            self._write_summary(overall, cleanup_error=cleanup_error)
             return overall
         except Exception as exc:  # noqa: BLE001
-            self._note_stderr(f"error: startup failed: {exc}")
+            startup_error = safe_error_message(exc)
+            self._note_stderr(f"error: startup failed: {startup_error}")
+            cleanup_error = await self._close_host()
+            self._write_summary(EXIT_CONFIG, error=startup_error, cleanup_error=cleanup_error)
             return EXIT_CONFIG
 
+        result_error: str | None = None
         try:
             for index, prompt in enumerate(prompts):
                 result = await self.run_turn(index, prompt)
                 self._write_stream({"type": "turn_result", **result})
                 if result["exit_code"] != EXIT_OK:
                     overall = result["exit_code"]
+                    result_error = result.get("error")
                     break
-            self._write_summary(overall)
         except asyncio.CancelledError:
             overall = EXIT_SIGINT
         finally:
-            await self._host.close()
+            cleanup_error = await self._close_host()
+        if cleanup_error is not None and overall == EXIT_OK:
+            overall = EXIT_AGENT
+        self._write_summary(overall, error=result_error, cleanup_error=cleanup_error)
         return overall
 
-    def _write_summary(self, exit_code: int) -> None:
+    def _write_summary(
+        self,
+        exit_code: int,
+        *,
+        error: str | None = None,
+        cleanup_error: str | None = None,
+    ) -> None:
         meta = self._host.meta
         usage = self._host.usage_snapshot()
         summary: dict[str, Any] = {
@@ -293,6 +322,10 @@ class ExecDriver:
         guard = getattr(self._host, "_budget_guard", None)
         if guard is not None and guard.active:
             summary["budget"] = guard.status()
+        if error is not None:
+            summary["error"] = error
+        if cleanup_error is not None:
+            summary["cleanup_error"] = cleanup_error
         cache = getattr(self._host, "_llm_cache", None)
         if cache is not None and hasattr(cache, "stats"):
             summary["llm_cache"] = cache.stats()

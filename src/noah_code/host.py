@@ -25,6 +25,7 @@ from noah_code.config import (
 from noah_code.custom_commands import CustomCommand, discover_custom_commands
 from noah_code.event_bridge import install_event_bridge
 from noah_code.events import HostEvent, HostEventKind
+from noah_code.redaction import safe_error_message
 from noah_code.sessions import SessionEventRecord, SessionMeta, SessionStore
 from noah_code.steer import SAFE_SLASH_WHILE_BUSY, SteerQueue, expansion_failed
 from noah_code.themes import THEME_NAMES, get_theme
@@ -42,7 +43,7 @@ logger = logging.getLogger(__name__)
 def _friendly_agent_error(exc: Exception) -> str:
     """Turn framework/provider failures into bounded, actionable UI copy."""
 
-    raw = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(exc)).strip()
+    raw = safe_error_message(exc)
     iteration = re.search(r"Generation failed after (\d+) iterations \(max_iterations=(\d+)\)", raw)
     if iteration:
         used, limit = iteration.groups()
@@ -343,6 +344,13 @@ class AgentHost:
 
         llm = wrap_conversational_replies(llm)
         lightweight_llm = wrap_conversational_replies(lightweight_llm)
+        cache_mode, cache_dir = resolve_cache_settings()
+        llm = wrap_with_cache(llm, cache_dir, cache_mode)
+        lightweight_llm = wrap_with_cache(lightweight_llm, cache_dir, cache_mode)
+        self._llm_cache = llm if hasattr(llm, "stats") else None
+
+        # Budget and prefix observation must remain outside the cache so replay
+        # hits cannot bypass session caps or request accounting.
         llm, self._budget_guard = wrap_with_budget(
             llm, self.config.budget, prefix_observer=self._usage
         )
@@ -353,10 +361,6 @@ class AgentHost:
             )
         elif isinstance(llm, _PrefixObserverOnly):
             lightweight_llm = _PrefixObserverOnly(lightweight_llm, self._usage)
-        cache_mode, cache_dir = resolve_cache_settings()
-        llm = wrap_with_cache(llm, cache_dir, cache_mode)
-        lightweight_llm = wrap_with_cache(lightweight_llm, cache_dir, cache_mode)
-        self._llm_cache = llm if hasattr(llm, "stats") else None
 
         self._setup_tracing(self.meta.session_id)
         self._storage = self.store.open_storage(self.meta.session_id)
@@ -415,7 +419,12 @@ class AgentHost:
             max_per_session=self.config.checkpoints.max_per_session,
         )
         self._teardown_event_bridge()
-        self._event_unsubs = install_event_bridge(agent, self._emit_with_hooks, self._usage)
+        self._event_unsubs = install_event_bridge(
+            agent,
+            self._emit_with_hooks,
+            self._usage,
+            self._budget_guard,
+        )
 
         self._custom_commands = discover_custom_commands(self.workspace.root)
 
@@ -507,8 +516,7 @@ class AgentHost:
         guard = getattr(self, "_budget_guard", None)
         if guard is None or not guard.active:
             return
-        usage = self.usage_snapshot()
-        guard.add_usage(cost_usd=usage.cost_usd - guard.status()["cost_usd"])
+        guard.sync_cost_usd(self.usage_snapshot().cost_usd)
 
     async def _capture_checkpoint(self, label: str) -> None:
         manager = self._checkpoints
@@ -1711,18 +1719,21 @@ class AgentHost:
     def _apply_runtime_llm_wrappers(self, llm: Any) -> Any:
         """Re-apply session budget and record/replay wraps after a client swap."""
 
-        from noah_code.budget import SharedBudgetLLM
+        from noah_code.budget import SharedBudgetLLM, _PrefixObserverOnly
         from noah_code.llm_cache import resolve_cache_settings, wrap_with_cache
         from noah_code.llm_replies import wrap_conversational_replies
 
         llm = wrap_conversational_replies(llm)
-        guard = getattr(self, "_budget_guard", None)
-        if guard is not None and guard.active:
-            llm = SharedBudgetLLM(llm, guard)
         cache_mode, cache_dir = resolve_cache_settings()
         llm = wrap_with_cache(llm, cache_dir, cache_mode)
         if hasattr(llm, "stats"):
             self._llm_cache = llm
+
+        guard = getattr(self, "_budget_guard", None)
+        if guard is not None and guard.active:
+            llm = SharedBudgetLLM(llm, guard, prefix_observer=self._usage)
+        elif guard is not None:
+            llm = _PrefixObserverOnly(llm, self._usage)
         return llm
 
     async def _switch_model(self, model: str, *, reasoning_effort: str | None = None) -> None:

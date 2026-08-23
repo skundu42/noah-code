@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import shlex
 import time
 from pathlib import Path
 
@@ -40,6 +42,23 @@ def test_open_workspace_rejects_file(tmp_path: Path) -> None:
     f.write_text("x")
     with pytest.raises(WorkspaceError):
         open_workspace(f)
+
+
+def test_workspace_constructor_canonicalizes_root(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    target = real / "target.txt"
+    target.write_text("inside\n")
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+
+    through_alias = Workspace(root=alias)
+    through_real_path = Workspace(root=real)
+
+    assert through_alias.root == real.resolve()
+    assert through_alias.identity == through_real_path.identity
+    assert through_alias.resolve("target.txt") == target.resolve()
+    assert through_alias.relpath(target) == "target.txt"
 
 
 @pytest.mark.asyncio
@@ -419,6 +438,139 @@ async def test_file_ops_survive_shell_cd_drift(tmp_path: Path) -> None:
         await ws.write_file("app.py", "root = 3\n")
         assert (tmp_path / "app.py").read_text() == "root = 3\n"
         assert (tmp_path / "src" / "app.py").read_text() == "nested = 1\n"
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_trusted_reads_and_searches_pin_and_restore_shell_cwd(tmp_path: Path) -> None:
+    (tmp_path / "root.txt").write_text("ROOT_ONLY_NEEDLE\n")
+    nested = tmp_path / "src"
+    nested.mkdir()
+    (nested / "nested.txt").write_text("nested only\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        await ws.run("cd src")
+
+        trusted_pwd = await ws.run_trusted_readonly("pwd")
+        assert Path(trusted_pwd.stdout.strip()).resolve() == tmp_path.resolve()
+
+        search = await ws.search("ROOT_ONLY_NEEDLE")
+        assert "root.txt" in search.stdout
+
+        persistent_pwd = await ws.run("pwd")
+        assert Path(persistent_pwd.stdout.strip()).resolve() == nested.resolve()
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_streamed_cd_is_synchronized_before_pin_and_restore(tmp_path: Path) -> None:
+    (tmp_path / "root.txt").write_text("ROOT_ONLY_NEEDLE\n")
+    nested = tmp_path / "src"
+    nested.mkdir()
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        async for _event in ws.run_stream("cd src"):
+            pass
+
+        assert ws.raw_shell.cwd.resolve() == nested.resolve()
+        trusted_pwd = await ws.run_trusted_readonly("pwd")
+        assert Path(trusted_pwd.stdout.strip()).resolve() == tmp_path.resolve()
+        search = await ws.search("ROOT_ONLY_NEEDLE")
+        assert "root.txt" in search.stdout
+        persistent_pwd = await ws.run("pwd")
+        assert Path(persistent_pwd.stdout.strip()).resolve() == nested.resolve()
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_shell_command_cannot_interleave_with_pinned_operation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    nested = tmp_path / "src"
+    nested.mkdir()
+    ws = _make_ws(tmp_path, auto=True)
+    pin_completed = asyncio.Event()
+    release_pin = asyncio.Event()
+    try:
+        await ws.run("cd src")
+        shell_run = ws.raw_shell.run
+        intercepted = False
+
+        async def controlled_run(command, *args, **kwargs):
+            nonlocal intercepted
+            result = await shell_run(command, *args, **kwargs)
+            if (
+                command.startswith("cd -- ")
+                and str(tmp_path.resolve()) in command
+                and not intercepted
+            ):
+                intercepted = True
+                pin_completed.set()
+                await release_pin.wait()
+            return result
+
+        monkeypatch.setattr(ws.raw_shell, "run", controlled_run)
+        trusted_task = asyncio.create_task(ws.run_trusted_readonly("pwd"))
+        await pin_completed.wait()
+        drift_task = asyncio.create_task(ws.run(f"cd {shlex.quote(str(nested.resolve()))}"))
+        await asyncio.sleep(0)
+        assert not drift_task.done()
+
+        release_pin.set()
+        trusted_pwd = await trusted_task
+        await drift_task
+
+        assert Path(trusted_pwd.stdout.strip()).resolve() == tmp_path.resolve()
+    finally:
+        release_pin.set()
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_restore_failure_does_not_mask_primary_error(tmp_path: Path, monkeypatch) -> None:
+    nested = tmp_path / "src"
+    nested.mkdir()
+    (tmp_path / "target.txt").write_text("inside\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        await ws.run("cd src")
+
+        async def fail_read(*_args, **_kwargs):
+            nested.rename(tmp_path / "moved")
+            raise ValueError("primary read failure")
+
+        monkeypatch.setattr(ws.raw_shell, "read", fail_read)
+        with pytest.raises(ValueError, match="primary read failure") as captured:
+            await ws.read("target.txt")
+
+        assert any(
+            "cannot restore shell cwd" in note for note in getattr(captured.value, "__notes__", ())
+        )
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_restore_failure_after_success_is_reported(tmp_path: Path, monkeypatch) -> None:
+    nested = tmp_path / "src"
+    nested.mkdir()
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        await ws.run("cd src")
+        shell_run = ws.raw_shell.run
+
+        async def remove_original_after_pwd(command, *args, **kwargs):
+            result = await shell_run(command, *args, **kwargs)
+            if command == "pwd" and nested.exists():
+                nested.rename(tmp_path / "moved")
+            return result
+
+        monkeypatch.setattr(ws.raw_shell, "run", remove_original_after_pwd)
+        with pytest.raises(RuntimeError, match="cannot restore shell cwd"):
+            await ws.run_trusted_readonly("pwd")
     finally:
         await ws.close()
 

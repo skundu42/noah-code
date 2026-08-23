@@ -149,9 +149,9 @@ class WorkspaceTools(Skill):
         # callers. Batched inspections can otherwise launch multiple shells
         # and orphan every process except the last one assigned to the session.
         self._shell_start_lock = asyncio.Lock()
-        # Delegated file operations pin the shell's path resolution to the
-        # workspace root so a model-driven `cd` inside the persistent shell can
-        # never redirect an authorized operation at a different file.
+        # Every operation on the persistent shell shares one transaction lock.
+        # Pinned operations hold it across pin, command, and cwd restoration;
+        # streamed commands hold it until their iterator finishes.
         self._file_op_lock = asyncio.Lock()
         # sha256 of raw bytes at read() time, keyed by absolute path. Anchored
         # (Match) edits verify this fingerprint before splicing so a stale
@@ -218,8 +218,8 @@ class WorkspaceTools(Skill):
         cmd = " ".join(
             shlex.quote(a) for a in ["rg", "-n", "--no-heading", "-S", "--", pattern, target]
         )
-        await self._ensure_shell_started()
-        result = await self._shell.run(cmd, timeout=self._default_timeout)
+        async with self._pinned_shell_cwd():
+            result = await self._shell.run(cmd, timeout=self._default_timeout)
         return self._cap_shell_result(self._redact_secret_search(result))
 
     async def list_files(
@@ -679,12 +679,13 @@ class WorkspaceTools(Skill):
             self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
             self._on_shell_chunk("status", f"$ {command}\n")
-        await self._ensure_shell_started()
-        result = await self._shell.run(
-            command,
-            stdin=stdin,
-            timeout=timeout or self._default_timeout,
-        )
+        async with self._file_op_lock:
+            await self._ensure_shell_started()
+            result = await self._shell.run(
+                command,
+                stdin=stdin,
+                timeout=timeout or self._default_timeout,
+            )
         if self._on_shell_chunk is not None:
             if result.stdout:
                 self._on_shell_chunk("stdout", result.stdout)
@@ -705,13 +706,21 @@ class WorkspaceTools(Skill):
             self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
             self._on_shell_chunk("status", f"$ {command}\n")
-        await self._ensure_shell_started()
-        async for event in self._shell.run_stream(
-            command, timeout=timeout or self._default_timeout
-        ):
-            if self._on_shell_chunk is not None and hasattr(event, "kind"):
-                self._on_shell_chunk(getattr(event, "kind", "stdout"), getattr(event, "text", ""))
-            yield event
+        async with self._file_op_lock:
+            await self._ensure_shell_started()
+            try:
+                async for event in self._shell.run_stream(
+                    command, timeout=timeout or self._default_timeout
+                ):
+                    if self._on_shell_chunk is not None and hasattr(event, "kind"):
+                        self._on_shell_chunk(
+                            getattr(event, "kind", "stdout"), getattr(event, "text", "")
+                        )
+                    yield event
+            finally:
+                # NOOA updates BashSession.cwd after a streamed command but
+                # currently leaves ShellTools.cwd stale.
+                self._shell.cwd = self._shell.session.cwd.resolve()
 
     def _shell_decision(self, command: str, *, tool: str = "ws_run") -> PermissionDecision:
         decision = self._engine.decide(PermissionCategory.BASH, command, tool=tool)
@@ -744,8 +753,8 @@ class WorkspaceTools(Skill):
             raise PermissionError(f"trusted command is not read-only: {command}") from exc
         if any(is_secret_path(token) or is_secret_path(Path(token).name) for token in tokens):
             raise PermissionError(f"trusted command targets a secret path: {command}")
-        await self._ensure_shell_started()
-        result = await self._shell.run(command, timeout=self._default_timeout)
+        async with self._pinned_shell_cwd():
+            result = await self._shell.run(command, timeout=self._default_timeout)
         return self._cap_shell_result(result)
 
     async def _ensure_shell_started(self) -> None:
@@ -755,20 +764,57 @@ class WorkspaceTools(Skill):
 
     @contextlib.asynccontextmanager
     async def _pinned_shell_cwd(self):
-        """Resolve delegated file operations against the workspace root.
+        """Temporarily pin delegated operations to the canonical workspace root.
 
-        NOOA joins every delegated path onto its live shell cwd. Pinning that
-        cwd (and passing absolute paths) keeps a model-driven `cd` from
-        redirecting an authorized operation at a different file.
+        NOOA keeps both a Python-side cwd and a live persistent-shell cwd.
+        Pinning both keeps a model-driven ``cd`` from redirecting authorized
+        file operations, trusted Git commands, or repository searches. Restore
+        the prior cwd afterward so user shell state retains its documented
+        persistence.
         """
 
         async with self._file_op_lock:
-            original = self._shell.cwd
-            self._shell.cwd = self._workspace.root.resolve()
+            await self._ensure_shell_started()
+            original = self._shell.session.cwd.resolve()
+            self._shell.cwd = original
+            workspace_root = self._workspace.root
+            if original != workspace_root:
+                pin = await self._shell.run(
+                    f"cd -- {shlex.quote(str(workspace_root))}",
+                    timeout=min(self._default_timeout, 5.0),
+                )
+                if pin.returncode != 0:
+                    raise RuntimeError(f"cannot pin shell cwd to workspace: {pin.stderr.strip()}")
+            primary_error: BaseException | None = None
             try:
                 yield
+            except BaseException as exc:
+                primary_error = exc
+                raise
             finally:
-                self._shell.cwd = original
+                if original != workspace_root:
+                    restore_error: BaseException | None = None
+                    message = ""
+                    try:
+                        restored = await self._shell.run(
+                            f"cd -- {shlex.quote(str(original))}",
+                            timeout=min(self._default_timeout, 5.0),
+                        )
+                        if restored.returncode != 0:
+                            detail = restored.stderr.strip() or restored.stdout.strip()
+                            message = f"cannot restore shell cwd to {original}"
+                            if detail:
+                                message += f": {detail}"
+                    except BaseException as exc:
+                        if primary_error is None and not isinstance(exc, Exception):
+                            raise
+                        restore_error = exc
+                        message = f"cannot restore shell cwd to {original}: {exc}"
+                    if message:
+                        if primary_error is not None:
+                            primary_error.add_note(message)
+                        else:
+                            raise RuntimeError(message) from restore_error
 
     def _record_read_fingerprint(self, resolved: Path) -> None:
         digest = self._hash_path(resolved)

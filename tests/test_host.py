@@ -12,7 +12,7 @@ import pytest
 from nooa.unifiedllm import FakeLLMClient
 
 from noah_code.approvals import ApprovalBroker, ApprovalChoice
-from noah_code.budget import SharedBudgetLLM
+from noah_code.budget import BudgetExceeded, BudgetGuard, SharedBudgetLLM
 from noah_code.commands import help_text
 from noah_code.config import BudgetConfig, NoahCodeConfig, PermissionRule, load_config
 from noah_code.host import (
@@ -61,6 +61,16 @@ def test_context_overflow_is_detected_from_provider_errors() -> None:
     assert _is_context_overflow(RuntimeError("This model's maximum context length was exceeded"))
     assert _is_context_overflow(RuntimeError("prompt is too long for the context window"))
     assert not _is_context_overflow(RuntimeError("rate limit exceeded"))
+
+
+def test_friendly_agent_error_redacts_provider_credentials() -> None:
+    text = _friendly_agent_error(
+        RuntimeError("provider rejected apiKey=HOST-LEAK-123456 password='two words secret'")
+    )
+
+    assert "HOST-LEAK-123456" not in text
+    assert "two words secret" not in text
+    assert "apiKey=***" in text
 
 
 @pytest.mark.asyncio
@@ -616,10 +626,49 @@ async def test_model_switch_keeps_budget_and_cache_wrappers(tmp_path: Path, monk
     await host._switch_model("next-model")
 
     llm = host.agent._llm
-    assert isinstance(llm, CachedLLM)
-    assert isinstance(llm._inner, SharedBudgetLLM)
-    assert llm._inner._guard is guard
+    assert isinstance(llm, SharedBudgetLLM)
+    assert isinstance(llm._inner, CachedLLM)
+    assert llm._guard is guard
     await host.close()
+
+
+@pytest.mark.asyncio
+async def test_cache_hits_cannot_bypass_an_exceeded_budget(tmp_path: Path, monkeypatch) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = NoahCodeConfig(
+        session_dir=tmp_path / "sessions",
+        budget=BudgetConfig(max_tokens=100),
+    )
+    monkeypatch.setenv("NOAH_CODE_LLM_CACHE", "auto")
+    monkeypatch.setenv("NOAH_CODE_LLM_CACHE_DIR", str(tmp_path / "llm-cache"))
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+
+    llm = host.agent._llm
+    assert isinstance(llm, SharedBudgetLLM)
+    assert isinstance(llm._inner, CachedLLM)
+    await llm.acall([{"role": "user", "content": "cache me"}])
+    hits_before = llm._inner.stats()["hits"]
+    llm._guard.add_usage(prompt_tokens=101)
+
+    with pytest.raises(BudgetExceeded, match="token limit exceeded"):
+        await llm.acall([{"role": "user", "content": "cache me"}])
+    assert llm._inner.stats()["hits"] == hits_before
+    await host.close()
+
+
+def test_host_cost_sync_enforces_session_cap(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = NoahCodeConfig(
+        session_dir=tmp_path / "sessions",
+        budget=BudgetConfig(max_cost_usd=0.10),
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    host._budget_guard = BudgetGuard(config.budget)
+    host._usage._cost = 0.25
+
+    with pytest.raises(BudgetExceeded, match="cost limit exceeded"):
+        host._sync_budget_cost()
 
 
 @pytest.mark.asyncio

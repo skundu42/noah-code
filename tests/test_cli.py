@@ -47,6 +47,49 @@ def test_config_show(tmp_path: Path) -> None:
     assert "model" in result.output
 
 
+def test_config_show_redacts_mcp_secrets(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "user-config.toml"
+    config_path.write_text(
+        "[mcp.example]\n"
+        'api_key = "api-secret"\n'
+        'apiKey = "camel-api-secret"\n'
+        'clientSecret = "camel-client-secret"\n'
+        "[mcp.example.env]\n"
+        'API_TOKEN = "env-secret"\n'
+        'UNUSUAL_NAME = "also-secret"\n'
+        "[mcp.example.headers]\n"
+        'Authorization = "header-secret"\n'
+        'X-Custom = "custom-secret"\n'
+    )
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    result = CliRunner().invoke(cli_group, ["config", "show", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["mcp"]["example"]["api_key"] == "***"
+    assert payload["mcp"]["example"]["apiKey"] == "***"
+    assert payload["mcp"]["example"]["clientSecret"] == "***"
+    assert payload["mcp"]["example"]["env"] == {
+        "API_TOKEN": "***",
+        "UNUSUAL_NAME": "***",
+    }
+    assert payload["mcp"]["example"]["headers"] == {
+        "Authorization": "***",
+        "X-Custom": "***",
+    }
+    for secret in (
+        "api-secret",
+        "camel-api-secret",
+        "camel-client-secret",
+        "env-secret",
+        "also-secret",
+        "header-secret",
+        "custom-secret",
+    ):
+        assert secret not in result.output
+
+
 def test_benchmark_is_offline_and_machine_readable(tmp_path: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(cli_group, ["benchmark", str(tmp_path), "--json"])

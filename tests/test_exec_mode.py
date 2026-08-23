@@ -14,6 +14,7 @@ from noah_code.events import HostEvent, HostEventKind
 from noah_code.exec_mode import (
     EXIT_AGENT,
     EXIT_BUDGET,
+    EXIT_CONFIG,
     EXIT_DENIED,
     EXIT_OK,
     ExecDriver,
@@ -156,6 +157,121 @@ async def test_driver_success_flow_reports_turns_and_summary() -> None:
     assert driver.turn_results[0]["exit_code"] == EXIT_OK
     assert driver.turn_results[0]["response"] == "reply to explain"
     assert driver.turn_results[1]["exit_code"] == EXIT_AGENT
+
+
+@pytest.mark.asyncio
+async def test_driver_handle_line_exception_is_structured_failure() -> None:
+    class ExplodingHost(StubHost):
+        async def handle_line(self, line: str) -> str:
+            raise RuntimeError("provider exploded")
+
+    host = ExplodingHost()
+    stream = io.StringIO()
+    stderr = io.StringIO()
+    ui = JsonUI(stream)
+    driver = ExecDriver(  # type: ignore[arg-type]
+        host,
+        ui,
+        output_format="stream-json",
+        stderr=stderr,
+    )
+
+    code = await driver.run(["explain"])
+
+    records = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert code == EXIT_AGENT
+    assert host.started and host.closed
+    assert driver.turn_results[0]["exit_code"] == EXIT_AGENT
+    assert driver.turn_results[0]["error"] == "provider exploded"
+    assert records[-2]["type"] == "turn_result"
+    assert records[-2]["error"] == "provider exploded"
+    assert records[-1]["type"] == "result"
+    assert records[-1]["exit_code"] == EXIT_AGENT
+    assert records[-1]["error"] == "provider exploded"
+    assert "exec turn 1 failed: provider exploded" in stderr.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_driver_redacts_and_bounds_exception_messages() -> None:
+    secret = "sk-1234567890abcdefghijklmnop"
+
+    class ExplodingHost(StubHost):
+        async def handle_line(self, line: str) -> str:
+            raise RuntimeError(
+                f"Authorization: Bearer {secret} apiKey=short-secret "
+                f"password='two words secret' "
+                f"https://operator:password@example.test/ {'x' * 900}"
+            )
+
+    host = ExplodingHost()
+    stream = io.StringIO()
+    stderr = io.StringIO()
+    driver = ExecDriver(  # type: ignore[arg-type]
+        host,
+        JsonUI(stream),
+        output_format="stream-json",
+        stderr=stderr,
+    )
+
+    assert await driver.run(["explain"]) == EXIT_AGENT
+    output = stream.getvalue() + stderr.getvalue()
+    assert secret not in output
+    assert "short-secret" not in output
+    assert "two words secret" not in output
+    assert "words secret" not in output
+    assert "operator:password" not in output
+    assert "***" in output
+    assert len(driver.turn_results[0]["error"]) <= 700
+
+
+@pytest.mark.asyncio
+async def test_driver_redacts_host_emitted_error_events() -> None:
+    class EmittingHost(StubHost):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ui: JsonUI | None = None
+
+        async def handle_line(self, line: str) -> str:
+            assert self.ui is not None
+            self.ui.render(_event(HostEventKind.ERROR, "apiKey=HOST-LEAK-123456"))
+            return "handled"
+
+    host = EmittingHost()
+    stream = io.StringIO()
+    ui = JsonUI(stream)
+    host.ui = ui
+    driver = ExecDriver(host, ui, output_format="stream-json")  # type: ignore[arg-type]
+
+    assert await driver.run(["explain"]) == EXIT_AGENT
+    assert "HOST-LEAK-123456" not in stream.getvalue()
+    assert "apiKey=***" in stream.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_driver_startup_exception_closes_partial_host_and_reports_failure() -> None:
+    class PartialStartupHost(StubHost):
+        async def start(self) -> None:
+            self.started = True
+            raise RuntimeError("startup exploded")
+
+    host = PartialStartupHost()
+    stream = io.StringIO()
+    ui = JsonUI(stream)
+    driver = ExecDriver(  # type: ignore[arg-type]
+        host,
+        ui,
+        output_format="stream-json",
+        stderr=io.StringIO(),
+    )
+
+    code = await driver.run(["explain"])
+
+    records = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert code == EXIT_CONFIG
+    assert host.started and host.closed
+    assert records[-1]["type"] == "result"
+    assert records[-1]["exit_code"] == EXIT_CONFIG
+    assert records[-1]["error"] == "startup exploded"
 
 
 @pytest.mark.asyncio

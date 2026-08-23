@@ -77,13 +77,6 @@ _MUTATING_GIT = re.compile(
     r"\bgit\s+(commit|add|push|pull|fetch|rebase|merge|reset|clean|checkout|stash|tag|remote)\b"
 )
 _READ_ONLY_PREFIXES = (
-    "git status",
-    "git diff",
-    "git log",
-    "git show",
-    "git branch",
-    "git rev-parse",
-    "rg ",
     "grep ",
     "egrep ",
     "fgrep ",
@@ -100,6 +93,64 @@ _READ_ONLY_PREFIXES = (
     "python -m pytest --collect-only",
 )
 _READ_ONLY_GIT_SUBCOMMANDS = frozenset({"branch", "diff", "log", "rev-parse", "show", "status"})
+_GIT_READ_UNSAFE_FLAGS = frozenset({"--ext-diff", "--output", "--textconv"})
+_GIT_BRANCH_MUTATING_LONG_FLAGS = frozenset(
+    {
+        "--copy",
+        "--create-reflog",
+        "--delete",
+        "--edit-description",
+        "--force",
+        "--move",
+        "--no-track",
+        "--recurse-submodules",
+        "--set-upstream-to",
+        "--track",
+        "--unset-upstream",
+    }
+)
+_GIT_BRANCH_LIST_LONG_FLAGS = frozenset(
+    {
+        "--abbrev",
+        "--all",
+        "--color",
+        "--column",
+        "--contains",
+        "--format",
+        "--ignore-case",
+        "--list",
+        "--merged",
+        "--no-color",
+        "--no-column",
+        "--no-contains",
+        "--no-merged",
+        "--omit-empty",
+        "--points-at",
+        "--quiet",
+        "--remotes",
+        "--show-current",
+        "--sort",
+        "--verbose",
+    }
+)
+_GIT_BRANCH_LIST_ACTION_LONG_FLAGS = frozenset(
+    {
+        "--all",
+        "--contains",
+        "--list",
+        "--merged",
+        "--no-contains",
+        "--no-merged",
+        "--points-at",
+        "--remotes",
+        "--show-current",
+    }
+)
+_GIT_BRANCH_VALUE_LONG_FLAGS = frozenset({"--format", "--sort"})
+_GIT_BRANCH_MUTATING_SHORT_FLAGS = frozenset("dDmMcCftu")
+_GIT_BRANCH_LIST_SHORT_FLAGS = frozenset("ailrvq")
+_GIT_BRANCH_LIST_ACTION_SHORT_FLAGS = frozenset("alr")
+_RG_UNSAFE_LONG_FLAGS = frozenset({"--pre", "--search-zip"})
 _FIND_MUTATING_FLAGS = frozenset(
     {
         "-delete",
@@ -127,6 +178,16 @@ _SECRET_BASENAMES = {
 }
 _SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
 _SECRET_ALLOW = {".env.example", ".env.sample", ".env.template"}
+_GLOB_META = frozenset("*?[")
+_DOT_SECRET_GLOB_PROBES = (
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.secret",
+    ".git",
+)
+_BASENAME_SECRET_GLOB_PROBES = tuple(sorted(_SECRET_BASENAMES))
+_SUFFIX_SECRET_GLOB_PROBES = tuple(f"private{suf}" for suf in _SECRET_SUFFIXES)
 
 
 @dataclass(frozen=True)
@@ -168,7 +229,7 @@ def is_secret_path(path: str | Path) -> bool:
         return True
     if "id_rsa" in name or "id_ed25519" in name:
         return True
-    parts = p.parts
+    parts = tuple(part.lower() for part in p.parts)
     if ".git" in parts:
         return True
     return name.endswith(".db") and "noah-code" in str(p).lower()
@@ -247,17 +308,21 @@ class PermissionEngine:
             action = matching.action
             reason = matching.reason or f"matched {matching.pattern}"
 
+        if action == "ask" and self.auto_approve:
+            # --auto never overrides explicit deny; only ask → allow.
+            action = "allow"
+            reason = f"{reason} (auto-approved)"
+
         if category == PermissionCategory.BASH and action == "allow":
+            # Apply the elevated-risk floor *after* ordinary auto-approval. This
+            # keeps --auto useful for routine asks without silently approving
+            # commands that are explicitly documented as always requiring a
+            # human confirmation. An exact session allow remains authoritative.
             elevated = self._elevated_bash_ask(normalized)
             if elevated is not None:
                 action = elevated.action
                 reason = elevated.reason
                 matching = elevated.matching_rule
-
-        if action == "ask" and self.auto_approve:
-            # --auto never overrides explicit deny; only ask → allow.
-            action = "allow"
-            reason = f"{reason} (auto-approved)"
 
         return PermissionDecision(
             category=category,
@@ -277,9 +342,10 @@ class PermissionEngine:
             tokens = shlex.split(command)
         except ValueError:
             tokens = []
+        normalized_tokens = " ".join(tokens)
 
         for index, token in enumerate(tokens):
-            if is_secret_path(token) or is_secret_path(Path(token).name):
+            if _is_secret_shell_token(token):
                 return PermissionDecision(
                     category=PermissionCategory.BASH,
                     target=command,
@@ -342,7 +408,10 @@ class PermissionEngine:
             )
 
         for pat in _ALWAYS_DENY_BASH:
-            if pat.search(command):
+            # Scan both the source and shlex-normalized tokens. Shell quote
+            # fragments such as ``r''m`` execute as ``rm`` but deliberately do
+            # not contain the raw substring matched by the policy regex.
+            if pat.search(command) or (normalized_tokens and pat.search(normalized_tokens)):
                 return PermissionDecision(
                     category=PermissionCategory.BASH,
                     target=command,
@@ -371,8 +440,12 @@ class PermissionEngine:
         )
         if session_allowed:
             return None
+        try:
+            normalized_tokens = " ".join(shlex.split(command))
+        except ValueError:
+            normalized_tokens = ""
         for pat in _ALWAYS_ASK_BASH:
-            if pat.search(command):
+            if pat.search(command) or (normalized_tokens and pat.search(normalized_tokens)):
                 return PermissionDecision(
                     category=PermissionCategory.BASH,
                     target=command,
@@ -443,12 +516,14 @@ class PermissionEngine:
             return True
         program = Path(tokens[0]).name.lower()
         if program == "git":
-            return len(tokens) > 1 and tokens[1].lower() in _READ_ONLY_GIT_SUBCOMMANDS
+            return _is_readonly_git(tokens[1:])
+        if program == "rg":
+            return _is_readonly_rg(tokens[1:])
         if program == "pwd":
             return len(tokens) == 1
         if program == "find":
             return not any(_is_mutating_find_flag(token) for token in tokens[1:])
-        return any(lowered == p.strip() or lowered.startswith(p) for p in _READ_ONLY_PREFIXES[6:])
+        return any(lowered == p.strip() or lowered.startswith(p) for p in _READ_ONLY_PREFIXES)
 
     @staticmethod
     def is_uncertain_shell(command: str) -> bool:
@@ -494,6 +569,201 @@ def _is_compound(command: str) -> bool:
 def _is_mutating_find_flag(token: str) -> bool:
     name = token.split("=", 1)[0]
     return name in _FIND_MUTATING_FLAGS or name.startswith(("-exec", "-ok", "-fprint", "-fprintf"))
+
+
+def _is_secret_shell_token(token: str) -> bool:
+    """Detect direct or secret-specific glob path arguments.
+
+    The permission engine cannot expand model-provided globs safely without a
+    workspace/cwd and a new TOCTOU window. Instead, recognize patterns that are
+    specific enough to target Noah's denied filename families while leaving
+    broad, ordinary source globs such as ``src/*.py`` untouched.
+    """
+
+    values = token.split("=", 1)[1:] if token.startswith("-") and "=" in token else [token]
+    for value in values:
+        if is_secret_path(value):
+            return True
+        for component in Path(value).parts:
+            if _glob_component_may_match_secret(component):
+                return True
+    return False
+
+
+def _glob_component_may_match_secret(component: str) -> bool:
+    pattern = component.lower()
+    if not any(marker in pattern for marker in _GLOB_META):
+        return False
+    literal_runs = _glob_literal_runs(pattern)
+    specificity = _glob_pattern_specificity(pattern)
+
+    # Every .env.* name except the three exact templates is denied. A wildcard
+    # in this namespace can therefore never be proven to select only an allow.
+    if pattern.startswith(".env."):
+        return True
+
+    if specificity >= 2 and any(
+        fnmatch.fnmatchcase(probe, pattern) for probe in _DOT_SECRET_GLOB_PROBES
+    ):
+        return True
+
+    for probe in _BASENAME_SECRET_GLOB_PROBES:
+        if not fnmatch.fnmatchcase(probe, pattern):
+            continue
+        stem = probe.rsplit(".", 1)[0]
+        distinctive = [fragment for run in literal_runs for fragment in run.split(".")]
+        if any(len(fragment) >= 2 and fragment in stem for fragment in distinctive):
+            return True
+
+    return specificity >= 2 and any(
+        fnmatch.fnmatchcase(probe, pattern) for probe in _SUFFIX_SECRET_GLOB_PROBES
+    )
+
+
+def _glob_literal_runs(pattern: str) -> list[str]:
+    """Return literal runs, retaining classes that name one distinct character."""
+
+    runs: list[str] = []
+    current: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char in {"*", "?"}:
+            if current:
+                runs.append("".join(current))
+                current = []
+            index += 1
+            continue
+        if char == "[":
+            closing = pattern.find("]", index + 1)
+            if closing < 0:
+                current.append(char)
+                index += 1
+                continue
+            members = pattern[index + 1 : closing]
+            if members and not members.startswith(("!", "^")) and len(set(members)) == 1:
+                current.append(members[0])
+            elif current:
+                runs.append("".join(current))
+                current = []
+            index = closing + 1
+            continue
+        current.append(char)
+        index += 1
+    if current:
+        runs.append("".join(current))
+    return runs
+
+
+def _glob_pattern_specificity(pattern: str) -> int:
+    """Count literal and character-class constraints in a shell glob."""
+
+    specificity = 0
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char in {"*", "?"}:
+            index += 1
+            continue
+        if char == "[":
+            closing = pattern.find("]", index + 1)
+            if closing >= 0:
+                specificity += 1
+                index = closing + 1
+                continue
+        specificity += 1
+        index += 1
+    return specificity
+
+
+def _is_readonly_git(args: list[str]) -> bool:
+    if not args:
+        return False
+    subcommand = args[0].lower()
+    if subcommand not in _READ_ONLY_GIT_SUBCOMMANDS:
+        return False
+    subcommand_args = args[1:]
+    if subcommand == "branch":
+        return _is_readonly_git_branch(subcommand_args)
+    options_done = False
+    for token in subcommand_args:
+        if token == "--":
+            options_done = True
+            continue
+        if options_done:
+            continue
+        name = token.lower().split("=", 1)[0]
+        if name in _GIT_READ_UNSAFE_FLAGS or (
+            name.startswith("--")
+            and any(unsafe.startswith(name) for unsafe in _GIT_READ_UNSAFE_FLAGS)
+        ):
+            return False
+    return True
+
+
+def _is_readonly_git_branch(args: list[str]) -> bool:
+    """Recognize branch listing/query forms without admitting ref mutations."""
+
+    if not args:
+        return True
+    listing = False
+    options_done = False
+    expects_value = False
+    for token in args:
+        lowered = token.lower()
+        if expects_value:
+            expects_value = False
+            continue
+        if options_done:
+            if not listing:
+                return False
+            continue
+        if lowered == "--":
+            options_done = True
+            continue
+        if lowered.startswith("--"):
+            name = lowered.split("=", 1)[0]
+            if name in _GIT_BRANCH_MUTATING_LONG_FLAGS:
+                return False
+            if name not in _GIT_BRANCH_LIST_LONG_FLAGS:
+                return False
+            if name in _GIT_BRANCH_LIST_ACTION_LONG_FLAGS:
+                listing = True
+            if "=" not in lowered and name in _GIT_BRANCH_VALUE_LONG_FLAGS:
+                expects_value = True
+            continue
+        if lowered.startswith("-") and lowered != "-":
+            flags = lowered[1:]
+            if any(flag in _GIT_BRANCH_MUTATING_SHORT_FLAGS for flag in flags):
+                return False
+            if not flags or any(flag not in _GIT_BRANCH_LIST_SHORT_FLAGS for flag in flags):
+                return False
+            if any(flag in _GIT_BRANCH_LIST_ACTION_SHORT_FLAGS for flag in flags):
+                listing = True
+            continue
+        # A bare branch name creates a ref unless a listing/query option has
+        # selected the non-mutating synopsis.
+        if not listing:
+            return False
+    return not expects_value
+
+
+def _is_readonly_rg(args: list[str]) -> bool:
+    options_done = False
+    for token in args:
+        if token == "--":
+            options_done = True
+            continue
+        if options_done:
+            continue
+        lowered = token.lower()
+        name = lowered.split("=", 1)[0]
+        if name in _RG_UNSAFE_LONG_FLAGS:
+            return False
+        if lowered.startswith("-") and not lowered.startswith("--") and "z" in lowered[1:]:
+            # -z/--search-zip launches external decompressors.
+            return False
+    return True
 
 
 def _command_has_external_path(command: str) -> bool:

@@ -6,10 +6,12 @@ from pathlib import Path
 
 import pytest
 from nooa.unifiedllm.unifiedllm import LLMResponse
+from pydantic import BaseModel, create_model
 
 from noah_code.llm_cache import (
     CachedLLM,
     CacheMissError,
+    LLMCacheError,
     request_key,
     resolve_cache_settings,
     response_from_payload,
@@ -85,6 +87,61 @@ def test_api_keys_never_enter_cache_key() -> None:
     messages = [{"role": "user", "content": "hi"}]
     base = request_key("m", messages, None, {})
     assert request_key("m", messages, None, {"api_key": "sk-secret"}) == base
+
+
+def test_output_model_is_part_of_cache_key() -> None:
+    class FirstResult(BaseModel):
+        value: str
+
+    class SecondResult(BaseModel):
+        value: str
+
+    messages = [{"role": "user", "content": "hi"}]
+    first = request_key("m", messages, None, {}, output_model=FirstResult)
+    second = request_key("m", messages, None, {}, output_model=SecondResult)
+    assert first != second
+
+
+def test_output_model_schema_is_part_of_cache_key() -> None:
+    first_model = create_model("Result", alpha=(str, ...))
+    second_model = create_model("Result", beta=(int, ...))
+    messages = [{"role": "user", "content": "hi"}]
+
+    first = request_key("m", messages, None, {}, output_model=first_model)
+    second = request_key("m", messages, None, {}, output_model=second_model)
+    assert first != second
+
+
+@pytest.mark.asyncio
+async def test_local_output_model_replays_without_importing_class(tmp_path: Path) -> None:
+    class LocalResult(BaseModel):
+        value: str
+
+    class StructuredInner(FakeInner):
+        async def acall(self, messages, tools=None, output_model=None, **kwargs):
+            self.calls += 1
+            response = _response()
+            response.content = LocalResult(value="recorded")
+            return response
+
+    messages = [{"role": "user", "content": "structured"}]
+    recorder = CachedLLM(StructuredInner(), tmp_path, "record")
+    await recorder.acall(messages, output_model=LocalResult)
+
+    replayer = CachedLLM(FakeInner(), tmp_path, "replay")
+    replayed = await replayer.acall(messages, output_model=LocalResult)
+    assert replayed.content == LocalResult(value="recorded")
+
+
+def test_structured_replay_rejects_incompatible_content_kind() -> None:
+    class ExpectedResult(BaseModel):
+        value: str
+
+    payload = response_to_payload(_response())
+    payload["content"] = {"kind": "str", "data": {"value": "tampered"}}
+
+    with pytest.raises(LLMCacheError, match="incompatible"):
+        response_from_payload(payload, output_model=ExpectedResult)
 
 
 def test_response_payload_roundtrip_preserves_fields() -> None:

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
-from noah_code.commands import config_text
+from noah_code.commands import config_json, config_text
 from noah_code.config import (
     NoahCodeConfig,
     load_config,
@@ -85,13 +86,61 @@ def test_auto_update_environment_override(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_config_command_lists_nested_settings_and_redacts_secrets() -> None:
-    config = NoahCodeConfig(mcp={"example": {"env": {"API_TOKEN": "do-not-print"}}})
+    config = NoahCodeConfig(
+        summarization={"max_tokens": 123},
+        mcp={
+            "example": {
+                "env": {"API_TOKEN": "env-secret", "UNUSUAL_NAME": "also-secret"},
+                "headers": {"Authorization": "header-secret", "X-Custom": "custom-secret"},
+                "api_key": "api-secret",
+                "client_secret": "oauth-secret",
+                "apiKey": "camel-api-secret",
+                "clientSecret": "camel-client-secret",
+                "refreshToken": "camel-refresh-secret",
+                "secretKey": "camel-secret-key",
+                "apiSecretKey": "camel-api-secret-key",
+                "sessionCookie": "camel-session-cookie",
+                "api_key_env": "COMPANY_LLM_API_KEY",
+            }
+        },
+    )
     text = config_text(config)
     assert "ui.theme" in text
     assert '"atom-one-dark"' in text
     assert "mcp.example.env.API_TOKEN" in text
-    assert "do-not-print" not in text
+    for secret in (
+        "env-secret",
+        "also-secret",
+        "header-secret",
+        "custom-secret",
+        "api-secret",
+        "oauth-secret",
+        "camel-api-secret",
+        "camel-client-secret",
+        "camel-refresh-secret",
+        "camel-secret-key",
+        "camel-api-secret-key",
+        "camel-session-cookie",
+    ):
+        assert secret not in text
     assert '"***"' in text
+    assert "summarization.max_tokens" in text
+    assert "123" in text
+    assert "COMPANY_LLM_API_KEY" in text
+
+    payload = json.loads(config_json(config))
+    assert payload["mcp"]["example"]["env"]["API_TOKEN"] == "***"
+    assert payload["mcp"]["example"]["headers"]["X-Custom"] == "***"
+    assert payload["mcp"]["example"]["api_key"] == "***"
+    assert payload["mcp"]["example"]["client_secret"] == "***"
+    assert payload["mcp"]["example"]["apiKey"] == "***"
+    assert payload["mcp"]["example"]["clientSecret"] == "***"
+    assert payload["mcp"]["example"]["refreshToken"] == "***"
+    assert payload["mcp"]["example"]["secretKey"] == "***"
+    assert payload["mcp"]["example"]["apiSecretKey"] == "***"
+    assert payload["mcp"]["example"]["sessionCookie"] == "***"
+    assert payload["mcp"]["example"]["api_key_env"] == "COMPANY_LLM_API_KEY"
+    assert payload["summarization"]["max_tokens"] == 123
 
     ui_text = config_text(config, "ui")
     assert "ui.theme" in ui_text

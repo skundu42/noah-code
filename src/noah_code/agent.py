@@ -28,6 +28,7 @@ from noah_code.approvals import ApprovalBroker
 from noah_code.config import NoahCodeConfig
 from noah_code.macos_sandbox import build_macos_profile, macos_worker_main
 from noah_code.permissions import PermissionEngine
+from noah_code.secure_files import read_text_bounded
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tools.git_tools import GitTools
 from noah_code.tools.github_tools import GithubTools
@@ -40,7 +41,7 @@ from noah_code.tools.question_tools import QuestionTools
 from noah_code.tools.task_tools import TaskTools
 from noah_code.tools.web_tools import WebTools
 from noah_code.tools.workspace_tools import WorkspaceTools
-from noah_code.workspace import Workspace
+from noah_code.workspace import Workspace, WorkspaceError
 
 
 def _interpreter_read_rules() -> tuple[FileRule, ...]:
@@ -631,15 +632,19 @@ class CodingAgent(InteractiveAgent):
 
     @hidden
     def _repo_instructions(self) -> str:
-        root = Path(self.workspace_root)
+        root = Path(self.workspace_root).resolve()
         chunks: list[str] = []
         for name in ("AGENTS.md", "CLAUDE.md", ".noah-code/instructions.md"):
-            path = root / name
-            if path.is_file():
-                text = path.read_text(errors="replace")
-                if len(text) > 4000:
-                    text = text[:4000] + "\n...(truncated)..."
-                chunks.append(f"## {name}\n{text}")
+            try:
+                result = read_text_bounded(root, name, max_bytes=16 * 1024)
+            except (OSError, WorkspaceError):
+                # Repository-controlled links and parent swaps must not turn
+                # trusted context assembly into an external-file read.
+                continue
+            text = result.text
+            if result.truncated or len(text) > 4000:
+                text = text[:4000] + "\n...(truncated)..."
+            chunks.append(f"## {name}\n{text}")
         return "\n\n".join(chunks) if chunks else "(no repository instruction files found)"
 
     @hidden

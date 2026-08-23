@@ -23,6 +23,35 @@ def test_auto_cannot_override_deny() -> None:
     assert d.action == "deny"
 
 
+def test_auto_does_not_override_elevated_bash_ask() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+
+    for command in (
+        "rm generated.txt",
+        "mv old.txt new.txt",
+        "curl https://example.com/archive.tar.gz",
+        "pip install example-package",
+    ):
+        decision = engine.decide("bash", command)
+        assert decision.action == "ask", command
+        assert "elevated-risk" in decision.reason
+
+
+def test_exact_session_allow_still_authorizes_elevated_bash() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    command = "rm generated.txt"
+    engine.add_session_rule(
+        PermissionRule(
+            category="bash",
+            pattern=command,
+            action="allow",
+            reason="explicit session approval",
+        )
+    )
+
+    assert engine.decide("bash", command).action == "allow"
+
+
 def test_auto_allows_ask() -> None:
     rules = [PermissionRule(category="edit", pattern="*", action="ask", reason="ask")]
     engine = PermissionEngine(rules, auto_approve=True)
@@ -46,6 +75,8 @@ def test_secret_paths_match_case_insensitively() -> None:
     assert is_secret_path("CREDENTIALS.JSON")
     assert is_secret_path("Service-Account.JSON")
     assert is_secret_path("deploy/ID_ED25519")
+    assert is_secret_path("repo/.GIT/config")
+    assert is_secret_path("repo/.Git/HEAD")
     assert not is_secret_path(".ENV.EXAMPLE")
     assert not is_secret_path("README.MD")
 
@@ -126,6 +157,55 @@ def test_destructive_and_env_dump_denied() -> None:
     assert engine.decide("bash", "gh pr checkout 12").action == "deny"
 
 
+def test_quote_fragments_cannot_hide_dangerous_programs() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+
+    assert engine.decide("bash", "r''m -rf /").action == "deny"
+    assert engine.decide("bash", 's""udo whoami').action == "deny"
+    assert engine.decide("bash", "g''h pr create --title x").action == "deny"
+    assert engine.decide("bash", "r''m generated.txt").action == "ask"
+
+
+def test_bash_denies_secret_specific_shell_globs() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+
+    for command in (
+        "cat .e*",
+        "c''at .e*",
+        "cat '.e*'",
+        "head .env.*",
+        'head ".ENV.*"',
+        "cat credentials.*",
+        "cat deploy/ID_*",
+        "cat deploy/id*",
+        "cat keys/*.pem",
+        "cat keys/*.p?m",
+        "cat keys/*.p??",
+        "cat .g*/config",
+        "cat [.]g*/config",
+        "cat .GIT/config",
+    ):
+        decision = engine.decide("bash", command)
+        assert decision.action == "deny", command
+        assert "secret" in decision.reason
+
+
+def test_bash_secret_glob_detection_preserves_benign_globs() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+
+    for command in (
+        "cat src/*.py",
+        "cat 'src/*.py'",
+        "cat docs/**/*.md",
+        "head tests/test_*.py",
+        "ls build/*",
+        "cat reports/*.txt",
+        "cat *.json",
+        "cat .env.example",
+    ):
+        assert engine.decide("bash", command).action == "allow", command
+
+
 def test_read_commands_are_not_implicitly_allowed_outside_workspace() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=False)
     assert engine.decide("bash", "grep -R password /tmp").action == "ask"
@@ -161,6 +241,89 @@ def test_find_delete_is_not_readonly_and_denied_in_plan_auto() -> None:
     plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
     assert plan.decide("bash", "find . -delete").action == "deny"
     assert plan.decide("bash", "find . -exec rm {} +").action == "deny"
+
+
+def test_git_branch_mutations_are_not_readonly() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    destructive = (
+        "git branch feature-x",
+        "git branch -d feature-x",
+        "git branch -D feature-x",
+        "git branch -m main renamed",
+        "git branch -M main renamed",
+        "git branch --delete feature-x",
+        "git branch --move main renamed",
+        "git branch --edit-description main",
+        "git branch --set-upstream-to=origin/main main",
+        "git branch -q feature-x",
+        "git branch -v feature-x",
+        "git branch --color feature-x",
+        "git branch --format='%(refname:short)' feature-x",
+    )
+
+    for command in destructive:
+        assert engine.is_readonly_command(command) is False, command
+
+    plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
+    for command in destructive:
+        assert plan.decide("bash", command).action == "deny", command
+
+
+def test_git_branch_listing_forms_remain_readonly() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+
+    for command in (
+        "git branch",
+        "git branch -a",
+        "git branch -l 'feature/*'",
+        "git branch -rvv",
+        "git branch --list 'feature/*'",
+        "git branch --contains HEAD",
+        "git branch --show-current",
+        "git branch --format='%(refname:short)'",
+        "git branch --format '%(refname:short)'",
+    ):
+        assert engine.is_readonly_command(command) is True, command
+
+
+def test_readonly_git_rejects_flags_that_write_or_execute_helpers() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+
+    for command in (
+        "git diff --output=changes.patch",
+        "git diff --out=changes.patch",
+        "git diff --ext-diff",
+        "git diff --ext",
+        "git show --textconv HEAD:file.txt",
+        "git show --textc HEAD:file.txt",
+    ):
+        assert engine.is_readonly_command(command) is False, command
+
+    assert engine.is_readonly_command("git diff --no-ext-diff -- src") is True
+    assert engine.is_readonly_command("git diff -p -- src") is True
+    assert engine.is_readonly_command("git diff -- --output=tracked-name") is True
+
+
+def test_ripgrep_preprocessors_and_external_decompressors_are_not_readonly() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    unsafe = (
+        "rg --pre=rm needle .",
+        "rg --pre touch needle .",
+        "rg --search-zip needle .",
+        "rg -z needle .",
+        "rg -zn needle .",
+    )
+
+    for command in unsafe:
+        assert engine.is_readonly_command(command) is False, command
+
+    plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
+    for command in unsafe:
+        assert plan.decide("bash", command).action == "deny", command
+
+    assert engine.is_readonly_command("rg -n --hidden needle src") is True
+    assert engine.is_readonly_command("rg --files src") is True
+    assert engine.is_readonly_command("rg -- --pre source.txt") is True
 
 
 def test_plan_mode_denies_readonly_shell_outside_workspace() -> None:

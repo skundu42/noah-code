@@ -1,8 +1,8 @@
 """Deterministic record/replay transport around NOOA's UnifiedLLM clients.
 
 Requests are keyed on a canonical hash of model + messages + tool schemas +
-sampling kwargs, so a harness can rerun identical turns without provider
-calls. Modes:
+structured-output type + sampling kwargs, so a harness can rerun identical
+turns without provider calls. Modes:
 
 - ``record``  call through, persist every response
 - ``replay``  serve from disk only; a miss raises ``CacheMissError``
@@ -60,11 +60,36 @@ def _tool_payloads(tools: list[Any] | None) -> list[dict[str, Any]]:
     return payloads
 
 
-def request_key(model: str, messages: list[dict], tools: list[Any] | None, kwargs: dict[str, Any]) -> str:
+def _output_model_identity(output_model: Any) -> str | None:
+    if output_model is None:
+        return None
+    candidate = output_model if isinstance(output_model, type) else type(output_model)
+    qualified_name = f"{candidate.__module__}.{candidate.__qualname__}"
+    schema_factory = getattr(candidate, "model_json_schema", None)
+    if not callable(schema_factory):
+        return qualified_name
+    try:
+        schema = schema_factory()
+        canonical = json.dumps(schema, sort_keys=True, separators=(",", ":"), default=repr)
+    except Exception:  # noqa: BLE001 - third-party schema factories are optional
+        return qualified_name
+    schema_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"{qualified_name}:{schema_hash}"
+
+
+def request_key(
+    model: str,
+    messages: list[dict],
+    tools: list[Any] | None,
+    kwargs: dict[str, Any],
+    *,
+    output_model: Any = None,
+) -> str:
     canonical = {
         "model": str(model),
         "messages": messages,
         "tools": _tool_payloads(tools),
+        "output_model": _output_model_identity(output_model),
         "kwargs": _sanitize_kwargs(kwargs),
     }
     blob = json.dumps(canonical, sort_keys=True, default=repr).encode("utf-8")
@@ -84,13 +109,19 @@ def _content_to_payload(content: Any) -> dict[str, Any]:
     return {"kind": "str", "data": content}
 
 
-def _content_from_payload(payload: dict[str, Any]) -> Any:
-    if payload.get("kind") == "pydantic":
-        import importlib
-
-        module = importlib.import_module(str(payload["module"]))
-        model_cls = getattr(module, str(payload["name"]))
-        return model_cls.model_validate(payload["data"])
+def _content_from_payload(payload: dict[str, Any], *, output_model: Any = None) -> Any:
+    kind = payload.get("kind")
+    if output_model is not None:
+        validator = getattr(output_model, "model_validate", None)
+        if kind != "pydantic" or not callable(validator):
+            raise LLMCacheError("cached structured output is incompatible with output_model")
+        return validator(payload["data"])
+    if kind == "pydantic":
+        # Never import a module named by a cache file. Besides being unsafe for
+        # a user-configurable cache directory, dynamic and function-local model
+        # classes cannot be reconstructed that way. The request's output model
+        # is the only authoritative validator.
+        raise LLMCacheError("cached structured output requires its output_model")
     return payload.get("data")
 
 
@@ -111,12 +142,15 @@ def response_to_payload(response: Any) -> dict[str, Any]:
     }
 
 
-def response_from_payload(payload: dict[str, Any]) -> Any:
+def response_from_payload(payload: dict[str, Any], *, output_model: Any = None) -> Any:
     from nooa.unifiedllm.unifiedllm import LLMResponse, ToolCall
 
     return LLMResponse(
         raw_response=None,
-        content=_content_from_payload(payload.get("content", {"kind": "str", "data": ""})),
+        content=_content_from_payload(
+            payload.get("content", {"kind": "str", "data": ""}),
+            output_model=output_model,
+        ),
         tool_calls=[
             ToolCall(id=item["id"], name=item["name"], arguments=item.get("arguments", ""))
             for item in payload.get("tool_calls", [])
@@ -175,12 +209,12 @@ class CachedLLM:
             Path(temp_name).unlink(missing_ok=True)
 
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
-        key = request_key(self.model, messages, tools, kwargs)
+        key = request_key(self.model, messages, tools, kwargs, output_model=output_model)
         cached = self._load(key)
         if cached is not None and self._mode in {"replay", "auto"}:
             with self._lock:
                 self.hits += 1
-            return response_from_payload(cached)
+            return response_from_payload(cached, output_model=output_model)
         if self._mode == "replay":
             with self._lock:
                 self.replay_misses += 1
@@ -192,12 +226,12 @@ class CachedLLM:
         return response
 
     def call(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
-        key = request_key(self.model, messages, tools, kwargs)
+        key = request_key(self.model, messages, tools, kwargs, output_model=output_model)
         cached = self._load(key)
         if cached is not None and self._mode in {"replay", "auto"}:
             with self._lock:
                 self.hits += 1
-            return response_from_payload(cached)
+            return response_from_payload(cached, output_model=output_model)
         if self._mode == "replay":
             with self._lock:
                 self.replay_misses += 1

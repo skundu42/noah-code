@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from noah_code.secure_files import read_text_bounded, unlink_file, write_text_atomic
+from noah_code.workspace import WorkspaceError
+
 PLAN_RELATIVE = ".noah-code/plan.md"
 MEMORY_RELATIVE = ".noah-code/memory.md"
 MEMORY_MAX_ITEMS = 40
 MEMORY_MAX_CHARS = 4000
 _SECRET_MARKERS = ("api_key", "password", "secret", "token=", "BEGIN ")
+_NOTE_MAX_BYTES = 1024 * 1024
 
 
 def parse_memory_facts(raw: str) -> list[str]:
@@ -48,23 +52,26 @@ class NoteStore:
         self.path = self.root / relative
 
     def read(self) -> str:
-        if not self.path.is_file():
-            return ""
         try:
-            return self.path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            result = read_text_bounded(
+                self.root,
+                self.relative,
+                max_bytes=_NOTE_MAX_BYTES,
+                reject_hardlinks=True,
+            )
+        except (OSError, WorkspaceError):
             return ""
+        return result.text
 
     def write(self, text: str) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         payload = text if text.endswith("\n") or text == "" else f"{text}\n"
-        self.path.write_text(payload, encoding="utf-8")
+        write_text_atomic(self.root, self.relative, payload)
 
     def clear(self) -> None:
-        self.path.unlink(missing_ok=True)
+        unlink_file(self.root, self.relative)
 
     def exists(self) -> bool:
-        return self.path.is_file() and bool(self.read().strip())
+        return bool(self.read().strip())
 
 
 class PlanStore(NoteStore):

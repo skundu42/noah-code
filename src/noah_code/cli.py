@@ -186,7 +186,9 @@ def _common_options(fn):  # noqa: ANN001
     )(fn)
     fn = click.option("--mode", type=click.Choice(["build", "plan"]), default=None)(fn)
     fn = click.option(
-        "--auto", is_flag=True, help="Auto-approve ask decisions (never overrides deny)"
+        "--auto",
+        is_flag=True,
+        help="Auto-approve routine asks (never overrides deny or elevated-risk approval)",
     )(fn)
     fn = click.option("--model", "model", default=None, help="Override the model for this launch")(
         fn
@@ -972,6 +974,8 @@ def doctor(path: str | None) -> None:
 @click.option("--auto", is_flag=True)
 def config_cmd(action: str, path: str | None, model: str | None, auto: bool) -> None:
     """Show resolved configuration."""
+    from noah_code.commands import config_json
+
     try:
         workspace = open_workspace(path)
     except WorkspaceError as exc:
@@ -983,7 +987,7 @@ def config_cmd(action: str, path: str | None, model: str | None, auto: bool) -> 
     if auto:
         overrides["auto_approve"] = True
     config = load_config(workspace.root, cli_overrides=overrides)
-    click.echo(config.model_dump_json(indent=2))
+    click.echo(config_json(config))
 
 
 @cli_group.group("providers")

@@ -15,6 +15,8 @@ from noah_code.budget import (
     wrap_with_budget,
 )
 from noah_code.config import BudgetConfig
+from noah_code.event_bridge import install_event_bridge
+from noah_code.usage import UsageTracker
 
 
 @dataclass
@@ -81,6 +83,52 @@ def test_cost_cap_reports_currency() -> None:
     guard.add_usage(cost_usd=1.5)
     with pytest.raises(BudgetExceeded, match=r"cost limit exceeded"):
         guard.enforce()
+
+
+def test_provider_cost_sync_is_idempotent_and_enforces_cap() -> None:
+    guard = BudgetGuard(BudgetConfig(max_cost_usd=1.0))
+    guard.sync_cost_usd(0.75)
+    guard.sync_cost_usd(0.75)
+    assert guard.status()["cost_usd"] == 0.75
+
+    with pytest.raises(BudgetExceeded, match=r"cost limit exceeded"):
+        guard.sync_cost_usd(1.25)
+    assert guard.exceeded is not None
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_event_blocks_next_call_before_provider() -> None:
+    class EventManager:
+        def __init__(self) -> None:
+            self.handlers: dict[str, Any] = {}
+
+        def on(self, event_type: str, handler: Any):
+            self.handlers[event_type] = handler
+            return lambda: None
+
+    llm = FakeLLM(
+        responses=[
+            FakeResponse(usage={"prompt_tokens": 1}),
+            FakeResponse(usage={"prompt_tokens": 1}),
+        ]
+    )
+    client, guard = wrap_with_budget(llm, BudgetConfig(max_cost_usd=0.10))
+    usage = UsageTracker()
+    manager = EventManager()
+    install_event_bridge(
+        type("Agent", (), {"event_manager": manager})(),
+        lambda _event: None,
+        usage,
+        guard,
+    )
+
+    await client.acall([])
+    manager.handlers["LLMComplete"](
+        type("CostEvent", (), {"cost_usd": 0.25})()
+    )
+    with pytest.raises(BudgetExceeded, match="cost limit exceeded"):
+        await client.acall([])
+    assert llm.calls == 1
 
 
 def test_wall_clock_cap() -> None:

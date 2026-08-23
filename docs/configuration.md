@@ -256,8 +256,10 @@ Permission rules are evaluated in order, and the last matching rule wins. The de
 - Denies plan-mode mutations regardless of broader allow rules. Plan mode may still run
   read-only subagents.
 
-`--auto` changes ask decisions to allow but never overrides an explicit deny. Compound shell
-commands and mutating or unrecognized Git commands cannot be silently auto-approved.
+`--auto` changes routine ask decisions to allow but never overrides an explicit deny.
+Elevated-risk commands such as file removal, downloads, and package installation still require
+explicit approval. Compound shell commands and mutating or unrecognized Git commands cannot be
+silently auto-approved.
 
 ## Installation and updates
 

@@ -17,6 +17,9 @@ class Workspace:
 
     root: Path
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "root", Path(self.root).expanduser().resolve())
+
     @property
     def identity(self) -> str:
         """Stable identity for resume checks."""

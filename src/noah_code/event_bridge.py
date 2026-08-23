@@ -203,7 +203,12 @@ def _describe_code_activity(code: str) -> str:
     return "Working"
 
 
-def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> list[Unsubscribe]:
+def install_event_bridge(
+    agent: Any,
+    emit: EmitFn,
+    usage: Any | None = None,
+    budget_guard: Any | None = None,
+) -> list[Unsubscribe]:
     """Subscribe to agent.event_manager and forward useful events to the UI.
 
     Returns unsubscribe callables (call all on host close / session switch).
@@ -328,6 +333,11 @@ def install_event_bridge(agent: Any, emit: EmitFn, usage: Any | None = None) -> 
     def on_llm_complete(event: Any) -> None:
         if usage is not None:
             usage.llm_complete(event)
+            if budget_guard is not None and budget_guard.active:
+                # EventManager treats subscribers as telemetry and swallows
+                # their exceptions. Record a sticky breach here; the outer
+                # BudgetedLLM rejects the next call before it reaches a provider.
+                budget_guard.observe_cost_usd(usage.snapshot().cost_usd)
 
     def on_reasoning(event: Any) -> None:
         text = str(getattr(event, "content", "") or "").strip()
