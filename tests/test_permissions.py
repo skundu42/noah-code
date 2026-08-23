@@ -100,22 +100,30 @@ def test_plan_mode_rejects_variable_expansion_paths() -> None:
 
 def test_auto_denies_environment_dumps() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
-    assert engine.decide("bash", "set").action == "deny"
-    assert engine.decide("bash", "declare -p").action == "deny"
-    assert engine.decide("bash", "export").action == "deny"
-    assert engine.decide("bash", "export -p").action == "deny"
-    assert engine.decide("bash", "readonly").action == "deny"
-    assert engine.decide("bash", "cat /proc/self/environ").action == "deny"
-    assert engine.decide("bash", "cat /proc/1/environ").action == "deny"
-    assert engine.decide("bash", "python -c 'import os; print(os.environ)'").action == "deny"
-    assert engine.decide("bash", "node -e 'console.log(process.env)'").action == "deny"
+    for command in (
+        "set",
+        "declare -p",
+        "export",
+        "export -p",
+        "readonly",
+        "cat /proc/self/environ",
+        "cat /proc/1/environ",
+        "python -c 'import os; print(os.environ)'",
+        "node -e 'console.log(process.env)'",
+        "builtin set",
+        "command typeset -p",
+        "FOO=bar builtin export -p",
+        "command env MODE=test",
+    ):
+        assert engine.decide("bash", command).action == "deny", command
 
 
-def test_auto_still_allows_var_assignments_and_shell_options() -> None:
+def test_auto_still_allows_var_assignments_and_inert_commands() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
     assert engine.decide("bash", "export FOO=bar").action == "allow"
     assert engine.decide("bash", "declare x=1").action == "allow"
-    assert engine.decide("bash", "python -c 'print(1+1)'").action == "allow"
+    assert engine.decide("bash", "python --version").action == "allow"
+    assert engine.decide("bash", "echo environment").action == "allow"
     assert engine.decide("bash", "cat /proc/cpuinfo").action == "allow"
 
 
@@ -123,7 +131,85 @@ def test_auto_env_dump_detection_ignores_arguments_and_plain_words() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
     assert engine.decide("bash", "echo export").action == "allow"
     assert engine.decide("bash", "rg readonly").action == "allow"
-    assert engine.decide("bash", "python -c \"print('environment')\"").action == "allow"
+    assert engine.decide("bash", "echo environment").action == "allow"
+
+
+def test_auto_denies_interpreters_that_can_read_environment_or_secret_files() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+
+    for command in (
+        "python -c \"print(open('.env').read())\"",
+        "python3 -c 'import os; print(os.getenv(\"TOKEN\"))'",
+        "node -e \"console.log(require('fs').readFileSync('.env', 'utf8'))\"",
+        "perl -e 'print `cat .env`'",
+        "ruby -e 'puts File.read(\".env\")'",
+        "php -r 'echo file_get_contents(\".env\");'",
+        "python scripts/read_secrets.py",
+        "env MODE=test python -c 'print(1)'",
+        "uv run python -c 'print(1)'",
+        "eval 'cat .env'",
+        "source scripts/read_secrets.sh",
+        ". scripts/read_secrets.sh",
+    ):
+        decision = engine.decide("bash", command)
+        assert decision.action == "deny", command
+        assert "interpreter" in decision.reason
+
+    assert engine.decide("bash", "builtin source .env").action == "deny"
+
+    for command in (
+        "builtin source .env.example",
+        "command eval 'cat .env'",
+        "FOO=bar eval 'cat .env'",
+        "command builtin source .env.example",
+        "exec python -c 'print(1)'",
+        "exec -- python -c 'print(1)'",
+        "exec -cl -a worker python -c 'print(1)'",
+        "command exec python -c 'print(1)'",
+        "env -i python -c 'print(1)'",
+        "env -S \"python -c 'print(1)'\"",
+        "nohup python -c 'print(1)'",
+        "nohup -- python -c 'print(1)'",
+        "nice -n 5 python -c 'print(1)'",
+        "nice --adjustment=5 python -c 'print(1)'",
+        "timeout -k 1 5 python -c 'print(1)'",
+        "gtimeout --signal=TERM 5 python -c 'print(1)'",
+        "time -p python -c 'print(1)'",
+        "xargs -n 1 python -c 'print(1)'",
+        "uv run --no-project python -c 'print(1)'",
+        "uv run -m scripts.read_secrets",
+    ):
+        decision = engine.decide("bash", command)
+        assert decision.action == "deny", command
+        assert "interpreter" in decision.reason
+
+    # Names appearing only as ordinary argument text are not executed.
+    assert engine.decide("bash", "echo python").action == "allow"
+    assert engine.decide("bash", "echo exec python").action == "allow"
+    assert engine.decide("bash", "echo printenv env").action == "allow"
+    assert engine.decide("bash", "printf '%s' eval source").action == "allow"
+    assert engine.decide("bash", "command -v python").action == "allow"
+
+
+def test_auto_denies_shell_expansion_that_can_hide_secret_paths() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+
+    for command in (
+        "cat .e{nv,xample}",
+        "cat {credentials.json,README.md}",
+        "cat $'.env'",
+        'cat "$SECRET_PATH"',
+        'cat "${SECRET_PATH}"',
+        'cat "$(printf .env)"',
+        "cat `printf .env`",
+    ):
+        decision = engine.decide("bash", command)
+        assert decision.action == "deny", command
+        assert "expansion" in decision.reason
+
+    # Quoting prevents the shell from interpreting these as expansion syntax.
+    assert engine.decide("bash", "printf '%s' '$SECRET_PATH'").action == "allow"
+    assert engine.decide("bash", "printf '%s' '.e{nv,xample}'").action == "allow"
 
 
 def test_non_auto_env_builtins_still_ask() -> None:
@@ -233,6 +319,36 @@ def test_session_remember_keeps_exact_bash_command() -> None:
     assert engine.decide("bash", "sh -c 'cat credentials.json'").action != "allow"
 
 
+def test_auto_security_floor_overrides_session_allow_for_interpreters() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    command = "python -c \"print(open('.env').read())\""
+    engine.add_session_rule(
+        PermissionRule(
+            category="bash",
+            pattern=command,
+            action="allow",
+            reason="remembered for session",
+        )
+    )
+
+    assert engine.decide("bash", command).action == "deny"
+
+
+def test_auto_security_floor_overrides_session_allow_for_eval_and_source() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+
+    for command in ("eval 'cat .env'", "source .env.example"):
+        engine.add_session_rule(
+            PermissionRule(
+                category="bash",
+                pattern=command,
+                action="allow",
+                reason="remembered for session",
+            )
+        )
+        assert engine.decide("bash", command).action == "deny", command
+
+
 def test_find_delete_is_not_readonly_and_denied_in_plan_auto() -> None:
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
     assert engine.is_readonly_command("find .") is True
@@ -324,6 +440,44 @@ def test_ripgrep_preprocessors_and_external_decompressors_are_not_readonly() -> 
     assert engine.is_readonly_command("rg -n --hidden needle src") is True
     assert engine.is_readonly_command("rg --files src") is True
     assert engine.is_readonly_command("rg -- --pre source.txt") is True
+
+
+def test_plan_readonly_requires_literal_unqualified_executable_names() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
+
+    for command in (
+        "./git status",
+        "bin/git status",
+        "/usr/bin/git status",
+        "./rg needle .",
+        "bin/rg needle .",
+        "tools/find .",
+        "./pwd",
+        '"git" status',
+        "g''it status",
+        "pwd-helper",
+    ):
+        assert engine.is_readonly_command(command) is False, command
+        assert plan.decide("bash", command).action == "deny", command
+
+    assert engine.is_readonly_command("git status") is True
+    assert engine.is_readonly_command("rg needle .") is True
+    assert engine.is_readonly_command("pwd") is True
+
+
+def test_pytest_collection_is_never_plan_readonly() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
+
+    for command in (
+        "pytest --collect-only",
+        "pytest --collect-only -q",
+        "python -m pytest --collect-only",
+        "./pytest --collect-only",
+    ):
+        assert engine.is_readonly_command(command) is False, command
+        assert plan.decide("bash", command).action == "deny", command
 
 
 def test_plan_mode_denies_readonly_shell_outside_workspace() -> None:

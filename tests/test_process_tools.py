@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from nooa.tools.shell_tools import ShellTools
 
-from noah_code.approvals import ApprovalBroker
+from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.config import DEFAULT_PERMISSION_RULES
 from noah_code.permissions import PermissionEngine
 from noah_code.snapshots import SnapshotJournal
@@ -19,19 +19,34 @@ from noah_code.tools.workspace_tools import WorkspaceTools
 from noah_code.workspace import Workspace
 
 
-def _manager(tmp_path: Path) -> ProcessTools:
+async def _approve_once(_request) -> ApprovalChoice:
+    return ApprovalChoice.ONCE
+
+
+def _manager(tmp_path: Path, *, auto: bool = False) -> ProcessTools:
     workspace = Workspace(tmp_path.resolve())
-    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=auto)
     journal = SnapshotJournal()
     journal.begin_turn()
     tools = WorkspaceTools(
         workspace,
         ShellTools(cwd=str(tmp_path)),
         engine,
-        ApprovalBroker(engine),
+        ApprovalBroker(engine, handler=None if auto else _approve_once),
         journal,
     )
     return ProcessTools(tools, max_runtime_seconds=5, stop_grace_seconds=0.2)
+
+
+@pytest.mark.asyncio
+async def test_auto_rejects_interpreter_background_job(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, auto=True)
+    command = f"{shlex.quote(sys.executable)} -c " + shlex.quote("print('not allowed')")
+    try:
+        with pytest.raises(PermissionError, match="interpreter"):
+            await manager.start(command, name="blocked")
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio

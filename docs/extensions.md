@@ -6,7 +6,7 @@ Add reusable Markdown prompts in either location:
 
 - `~/.config/noah-code/commands/*.md` for user commands.
 - `.noah-code/commands/*.md` for repository commands. Repository commands override user commands
-  with the same name.
+  with the same non-built-in name. A repository cannot shadow Noah's built-in slash commands.
 
 For example, `.noah-code/commands/fix.md`:
 
@@ -44,7 +44,14 @@ readonly: true
 Review the assigned change. Cite files. Do not edit.
 ```
 
-`/agents` lists discovered names. Project files override user files with the same stem.
+`/agents` lists discovered names. Project files override user files with the same stem, except that
+the built-in `explore` and `general` agents are reserved and cannot be replaced by repository
+content.
+
+Repository command and agent files are limited to 64 KiB and must be ordinary, singly linked files
+inside their expected `.noah-code` directory. Symlinks, hardlinks, linked directories, special
+files, and oversized files are ignored. User-level files remain linkable because they are trusted
+configuration owned by the user.
 
 ## Skills
 

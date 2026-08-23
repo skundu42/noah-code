@@ -181,9 +181,13 @@ Lifecycle updates appear in the TUI without copying continuous logs into model c
 The parent agent can run isolated NOOA subagents with `self.task.run("explore", ...)` or
 `self.task.run("general", ...)`. Explore is read-only. General can edit but does not own todos.
 Custom agents are markdown files in `.noah-code/agents/` or `~/.config/noah-code/agents/`. List
-them with `/agents`. Plan mode can run read-only agents only.
+them with `/agents`. Repository files cannot replace the built-in `explore` or `general` agents,
+and unsafe linked or oversized repository definitions are ignored. Plan mode can run read-only
+agents only.
 
-`self.web.fetch(url)` and `self.web.search(query)` ask before leaving the machine.
+`self.web.fetch(url)` and `self.web.search(query)` ask before leaving the machine. Fetch follows a
+bounded number of redirects and accepts only public HTTP(S) destinations; private, loopback,
+link-local, and mixed public/private DNS results are rejected at every hop.
 `self.ask.question(header, prompt, options)` pauses the turn for a structured choice.
 
 Type `@path` in the composer to inline a workspace file or attach a PNG/JPEG/WebP/GIF as a NOOA

@@ -5,11 +5,13 @@ from __future__ import annotations
 import re
 
 _KEYED_SECRET = re.compile(
-    r"(?P<prefix>\b(?:authorization|proxy[-_ ]?authorization|api[-_ ]?key|apiKey|"
+    r"(?P<prefix>(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[-_.])*"
+    r"(?:authorization|proxy[-_ ]?authorization|api[-_ ]?key|apiKey|"
     r"access[-_ ]?token|accessToken|refresh[-_ ]?token|refreshToken|auth[-_ ]?token|"
     r"client[-_ ]?secret|clientSecret|password|passwd|private[-_ ]?key|"
-    r"api[-_ ]?secret[-_ ]?key|secret[-_ ]?key|session[-_ ]?cookie|"
-    r"set[-_ ]?cookie|cookie)"
+    r"api[-_ ]?secret[-_ ]?key|secret[-_ ]?access[-_ ]?key|secret[-_ ]?key|"
+    r"session[-_ ]?cookie|"
+    r"set[-_ ]?cookie|credential|credentials|cookie|token|secret)"
     r"[\"']?\s*[:=]\s*)"
     r"(?:(?P<quote>[\"'])(?P<quoted>.*?)(?P=quote)|"
     r"(?P<bearer>Bearer\s+[^\s,;}]+)|(?P<bare>[^\s,;}]+))",

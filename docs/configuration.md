@@ -254,12 +254,16 @@ Permission rules are evaluated in order, and the last matching rule wins. The de
   or comment.
 - Keeps file tools inside the active workspace and asks before skill or MCP access.
 - Denies plan-mode mutations regardless of broader allow rules. Plan mode may still run
-  read-only subagents.
+  read-only subagents. Its shell allowlist accepts only literal, unqualified read-only programs;
+  test collection and interpreter execution are not treated as read-only because they can load
+  repository code.
 
 `--auto` changes routine ask decisions to allow but never overrides an explicit deny.
 Elevated-risk commands such as file removal, downloads, and package installation still require
 explicit approval. Compound shell commands and mutating or unrecognized Git commands cannot be
-silently auto-approved.
+silently auto-approved. Interpreters, eval/source commands, and indirect execution wrappers, plus
+arguments hidden behind variable, command, ANSI-C, or brace expansion, are denied under `--auto`;
+run without `--auto` when one of these commands needs explicit approval.
 
 ## Installation and updates
 

@@ -106,6 +106,33 @@ async def test_plan_mode_cannot_edit(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_plan_mode_pytest_collection_cannot_execute_conftest(tmp_path: Path) -> None:
+    marker = tmp_path / "COLLECTION_EXECUTED"
+    (tmp_path / "conftest.py").write_text(
+        "from pathlib import Path\nPath('COLLECTION_EXECUTED').write_text('repository code ran')\n"
+    )
+    (tmp_path / "test_example.py").write_text("def test_example(): pass\n")
+    ws = _make_ws(tmp_path, mode="plan", auto=True)
+    try:
+        with pytest.raises(PermissionError, match="plan mode"):
+            await ws.run("pytest --collect-only")
+        assert not marker.exists()
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_interpreter_cannot_read_dotenv(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("API_TOKEN=do-not-read\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        with pytest.raises(PermissionError, match="interpreter"):
+            await ws.run("python -c \"print(open('.env').read())\"")
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
 async def test_build_edit_asks_without_auto(tmp_path: Path) -> None:
     (tmp_path / "a.py").write_text("x = 1\n")
     workspace = Workspace(root=tmp_path.resolve())

@@ -76,21 +76,21 @@ _ALWAYS_ASK_BASH = (
 _MUTATING_GIT = re.compile(
     r"\bgit\s+(commit|add|push|pull|fetch|rebase|merge|reset|clean|checkout|stash|tag|remote)\b"
 )
-_READ_ONLY_PREFIXES = (
-    "grep ",
-    "egrep ",
-    "fgrep ",
-    "find ",
-    "ls ",
-    "pwd",
-    "head ",
-    "tail ",
-    "wc ",
-    "file ",
-    "stat ",
-    "test ",
-    "pytest --collect-only",
-    "python -m pytest --collect-only",
+_READ_ONLY_PROGRAMS = frozenset(
+    {
+        "grep",
+        "egrep",
+        "fgrep",
+        "find",
+        "ls",
+        "pwd",
+        "head",
+        "tail",
+        "wc",
+        "file",
+        "stat",
+        "test",
+    }
 )
 _READ_ONLY_GIT_SUBCOMMANDS = frozenset({"branch", "diff", "log", "rev-parse", "show", "status"})
 _GIT_READ_UNSAFE_FLAGS = frozenset({"--ext-diff", "--output", "--textconv"})
@@ -273,9 +273,8 @@ class PermissionEngine:
     def _decide(self, category: str, target: str) -> PermissionDecision:
         normalized = target.strip() or "*"
         # Hard denies for secrets on read/edit.
-        if (
-            category in {PermissionCategory.READ, PermissionCategory.EDIT}
-            and is_secret_path(normalized)
+        if category in {PermissionCategory.READ, PermissionCategory.EDIT} and is_secret_path(
+            normalized
         ):
             return PermissionDecision(
                 category=category,
@@ -343,6 +342,18 @@ class PermissionEngine:
         except ValueError:
             tokens = []
         normalized_tokens = " ".join(tokens)
+        effective_tokens = _effective_shell_tokens(tokens)
+        effective_program = _program_name(effective_tokens[0]) if effective_tokens else ""
+
+        if effective_program in {"env", "printenv"}:
+            return PermissionDecision(
+                category=PermissionCategory.BASH,
+                target=command,
+                action="deny",
+                matching_rule=None,
+                reason="credential dump denied",
+                remember_pattern=command,
+            )
 
         for index, token in enumerate(tokens):
             if _is_secret_shell_token(token):
@@ -355,24 +366,6 @@ class PermissionEngine:
                     remember_pattern=command,
                 )
             program = Path(token).name.lower()
-            if program == "printenv":
-                return PermissionDecision(
-                    category=PermissionCategory.BASH,
-                    target=command,
-                    action="deny",
-                    matching_rule=None,
-                    reason="credential dump denied",
-                    remember_pattern=command,
-                )
-            if program == "env" and not any("=" in part for part in tokens[index + 1 :]):
-                return PermissionDecision(
-                    category=PermissionCategory.BASH,
-                    target=command,
-                    action="deny",
-                    matching_rule=None,
-                    reason="credential dump denied",
-                    remember_pattern=command,
-                )
             if program != "git":
                 continue
             remaining = tokens[index + 1 :]
@@ -397,13 +390,33 @@ class PermissionEngine:
                     remember_pattern=command,
                 )
 
-        if self.auto_approve and _is_env_dump(command, tokens):
+        if self.auto_approve and _is_env_dump(tokens):
             return PermissionDecision(
                 category=PermissionCategory.BASH,
                 target=command,
                 action="deny",
                 matching_rule=None,
                 reason="environment dump denied under auto-approval",
+                remember_pattern=command,
+            )
+
+        if self.auto_approve and _contains_executing_interpreter(tokens):
+            return PermissionDecision(
+                category=PermissionCategory.BASH,
+                target=command,
+                action="deny",
+                matching_rule=None,
+                reason="interpreter, eval, and indirect execution commands cannot be auto-approved",
+                remember_pattern=command,
+            )
+
+        if self.auto_approve and _has_ambiguous_shell_expansion(command):
+            return PermissionDecision(
+                category=PermissionCategory.BASH,
+                target=command,
+                action="deny",
+                matching_rule=None,
+                reason="ambiguous shell expansion cannot be auto-approved",
                 remember_pattern=command,
             )
 
@@ -514,7 +527,13 @@ class PermissionEngine:
             return False
         if not tokens:
             return True
-        program = Path(tokens[0]).name.lower()
+        # Only the literal, unqualified executable names below are trusted.
+        # Reducing ``./git`` or ``bin/rg`` to a basename would let a repository
+        # replace a supposedly read-only utility with arbitrary executable code.
+        source_program = cmd.split(None, 1)[0]
+        program = tokens[0]
+        if source_program != program or program not in _READ_ONLY_PROGRAMS | {"git", "rg"}:
+            return False
         if program == "git":
             return _is_readonly_git(tokens[1:])
         if program == "rg":
@@ -523,7 +542,7 @@ class PermissionEngine:
             return len(tokens) == 1
         if program == "find":
             return not any(_is_mutating_find_flag(token) for token in tokens[1:])
-        return any(lowered == p.strip() or lowered.startswith(p) for p in _READ_ONLY_PREFIXES)
+        return program in _READ_ONLY_PROGRAMS
 
     @staticmethod
     def is_uncertain_shell(command: str) -> bool:
@@ -544,6 +563,8 @@ class PermissionEngine:
 def _is_compound(command: str) -> bool:
     """Detect pipes, chains, redirects, substitutions, heredocs."""
     # Rough conservative scan - not a full shell parser.
+    if _has_ambiguous_shell_expansion(command):
+        return True
     specials = ("|", "&&", "||", ";", "&", "`", "$(", "${", ">", "<", "<<", "\n")
     in_single = False
     in_double = False
@@ -563,6 +584,44 @@ def _is_compound(command: str) -> bool:
         shlex.split(command)
     except ValueError:
         return True
+    return False
+
+
+def _has_ambiguous_shell_expansion(command: str) -> bool:
+    """Return true when the shell can derive arguments hidden from ``shlex``.
+
+    Expansion is safe to approve only after it has happened, but executing a
+    command to discover its expansion introduces a TOCTOU boundary. Auto mode
+    therefore fails closed on variable/command/ANSI-C expansion and on brace
+    forms that the shell expands into multiple arguments. Single-quoted and
+    backslash-escaped literals remain ordinary arguments.
+    """
+
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and not in_single:
+            index += 2
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            index += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            index += 1
+            continue
+        if not in_single and char in {"$", "`"}:
+            return True
+        if not in_single and not in_double and char == "{":
+            closing = command.find("}", index + 1)
+            if closing >= 0:
+                body = command[index + 1 : closing]
+                if "," in body or ".." in body:
+                    return True
+        index += 1
     return False
 
 
@@ -788,26 +847,148 @@ def _command_has_external_path(command: str) -> bool:
     return False
 
 
-_ENV_DUMP_PROGRAMS = frozenset(
-    {"set", "declare", "local", "typeset", "readonly", "export"}
-)
+_ENV_DUMP_PROGRAMS = frozenset({"set", "declare", "local", "typeset", "readonly", "export"})
 _AUTO_ENV_INTERPRETERS = frozenset({"python", "python3", "node", "perl", "ruby", "php"})
+_AUTO_INTERPRETER_NAME = re.compile(
+    r"(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?t?|node(?:js)?|perl|ruby|php|(?:ba|z|k|da)?sh"
+)
+_INERT_INTERPRETER_FLAGS = frozenset({"-v", "-V", "-VV", "--version"})
+_SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=.*", re.DOTALL)
+_ENV_OPTIONS_WITH_VALUE = frozenset({"-u", "--unset", "-C", "--chdir"})
+_ENV_SPLIT_OPTIONS = frozenset({"-S", "--split-string"})
+_AUTO_INDIRECT_EXECUTORS = frozenset(
+    {"exec", "nohup", "nice", "timeout", "gtimeout", "time", "xargs"}
+)
 
 
-def _is_env_dump(command: str, tokens: list[str]) -> bool:
+def _program_name(token: str) -> str:
+    return Path(token).name.lower().removesuffix(".exe")
+
+
+def _effective_shell_tokens(tokens: list[str]) -> list[str]:
+    """Resolve the command position through simple shell builtins/wrappers."""
+
+    index = 0
+    while index < len(tokens) and _SHELL_ASSIGNMENT.fullmatch(tokens[index]):
+        index += 1
+
+    while index < len(tokens):
+        wrapper_start = index
+        program = _program_name(tokens[index])
+        if program == "command":
+            index += 1
+            while index < len(tokens) and tokens[index].startswith("-"):
+                option = tokens[index]
+                if option in {"-v", "-V"}:
+                    # Query-only forms inspect a name without invoking it.
+                    return tokens[wrapper_start:]
+                index += 1
+                if option == "--":
+                    break
+            continue
+        if program == "builtin":
+            index += 1
+            if index < len(tokens) and tokens[index] == "--":
+                index += 1
+                continue
+            if index < len(tokens) and tokens[index].startswith("-"):
+                # ``builtin -p/-a/-s`` query builtin metadata; it does not run
+                # the following name as a command.
+                return tokens[wrapper_start:]
+            continue
+        if program == "env":
+            index += 1
+            while index < len(tokens):
+                token = tokens[index]
+                if _SHELL_ASSIGNMENT.fullmatch(token):
+                    index += 1
+                    continue
+                option_name = token.split("=", 1)[0]
+                if option_name in _ENV_SPLIT_OPTIONS:
+                    if "=" in token:
+                        split_value = token.split("=", 1)[1]
+                        remainder = tokens[index + 1 :]
+                    elif index + 1 < len(tokens):
+                        split_value = tokens[index + 1]
+                        remainder = tokens[index + 2 :]
+                    else:
+                        return tokens[wrapper_start:]
+                    try:
+                        split_tokens = shlex.split(split_value)
+                    except ValueError:
+                        return tokens[wrapper_start:]
+                    return _effective_shell_tokens([*split_tokens, *remainder])
+                if option_name in _ENV_OPTIONS_WITH_VALUE and "=" not in token:
+                    index += 2
+                    continue
+                if token == "--":
+                    index += 1
+                    break
+                if token.startswith("-"):
+                    index += 1
+                    continue
+                break
+            if index >= len(tokens):
+                # ``env`` with only options/assignments prints the environment.
+                return tokens[wrapper_start:]
+            continue
+        break
+    return tokens[index:]
+
+
+def _contains_executing_interpreter(tokens: list[str]) -> bool:
+    """Detect interpreters that could execute model- or repository-owned code.
+
+    The effective-command pass prevents argument text such as ``echo python``
+    from being mistaken for execution while retaining wrapper coverage.
+    Version-only invocations remain a useful inert operation under auto.
+    """
+
+    effective = _effective_shell_tokens(tokens)
+    if not effective:
+        return False
+    program = _program_name(effective[0])
+    if effective[0] == "." or program in {"eval", "source"}:
+        return True
+    if program in _AUTO_INDIRECT_EXECUTORS:
+        return True
+
+    if _AUTO_INTERPRETER_NAME.fullmatch(program) is not None:
+        remaining = effective[1:]
+        return not (len(remaining) == 1 and remaining[0] in _INERT_INTERPRETER_FLAGS)
+
+    if program == "uv" and "run" in effective[1:]:
+        run_index = effective.index("run", 1)
+        run_args = effective[run_index + 1 :]
+        if any(arg in {"-m", "--module", "-s", "--script", "--gui-script"} for arg in run_args):
+            return True
+        for index, token in enumerate(run_args):
+            if _AUTO_INTERPRETER_NAME.fullmatch(_program_name(token)) is None:
+                continue
+            remaining = run_args[index + 1 :]
+            return not (len(remaining) == 1 and remaining[0] in _INERT_INTERPRETER_FLAGS)
+    return False
+
+
+def _is_env_dump(tokens: list[str]) -> bool:
     """Detect commands whose primary effect is printing environment state.
 
     Only consulted under ``--auto``, where there is no user to approve an
     ask; printenv/bare-env are handled separately by the always-on deny.
     """
-    if not tokens:
+    effective = _effective_shell_tokens(tokens)
+    if not effective:
         return False
 
-    program = Path(tokens[0]).name.lower()
-    rest = tokens[1:]
+    program = _program_name(effective[0])
+    rest = effective[1:]
     if any(fnmatch.fnmatch(part, "/proc/*/environ") for part in rest):
         return True
+    if program in {"env", "printenv"}:
+        return True
     if program in _ENV_DUMP_PROGRAMS:
+        if "-p" in rest:
+            return True
         # Bare or flag-only invocations list variables; assignments do not.
         return not rest or all(part.startswith("-") for part in rest)
     if program in _AUTO_ENV_INTERPRETERS:

@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from noah_code.custom_commands import parse_frontmatter
+from noah_code.custom_commands import (
+    list_markdown_paths,
+    parse_frontmatter,
+    read_markdown_bounded,
+)
 
 AgentMode = Literal["build", "plan"]
 
@@ -59,28 +63,53 @@ def builtin_agents() -> list[AgentSpec]:
 
 
 def discover_agents(workspace: Path, *, home: Path | None = None) -> list[AgentSpec]:
-    """Built-ins plus user and project markdown agents. Project names win."""
+    """Built-ins plus user and project markdown agents."""
 
     found = {spec.name: spec for spec in builtin_agents()}
+    reserved = frozenset(found)
+    workspace = workspace.expanduser().resolve()
     user_home = (home or Path.home()).expanduser()
     user_dir = user_home / ".config" / "noah-code" / "agents"
     project_dir = workspace / ".noah-code" / "agents"
-    for directory, source in ((user_dir, "user"), (project_dir, "project")):
-        found.update(_load_markdown_agents(directory, source=source))
+    found.update(_load_markdown_agents(user_dir, source="user"))
+    project_agents = _load_markdown_agents(
+        project_dir,
+        source="project",
+        secure_root=workspace,
+        secure_relative_dir=Path(".noah-code") / "agents",
+    )
+    found.update({name: spec for name, spec in project_agents.items() if name not in reserved})
     return list(found.values())
 
 
-def _load_markdown_agents(directory: Path, *, source: str) -> dict[str, AgentSpec]:
+def _load_markdown_agents(
+    directory: Path,
+    *,
+    source: str,
+    secure_root: Path | None = None,
+    secure_relative_dir: Path | None = None,
+) -> dict[str, AgentSpec]:
     out: dict[str, AgentSpec] = {}
-    if not directory.is_dir():
-        return out
-    for path in sorted(directory.glob("*.md")):
+    if (secure_root is None) != (secure_relative_dir is None):
+        raise ValueError("secure_root and secure_relative_dir must be provided together")
+    paths = list_markdown_paths(
+        directory,
+        secure_root=secure_root,
+        secure_relative_dir=secure_relative_dir,
+    )
+    for path in paths:
         name = path.stem.strip().lower().lstrip("/")
         if not name or name.startswith("."):
             continue
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
+        secure_relative = (
+            secure_relative_dir / path.name if secure_relative_dir is not None else None
+        )
+        raw = read_markdown_bounded(
+            path,
+            secure_root=secure_root,
+            secure_relative=secure_relative,
+        )
+        if raw is None:
             continue
         meta, body = parse_frontmatter(raw)
         mode_raw = str(meta.get("mode") or "build").strip().lower()

@@ -1066,6 +1066,177 @@ async def test_session_switch_clears_steer_queue(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_new_workspace_session_cancels_and_awaits_overlapping_memory_tasks(
+    tmp_path: Path,
+) -> None:
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    old_root.mkdir()
+    new_root.mkdir()
+    workspace = Workspace(root=old_root.resolve())
+    config = NoahCodeConfig(session_dir=tmp_path / "sessions")
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    origin_agent = host.agent
+    origin = host._background_task_origin(origin_agent)
+    both_started = asyncio.Event()
+    both_cancelled = asyncio.Event()
+    release = asyncio.Event()
+    started = 0
+    cancelled = 0
+
+    async def cancellation_resistant_distill(_text: str) -> str:
+        nonlocal started, cancelled
+        started += 1
+        if started == 2:
+            both_started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            # Model/provider adapters should propagate cancellation, but the
+            # host must stay safe even if one suppresses it during cleanup.
+            cancelled += 1
+            if cancelled == 2:
+                both_cancelled.set()
+            await release.wait()
+        return "MEMORY: must remain in the old workspace"
+
+    object.__setattr__(origin_agent, "distill_memories", cancellation_resistant_distill)
+    object.__setattr__(
+        origin_agent,
+        "absorb_memories",
+        MagicMock(return_value=["must remain in the old workspace"]),
+    )
+    host._can_distill_memories = lambda _agent: True
+    tasks = [
+        host._track_background_task(
+            host._maybe_remember("first completed turn " * 4, origin),
+            name="test-memory-one",
+        ),
+        host._track_background_task(
+            host._maybe_remember("second completed turn " * 4, origin),
+            name="test-memory-two",
+        ),
+    ]
+    await asyncio.wait_for(both_started.wait(), timeout=2)
+
+    switch = asyncio.create_task(
+        host.start_new_session(Workspace(root=new_root.resolve())),
+    )
+    await asyncio.wait_for(both_cancelled.wait(), timeout=2)
+    assert switch.done() is False
+    assert host.workspace.root == old_root.resolve()
+
+    release.set()
+    await asyncio.wait_for(switch, timeout=5)
+
+    assert all(task.done() for task in tasks)
+    assert not host._background_tasks
+    assert host.workspace.root == new_root.resolve()
+    assert host.agent is not origin_agent
+    origin_agent.absorb_memories.assert_not_called()
+    assert not (new_root / ".noah-code" / "memory.md").exists()
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_title_and_memory_results_cannot_mutate_new_identity(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    old_root.mkdir()
+    new_root.mkdir()
+    release = asyncio.Event()
+    both_started = asyncio.Event()
+    started = 0
+
+    class Agent:
+        def __init__(self) -> None:
+            self._lightweight_llm = object()
+            self.absorb_memories = MagicMock(return_value=["stale"])
+
+        async def name_session(self, _text: str) -> str:
+            nonlocal started
+            started += 1
+            if started == 2:
+                both_started.set()
+            await release.wait()
+            return "stale title"
+
+        async def distill_memories(self, _text: str) -> str:
+            nonlocal started
+            started += 1
+            if started == 2:
+                both_started.set()
+            await release.wait()
+            return "MEMORY: stale"
+
+        def refresh_context_sources(self) -> None:
+            raise AssertionError("stale task must not refresh context")
+
+    old_agent = Agent()
+    new_agent = Agent()
+    host = AgentHost.__new__(AgentHost)
+    host._agent = old_agent
+    host.meta = SimpleNamespace(session_id="old")
+    host.workspace = Workspace(root=old_root.resolve())
+    host.ui = MagicMock()
+    host._set_session_title = MagicMock()
+    origin = host._background_task_origin(old_agent)
+    title_task = asyncio.create_task(host._maybe_title("old turn", origin))
+    memory_task = asyncio.create_task(host._maybe_remember("old completed turn " * 4, origin))
+    await asyncio.wait_for(both_started.wait(), timeout=2)
+
+    host._agent = new_agent
+    host.meta = SimpleNamespace(session_id="new")
+    host.workspace = Workspace(root=new_root.resolve())
+    release.set()
+    await asyncio.gather(title_task, memory_task)
+
+    host._set_session_title.assert_not_called()
+    old_agent.absorb_memories.assert_not_called()
+    new_agent.absorb_memories.assert_not_called()
+    host.ui.render.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_and_awaits_owned_title_task(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = NoahCodeConfig(session_dir=tmp_path / "sessions")
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    origin = host._background_task_origin(host.agent)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancellation_resistant_title(_text: str) -> str:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+        return "late title"
+
+    object.__setattr__(host.agent, "name_session", cancellation_resistant_title)
+    host._start_title_task("name this session", origin)
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    closing = asyncio.create_task(host.close())
+    await asyncio.wait_for(cancelled.wait(), timeout=2)
+    assert closing.done() is False
+
+    release.set()
+    await asyncio.wait_for(closing, timeout=5)
+
+    assert not host._background_tasks
+    assert host._title_task is None
+    assert host.meta is not None and host.meta.title == "untitled"
+
+
+@pytest.mark.asyncio
 async def test_undo_slash_blocked_while_turn_running(tmp_path: Path, monkeypatch) -> None:
     host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
     host.ui.render = MagicMock()

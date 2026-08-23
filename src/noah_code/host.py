@@ -7,6 +7,7 @@ import contextlib
 import logging
 import re
 import shlex
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -179,6 +180,15 @@ class HostResult:
     session_id: str | None = None
 
 
+@dataclass(frozen=True)
+class _BackgroundTaskOrigin:
+    """Identity that a title or memory task is allowed to mutate."""
+
+    agent: Any
+    session_id: str
+    workspace_root: Path
+
+
 class AgentHost:
     """Owns session lifecycle and the InteractiveAgent dispatcher loop."""
 
@@ -202,7 +212,7 @@ class AgentHost:
         self.meta = session_meta
         self._exit_requested = False
         self._title_task: asyncio.Task[Any] | None = None
-        self._memory_task: asyncio.Task[Any] | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._budget_guard: Any = None
         self._llm_cache: Any = None
         self._hooks: Any = None
@@ -578,9 +588,12 @@ class AgentHost:
 
     async def close(self) -> None:
         try:
+            await self._cancel_background_tasks()
             await self._flush_post_hooks()
             await self._persist_async()
         finally:
+            # Also cover cancellation/failure before the normal drain above.
+            await self._cancel_background_tasks()
             self._teardown_event_bridge()
             if self._agent is not None:
                 try:
@@ -690,12 +703,12 @@ class AgentHost:
         """Persist current session and open a fresh one in-process."""
         self._require_idle_turn()
         self._clear_steer_state()
+        await self._cancel_background_tasks()
         await self._persist_async()
         if workspace is not None:
             self.workspace = workspace
         self._pending_worktree_name = worktree_name
         self._teardown_event_bridge()
-        self._cancel_background_tasks()
         if self._agent is not None:
             with contextlib.suppress(Exception):
                 await self._agent.close_tools()
@@ -712,9 +725,9 @@ class AgentHost:
         """Persist current session and resume another."""
         self._require_idle_turn()
         self._clear_steer_state()
+        await self._cancel_background_tasks()
         await self._persist_async()
         self._teardown_event_bridge()
-        self._cancel_background_tasks()
         if self._agent is not None:
             with contextlib.suppress(Exception):
                 await self._agent.close_tools()
@@ -1780,13 +1793,13 @@ class AgentHost:
         agent.inject_status_snapshot()
         agent.journal.begin_turn()
         self._deliver_expanded(agent, self._expand_user_text(text, attach_paths))
+        background_origin = self._background_task_origin(agent)
 
         if self.meta and self.meta.title == "untitled":
             if self.config.efficiency.deterministic_titles:
                 self._set_session_title(_deterministic_title(text))
             else:
-                # Keep a strong reference; the event loop only holds tasks weakly.
-                self._title_task = asyncio.create_task(self._maybe_title(text))
+                self._start_title_task(text, background_origin)
 
         exit_code = 0
         explanation = ""
@@ -1861,66 +1874,130 @@ class AgentHost:
                 label = " ".join(text.split())[:80] or "turn"
                 await self._capture_checkpoint(label)
                 if exit_code == 0:
-                    self._memory_task = asyncio.create_task(self._maybe_remember(text))
+                    self._track_background_task(
+                        self._maybe_remember(text, background_origin),
+                        name="noah-memory",
+                    )
         return HostResult(
             exit_code=exit_code,
             explanation=explanation,
             session_id=self.meta.session_id if self.meta else None,
         )
 
-    async def _maybe_title(self, text: str) -> None:
-        session_id = self.meta.session_id if self.meta else None
+    def _background_task_origin(self, agent: Any) -> _BackgroundTaskOrigin:
+        if self.meta is None:
+            raise RuntimeError("cannot start background work without a session")
+        return _BackgroundTaskOrigin(
+            agent=agent,
+            session_id=self.meta.session_id,
+            workspace_root=self.workspace.root,
+        )
+
+    def _origin_is_current(self, origin: _BackgroundTaskOrigin) -> bool:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            return False
+        return bool(
+            self._agent is origin.agent
+            and self.meta is not None
+            and self.meta.session_id == origin.session_id
+            and self.workspace.root == origin.workspace_root
+        )
+
+    def _track_background_task(
+        self,
+        coroutine: Coroutine[Any, Any, Any],
+        *,
+        name: str,
+    ) -> asyncio.Task[Any]:
+        """Own a task strongly until it finishes so teardown can drain it."""
+
+        task = asyncio.create_task(coroutine, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _start_title_task(self, text: str, origin: _BackgroundTaskOrigin) -> None:
+        # Only the first turn should name an untitled session. Serializing title
+        # generation avoids a later turn racing and overwriting the first title.
+        if self._title_task is not None and not self._title_task.done():
+            return
+        task = self._track_background_task(
+            self._maybe_title(text, origin),
+            name="noah-title",
+        )
+        self._title_task = task
+
+        def clear_title(completed: asyncio.Task[Any]) -> None:
+            if self._title_task is completed:
+                self._title_task = None
+
+        task.add_done_callback(clear_title)
+
+    async def _cancel_background_tasks(self) -> None:
+        """Cancel and drain all owned title/memory tasks except the caller."""
+
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in tuple(self._background_tasks)
+            if task is not current and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.difference_update(task for task in tasks if task.done())
+        if self._title_task is not None and self._title_task.done():
+            self._title_task = None
+
+    async def _maybe_title(self, text: str, origin: _BackgroundTaskOrigin) -> None:
+        if not self._origin_is_current(origin):
+            return
         try:
-            title = await self.agent.name_session(text)
+            title = await origin.agent.name_session(text)
         except Exception:  # noqa: BLE001 - never fail the main task
             logger.debug("title generation failed", exc_info=True)
             return
-        if session_id and (self.meta is None or self.meta.session_id != session_id):
-            # The user switched sessions while the title call was in flight;
-            # never write a stale title into the new session's meta.
+        if not self._origin_is_current(origin):
             return
         title = (title or "").strip().strip('"')[:60]
         self._set_session_title(title)
 
-    def _cancel_title_task(self) -> None:
-        if self._title_task is not None and not self._title_task.done():
-            self._title_task.cancel()
-        self._title_task = None
-
-    def _cancel_memory_task(self) -> None:
-        if self._memory_task is not None and not self._memory_task.done():
-            self._memory_task.cancel()
-        self._memory_task = None
-
-    def _cancel_background_tasks(self) -> None:
-        self._cancel_title_task()
-        self._cancel_memory_task()
-
-    def _can_distill_memories(self) -> bool:
-        if self._agent is None:
+    @staticmethod
+    def _can_distill_memories(agent: Any) -> bool:
+        if agent is None:
             return False
-        llm: Any = self.agent._lightweight_llm
+        llm: Any = agent._lightweight_llm
         seen: set[int] = set()
         while hasattr(llm, "_inner") and id(llm) not in seen:
             seen.add(id(llm))
             llm = llm._inner
         return type(llm).__name__ != "FakeLLMClient"
 
-    async def _maybe_remember(self, text: str) -> None:
-        if len(text.strip()) < 40 or not self._can_distill_memories():
+    async def _maybe_remember(self, text: str, origin: _BackgroundTaskOrigin) -> None:
+        if (
+            len(text.strip()) < 40
+            or not self._origin_is_current(origin)
+            or not self._can_distill_memories(origin.agent)
+        ):
             return
-        session_id = self.meta.session_id if self.meta else None
         try:
-            raw = await self.agent.distill_memories(text[:4000])
-            added = self.agent.absorb_memories(raw or "")
+            raw = await origin.agent.distill_memories(text[:4000])
         except Exception:  # noqa: BLE001 - never fail the main task
             logger.debug("memory distillation failed", exc_info=True)
             return
-        if session_id and (self.meta is None or self.meta.session_id != session_id):
+        # This check must precede absorb_memories(), which writes project notes.
+        if not self._origin_is_current(origin):
+            return
+        try:
+            added = origin.agent.absorb_memories(raw or "")
+        except Exception:  # noqa: BLE001 - never fail the main task
+            logger.debug("memory absorption failed", exc_info=True)
             return
         if not added:
             return
-        self.agent.refresh_context_sources()
+        origin.agent.refresh_context_sources()
         self.ui.render(
             HostEvent(
                 HostEventKind.STATUS,
