@@ -8,6 +8,7 @@ import contextlib
 import json
 import os
 import signal
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -62,6 +63,7 @@ class ProcessTools(Skill):
         max_jobs: int = 8,
         max_runtime_seconds: float = 86_400.0,
         max_buffer_chars: int = 64_000,
+        max_log_bytes: int = 4_000_000,
         stop_grace_seconds: float = 2.0,
         runtime: RuntimeStateStore | None = None,
     ) -> None:
@@ -70,6 +72,7 @@ class ProcessTools(Skill):
         self._max_jobs = max_jobs
         self._max_runtime = max_runtime_seconds
         self._max_buffer = max_buffer_chars
+        self._max_log_bytes = max_log_bytes
         self._stop_grace = stop_grace_seconds
         self._jobs: dict[str, BackgroundJob] = {}
         self._on_lifecycle: Any = None
@@ -310,6 +313,62 @@ class ProcessTools(Skill):
             with job.log_path.open("a", encoding="utf-8") as output:
                 output.write(payload + "\n")
                 output.flush()
+            self._cap_durable_log(job)
+
+    def _cap_durable_log(self, job: BackgroundJob) -> None:
+        """Rotate an oversized JSONL log, keeping whole recent lines.
+
+        The durable log is written for crash recovery, so it must stay
+        bounded even when a job streams output forever. Rotation truncates
+        the head down to roughly half the cap and leaves a marker line
+        noting the truncation.
+        """
+        path = job.log_path
+        if path is None:
+            return
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        if size <= self._max_log_bytes:
+            return
+        keep = max(self._max_log_bytes // 2, 1)
+        # Rotation runs right after the append that crossed the cap, so the
+        # file holds at most cap + one event: reading it here stays bounded.
+        try:
+            lines = path.read_bytes().splitlines(keepends=True)
+        except OSError:
+            return
+        retained: list[bytes] = []
+        retained_bytes = 0
+        for line in reversed(lines):
+            # Always keep the newest line, then as many whole older lines as
+            # fit (a single event line can exceed ``keep``).
+            if retained and retained_bytes + len(line) > keep:
+                break
+            retained.append(line)
+            retained_bytes += len(line)
+        retained.reverse()
+        marker = json.dumps(
+            {
+                "sequence": 0,
+                "stream": "stderr",
+                "text": f"… earlier durable log truncated; kept last {retained_bytes} bytes …",
+                "timestamp": time.time(),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(marker.encode("utf-8") + b"\n")
+                stream.writelines(retained)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_name, path)
+        finally:
+            Path(temp_name).unlink(missing_ok=True)
 
     async def _wait(
         self,
@@ -326,7 +385,13 @@ class ProcessTools(Skill):
         job.returncode = returncode
         job.finished_at = time.monotonic()
         if self._runtime is not None:
-            self._runtime.update_job(job.id, job.state, returncode=returncode)
+            try:
+                self._runtime.update_job(job.id, job.state, returncode=returncode)
+            except Exception as exc:
+                # Durable bookkeeping must never suppress the terminal
+                # lifecycle event; the host is waiting on it to wake up.
+                with contextlib.suppress(Exception):
+                    self._append(job, "stderr", f"[noah] runtime state update failed: {exc!r}")
         self._emit(job, f"{job.state} exit={returncode}", terminal=True)
         self._close_transport(job.process)
         await asyncio.sleep(0)
@@ -421,8 +486,9 @@ class ProcessTools(Skill):
         rows: list[str] = []
         used = 0
         next_cursor = cursor
+        limit = min(max(max_chars, 1000), 32_000)
         if path.is_file():
-            for raw in path.read_text(errors="replace").splitlines():
+            for raw in self._tail_lines(path, limit):
                 try:
                     event = json.loads(raw)
                     sequence = int(event.get("sequence", 0))
@@ -433,7 +499,7 @@ class ProcessTools(Skill):
                         text = "! " + text
                 except (json.JSONDecodeError, TypeError, ValueError):
                     continue
-                if used + len(text) > min(max(max_chars, 1000), 32_000):
+                if used + len(text) > limit:
                     break
                 rows.append(text.rstrip("\n"))
                 used += len(text)
@@ -443,6 +509,29 @@ class ProcessTools(Skill):
             f"{body}\n\n{self._durable_status_line(record)} · "
             f"next_cursor={max(next_cursor, cursor)}"
         )
+
+    @staticmethod
+    def _tail_lines(path: Path, limit: int) -> list[str]:
+        """Read only the newest log lines; never load the whole file.
+
+        The window comfortably covers one page of events. Durable logs are
+        capped by rotation, and cursors older than the retained window simply
+        see the newest retained lines (rotation leaves a marker line).
+        """
+        size = path.stat().st_size
+        window = min(size, max(262_144, limit * 16))
+        offset = size - window
+        with path.open("rb") as stream:
+            if offset:
+                stream.seek(offset - 1)
+                starts_mid_line = stream.read(1) != b"\n"
+            else:
+                starts_mid_line = False
+            data = stream.read(window)
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        if starts_mid_line and lines:
+            lines = lines[1:]  # drop the partially read first line
+        return lines
 
     @hidden
     async def close(self) -> None:

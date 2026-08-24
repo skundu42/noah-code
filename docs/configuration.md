@@ -215,6 +215,10 @@ Inspect the resolved configuration from the CLI or inside an interactive session
 lists every nested path, while an optional path scopes the output. Values whose names look like
 credentials are redacted.
 
+Configuration is validated strictly: unknown keys (including typos such as `theem` under `[ui]`)
+and invalid values or TOML syntax fail every command with a one-line error naming the file and
+field, never a traceback. Fix the named key or remove it; `noah doctor` reports the same error.
+
 ```bash
 noah config show .
 ```
@@ -297,14 +301,19 @@ limits.
 | `plan` | Reads are allowed; file edits and mutating shell commands are denied. `self.plan.write` may pin `.noah-code/plan.md` |
 
 Switch modes with `--mode`, `/mode build`, or `/mode plan`. The agent can propose a switch with
-`self.plan.enter()` / `self.plan.exit_to_build()` after writing a plan. The active mode is stored with the
-session.
+`self.plan.enter()` / `self.plan.exit_to_build()` after writing a plan; the transition always asks
+for confirmation and is never auto-approved, so in `noah run --auto` it is refused and the session
+stays in plan mode. The active mode is stored with the session.
 
 Permission rules are evaluated in order, and the last matching rule wins. The default policy:
 
 - Allows ordinary reads.
-- Denies likely secrets, including `.env` variants, private keys, `.git` internals, and session
-  databases. `.env.example` remains readable.
+- Denies likely secrets, including `.env` variants, private keys, `.git` internals, credential
+  stores (`.npmrc`, `.pypirc`, `.netrc`, `.pgpass`, `.kube/config`, `.docker/config.json`,
+  `.aws/credentials`), Java/JCEKS key stores, and session databases. `.env.example` remains
+  readable. The same denials apply to Git object syntax (`git show HEAD:.env`) and to patch-output
+  Git commands with no path scope (`git log -p`, bare `git show`), which ask instead of being
+  auto-approved.
 - Allows workspace edits, read-only in-workspace shell inspection, web reads, skills, and
   delegated tasks without interrupting the turn.
 - Asks before arbitrary shell execution, external paths, MCP access, and remote mutations.
@@ -322,10 +331,12 @@ Permission rules are evaluated in order, and the last matching rule wins. The de
 
 `--auto` changes routine ask decisions to allow but never overrides an explicit deny.
 Elevated-risk commands such as file removal, downloads, and package installation still require
-explicit approval. Compound shell commands and mutating or unrecognized Git commands cannot be
-silently auto-approved. Interpreters, eval/source commands, and indirect execution wrappers, plus
-arguments hidden behind variable, command, ANSI-C, or brace expansion, are denied under `--auto`;
-run without `--auto` when one of these commands needs explicit approval.
+explicit approval: interactively they ask, and in non-interactive `noah run --auto` they are
+rejected outright instead of being silently approved. Compound shell commands and mutating or
+unrecognized Git commands cannot be silently auto-approved. Interpreters, eval/source commands, and
+indirect execution wrappers, plus arguments hidden behind variable, command, ANSI-C, or brace
+expansion, are denied under `--auto`; run without `--auto` when one of these commands needs
+explicit approval.
 
 ## Installation and updates
 

@@ -8,7 +8,7 @@
 | `Shift+Enter` | Insert a newline without sending |
 | `Tab` | Toggle `build`/`plan` mode; accept the highlighted slash option while suggestions are open |
 | `Ctrl+P` | Open the command palette |
-| `Ctrl+K` | Open the searchable skills picker |
+| `Ctrl+G` | Open the searchable skills picker |
 | `Ctrl+O` | Open the session picker |
 | `Ctrl+N` | Start a new session |
 | `Ctrl+C` | Cancel the active turn and clear queued follow-ups; press twice while idle to quit |
@@ -16,7 +16,7 @@
 | `F1` or `?` | Show help |
 | `F2` | Open recent activity and full captured output |
 | `F3` | Open paginated persisted conversation history |
-| `End` | Return to live transcript output and clear the new-output counter |
+| `Ctrl+]` | Return to live transcript output and clear the new-output counter |
 
 At an approval prompt, press `1` to approve once, `2` to remember the approval for the current
 session, or `3`/`Esc` to reject it.
@@ -41,8 +41,9 @@ their transcript normally.
 
 Drag across transcript, activity, diff, or history text to select it. `Cmd+C` on macOS or
 `Ctrl+Shift+C` in other terminals copies the selection; when there is no selection, the same
-shortcut copies Noah's latest reply. `Ctrl+C` also copies an active selection before falling back
-to cancel-turn behavior. Selection uses a high-contrast highlight in every Noah theme.
+shortcut copies Noah's latest reply. Inside the composer, `Cmd+C`/`Ctrl+C` copies the composer's
+own selection; `Ctrl+C` with no composer selection keeps its cancel-turn behavior. Selection uses a
+high-contrast highlight in every Noah theme.
 
 ### Mid-turn follow-ups
 

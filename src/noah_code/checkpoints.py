@@ -8,12 +8,23 @@ base commit or restore explicitly with standard git plumbing.
 
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 
+from noah_code.permissions import is_secret_path
+
 REF_PREFIX = "refs/noah-code/checkpoints"
+
+# Plumbing always runs with an explicit temporary index; a polluted parent
+# environment must never redirect it at another repository, worktree, or
+# object store.
+_STRIPPED_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY")
+
+_GIT_TIMEOUT = 60
 
 
 class CheckpointError(RuntimeError):
@@ -45,30 +56,41 @@ class CheckpointManager:
 
         try:
             entries = self.list()
-        except (OSError, subprocess.SubprocessError, ValueError):
+        except (CheckpointError, OSError, subprocess.SubprocessError, ValueError):
             return 0
         return max((int(item["seq"]) for item in entries), default=0)
 
-    def _git(self, *args: str, env_index: str | None = None) -> subprocess.CompletedProcess[bytes]:
-        import os
-
+    def _git(
+        self,
+        *args: str,
+        env_index: str | None = None,
+        input_bytes: bytes | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
         env = os.environ.copy()
+        for name in _STRIPPED_GIT_ENV:
+            env.pop(name, None)
         if env_index is not None:
             env["GIT_INDEX_FILE"] = env_index
-        return subprocess.run(
-            ["git", *args],
-            cwd=self._root,
-            env=env,
-            capture_output=True,
-            timeout=15,
-            check=False,
-        )
+        try:
+            return subprocess.run(
+                ["git", *args],
+                cwd=self._root,
+                env=env,
+                input=input_bytes,
+                capture_output=True,
+                timeout=_GIT_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CheckpointError(f"git {args[0]} timed out after {_GIT_TIMEOUT}s") from exc
+        except OSError as exc:
+            raise CheckpointError(f"git {args[0]} could not run: {exc}") from exc
 
     def available(self) -> bool:
         if not (self._root / ".git").exists():
             try:
                 probe = self._git("rev-parse", "--is-inside-work-tree")
-            except (OSError, subprocess.SubprocessError):
+            except (CheckpointError, OSError, subprocess.SubprocessError):
                 return False
             return probe.returncode == 0 and probe.stdout.strip() == b"true"
         return True
@@ -84,6 +106,7 @@ class CheckpointManager:
             # long sessions instead of silently stopping at the first limit.
             self.prune_to(max(self._max - 1, 0))
         head = self._head_commit()
+        top = self._toplevel()
         with tempfile.NamedTemporaryFile(prefix="noah-index-") as handle:
             index_path = handle.name
             if head:
@@ -92,9 +115,7 @@ class CheckpointManager:
                 read_tree = self._git("read-tree", "--empty", env_index=index_path)
             if read_tree.returncode != 0:
                 raise CheckpointError(f"checkpoint read-tree failed: {_err(read_tree)}")
-            add = self._git("add", "--all", env_index=index_path)
-            if add.returncode != 0:
-                raise CheckpointError(f"checkpoint staging failed: {_err(add)}")
+            self._stage_worktree(index_path, top)
             tree = self._git("write-tree", env_index=index_path)
             if tree.returncode != 0:
                 raise CheckpointError(f"checkpoint write-tree failed: {_err(tree)}")
@@ -119,6 +140,99 @@ class CheckpointManager:
             "timestamp": time.time(),
         }
         return self.last
+
+    def _toplevel(self) -> Path:
+        """Absolute worktree root; paths git reports are relative to this."""
+
+        result = self._git("rev-parse", "--show-toplevel")
+        if result.returncode != 0:
+            raise CheckpointError(f"checkpoint rev-parse failed: {_err(result)}")
+        return Path(os.fsdecode(result.stdout.strip()))
+
+    def _stage_worktree(self, index_path: str, top: Path) -> None:
+        """Mirror the worktree into the temp index with filter-free plumbing.
+
+        ``git add --all`` would execute repo-defined clean filters (arbitrary
+        commands configured via .gitattributes) and stage secret files that
+        the permission engine hard-denies. Hashing blobs directly with
+        ``--no-filters`` and registering them with ``update-index
+        --cacheinfo`` avoids both.
+        """
+
+        tracked = self._git("ls-files", "-z", "--full-name", "--", ":/", env_index=index_path)
+        if tracked.returncode != 0:
+            raise CheckpointError(f"checkpoint ls-files failed: {_err(tracked)}")
+        deleted = self._git(
+            "ls-files", "-d", "-z", "--full-name", "--", ":/", env_index=index_path
+        )
+        if deleted.returncode != 0:
+            raise CheckpointError(f"checkpoint ls-files failed: {_err(deleted)}")
+
+        # Defensively drop already-tracked secret paths (committed before the
+        # permission engine denied them) alongside ordinary deletions.
+        removals = {p for p in _split_nul(tracked.stdout) if is_secret_path(p)}
+        removals.update(_split_nul(deleted.stdout))
+        for path in sorted(removals):
+            # Absolute path: update-index prefixes relative paths with the
+            # process cwd, which may differ from the worktree root here.
+            remove = self._git(
+                "update-index", "--force-remove", "--", str(top / path), env_index=index_path
+            )
+            if remove.returncode != 0:
+                raise CheckpointError(
+                    f"checkpoint index removal failed for {path!r}: {_err(remove)}"
+                )
+
+        candidates = self._git(
+            "ls-files", "-c", "-o", "--exclude-standard", "-z", "--full-name", "--", ":/",
+            env_index=index_path,
+        )
+        if candidates.returncode != 0:
+            raise CheckpointError(f"checkpoint ls-files failed: {_err(candidates)}")
+        for path in _split_nul(candidates.stdout):
+            if is_secret_path(path):
+                continue
+            self._stage_file(index_path, top, path)
+
+    def _stage_file(self, index_path: str, top: Path, rel_path: str) -> None:
+        full_path = top / rel_path
+        try:
+            info = os.lstat(full_path)
+        except OSError:
+            return  # Vanished between listing and staging.
+        if stat.S_ISLNK(info.st_mode):
+            try:
+                # The blob content is the link target itself; never follow it.
+                content = os.fsencode(os.readlink(full_path))
+            except OSError:
+                return
+            blob = self._git("hash-object", "-w", "--no-filters", "--stdin", input_bytes=content)
+            mode = "120000"
+        elif stat.S_ISREG(info.st_mode):
+            # --no-filters: without it hash-object applies attributes-based
+            # clean filters, which are repo-defined arbitrary commands.
+            blob = self._git("hash-object", "-w", "--no-filters", "--", str(full_path))
+            mode = "100755" if info.st_mode & 0o111 else "100644"
+        else:
+            return  # Directories, fifos, sockets, and devices are not files.
+        if blob.returncode != 0:
+            if not os.path.lexists(full_path):
+                return  # Lost a race with a concurrent edit; skip it.
+            raise CheckpointError(f"checkpoint hashing failed for {rel_path!r}: {_err(blob)}")
+        sha = blob.stdout.decode().strip()
+        # --cacheinfo takes the path verbatim (root-relative, never prefixed).
+        register = self._git(
+            "update-index",
+            "--add",
+            "--replace",
+            "--cacheinfo",
+            f"{mode},{sha},{rel_path}",
+            env_index=index_path,
+        )
+        if register.returncode != 0:
+            raise CheckpointError(
+                f"checkpoint index update failed for {rel_path!r}: {_err(register)}"
+            )
 
     def _head_commit(self) -> str | None:
         result = self._git("rev-parse", "--verify", "HEAD")
@@ -183,6 +297,12 @@ def session_id_from_checkpoint_ref(ref: str) -> str | None:
     if not sep or not session or not seq:
         return None
     return session
+
+
+def _split_nul(data: bytes) -> list[str]:
+    """Decode NUL-separated ``git -z`` output into filesystem-native paths."""
+
+    return [os.fsdecode(part) for part in data.split(b"\0") if part]
 
 
 def _err(result: subprocess.CompletedProcess[bytes]) -> str:

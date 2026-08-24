@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
+import sqlite3
 import time
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from nooa.tools.shell_tools import Match, ShellTools
 from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.config import DEFAULT_PERMISSION_RULES
 from noah_code.permissions import PermissionEngine
+from noah_code.runtime_state import RuntimeStateStore
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tools.workspace_tools import WorkspaceTools, _matches_glob
 from noah_code.workspace import Workspace, WorkspaceError, open_workspace
@@ -22,14 +25,21 @@ async def _always_once(req):
     return ApprovalChoice.ONCE
 
 
-def _make_ws(tmp_path: Path, *, mode: str = "build", auto: bool = True) -> WorkspaceTools:
+def _make_ws(
+    tmp_path: Path,
+    *,
+    mode: str = "build",
+    auto: bool = True,
+    journal: SnapshotJournal | None = None,
+    runtime: RuntimeStateStore | None = None,
+) -> WorkspaceTools:
     workspace = Workspace(root=tmp_path.resolve())
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, mode=mode, auto_approve=auto)  # type: ignore[arg-type]
     approvals = ApprovalBroker(engine, handler=_always_once)
-    journal = SnapshotJournal()
+    journal = journal or SnapshotJournal()
     journal.begin_turn()
     shell = ShellTools(cwd=str(workspace.root))
-    return WorkspaceTools(workspace, shell, engine, approvals, journal)
+    return WorkspaceTools(workspace, shell, engine, approvals, journal, runtime=runtime)
 
 
 def test_open_workspace_rejects_missing(tmp_path: Path) -> None:
@@ -567,14 +577,17 @@ async def test_restore_failure_does_not_mask_primary_error(tmp_path: Path, monke
     ws = _make_ws(tmp_path, auto=True)
     try:
         await ws.run("cd src")
+        shell_run = ws.raw_shell.run
 
-        async def fail_read(*_args, **_kwargs):
+        async def fail_search(command, *args, **kwargs):
+            if command.startswith("cd -- "):
+                return await shell_run(command, *args, **kwargs)
             nested.rename(tmp_path / "moved")
-            raise ValueError("primary read failure")
+            raise ValueError("primary search failure")
 
-        monkeypatch.setattr(ws.raw_shell, "read", fail_read)
-        with pytest.raises(ValueError, match="primary read failure") as captured:
-            await ws.read("target.txt")
+        monkeypatch.setattr(ws.raw_shell, "run", fail_search)
+        with pytest.raises(ValueError, match="primary search failure") as captured:
+            await ws.search("needle")
 
         assert any(
             "cannot restore shell cwd" in note for note in getattr(captured.value, "__notes__", ())
@@ -648,5 +661,318 @@ async def test_write_file_is_atomic_and_mode_preserving(tmp_path: Path) -> None:
         assert "script.sh" in result.message
         assert target.stat().st_mode & 0o777 == 0o755
         assert not list(tmp_path.glob(".script.sh*"))
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_string_replace_preserves_crlf_outside_hunk(tmp_path: Path) -> None:
+    target = tmp_path / "win.py"
+    target.write_bytes(b"a = 1\r\nb = 2\r\nc = 3\r\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        await ws.edit("win.py", "b = 2", "b = 20")
+        assert target.read_bytes() == b"a = 1\r\nb = 20\r\nc = 3\r\n"
+        assert not list(tmp_path.glob(".win.py*"))
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_string_replace_requires_exactly_one_match(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("dup\ndup\nunique\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        with pytest.raises(ValueError, match="not found"):
+            await ws.edit("a.py", "missing", "x")
+        with pytest.raises(ValueError, match="matched 2 times"):
+            await ws.edit("a.py", "dup", "x")
+        assert (tmp_path / "a.py").read_text() == "dup\ndup\nunique\n"
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_string_replace_commit_failure_leaves_original_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "a.py"
+    target.write_bytes(b"one\r\ntwo\r\n")
+    ws = _make_ws(tmp_path, auto=True)
+
+    def fail_rename(_source, _destination):
+        raise OSError("simulated mid-write crash")
+
+    monkeypatch.setattr("noah_code.tools.workspace_tools.os.replace", fail_rename)
+    try:
+        with pytest.raises(OSError, match="simulated mid-write crash"):
+            await ws.edit("a.py", "two", "TWO")
+        # temp+rename means the original file is never partially written.
+        assert target.read_bytes() == b"one\r\ntwo\r\n"
+        assert not list(tmp_path.glob(".a.py*"))
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_ranged_read_streams_large_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    big = tmp_path / "big.log"
+    with big.open("w") as stream:
+        for index in range(300_000):
+            stream.write(f"log line {index}\n")
+    assert big.stat().st_size > 2_000_000  # beyond the journal blob limit
+    ws = _make_ws(tmp_path, auto=True)
+
+    def no_full_read(*_args, **_kwargs):
+        raise AssertionError("read_text() would load the whole file")
+
+    monkeypatch.setattr(Path, "read_text", no_full_read)
+    try:
+        m = await ws.read("big.log", lines=(200_000, 200_002))
+        assert isinstance(m, Match)
+        assert (m.start, m.end) == (200_000, 200_002)
+        assert m.text == "log line 199999\nlog line 200000\nlog line 200001\n"
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_whole_file_read_over_limit_suggests_line_range(tmp_path: Path) -> None:
+    (tmp_path / "big.log").write_text("x\n" * 400_000)  # 800KB > 512_000 cap
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        with pytest.raises(ValueError, match=r"lines=\(start, end\)"):
+            await ws.read("big.log")
+        m = await ws.read("big.log", lines=(1, 2))
+        assert isinstance(m, Match)
+        assert m.text == "x\nx\n"
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_read_reports_binary_file_cleanly(tmp_path: Path) -> None:
+    (tmp_path / "blob.bin").write_bytes(b"\x80\x81\x82\x83" * 16)
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        with pytest.raises(ValueError, match="binary or non-UTF-8"):
+            await ws.read("blob.bin")
+        with pytest.raises(ValueError, match="binary or non-UTF-8"):
+            await ws.read("blob.bin", lines=(1, 2))
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_read_skips_fingerprint_for_oversized_files(tmp_path: Path) -> None:
+    ws = _make_ws(tmp_path, journal=SnapshotJournal(blob_limit=100))
+    (tmp_path / "big.txt").write_text("y" * 200)
+    (tmp_path / "small.txt").write_text("y" * 50)
+    try:
+        await ws.read("big.txt")
+        assert ws._read_fingerprints == {}
+        await ws.read("small.txt")
+        assert len(ws._read_fingerprints) == 1
+    finally:
+        await ws.close()
+
+
+def _file_operation_rows(runtime: RuntimeStateStore) -> list[tuple]:
+    with sqlite3.connect(runtime.path) as connection:
+        return connection.execute(
+            "SELECT state, pre_bytes FROM file_operations"
+        ).fetchall()
+
+
+@pytest.mark.asyncio
+async def test_write_file_skips_durable_preimage_for_oversized_file(tmp_path: Path) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+    ws = _make_ws(tmp_path, journal=SnapshotJournal(blob_limit=64), runtime=runtime)
+    target = tmp_path / "huge.bin"
+    target.write_bytes(b"x" * 200)
+    try:
+        result = await ws.write_file("huge.bin", "y" * 200)
+        assert target.read_bytes() == b"y" * 200
+        assert "durable rollback skipped" in result.message
+        assert _file_operation_rows(runtime) == []
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_write_failure_rolls_back_normally_but_not_for_oversized_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+    ws = _make_ws(tmp_path, runtime=runtime)
+    target = tmp_path / "small.txt"
+    target.write_text("original\n")
+
+    def crash_after_write(_mut, _path):
+        raise RuntimeError("simulated crash after write")
+
+    monkeypatch.setattr(ws._journal, "record_postimage", crash_after_write)
+    try:
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await ws.write_file("small.txt", "updated\n")
+        # Normal-sized files keep full durable rollback.
+        assert target.read_text() == "original\n"
+        assert [row[0] for row in _file_operation_rows(runtime)] == ["rolled_back"]
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_write_failure_oversized_file_is_marked_unrecoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+    ws = _make_ws(tmp_path, journal=SnapshotJournal(blob_limit=64), runtime=runtime)
+    target = tmp_path / "huge.txt"
+    target.write_bytes(b"x" * 200)
+
+    def crash_after_write(_mut, _path):
+        raise RuntimeError("simulated crash after write")
+
+    monkeypatch.setattr(ws._journal, "record_postimage", crash_after_write)
+    try:
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await ws.write_file("huge.txt", "y" * 200)
+        # No durable preimage was recorded, so nothing can roll back.
+        assert target.read_bytes() == b"y" * 200
+        assert _file_operation_rows(runtime) == []
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_fsync_failure_rolls_back_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("a.py", "b.py", "c.py"):
+        (tmp_path / name).write_text(f"{name[0]} = 1\n")
+    ws = _make_ws(tmp_path, auto=True)
+    real_fsync = WorkspaceTools._fsync_directory
+    calls = 0
+
+    def fail_second_fsync(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated fsync failure")
+        real_fsync(path)
+
+    monkeypatch.setattr(
+        WorkspaceTools, "_fsync_directory", staticmethod(fail_second_fsync)
+    )
+    try:
+        with pytest.raises(RuntimeError, match="all changes rolled back"):
+            await ws.apply_patch(
+                [
+                    {"path": "a.py", "old": "a = 1", "new": "a = 2"},
+                    {"path": "b.py", "old": "b = 1", "new": "b = 2"},
+                    {"path": "c.py", "old": "c = 1", "new": "c = 2"},
+                ]
+            )
+        assert (tmp_path / "a.py").read_text() == "a = 1\n"
+        assert (tmp_path / "b.py").read_text() == "b = 1\n"
+        assert (tmp_path / "c.py").read_text() == "c = 1\n"
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_new_file_gets_umask_default_permissions(tmp_path: Path) -> None:
+    ws = _make_ws(tmp_path, auto=True)
+    previous = os.umask(0o022)
+    try:
+        await ws.write_file("fresh.py", "x = 1\n")
+        assert (tmp_path / "fresh.py").stat().st_mode & 0o777 == 0o644
+        # Existing files keep their mode.
+        target = tmp_path / "old.py"
+        target.write_text("y = 1\n")
+        target.chmod(0o640)
+        await ws.write_file("old.py", "y = 2\n")
+        assert target.stat().st_mode & 0o777 == 0o640
+    finally:
+        os.umask(previous)
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_shell_chunk_handler_errors_do_not_fail_run(tmp_path: Path) -> None:
+    ws = _make_ws(tmp_path, auto=True)
+
+    def bad_handler(_stream: str, _text: str) -> None:
+        raise RuntimeError("UI bug")
+
+    ws.set_shell_chunk_handler(bad_handler)
+    try:
+        result = await ws.run("echo hello")
+        assert "hello" in result.stdout
+        events = [event async for event in ws.run_stream("echo world")]
+        assert any("world" in getattr(event, "text", "") for event in events)
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_grep_harvested_anchor_rejects_stale_file(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("alpha = 1\nbeta = 2\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        result = await ws.run("grep -n alpha app.py")
+        assert result.matches
+        anchor = result.matches[0]
+        # The file changes after the anchor was harvested (never read()).
+        target.write_text("alpha = 100\nbeta = 2\n")
+        with pytest.raises(ValueError, match="stale edit anchor"):
+            await ws.replace(anchor, "alpha = 1\n")
+        assert target.read_text() == "alpha = 100\nbeta = 2\n"
+        # A fresh anchor on the unchanged file still edits fine.
+        fresh = await ws.run("grep -n beta app.py")
+        assert fresh.matches
+        await ws.replace(fresh.matches[0], "beta = 3\n")
+        assert target.read_text() == "alpha = 100\nbeta = 3\n"
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_eviction_is_oldest_first(tmp_path: Path) -> None:
+    ws = _make_ws(tmp_path, auto=True)
+    paths = []
+    for index in range(514):
+        candidate = tmp_path / f"f{index}.txt"
+        candidate.write_text("x")
+        paths.append(candidate.resolve())
+    try:
+        for candidate in paths:
+            ws._record_read_fingerprint(candidate)
+        assert len(ws._read_fingerprints) == 513
+        assert str(paths[0]) not in ws._read_fingerprints  # oldest evicted
+        assert str(paths[1]) in ws._read_fingerprints  # not a full clear
+        assert str(paths[-1]) in ws._read_fingerprints
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_grep_anchor_after_cd_edits_file_under_new_cwd(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("alpha = 999\n")
+    nested = tmp_path / "src"
+    nested.mkdir()
+    (nested / "app.py").write_text("alpha = 1\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        await ws.run("cd src")
+        result = await ws.run("grep -n alpha app.py")
+        assert result.matches
+        await ws.replace(result.matches[0], "alpha = 2\n")
+        assert (nested / "app.py").read_text() == "alpha = 2\n"
+        assert (tmp_path / "app.py").read_text() == "alpha = 999\n"
     finally:
         await ws.close()

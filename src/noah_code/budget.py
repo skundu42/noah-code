@@ -3,6 +3,10 @@
 Enforcement points:
 - ``BudgetedLLM`` wraps the NOOA client so every model call checks the
   deadline up front and token usage immediately after each response;
+- per-call cost is recovered from the raw LiteLLM response (NOOA keeps it
+  as ``LLMResponse.raw_response`` but drops it from ``usage``) and stamped
+  back onto the usage dict, so NOOA's ``LLMComplete`` telemetry and the
+  usage tracker observe real cost;
 - the exec/interactive drivers re-check accumulated cost between turns,
   where provider-reported pricing becomes available.
 """
@@ -150,18 +154,55 @@ class BudgetGuard:
             self.exceeded = str(exceeded) if exceeded else None
 
 
+def _cost_from_response(response: Any, usage: dict[str, Any]) -> float:
+    """Best-effort per-call USD cost; 0.0 whenever pricing is unavailable.
+
+    NOOA's ``LLMResponse.usage`` carries token counts only. LiteLLM's price
+    lives on the raw response — kept as ``LLMResponse.raw_response`` — either
+    precomputed in ``_hidden_params["response_cost"]`` or derivable from the
+    model and token counts via ``litellm.completion_cost``.
+    """
+
+    try:
+        # Usage-dict keys first: our own stamp, or provider-reported cost.
+        cost = usage.get("cost_usd") or usage.get("cost")
+        raw = getattr(response, "raw_response", None)
+        if not cost:
+            cost = (getattr(raw, "_hidden_params", None) or {}).get("response_cost")
+        if not cost:
+            # Legacy seam: some clients surface the LiteLLM response itself.
+            cost = (getattr(response, "_hidden_params", None) or {}).get("response_cost")
+        if not cost and raw is not None:
+            import litellm
+
+            cost = litellm.completion_cost(completion_response=raw)
+        return max(float(cost or 0.0), 0.0)
+    except Exception:  # noqa: BLE001 - pricing must never break a turn
+        return 0.0
+
+
 def _usage_from_response(response: Any) -> tuple[int, int, float]:
-    usage = getattr(response, "usage", None) or {}
-    prompt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-    completion = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-    hidden = getattr(response, "_hidden_params", None) or {}
-    cost = float(
-        usage.get("cost_usd")
-        or usage.get("cost")
-        or hidden.get("response_cost")
-        or 0.0
-    )
-    return prompt, completion, max(cost, 0.0)
+    """Token usage and best-effort USD cost for one model call.
+
+    The extracted cost is stamped back onto the response's usage dict as
+    ``cost_usd``: NOOA's runtime builds ``LLMComplete`` telemetry from
+    ``response.usage`` after the wrapper returns, so this is how per-call
+    cost reaches the usage tracker even where no budget cap applies.
+    """
+
+    usage = getattr(response, "usage", None)
+    usage_dict = usage if isinstance(usage, dict) else {}
+    prompt = int(usage_dict.get("prompt_tokens") or usage_dict.get("input_tokens") or 0)
+    completion = int(usage_dict.get("completion_tokens") or usage_dict.get("output_tokens") or 0)
+    cost = _cost_from_response(response, usage_dict)
+    try:
+        if isinstance(usage, dict):
+            usage.setdefault("cost_usd", cost)
+        elif cost > 0.0:
+            response.usage = {"cost_usd": cost}
+    except Exception:  # noqa: BLE001 - telemetry must never break a turn
+        pass
+    return prompt, completion, cost
 
 
 class BudgetedLLM:
@@ -253,7 +294,7 @@ def wrap_with_budget(
 
 
 class _PrefixObserverOnly:
-    """No budget caps; only observe request prefixes."""
+    """No budget caps; observe request prefixes and stamp per-call cost."""
 
     def __init__(self, inner: Any, observer: Any) -> None:
         self._inner = inner
@@ -261,11 +302,15 @@ class _PrefixObserverOnly:
 
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
         self._observer.observe_prefix(messages)
-        return await self._inner.acall(messages, tools=tools, output_model=output_model, **kwargs)
+        response = await self._inner.acall(messages, tools=tools, output_model=output_model, **kwargs)
+        _usage_from_response(response)  # stamp cost_usd for NOOA's LLMComplete telemetry
+        return response
 
     def call(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
         self._observer.observe_prefix(messages)
-        return self._inner.call(messages, tools=tools, output_model=output_model, **kwargs)
+        response = self._inner.call(messages, tools=tools, output_model=output_model, **kwargs)
+        _usage_from_response(response)  # stamp cost_usd for NOOA's LLMComplete telemetry
+        return response
 
     def count_tokens(self, text: str) -> int:
         return self._inner.count_tokens(text)

@@ -123,6 +123,8 @@ Type `/` to search the full command and configuration reference. The most common
 | `Shift+Enter` | Insert a newline |
 | Drag, then `Cmd+C` / `Ctrl+Shift+C` | Select and copy TUI text |
 | `Ctrl+Shift+C` with no selection | Copy the latest Noah reply |
+| `Ctrl+G` | Open the searchable skills picker |
+| `Ctrl+]` | Return to live transcript output |
 | `Tab` | Switch between build and plan mode |
 | `F2` | Open execution activity |
 | `F3` | Open paginated conversation history |

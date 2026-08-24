@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 from noah_code.config import DEFAULT_PERMISSION_RULES, PermissionRule
-from noah_code.permissions import PermissionEngine, is_secret_path
+from noah_code.permissions import PermissionDecision, PermissionEngine, is_secret_path
 
 
 def test_last_matching_rule_wins() -> None:
@@ -543,3 +545,158 @@ def test_permission_pattern_does_not_match_foreign_basenames() -> None:
     )
     assert engine.decide("read", "a.py").action == "allow"
     assert engine.decide("read", "deep/a.py").action == "deny"
+
+
+def test_git_object_syntax_cannot_smuggle_secret_paths() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+
+    for command in (
+        "git show HEAD:.env",
+        "git show :.env",
+        "git show main:.env",
+    ):
+        decision = engine.decide("bash", command)
+        assert decision.action == "deny", command
+        assert "secret" in decision.reason
+
+    # A non-secret object path stays read-only and allowed.
+    assert engine.decide("bash", "git show main:src/app.py").action == "allow"
+    assert engine.decide("bash", "git show HEAD:src/app.py").action == "allow"
+
+
+def test_url_tokens_are_not_misread_as_git_object_syntax() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+
+    decision = engine.decide("bash", "git ls-remote https://github.com:443/org/repo.git")
+    assert decision.action == "ask"
+    assert "secret" not in decision.reason
+
+
+def test_unscoped_git_patch_output_is_not_readonly_auto_allowed() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="build", auto_approve=False)
+
+    for command in (
+        "git log -p",
+        "git log --patch",
+        "git log",
+        "git show",
+        "git show --patch",
+        "git diff",
+    ):
+        assert engine.decide("bash", command).action == "ask", command
+
+    for command in (
+        "git log --oneline -5",
+        "git log --stat",
+        "git log --format=%H",
+        "git diff --stat",
+        "git diff --name-only",
+        "git status",
+        "git show HEAD -- src/app.py",
+        "git show HEAD:src/app.py",
+        "git log -p -- src/app.py",
+        "git diff -p -- src",
+    ):
+        assert engine.decide("bash", command).action == "allow", command
+
+    # The read-only classification itself is unchanged; only the auto-allow
+    # bump is withheld for unscoped patch output.
+    assert engine.is_readonly_command("git log -p") is True
+    assert engine.is_readonly_command("git show") is True
+
+
+def test_secret_paths_cover_credential_stores() -> None:
+    assert is_secret_path(".npmrc")
+    assert is_secret_path(".pypirc")
+    assert is_secret_path(".netrc")
+    assert is_secret_path(".pgpass")
+    assert is_secret_path(".envrc")
+    assert is_secret_path(".kube/config")
+    assert is_secret_path(".docker/config.json")
+    assert is_secret_path("/home/u/.aws/credentials")
+    assert is_secret_path("credentials")
+    assert is_secret_path("store.jks")
+    assert is_secret_path("store.keystore")
+    assert is_secret_path("cert.pfx")
+    assert is_secret_path("cert.p12")
+    assert not is_secret_path("credentials.py")
+    assert not is_secret_path("src/config.py")
+    assert not is_secret_path("src/app/config.py")
+
+
+def test_read_and_bash_deny_credential_store_files() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    assert engine.decide("read", ".npmrc").action == "deny"
+    assert engine.decide("read", ".kube/config").action == "deny"
+    assert engine.decide("bash", "cat .npmrc").action == "deny"
+
+
+def test_joined_short_flag_values_cannot_hide_external_paths() -> None:
+    plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
+    assert plan.decide("bash", "grep -f/etc/passwd x .").action == "deny"
+    assert plan.decide("bash", "tail -F~/log").action == "deny"
+
+
+def test_joined_short_flag_values_cannot_hide_secret_paths() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    decision = engine.decide("bash", "rg -f.env x")
+    assert decision.action == "deny"
+    assert "secret" in decision.reason
+
+
+def test_joined_short_flag_scanning_leaves_plain_flags_alone() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    assert engine.decide("bash", "grep -n foo bar.py").action == "allow"
+
+    plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
+    assert plan.decide("bash", "grep -n foo bar.py").action == "allow"
+
+
+def test_elevated_floor_flag_marks_floor_downgrades() -> None:
+    field_names = [field.name for field in fields(PermissionDecision)]
+    assert field_names.index("elevated_floor") == field_names.index("tool") + 1
+
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+
+    decision = engine.decide("bash", "rm generated.txt")
+    assert decision.action == "ask"
+    assert decision.elevated_floor is True
+
+    # The tool-attaching replace() path preserves the flag.
+    with_tool = engine.decide("bash", "rm generated.txt", tool="bash")
+    assert with_tool.tool == "bash"
+    assert with_tool.elevated_floor is True
+
+    allowed = engine.decide("bash", "git status")
+    assert allowed.action == "allow"
+    assert allowed.elevated_floor is False
+
+    denied = engine.decide("bash", "cat .env")
+    assert denied.action == "deny"
+    assert denied.elevated_floor is False
+
+
+def test_find_delete_and_exec_hit_the_elevated_risk_floor() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+
+    for command in (
+        "find . -delete",
+        "find . -exec echo {} +",
+        "find . -execdir echo {} +",
+    ):
+        decision = engine.decide("bash", command)
+        assert decision.action == "ask", command
+        assert "elevated-risk" in decision.reason
+        assert decision.elevated_floor is True
+
+    assert engine.decide("bash", "find . -type f -name '*.py'").action == "allow"
+
+
+def test_rg_hostname_bin_is_not_readonly() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    assert engine.is_readonly_command("rg --hostname-bin=/tmp/hostcat needle .") is False
+    assert engine.is_readonly_command("rg --hostname-bin /tmp/hostcat needle .") is False
+    assert engine.is_readonly_command("rg --with-filename needle .") is True
+
+    plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
+    assert plan.decide("bash", "rg --hostname-bin=/tmp/hostcat needle .").action == "deny"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -21,7 +22,8 @@ from noah_code.usage import UsageTracker
 
 @dataclass
 class FakeResponse:
-    usage: dict[str, int] | None = None
+    usage: dict[str, Any] | None = None
+    raw_response: Any = None
 
 
 @dataclass
@@ -83,6 +85,96 @@ def test_cost_cap_reports_currency() -> None:
     guard.add_usage(cost_usd=1.5)
     with pytest.raises(BudgetExceeded, match=r"cost limit exceeded"):
         guard.enforce()
+
+
+def test_response_cost_flows_from_raw_hidden_params_into_guard_and_usage() -> None:
+    raw = SimpleNamespace(_hidden_params={"response_cost": 0.42})
+    llm = FakeLLM(
+        responses=[
+            FakeResponse(
+                usage={"prompt_tokens": 10, "completion_tokens": 5},
+                raw_response=raw,
+            )
+        ]
+    )
+    usage = UsageTracker()
+    client, guard = wrap_with_budget(llm, BudgetConfig(max_cost_usd=1.0))
+
+    response = asyncio.run(client.acall([{"role": "user", "content": "hi"}]))
+
+    assert response.usage is not None
+    assert response.usage["cost_usd"] == 0.42
+    assert guard.status()["cost_usd"] == 0.42
+    # NOOA's runtime rebuilds LLMComplete from response.usage; mirror that here.
+    usage.llm_complete(SimpleNamespace(cost_usd=response.usage["cost_usd"]))
+    assert usage.snapshot().cost_usd == 0.42
+
+
+def test_cost_cap_blocks_the_next_call_before_hitting_the_provider() -> None:
+    raw = SimpleNamespace(_hidden_params={"response_cost": 0.42})
+    llm = FakeLLM(responses=[FakeResponse(usage={"prompt_tokens": 1}, raw_response=raw)])
+    client, guard = wrap_with_budget(llm, BudgetConfig(max_cost_usd=0.10))
+
+    with pytest.raises(BudgetExceeded, match="cost limit exceeded"):
+        asyncio.run(client.acall([]))  # breach surfaces immediately after the response
+    with pytest.raises(BudgetExceeded, match="cost limit exceeded"):
+        asyncio.run(client.acall([]))  # sticky: rejected before the provider is hit
+    assert llm.calls == 1
+    assert "cost limit" in (guard.exceeded or "")
+
+
+def test_response_without_cost_info_yields_zero_cost() -> None:
+    llm = FakeLLM(responses=[FakeResponse(usage={"prompt_tokens": 3, "completion_tokens": 4})])
+    client, guard = wrap_with_budget(llm, BudgetConfig(max_cost_usd=0.10))
+
+    response = asyncio.run(client.acall([]))
+
+    assert response.usage is not None
+    assert response.usage["cost_usd"] == 0.0
+    assert guard.status()["cost_usd"] == 0.0
+
+
+def test_cost_falls_back_to_litellm_completion_cost(monkeypatch) -> None:
+    import litellm
+
+    monkeypatch.setattr(litellm, "completion_cost", lambda **kwargs: 0.07)
+    raw = SimpleNamespace(_hidden_params={})
+    llm = FakeLLM(responses=[FakeResponse(usage={"prompt_tokens": 9}, raw_response=raw)])
+    client, guard = wrap_with_budget(llm, BudgetConfig(max_cost_usd=1.0))
+
+    asyncio.run(client.acall([]))
+
+    assert guard.status()["cost_usd"] == 0.07
+
+
+def test_cost_extraction_failure_never_breaks_the_turn(monkeypatch) -> None:
+    import litellm
+
+    def _explode(**kwargs: Any) -> float:
+        raise RuntimeError("no pricing data")
+
+    monkeypatch.setattr(litellm, "completion_cost", _explode)
+    raw = SimpleNamespace(_hidden_params={})
+    llm = FakeLLM(responses=[FakeResponse(usage={"prompt_tokens": 9}, raw_response=raw)])
+    client, guard = wrap_with_budget(llm, BudgetConfig(max_cost_usd=1.0))
+
+    response = asyncio.run(client.acall([]))
+
+    assert response.usage is not None
+    assert response.usage["cost_usd"] == 0.0
+    assert guard.status()["cost_usd"] == 0.0
+
+
+def test_cost_is_stamped_without_active_caps_for_usage_reporting() -> None:
+    raw = SimpleNamespace(_hidden_params={"response_cost": 0.42})
+    llm = FakeLLM(responses=[FakeResponse(usage={"prompt_tokens": 7}, raw_response=raw)])
+    client, guard = wrap_with_budget(llm, BudgetConfig(), prefix_observer=UsageTracker())
+    assert guard.active is False
+
+    response = asyncio.run(client.acall([{"role": "user", "content": "hi"}]))
+
+    assert response.usage is not None
+    assert response.usage["cost_usd"] == 0.42
 
 
 def test_provider_cost_sync_is_idempotent_and_enforces_cap() -> None:

@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - main
+    # Also run on version tags so the exact released ref is checked.
+    tags:
+      - "v*"
 
 permissions:
   contents: read
@@ -67,6 +70,31 @@ jobs:
       - name: Build distributions
         run: uv build --out-dir build-dist
 
+  integration:
+    name: Integration tests (network)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Integration-marked tests hit the live network and can flake for reasons
+    # unrelated to the code; keep the signal visible without blocking PRs.
+    continue-on-error: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-extras --dev
+
+      - name: Run integration tests
+        run: uv run pytest -m integration -q
+
   platform:
     name: ${{ matrix.name }} smoke test
     runs-on: ${{ matrix.runner }}
@@ -109,7 +137,17 @@ jobs:
           rg --version
 
       - name: Run tests
+        if: runner.os != 'macOS'
         run: uv run pytest tests -W error::pytest.PytestUnraisableExceptionWarning
+
+      - name: Run tests with coverage (macOS)
+        if: runner.os == 'macOS'
+        # Collect coverage on macOS too so mac-only paths are measured, but
+        # without a fail-under gate: per-platform coverage totals differ,
+        # and the 70% gate stays on the ubuntu quality job.
+        run: |
+          uv run pytest tests --cov=noah_code --cov-report=term \
+            -W error::pytest.PytestUnraisableExceptionWarning
 
       - name: Verify command entry point
         run: uv run noah --version

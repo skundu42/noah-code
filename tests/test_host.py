@@ -30,12 +30,99 @@ from noah_code.workspace import Workspace
 from noah_code.worktree import WorktreeError
 
 
+def _find_resilient(layers: list[str]) -> object:
+    """Return the ResilientLLM layer from a wrapped client chain."""
+    from noah_code.llm import ResilientLLM
+
+    seen: set[int] = set()
+    current = layers
+    while id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ResilientLLM):
+            return current
+        inner = getattr(current, "_inner", None)
+        if inner is None:
+            return None
+        current = inner
+    return None
+
+
+@pytest.mark.asyncio
+async def test_model_switch_restores_retry_and_fallback_wrapping(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """After a live switch, a transient failure on the primary must fail over."""
+
+    workspace = Workspace(root=tmp_path.resolve())
+    config = NoahCodeConfig(
+        session_dir=tmp_path / "sessions",
+        reliability={"retries": {"fallback_models": ["backup-model"]}},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+
+    class Primary:
+        model = "next-model"
+        calls = 0
+
+        def call(self, messages, **_kw):
+            type(self).calls += 1
+            raise TimeoutError("timed out")
+
+        async def acall(self, messages, **_kw):
+            type(self).calls += 1
+            raise TimeoutError("timed out")
+
+        def count_tokens(self, text):
+            return 0
+
+        def get_model_info(self):
+            return None
+
+    class Fallback:
+        model = "backup-model"
+
+        def call(self, messages, **_kw):
+            return {"ok": True}
+
+        async def acall(self, messages, **_kw):
+            return {"ok": True}
+
+        def count_tokens(self, text):
+            return 0
+
+        def get_model_info(self):
+            return None
+
+    primary, fallback = Primary(), Fallback()
+
+    def make_client(model: str, **_kw):
+        return primary if model == "next-model" else fallback
+
+    monkeypatch.setattr("noah_code.llm.get_llm_client", make_client)
+
+    await host._switch_model("next-model")
+
+    resilient = _find_resilient(host.agent._llm)
+    assert resilient is not None, "switch must restore the ResilientLLM chain"
+    assert list(resilient._clients) == [primary, fallback]
+    result = resilient.call([{"role": "user", "content": "hi"}])
+    assert result == {"ok": True}
+    assert primary.calls > 1, "transient errors retry before failover"
+    await host.close()
+
+
 def _unwrap_llm(llm):
     seen: set[int] = set()
     current = llm
-    while hasattr(current, "_inner") and id(current) not in seen:
+    while id(current) not in seen:
         seen.add(id(current))
-        current = current._inner
+        if hasattr(current, "_inner"):
+            current = current._inner
+        elif hasattr(current, "_clients"):
+            current = current._clients[0]
+        else:
+            break
     return current
 
 
@@ -1018,6 +1105,69 @@ async def test_waiting_run_resumes_when_background_job_finishes(
     assert handles["n"] == 2
     assert races["n"] == 2
     assert host._runtime.latest_incomplete_run() is None  # noqa: SLF001
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_with_latched_terminal_emit_does_not_fail(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A terminal emit racing the WAIT clear() is a normal wake, not a failure."""
+
+    from types import SimpleNamespace
+
+    from nooa.interactive import RespondReason
+
+    host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+    host.agent.processes.has_running = MagicMock(return_value=False)
+    handles = {"n": 0}
+
+    async def handle(_agent, _notification, render=None):  # noqa: ANN001
+        handles["n"] += 1
+        if handles["n"] == 1:
+            host._wake_event.set()  # terminal emit fires before the clear()
+            return SimpleNamespace(kind=RespondReason.WAIT, explanation="waiting for tests")
+        return SimpleNamespace(kind=RespondReason.DONE, explanation="tests passed")
+
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    result = await asyncio.wait_for(host._run_user_turn("run the full suite"), timeout=3)
+
+    assert result.exit_code == 0
+    assert handles["n"] == 2
+    assert host._runtime.latest_incomplete_run() is None  # noqa: SLF001
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_without_terminal_emit_exits_cleanly(tmp_path: Path, monkeypatch) -> None:
+    """A missing terminal emit must not hang the turn forever."""
+
+    from types import SimpleNamespace
+
+    from nooa.interactive import RespondReason
+
+    host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+    host._wake_timeout_seconds = 0.01
+    polls = {"n": 0}
+
+    def has_running() -> bool:
+        polls["n"] += 1
+        return polls["n"] < 3  # job "finishes" without ever emitting a wake
+
+    host.agent.processes.has_running = has_running
+    handles = {"n": 0}
+
+    async def handle(_agent, _notification, render=None):  # noqa: ANN001
+        handles["n"] += 1
+        return SimpleNamespace(kind=RespondReason.WAIT, explanation="waiting")
+
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    result = await asyncio.wait_for(host._run_user_turn("run the full suite"), timeout=5)
+
+    assert result.exit_code == 1
+    assert "WAIT without a running background job" in result.explanation
+    assert handles["n"] == 1
+    assert polls["n"] >= 3
     await host.close()
 
 

@@ -9,6 +9,7 @@ import pytest
 
 from noah_code.commands import config_json, config_text
 from noah_code.config import (
+    ConfigError,
     NoahCodeConfig,
     load_config,
     save_user_default_model,
@@ -241,3 +242,47 @@ def test_user_hooks_load_from_flat_array_tables(tmp_path: Path, monkeypatch) -> 
 def test_reasoning_effort_environment_override(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("NOAH_CODE_REASONING_EFFORT", "LOW")
     assert load_config(tmp_path).reasoning_effort == "low"
+
+
+def test_mode_environment_override_is_case_insensitive(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("NOAH_CODE_MODE", "PLAN")
+    assert load_config(tmp_path).mode == "plan"
+
+
+def test_invalid_toml_raises_config_error(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "user-config.toml"
+    config_path.write_text("model = [\n")
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    with pytest.raises(ConfigError, match="user-config.toml"):
+        load_config(tmp_path)
+
+
+def test_invalid_value_raises_config_error(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: tmp_path / "missing.toml")
+    conf = tmp_path / ".noah-code"
+    conf.mkdir()
+    (conf / "config.toml").write_text('max_output_chars = "abc"\n')
+
+    with pytest.raises(ConfigError, match="max_output_chars"):
+        load_config(tmp_path)
+
+
+def test_unknown_top_level_key_raises_config_error(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: tmp_path / "missing.toml")
+    conf = tmp_path / ".noah-code"
+    conf.mkdir()
+    (conf / "config.toml").write_text("modle_typo = 1\n")
+
+    with pytest.raises(ConfigError, match="modle_typo"):
+        load_config(tmp_path)
+
+
+def test_unknown_nested_key_raises_config_error(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: tmp_path / "missing.toml")
+    conf = tmp_path / ".noah-code"
+    conf.mkdir()
+    (conf / "config.toml").write_text('[ui]\ntheem = "dark"\n')
+
+    with pytest.raises(ConfigError, match="theem"):
+        load_config(tmp_path)

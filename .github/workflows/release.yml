@@ -53,6 +53,9 @@ jobs:
           sudo apt-get install -y ripgrep
           rg --version
 
+      - name: Type check
+        run: uv run mypy src/noah_code
+
       - name: Run release checks
         run: |
           uv run ruff check src tests

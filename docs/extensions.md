@@ -20,7 +20,9 @@ test.
 ```
 
 Invoke it as `/fix the parser`. Commands support `$ARGUMENTS` and positional placeholders `$1`
-through `$9`. Front matter may also select a mode or model.
+through `$9`. Front matter may also select a mode or model — but only for trusted user commands:
+`mode` and `model` front matter in repository commands is ignored, so a checkout cannot switch the
+session out of plan mode or onto another model without confirmation.
 
 ## Subagents
 
@@ -57,7 +59,7 @@ configuration owned by the user.
 
 ## Skills
 
-Open the dedicated searchable picker with `/skills` or `Ctrl+K`. Selecting a document skill
+Open the dedicated searchable picker with `/skills` or `Ctrl+G`. Selecting a document skill
 inserts `$skill-name ` into the composer so you can add the task directly. Noah reads the standard
 `SKILL.md` directory format used by Codex and Claude, including companion `scripts/`, `references/`,
 and `assets/` folders.

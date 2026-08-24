@@ -5,10 +5,20 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from click.testing import CliRunner
 
-from noah_code.cli import _configure_first_run_model, cli_group, interactive_cmd, main
+from noah_code.cli import (
+    EXIT_OK,
+    _configure_first_run_model,
+    _prepare,
+    cli_group,
+    interactive_cmd,
+    main,
+)
+from noah_code.updates import UpdateStatus
 
 
 def test_help() -> None:
@@ -272,3 +282,99 @@ def test_pr_cli_list_and_create(tmp_path: Path, monkeypatch) -> None:
     checked = runner.invoke(cli_group, ["pr", "checkout", "4", "-C", str(tmp_path)])
     assert checked.exit_code == 0
     assert "pr/4" in checked.output
+
+
+def test_config_show_reports_config_error_without_traceback(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "user-config.toml"
+    config_path.write_text("model = [\n")
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    result = CliRunner().invoke(cli_group, ["config", "show", str(tmp_path)])
+
+    assert result.exit_code == 2
+    assert "error:" in result.output
+    assert "user-config.toml" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_doctor_reports_config_error_without_traceback(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "user-config.toml"
+    config_path.write_text("model = [\n")
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    result = CliRunner().invoke(cli_group, ["doctor", str(tmp_path)])
+
+    assert result.exit_code == 2
+    assert "config: FAIL" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_run_reports_config_error_without_traceback(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "user-config.toml"
+    config_path.write_text("model = [\n")
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    result = CliRunner().invoke(cli_group, ["run", "hello", str(tmp_path)])
+
+    assert result.exit_code == 2
+    assert "error:" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_continue_and_session_are_mutually_exclusive() -> None:
+    result = CliRunner().invoke(interactive_cmd, ["--continue", "--session", "abc123"])
+
+    assert result.exit_code == 2
+    assert "--continue and --session cannot be used together" in result.output
+
+
+def test_run_does_not_auto_install_update(monkeypatch, tmp_path: Path) -> None:
+    """`noah run` prints an update notice and proceeds instead of installing."""
+    calls: list[str] = []
+
+    def fake_check(*, interval_hours: int, timeout: float) -> UpdateStatus:
+        calls.append("check")
+        return UpdateStatus(current="0.1.0", latest="9.9.9")
+
+    def fake_install(*, interval_hours: int, timeout: float) -> str:
+        calls.append("install")
+        return "installed"
+
+    class FakeHost:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        async def run_once(self, prompt: str) -> SimpleNamespace:
+            return SimpleNamespace(exit_code=0)
+
+    monkeypatch.setattr("noah_code.cli._AUTO_UPDATE_CHECKED", False)
+    monkeypatch.setattr("noah_code.cli.maybe_check_for_update", fake_check)
+    monkeypatch.setattr("noah_code.cli.maybe_auto_update", fake_install)
+    monkeypatch.setattr("noah_code.cli.AgentHost", FakeHost)
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: tmp_path / "missing.toml")
+    monkeypatch.setenv("NOAH_CODE_AUTO_UPDATE", "true")
+    monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))
+
+    result = CliRunner().invoke(cli_group, ["run", "hello", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert calls == ["check"]
+    assert "update available" in result.output
+    assert "9.9.9" in result.output
+
+
+@pytest.mark.asyncio
+async def test_prepare_interactive_still_auto_installs(monkeypatch, tmp_path: Path) -> None:
+    """Interactive launches keep the auto-install short-circuit."""
+    monkeypatch.setattr("noah_code.cli._AUTO_UPDATE_CHECKED", False)
+    monkeypatch.setattr("noah_code.cli.maybe_auto_update", lambda **kwargs: "updated")
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: tmp_path / "missing.toml")
+    monkeypatch.setenv("NOAH_CODE_AUTO_UPDATE", "true")
+    monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))
+
+    prepared, code = await _prepare(
+        path=str(tmp_path), model=None, reasoning_effort=None, auto=False, mode=None
+    )
+
+    assert prepared is None
+    assert code == EXIT_OK

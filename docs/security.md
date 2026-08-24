@@ -40,9 +40,16 @@ repositories, or models.
 
 The generated-code sandbox is only one layer. Host-owned tools also enforce:
 
-- canonical workspace path checks and hard secret-file denials;
+- canonical workspace path checks and hard secret-file denials that also cover Git object syntax
+  (`git show HEAD:.env`), credential stores (`.npmrc`, `.netrc`, `.kube/config`, and similar), and
+  short-flag-joined path arguments (`grep -f/etc/passwd`);
 - ordered `allow`, `ask`, and `deny` rules that `--auto` cannot use to override explicit denials or
-  elevated-risk approval;
+  elevated-risk approval — in non-interactive `noah run --auto`, elevated-risk commands are
+  rejected rather than silently approved;
+- Git checkpoint capture that never stages secret-classified paths and never executes repository
+  clean filters (filter-free plumbing only);
+- plan-mode boundaries that cannot be crossed without confirmation: repository custom commands
+  cannot flip modes or models via front matter, and `plan.exit_to_build()` is never auto-approved;
 - an exclusive checkout lease enabled by default, preventing two Noah processes from mutating the
   same worktree;
 - serialized mutating subagents and atomic multi-file patches with exact pre-images;

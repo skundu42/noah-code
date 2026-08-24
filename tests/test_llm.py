@@ -5,7 +5,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from noah_code.config import RetryConfig
+from noah_code.budget import wrap_with_budget
+from noah_code.config import BudgetConfig, RetryConfig
 from noah_code.llm import ResilientLLM, get_llm_client, reasoning_overrides
 
 
@@ -160,3 +161,18 @@ def test_resilient_llm_retries_synchronous_failure() -> None:
 
     assert ResilientLLM(client, _retry_config()).call([]) is expected
     assert client.calls == 2
+
+
+def test_retried_call_counts_cost_once_for_the_successful_attempt() -> None:
+    response = SimpleNamespace(
+        usage={"prompt_tokens": 5, "completion_tokens": 2},
+        raw_response=SimpleNamespace(_hidden_params={"response_cost": 0.42}),
+    )
+    client = _SequenceClient(TimeoutError("provider timed out"), response)
+    resilient = ResilientLLM(client, _retry_config())
+    budgeted, guard = wrap_with_budget(resilient, BudgetConfig(max_cost_usd=1.0))
+
+    assert budgeted.call([]) is response
+    assert client.calls == 2  # one transient failure, then the successful attempt
+    assert response.usage["cost_usd"] == 0.42
+    assert guard.status()["cost_usd"] == 0.42  # not 0.84: the retry is not double-counted

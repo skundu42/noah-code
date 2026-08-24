@@ -71,6 +71,7 @@ _ALWAYS_ASK_BASH = (
     re.compile(r"\buv\s+pip\s+install\b"),
     re.compile(r"\bcurl\b"),
     re.compile(r"\bwget\b"),
+    re.compile(r"\bfind\b[^|;&]*\s+-(?:delete|execdir|exec)\b"),
 )
 
 _MUTATING_GIT = re.compile(
@@ -94,6 +95,28 @@ _READ_ONLY_PROGRAMS = frozenset(
 )
 _READ_ONLY_GIT_SUBCOMMANDS = frozenset({"branch", "diff", "log", "rev-parse", "show", "status"})
 _GIT_READ_UNSAFE_FLAGS = frozenset({"--ext-diff", "--output", "--textconv"})
+_GIT_PATCH_SUBCOMMANDS = frozenset({"diff", "log", "show"})
+# Flags that replace the patch body with a non-patch summary, so the command
+# can no longer dump committed file contents.
+_GIT_NON_PATCH_OUTPUT_FLAGS = frozenset(
+    {
+        "--dirstat",
+        "--exit-code",
+        "--format",
+        "--name-only",
+        "--name-status",
+        "--no-patch",
+        "--numstat",
+        "--oneline",
+        "--pretty",
+        "--quiet",
+        "--raw",
+        "--shortlog",
+        "--shortstat",
+        "--stat",
+        "--summary",
+    }
+)
 _GIT_BRANCH_MUTATING_LONG_FLAGS = frozenset(
     {
         "--copy",
@@ -150,7 +173,7 @@ _GIT_BRANCH_VALUE_LONG_FLAGS = frozenset({"--format", "--sort"})
 _GIT_BRANCH_MUTATING_SHORT_FLAGS = frozenset("dDmMcCftu")
 _GIT_BRANCH_LIST_SHORT_FLAGS = frozenset("ailrvq")
 _GIT_BRANCH_LIST_ACTION_SHORT_FLAGS = frozenset("alr")
-_RG_UNSAFE_LONG_FLAGS = frozenset({"--pre", "--search-zip"})
+_RG_UNSAFE_LONG_FLAGS = frozenset({"--hostname-bin", "--pre", "--search-zip"})
 _FIND_MUTATING_FLAGS = frozenset(
     {
         "-delete",
@@ -170,14 +193,26 @@ _SECRET_BASENAMES = {
     ".env.local",
     ".env.production",
     ".env.development",
+    ".envrc",
+    ".netrc",
+    ".npmrc",
+    ".pgpass",
+    ".pypirc",
+    "credentials",
     "credentials.json",
     "service-account.json",
     "id_rsa",
     "id_ed25519",
     "id_ecdsa",
 }
-_SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
+_SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".keystore")
 _SECRET_ALLOW = {".env.example", ".env.sample", ".env.template"}
+# Credential stores whose file names are too generic to deny on their own,
+# matched as (directory name, file name) on the final two path components.
+_SECRET_DIR_FILES = {
+    (".docker", "config.json"),
+    (".kube", "config"),
+}
 _GLOB_META = frozenset("*?[")
 _DOT_SECRET_GLOB_PROBES = (
     ".env",
@@ -199,6 +234,9 @@ class PermissionDecision:
     reason: str
     remember_pattern: str
     tool: str = ""
+    # True when the elevated-risk floor downgraded this decision to ask. Hosts
+    # reject such decisions outright in non-interactive --auto mode.
+    elevated_floor: bool = False
 
     @property
     def allowed(self) -> bool:
@@ -227,6 +265,8 @@ def is_secret_path(path: str | Path) -> bool:
         return True
     parts = tuple(part.lower() for part in p.parts)
     if ".git" in parts:
+        return True
+    if len(parts) >= 2 and (parts[-2], parts[-1]) in _SECRET_DIR_FILES:
         return True
     return name.endswith(".db") and "noah-code" in str(p).lower()
 
@@ -306,7 +346,9 @@ class PermissionEngine:
         # The built-in balanced policy asks for arbitrary shell execution, but
         # does not interrupt users for commands the parser can prove are
         # read-only and confined to the workspace. A remembered session rule
-        # remains authoritative, including an explicit ask.
+        # remains authoritative, including an explicit ask. Read-only git
+        # commands that still dump unscoped patch output are excluded: they
+        # can expose committed secrets without naming a path.
         if (
             category == PermissionCategory.BASH
             and action == "ask"
@@ -315,6 +357,7 @@ class PermissionEngine:
             and not any(rule is matching for rule in self._session_rules)
             and self.is_readonly_command(normalized)
             and not _command_has_external_path(normalized)
+            and not _git_unscoped_patch_output(normalized)
         ):
             action = "allow"
             reason = "read-only workspace shell command allowed"
@@ -324,6 +367,7 @@ class PermissionEngine:
             action = "allow"
             reason = f"{reason} (auto-approved)"
 
+        elevated: PermissionDecision | None = None
         if category == PermissionCategory.BASH and action == "allow":
             # Apply the elevated-risk floor *after* ordinary auto-approval. This
             # keeps --auto useful for routine asks without silently approving
@@ -342,6 +386,7 @@ class PermissionEngine:
             matching_rule=matching,
             reason=reason,
             remember_pattern=self._remember_pattern(category, normalized),
+            elevated_floor=elevated is not None,
         )
 
     def _remember_pattern(self, category: str, target: str) -> str:
@@ -478,6 +523,7 @@ class PermissionEngine:
                     matching_rule=None,
                     reason="elevated-risk shell command requires approval",
                     remember_pattern=self._remember_pattern(PermissionCategory.BASH, command),
+                    elevated_floor=True,
                 )
         return None
 
@@ -642,20 +688,51 @@ def _is_mutating_find_flag(token: str) -> bool:
     return name in _FIND_MUTATING_FLAGS or name.startswith(("-exec", "-ok", "-fprint", "-fprintf"))
 
 
+# Short flag cluster carrying a joined value, e.g. ``-f/etc/passwd`` or
+# ``-F~/log``: the characters after the flag letter are a path candidate.
+_SHORT_FLAG_JOINED_VALUE = re.compile(r"^-[a-zA-Z].{1,}")
+# Windows drive prefix (``C:`` alone or ``C:\...``/``C:/...``) — its colon
+# does not introduce a git ``<rev>:<path>`` object path.
+_WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:(?:$|[\\/])")
+
+
+def _git_object_path_candidate(value: str) -> str | None:
+    """Return the path part of a git ``<rev>:<path>`` object token, if any.
+
+    URLs (``scheme://``) and Windows drive paths are excluded so ordinary
+    arguments are not misread as object syntax.
+    """
+    if ":" not in value or "://" in value or _WINDOWS_DRIVE_PATH.match(value):
+        return None
+    return value.rsplit(":", 1)[1]
+
+
 def _is_secret_shell_token(token: str) -> bool:
     """Detect direct or secret-specific glob path arguments.
 
     The permission engine cannot expand model-provided globs safely without a
     workspace/cwd and a new TOCTOU window. Instead, recognize patterns that are
     specific enough to target Noah's denied filename families while leaving
-    broad, ordinary source globs such as ``src/*.py`` untouched.
+    broad, ordinary source globs such as ``src/*.py`` untouched. Flag-joined
+    values (``-f.env``) and git ``<rev>:<path>`` object syntax (``HEAD:.env``)
+    are scanned as path candidates as well.
     """
 
-    values = token.split("=", 1)[1:] if token.startswith("-") and "=" in token else [token]
+    if token.startswith("-") and "=" in token:
+        values = token.split("=", 1)[1:]
+    elif _SHORT_FLAG_JOINED_VALUE.match(token):
+        values = [token[2:]]
+    else:
+        values = [token]
+    candidates = list(values)
     for value in values:
-        if is_secret_path(value):
+        git_object_path = _git_object_path_candidate(value)
+        if git_object_path is not None:
+            candidates.append(git_object_path)
+    for candidate in candidates:
+        if is_secret_path(candidate):
             return True
-        for component in Path(value).parts:
+        for component in Path(candidate).parts:
             if _glob_component_may_match_secret(component):
                 return True
     return False
@@ -745,6 +822,49 @@ def _glob_pattern_specificity(pattern: str) -> int:
         specificity += 1
         index += 1
     return specificity
+
+
+def _git_unscoped_patch_output(command: str) -> bool:
+    """Detect read-only git commands that still dump full patch contents.
+
+    ``git show``/``git log``/``git diff`` print complete diffs by default (or
+    with ``-p``/``--patch``), exposing committed secrets without naming a path
+    token. Unless the output is a non-patch summary or the command is scoped
+    to an explicit path, the read-only auto-allow bump must not apply. The
+    read-only classification itself is unchanged.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if len(tokens) < 2 or tokens[0] != "git":
+        return False
+    if tokens[1].lower() not in _GIT_PATCH_SUBCOMMANDS:
+        return False
+    patch_requested = False
+    patch_suppressed = False
+    args = tokens[2:]
+    for index, token in enumerate(args):
+        if token == "--":
+            # Only an explicit path limiter after ``--`` scopes the output.
+            if args[index + 1 :]:
+                return False
+            break
+        lowered = token.lower()
+        name = lowered.split("=", 1)[0]
+        if lowered == "-p" or name == "--patch":
+            patch_requested = True
+            continue
+        if lowered == "-s" or name in _GIT_NON_PATCH_OUTPUT_FLAGS:
+            patch_suppressed = True
+            continue
+        if not token.startswith("-") and (
+            "/" in token or ":" in token or token.startswith((".", "~"))
+        ):
+            # A path-like argument (pathspec or ``<rev>:<path>`` object)
+            # scopes the output without needing ``--``.
+            return False
+    return patch_requested or not patch_suppressed
 
 
 def _is_readonly_git(args: list[str]) -> bool:
@@ -843,9 +963,15 @@ def _command_has_external_path(command: str) -> bool:
     except ValueError:
         return True
     for token in tokens:
-        pieces = token.split("=", 1)[1:] if token.startswith("-") and "=" in token else [token]
-        if token.startswith("-") and "=" not in token:
+        if token.startswith("-") and "=" in token:
+            pieces = token.split("=", 1)[1:]
+        elif _SHORT_FLAG_JOINED_VALUE.match(token):
+            # Short flag cluster with a joined value: -f/etc/passwd, -F~/log.
+            pieces = [token[2:]]
+        elif token.startswith("-"):
             continue
+        else:
+            pieces = [token]
         for piece in pieces:
             # Fail closed on expansion syntax: $HOME, ${HOME}, and `cmd`
             # resolve outside the workspace at execution time, so a plan-mode

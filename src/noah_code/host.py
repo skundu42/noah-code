@@ -232,6 +232,8 @@ class AgentHost:
         self._usage = UsageTracker()
         self.steer_queue = SteerQueue()
         self._wake_event = asyncio.Event()
+        # Bounded poll interval for WAIT turns; re-checks job liveness each pass.
+        self._wake_timeout_seconds = 30.0
         self._current_run_id: str | None = None
         self._interrupted_run: RunRecord | None = None
         self._pending_attach_paths: list[Path] = []
@@ -357,7 +359,7 @@ class AgentHost:
         # is by far the largest cold-start cost. Do it in a worker thread so the
         # Textual shell can paint and remain responsive meanwhile.
         agent_class, get_llm_client = await asyncio.to_thread(_load_agent_runtime)
-        from noah_code.llm import ResilientLLM, reasoning_overrides, sampling_overrides
+        from noah_code.llm import reasoning_overrides, sampling_overrides
 
         client_kwargs: dict[str, Any] = {}
         if self._llm is None:
@@ -379,40 +381,19 @@ class AgentHost:
             )
 
         retry_config = self.config.reliability.retries
-        fallback_names = [
-            name for name in retry_config.fallback_models if name and name != self.meta.model
-        ]
-        fallback_clients = await asyncio.gather(
-            *(
-                asyncio.to_thread(
-                    get_llm_client,
-                    name,
-                    **reasoning_overrides(self.meta.reasoning_effort),
-                    **client_kwargs,
-                )
-                for name in fallback_names
-            )
+        fallback_clients = await self._build_fallback_clients(
+            get_llm_client,
+            self.meta.model,
+            effort=self.meta.reasoning_effort,
+            client_kwargs=client_kwargs,
         )
-
-        def _record_retry(payload: dict[str, Any]) -> None:
-            if self._runtime is not None:
-                self._runtime.event("llm.retry", payload)
 
         shared_route = lightweight_llm is llm
-        llm = ResilientLLM(
-            llm,
-            retry_config,
-            fallbacks=fallback_clients,
-            on_retry=_record_retry,
-        )
+        llm = self._wrap_resilient(llm, retry_config, fallback_clients)
         if shared_route:
             lightweight_llm = llm
         else:
-            lightweight_llm = ResilientLLM(
-                lightweight_llm,
-                retry_config,
-                on_retry=_record_retry,
-            )
+            lightweight_llm = self._wrap_resilient(lightweight_llm, retry_config)
 
         from noah_code.budget import SharedBudgetLLM, _PrefixObserverOnly, wrap_with_budget
         from noah_code.llm_replies import wrap_conversational_replies
@@ -1890,6 +1871,55 @@ class AgentHost:
             self.ui.set_status(self.status_prompt())
         return "continue"
 
+    def _record_retry(self, payload: dict[str, Any]) -> None:
+        """Emit retry telemetry to the runtime when it exists."""
+
+        if self._runtime is not None:
+            self._runtime.event("llm.retry", payload)
+
+    def _wrap_resilient(
+        self,
+        client: Any,
+        retry_config: Any,
+        fallbacks: Any = (),
+    ) -> Any:
+        """Apply the provider-retry/failover wrapper; used by start() and live switches."""
+
+        from noah_code.llm import ResilientLLM
+
+        return ResilientLLM(client, retry_config, fallbacks=fallbacks, on_retry=self._record_retry)
+
+    async def _build_fallback_clients(
+        self,
+        get_llm_client: Any,
+        model: str,
+        *,
+        effort: str,
+        client_kwargs: dict[str, Any],
+    ) -> list[Any]:
+        """Build fallback-route clients as configured, skipping the primary model."""
+
+        from noah_code.llm import reasoning_overrides
+
+        names = [
+            name
+            for name in self.config.reliability.retries.fallback_models
+            if name and name != model
+        ]
+        return list(
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        get_llm_client,
+                        name,
+                        **reasoning_overrides(effort),
+                        **client_kwargs,
+                    )
+                    for name in names
+                )
+            )
+        )
+
     def _apply_runtime_llm_wrappers(self, llm: Any) -> Any:
         """Re-apply conversational and session-budget wrappers after a client swap."""
 
@@ -1911,13 +1941,22 @@ class AgentHost:
         effort = reasoning_effort or (
             self.meta.reasoning_effort if self.meta else self.config.reasoning_effort
         )
+        client_kwargs = sampling_overrides(self.config.sampling)
         llm = await asyncio.to_thread(
             get_llm_client,
             model,
             **reasoning_overrides(effort),
-            **sampling_overrides(self.config.sampling),
+            **client_kwargs,
         )
-        llm = self._apply_runtime_llm_wrappers(llm)
+        fallback_clients = await self._build_fallback_clients(
+            get_llm_client,
+            model,
+            effort=effort,
+            client_kwargs=client_kwargs,
+        )
+        llm = self._apply_runtime_llm_wrappers(
+            self._wrap_resilient(llm, self.config.reliability.retries, fallback_clients)
+        )
         self.agent.set_main_llm(
             llm,
             lightweight_follows_main=not bool(self.config.lightweight_model),
@@ -1968,6 +2007,28 @@ class AgentHost:
             self.ui.render(HostEvent(HostEventKind.STATUS, f"steer applied · {preview}"))
             self.ui.set_status(self.status_prompt())
             return True
+
+    async def _wait_for_wake(self, agent: Any, *, latched: bool = False) -> bool:
+        """Bounded poll for a background-job terminal wake.
+
+        Returns True on a normal wake. A latched event with no running
+        jobs is also a normal wake: the job's terminal emit raced the
+        initial ``clear()``. Returns False when nothing is running and
+        no wake ever arrived, so the caller fails the run instead of
+        hanging the turn until Ctrl-C.
+        """
+
+        while True:
+            if not agent.processes.has_running():
+                return latched or self._wake_event.is_set()
+            try:
+                await asyncio.wait_for(
+                    self._wake_event.wait(),
+                    timeout=self._wake_timeout_seconds,
+                )
+                return True
+            except TimeoutError:
+                continue
 
     async def _run_user_turn(
         self,
@@ -2052,20 +2113,13 @@ class AgentHost:
                                 wake_ref=explanation,
                             )
                     elif kind == RespondReason.WAIT:
-                        # Clear before checking state so a terminal callback
-                        # cannot race between the check and the wait.
-                        self._wake_event.clear()
                         if self._apply_next_steer(agent):
                             continue
-                        if not agent.processes.has_running():
-                            exit_code = 1
-                            run_state = "failed"
-                            explanation = (
-                                "Agent returned WAIT without a running background job; "
-                                "start one with self.processes.start() or finish with DONE."
-                            )
-                            self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
-                            break
+                        # Snapshot before clearing: a terminal emit that
+                        # fired between the agent returning WAIT and this
+                        # branch is a normal wake, not a spurious failure.
+                        latched = self._wake_event.is_set()
+                        self._wake_event.clear()
                         run_state = "waiting_process"
                         if runtime is not None and run_id is not None:
                             runtime.transition_run(
@@ -2074,7 +2128,17 @@ class AgentHost:
                                 wake_kind="process",
                                 wake_ref=explanation,
                             )
-                        await self._wake_event.wait()
+                        self._wake_event.clear()
+                        woken = await self._wait_for_wake(agent, latched=latched)
+                        if not woken:
+                            exit_code = 1
+                            run_state = "failed"
+                            explanation = (
+                                "Agent returned WAIT without a running background job; "
+                                "start one with self.processes.start() or finish with DONE."
+                            )
+                            self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
+                            break
                         run_state = "running"
                         if runtime is not None and run_id is not None:
                             runtime.transition_run(run_id, "running")

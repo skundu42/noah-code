@@ -643,7 +643,20 @@ class QuestionModal(ModalScreen[QuestionAnswer | None]):
         self.dismiss(QuestionAnswer(selections=[self.prompt.options[index]], custom=""))
 
     def action_other(self) -> None:
-        self.dismiss(QuestionAnswer(selections=[], custom="other"))
+        """Chain a free-text prompt, mirroring the console ``other`` flow."""
+
+        def _submit_custom(answer: str | None) -> None:
+            if answer is not None:
+                self.dismiss(QuestionAnswer(selections=[], custom=answer))
+
+        self.app.push_screen(
+            TextPromptModal(
+                self.prompt.header,
+                "Type your own answer",
+                "Enter submit · Esc back to choices",
+            ),
+            _submit_custom,
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1309,16 +1322,16 @@ class NoahCodeApp(App[None]):
     BINDINGS = [
         Binding("ctrl+q", "quit_app", "Quit", show=True),
         Binding("ctrl+c", "cancel_or_quit", "Cancel", show=True),
-        Binding("ctrl+shift+c,super+c", "copy_selection", "Copy", show=True, priority=True),
+        Binding("ctrl+shift+c", "copy_selection", "Copy", show=True, priority=True),
         Binding("ctrl+p", "palette", "Commands", show=True),
-        Binding("ctrl+k", "skills", "Skills", show=True, priority=True),
+        Binding("ctrl+g", "skills", "Skills", show=True),
         Binding("ctrl+o", "sessions", "Sessions", show=True),
         Binding("ctrl+n", "new_session", "New", show=True),
         Binding("tab", "toggle_mode", "Build/Plan", show=True),
         Binding("f1", "show_help", "Help", show=True),
         Binding("f2", "activity_history", "Activity", show=True),
         Binding("f3", "conversation_history", "History", show=True),
-        Binding("end", "scroll_live", "Latest", show=False, priority=True),
+        Binding("ctrl+]", "scroll_live", "Latest", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
     ]
 
@@ -2348,11 +2361,15 @@ class NoahCodeApp(App[None]):
         return QuestionAnswer(selections=selections, custom=" ".join(custom_parts).strip())
 
     def _dismiss_stranded_modal(self) -> None:
-        """Pop a modal left on screen by a cancelled push_screen_wait await."""
+        """Dismiss modals left on screen by a cancelled push_screen_wait await.
+
+        QuestionModal can stack a TextPromptModal for its Other free-text
+        answer, so every known modal on top of the stack is released.
+        """
 
         with contextlib.suppress(Exception):
-            if isinstance(self.screen, (ApprovalModal, QuestionModal)):
-                self.pop_screen()
+            while isinstance(self.screen, (ApprovalModal, QuestionModal, TextPromptModal)):
+                self.screen.dismiss(None)
 
     def action_show_help(self) -> None:
         self._append_entry(
@@ -2934,6 +2951,15 @@ class NoahCodeApp(App[None]):
     def action_copy_selection(self) -> None:
         """Copy selected text, or the latest Noah reply when nothing is selected."""
 
+        focused = self.focused
+        if isinstance(focused, TextArea):
+            # Shift-arrow selections live inside the TextArea and are invisible
+            # to screen.get_selected_text(), which only sees mouse drags.
+            composer_selection = focused.selected_text
+            if composer_selection:
+                self.copy_to_clipboard(composer_selection)
+                self._show_notice("Copied selected text", temporary=True)
+                return
         selected = self.screen.get_selected_text()
         if selected:
             self.copy_to_clipboard(selected)
@@ -2956,9 +2982,10 @@ class NoahCodeApp(App[None]):
             self.action_copy_selection()
             return
         if self.ui.busy and self._turn_task and not self._turn_task.done():
+            # The host renders the "turn cancelled" status entry itself when
+            # the turn task unwinds; the app only triggers the cancellation.
             self.host.cancel_active_turn()
             self.ui.set_busy(False)
-            self._append_entry(TranscriptEntry("STATUS", "Turn cancelled"))
             self._interrupt_count = 0
             return
         self._interrupt_count += 1
@@ -3094,8 +3121,6 @@ class NoahCodeApp(App[None]):
             action = await self.host.handle_line(text)
             if action == "exit":
                 self.exit()
-        except asyncio.CancelledError:
-            self._append_entry(TranscriptEntry("STATUS", "Turn cancelled"))
         except Exception as exc:  # noqa: BLE001
             self._append_entry(TranscriptEntry("ERROR", str(exc)))
         finally:

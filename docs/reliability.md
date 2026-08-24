@@ -59,7 +59,10 @@ on the next launch. This protection complements the persistent edit journal used
 Git checkpoints are enabled by default. Noah captures them at turn boundaries and before mutating
 shell commands, stores them under `refs/noah-code/checkpoints/<session>/`, and keeps the newest 50
 by default. Capturing uses a temporary Git index and does not move `HEAD` or disturb the user's
-index. Inspect and restore them with:
+index. Capture is filter-free plumbing (`hash-object --no-filters` + `update-index --cacheinfo`),
+so repository clean filters never execute during capture, and paths the permission engine
+classifies as secrets (`.env`, key stores, credential files) are never staged into checkpoint
+refs. Inspect and restore them with:
 
 ```text
 /checkpoints
@@ -110,6 +113,9 @@ The defaults favor long-running work while keeping growth finite:
 | --- | ---: | --- |
 | `processes.max_jobs` | `8` | Maximum managed background jobs |
 | `processes.max_runtime_seconds` | `86400` | Per-job runtime ceiling (24 hours) |
+| Background-job log cap | `4000000` bytes | Durable per-job JSONL log rotates, keeping the newest lines |
+| `max_file_bytes` | `512000` | Whole-file reads above this require an explicit line range |
+| `undo_blob_limit` | `2000000` | Per-file cap for undo/durable pre-images (larger edits are hash-only) |
 | `reliability.interaction_timeout_seconds` | `86400` | Approval/question timeout |
 | `reliability.artifact_max_bytes` | `2000000000` | Full-output artifact quota per session |
 | `reliability.session_max_bytes` | `5000000000` | Total session-storage ceiling |
@@ -117,7 +123,9 @@ The defaults favor long-running work while keeping growth finite:
 | `checkpoints.max_per_session` | `50` | Rolling Git checkpoint count |
 
 Optional `[budget]` limits cap cumulative model tokens, estimated/provider-reported cost, or session
-wall-clock time. Counters persist across restarts:
+wall-clock time. Cost is computed per response from the provider's reported cost when present,
+falling back to LiteLLM's pricing table (`completion_cost`), so `max_cost_usd` is enforced against
+real charges. Counters persist across restarts:
 
 ```toml
 [budget]

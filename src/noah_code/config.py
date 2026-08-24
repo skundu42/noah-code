@@ -10,9 +10,13 @@ import tomllib
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from noah_code.themes import ThemeName, get_theme
+
+
+class ConfigError(Exception):
+    """Configuration could not be parsed or validated."""
 
 PermissionAction = Literal["allow", "ask", "deny"]
 ReasoningEffort = Literal["default", "none", "minimal", "low", "medium", "high", "xhigh"]
@@ -30,6 +34,8 @@ REASONING_EFFORTS: tuple[ReasoningEffort, ...] = (
 class PermissionRule(BaseModel):
     """Ordered permission rule; last match wins."""
 
+    model_config = ConfigDict(extra="forbid")
+
     category: str = "*"
     pattern: str = "*"
     action: PermissionAction = "ask"
@@ -37,11 +43,15 @@ class PermissionRule(BaseModel):
 
 
 class TracingConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     enabled: bool = True
     jsonl_dir: str | None = None
 
 
 class SummarizationPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     policy: Literal["token_budget", "none"] = "token_budget"
     max_tokens: int | None = None
     trigger_ratio: float = Field(default=0.35, gt=0.05, lt=0.95)
@@ -51,6 +61,8 @@ class SummarizationPolicy(BaseModel):
 
 class EfficiencyConfig(BaseModel):
     """Token and latency controls for the coding agent."""
+
+    model_config = ConfigDict(extra="forbid")
 
     profile: Literal["fast", "balanced", "deep"] = "fast"
     strategy: Literal["lean", "standard"] = "lean"
@@ -67,6 +79,8 @@ class EfficiencyConfig(BaseModel):
 class RetryConfig(BaseModel):
     """Provider retry and failover policy for transient model failures."""
 
+    model_config = ConfigDict(extra="forbid")
+
     max_attempts: int = Field(default=5, ge=1, le=12)
     base_delay_seconds: float = Field(default=0.5, ge=0.0, le=30.0)
     max_delay_seconds: float = Field(default=20.0, ge=0.1, le=300.0)
@@ -78,6 +92,8 @@ class RetryConfig(BaseModel):
 class ReliabilityConfig(BaseModel):
     """Durability and unattended-operation limits."""
 
+    model_config = ConfigDict(extra="forbid")
+
     auto_resume_interrupted_runs: bool = True
     interaction_timeout_seconds: float = Field(default=86_400.0, gt=1.0, le=604_800.0)
     artifact_max_bytes: int = Field(default=2_000_000_000, ge=1_000_000)
@@ -88,6 +104,8 @@ class ReliabilityConfig(BaseModel):
 
 
 class UIConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     theme: ThemeName = "atom-one-dark"
     show_reasoning: bool = False
     markdown: bool = True
@@ -95,6 +113,8 @@ class UIConfig(BaseModel):
 
 
 class UpdateConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     auto_install: bool = False
     interval_hours: int = Field(default=24, ge=1, le=24 * 30)
     check_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
@@ -102,6 +122,8 @@ class UpdateConfig(BaseModel):
 
 class LSPConfig(BaseModel):
     """Lazy local language-server settings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
     timeout_seconds: float = Field(default=5.0, gt=0, le=30)
@@ -112,6 +134,8 @@ class LSPConfig(BaseModel):
 class ProcessConfig(BaseModel):
     """Bounds for background commands owned by one Noah session."""
 
+    model_config = ConfigDict(extra="forbid")
+
     max_jobs: int = Field(default=8, ge=1, le=32)
     max_runtime_seconds: float = Field(default=86_400.0, gt=1, le=604_800)
     max_buffer_chars: int = Field(default=64_000, ge=4000, le=2_000_000)
@@ -120,6 +144,8 @@ class ProcessConfig(BaseModel):
 
 class SamplingConfig(BaseModel):
     """Deterministic sampling controls forwarded to the provider client."""
+
+    model_config = ConfigDict(extra="forbid")
 
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     top_p: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -134,6 +160,8 @@ class SamplingConfig(BaseModel):
 class BudgetConfig(BaseModel):
     """Hard session caps; the first breach cancels the turn and exits."""
 
+    model_config = ConfigDict(extra="forbid")
+
     max_tokens: int | None = Field(default=None, ge=1)
     max_cost_usd: float | None = Field(default=None, gt=0.0)
     max_seconds: float | None = Field(default=None, gt=0.0)
@@ -142,18 +170,24 @@ class BudgetConfig(BaseModel):
 class HookSpec(BaseModel):
     """One shell hook bound to tool names via a glob pattern."""
 
+    model_config = ConfigDict(extra="forbid")
+
     match: str = "*"
     command: str
     timeout_seconds: float = Field(default=10.0, gt=0.0, le=600.0)
 
 
 class HooksConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     pre_tool: list[HookSpec] = Field(default_factory=list)
     post_tool: list[HookSpec] = Field(default_factory=list)
 
 
 class CheckpointConfig(BaseModel):
     """Automatic git worktree snapshots captured at turn boundaries."""
+
+    model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
     max_per_session: int = Field(default=50, ge=1, le=500)
@@ -162,6 +196,8 @@ class CheckpointConfig(BaseModel):
 
 class NoahCodeConfig(BaseModel):
     """Resolved configuration for a noah-code run."""
+
+    model_config = ConfigDict(extra="forbid")
 
     model: str = "gpt-4o-mini"
     reasoning_effort: ReasoningEffort = "default"
@@ -529,8 +565,12 @@ _USER_ONLY_CONFIG_KEYS = frozenset(
 def _load_toml(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
-    with path.open("rb") as fh:
-        data = tomllib.load(fh)
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        # TOMLDecodeError's message carries the line/column of the failure.
+        raise ConfigError(f"invalid TOML in {path}: {exc}") from exc
     return data if isinstance(data, dict) else {}
 
 
@@ -562,7 +602,7 @@ def _env_overrides() -> dict[str, Any]:
     if session_dir := os.environ.get("NOAH_CODE_SESSION_DIR"):
         out["session_dir"] = session_dir
     if mode := os.environ.get("NOAH_CODE_MODE"):
-        out["mode"] = mode
+        out["mode"] = mode.lower()
     if unsafe := os.environ.get("NOAH_CODE_UNSAFE_INPROCESS"):
         out["unsafe_inprocess_code_execution"] = unsafe.lower() in {"1", "true", "yes", "on"}
     if auto_update := os.environ.get("NOAH_CODE_AUTO_UPDATE"):
@@ -592,6 +632,19 @@ def _normalize_raw(raw: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _summarize_validation_error(exc: ValidationError, *, limit: int = 3) -> str:
+    """Compress a pydantic ValidationError into a single-line summary."""
+
+    errors = exc.errors()
+    parts = []
+    for error in errors[:limit]:
+        location = ".".join(str(part) for part in error["loc"]) or "(root)"
+        parts.append(f"{location}: {error['msg']}")
+    if len(errors) > limit:
+        parts.append(f"(+{len(errors) - limit} more)")
+    return "; ".join(parts)
+
+
 def load_config(
     workspace: Path,
     *,
@@ -613,7 +666,17 @@ def load_config(
             # last-match-wins, so explicit denies outrank earlier allows.
             existing = list(merged.get("permission_rules") or [])
             merged["permission_rules"] = [*existing, *extra_rules]
-    return NoahCodeConfig.model_validate(_normalize_raw(merged))
+    try:
+        return NoahCodeConfig.model_validate(_normalize_raw(merged))
+    except ValidationError as exc:
+        files = [
+            str(path)
+            for path in (_user_config_path(), _project_config_path(workspace))
+            if path.is_file()
+        ]
+        where = f" in {', '.join(files)}" if files else ""
+        detail = _summarize_validation_error(exc)
+        raise ConfigError(f"invalid configuration{where}: {detail}") from exc
 
 
 def config_sources(workspace: Path) -> dict[str, Path | None]:

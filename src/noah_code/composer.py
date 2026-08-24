@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,13 @@ _MENTION = re.compile(r"(?<![\w/])@([A-Za-z0-9_./-]+)")
 _MAX_INLINE_CHARS = 8_000
 _MAX_FILES = 8
 
+# Live @mention completion re-lists the workspace on every keystroke, so the
+# walk is cached briefly per root; excluded directories are pruned in place
+# instead of being enumerated by the walk and filtered from the results.
+_SUGGESTION_CACHE_TTL = 5.0
+_EXCLUDED_DIRS = frozenset({".git", ".venv", "node_modules", "dist", "build"})
+_suggestion_cache: dict[Path, tuple[float, list[Path]]] = {}
+
 
 @dataclass
 class ExpandedTurn:
@@ -29,6 +38,28 @@ class ExpandedTurn:
 
     text: str
     images: list[Any] = field(default_factory=list)
+
+
+def _workspace_files(root: Path) -> list[Path]:
+    """Return eligible files under ``root``, walking at most once per TTL window."""
+
+    now = time.monotonic()
+    cached = _suggestion_cache.get(root)
+    if cached is not None and now - cached[0] < _SUGGESTION_CACHE_TTL:
+        return cached[1]
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            name for name in dirnames if name not in _EXCLUDED_DIRS and not name.startswith(".")
+        ]
+        for filename in filenames:
+            path = Path(dirpath) / filename
+            if not path.is_file() or is_secret_path(path):
+                continue
+            files.append(path)
+    files.sort()
+    _suggestion_cache[root] = (now, files)
+    return files
 
 
 def mention_suggestions(workspace: Path, prefix: str, *, limit: int = 8) -> list[str]:
@@ -42,18 +73,10 @@ def mention_suggestions(workspace: Path, prefix: str, *, limit: int = 8) -> list
         return []
     root = workspace.resolve()
     matches: list[str] = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or is_secret_path(path):
-            continue
+    for path in _workspace_files(root):
         try:
             relative = path.relative_to(root).as_posix()
         except ValueError:
-            continue
-        parts = Path(relative).parts
-        if any(
-            part in {".git", ".venv", "node_modules", "dist", "build"} or part.startswith(".")
-            for part in parts[:-1]
-        ):
             continue
         if relative.startswith(query) or Path(relative).name.startswith(Path(query).name):
             matches.append(relative)

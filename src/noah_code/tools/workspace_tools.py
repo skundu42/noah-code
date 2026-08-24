@@ -116,6 +116,10 @@ def _matches_glob(relative: str, pattern: str) -> bool:
         return False
 
 
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 class WorkspaceTools(Skill):
     """Read, search, edit, and run commands inside the active workspace.
 
@@ -138,6 +142,7 @@ class WorkspaceTools(Skill):
         max_output_lines: int = 250,
         max_search_results: int = 100,
         max_file_results: int = 500,
+        max_file_bytes: int = 512_000,
         output_retention_hours: int = 24,
         default_timeout: float = 60.0,
         lsp: Any = None,
@@ -156,6 +161,7 @@ class WorkspaceTools(Skill):
         self._max_output_lines = max_output_lines
         self._max_search_results = max_search_results
         self._max_file_results = max_file_results
+        self._max_file_bytes = max_file_bytes
         self._output_store = ToolOutputStore(
             root=output_store_root,
             retention_hours=None if output_store_root is not None else output_retention_hours,
@@ -224,15 +230,59 @@ class WorkspaceTools(Skill):
     ) -> Match | str:
         """Read a file range; oversized reads return a managed preview, not an edit anchor."""
         resolved = await self._authorize_path(path, PermissionCategory.READ, tool="ws_read")
-        async with self._pinned_shell_cwd():
-            result = await self._shell.read(str(resolved), lines=lines)
-        self._record_read_fingerprint(resolved)
-        bounded = self._bound(result.text)
-        if bounded != result.text:
+        stat = resolved.stat()
+        if lines is None and stat.st_size > self._max_file_bytes:
+            display = self._workspace.relpath(resolved)
+            raise ValueError(
+                f"{display} is {stat.st_size} bytes, above the {self._max_file_bytes}-byte "
+                "whole-file read limit; re-read a range with lines=(start, end)"
+            )
+        # Reads run natively on the authorized absolute path: no shell pinning,
+        # no whole-file load for ranged reads, and a clean binary-file error.
+        try:
+            match = (
+                self._read_whole_file(resolved)
+                if lines is None
+                else self._read_line_range(resolved, lines)
+            )
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"binary or non-UTF-8 file is not readable: "
+                f"{self._workspace.relpath(resolved)}"
+            ) from exc
+        if stat.st_size <= self._journal.blob_limit:
+            self._record_read_fingerprint(resolved)
+        bounded = self._bound(match.text)
+        if bounded != match.text:
             # A head/tail preview is not contiguous file content and therefore
             # must never masquerade as an editable Match anchor.
-            return f"{result.path}:{result.start}-{result.end}\n{bounded}"
-        return result
+            return f"{match.path}:{match.start}-{match.end}\n{bounded}"
+        return match
+
+    def _read_whole_file(self, resolved: Path) -> Match:
+        with resolved.open(encoding="utf-8") as stream:
+            content = stream.read()
+        total = len(content.splitlines(keepends=True))
+        return Match(str(resolved), 1, total, content)
+
+    @staticmethod
+    def _read_line_range(resolved: Path, lines: tuple[int, int]) -> Match:
+        """Stream only the requested 1-indexed inclusive range from disk."""
+        start = max(1, lines[0])
+        end = lines[1]
+        collected: list[str] = []
+        last = 0
+        with resolved.open(encoding="utf-8") as stream:
+            for lineno, line in enumerate(stream, 1):
+                if lineno > end:
+                    break
+                last = lineno
+                if lineno >= start:
+                    collected.append(line)
+            else:
+                # The file ended before the range did; clamp like a full read.
+                end = min(end, last)
+        return Match(str(resolved), start, end, "".join(collected))
 
     async def search(
         self,
@@ -398,6 +448,11 @@ class WorkspaceTools(Skill):
                         f"stale edit anchor: {self._workspace.relpath(resolved)} changed "
                         "since read(); call read() again to refresh the Match"
                     )
+            else:
+                # Anchors harvested via grep/run() never passed through read(),
+                # so verify the anchored region's current content instead.
+                self._verify_anchor_fresh(resolved, match)
+            oversized = self._preimage_exceeds_blob_limit(resolved)
             durable = self._begin_durable_file_operation(resolved)
             mut = self._journal.record_preimage(resolved)
             try:
@@ -408,20 +463,29 @@ class WorkspaceTools(Skill):
                 self._journal.discard_mutation(mut)
                 self._rollback_durable_file_operation(durable)
                 raise
+            if oversized:
+                result.message += self._durable_skip_note()
             return result
         if isinstance(match, str):
+            if new is None:
+                raise ValueError(
+                    "replace(path, old, new) requires 3 arguments. "
+                    "Did you mean replace(match, new_text)?"
+                )
             resolved = await self._authorize_path(match, PermissionCategory.EDIT, tool="ws_edit")
+            oversized = self._preimage_exceeds_blob_limit(resolved)
             durable = self._begin_durable_file_operation(resolved)
             mut = self._journal.record_preimage(resolved)
             try:
-                async with self._pinned_shell_cwd():
-                    result = await self._shell.replace(str(resolved), new_text, new)
+                result = self._native_replace_string(resolved, match, new_text, new)
                 self._journal.record_postimage(mut, resolved)
                 self._complete_durable_file_operation(durable, resolved)
             except Exception:
                 self._journal.discard_mutation(mut)
                 self._rollback_durable_file_operation(durable)
                 raise
+            if oversized:
+                result.message += self._durable_skip_note()
             return result
         raise TypeError("replace expects a Match or path string")
 
@@ -446,6 +510,7 @@ class WorkspaceTools(Skill):
 
     async def _write_file_locked(self, path: str, content: str) -> Any:
         resolved = await self._authorize_path(path, PermissionCategory.EDIT, tool="write_file")
+        oversized = self._preimage_exceeds_blob_limit(resolved)
         durable = self._begin_durable_file_operation(resolved)
         mut = self._journal.record_preimage(resolved)
         try:
@@ -456,6 +521,8 @@ class WorkspaceTools(Skill):
             self._journal.discard_mutation(mut)
             self._rollback_durable_file_operation(durable)
             raise
+        if oversized:
+            result.message += self._durable_skip_note()
         return result
 
     async def write(
@@ -598,6 +665,10 @@ class WorkspaceTools(Skill):
                     os.fsync(stream.fileno())
                 if item["mode"] is not None:
                     temp_path.chmod(item["mode"])
+                else:
+                    # mkstemp creates 0600; a brand-new file should get the
+                    # umask-default mode a normal create would produce.
+                    temp_path.chmod(self._default_file_mode())
                 temporary[target] = temp_path
 
             # Close the TOCTOU window: every file must still match its preflight bytes.
@@ -623,8 +694,10 @@ class WorkspaceTools(Skill):
                     target.unlink()
                 else:
                     os.replace(temporary.pop(target), target)
-                self._fsync_directory(target.parent)
+                # Record the commit BEFORE fsync: an fsync failure must still
+                # roll back the rename/unlink that already happened.
                 committed.append(item)
+                self._fsync_directory(target.parent)
             for mutation, item in zip(mutations, prepared, strict=True):
                 self._journal.record_postimage(mutation, item["resolved"])
             if durable_operations and self._runtime is not None:
@@ -741,7 +814,8 @@ class WorkspaceTools(Skill):
             await self.checkpoint_before_shell(command)
             self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
-            self._on_shell_chunk("status", f"$ {command}\n")
+            with contextlib.suppress(Exception):
+                self._on_shell_chunk("status", f"$ {command}\n")
         mutating = not self._engine.is_readonly_command(command)
         async with self._mutation_guard(mutating), self._file_op_lock:
             await self._ensure_shell_started()
@@ -750,12 +824,14 @@ class WorkspaceTools(Skill):
                 stdin=stdin,
                 timeout=timeout or self._default_timeout,
             )
+        self._absolutize_harvested_matches(result)
         if self._on_shell_chunk is not None:
-            if result.stdout:
-                self._on_shell_chunk("stdout", result.stdout)
-            if result.stderr:
-                self._on_shell_chunk("stderr", result.stderr)
-            self._on_shell_chunk("status", f"[exit {result.returncode}]\n")
+            with contextlib.suppress(Exception):
+                if result.stdout:
+                    self._on_shell_chunk("stdout", result.stdout)
+                if result.stderr:
+                    self._on_shell_chunk("stderr", result.stderr)
+                self._on_shell_chunk("status", f"[exit {result.returncode}]\n")
         return self._cap_shell_result(result)
 
     async def run_stream(
@@ -770,7 +846,8 @@ class WorkspaceTools(Skill):
             await self.checkpoint_before_shell(command)
             self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
-            self._on_shell_chunk("status", f"$ {command}\n")
+            with contextlib.suppress(Exception):
+                self._on_shell_chunk("status", f"$ {command}\n")
         mutating = not self._engine.is_readonly_command(command)
         async with self._mutation_guard(mutating), self._file_op_lock:
             await self._ensure_shell_started()
@@ -779,9 +856,10 @@ class WorkspaceTools(Skill):
                     command, timeout=timeout or self._default_timeout
                 ):
                     if self._on_shell_chunk is not None and hasattr(event, "kind"):
-                        self._on_shell_chunk(
-                            getattr(event, "kind", "stdout"), getattr(event, "text", "")
-                        )
+                        with contextlib.suppress(Exception):
+                            self._on_shell_chunk(
+                                getattr(event, "kind", "stdout"), getattr(event, "text", "")
+                            )
                     yield event
             finally:
                 # NOOA updates BashSession.cwd after a streamed command but
@@ -821,7 +899,26 @@ class WorkspaceTools(Skill):
     ) -> str:
         if self._runtime is None:
             return ""
+        if self._preimage_exceeds_blob_limit(path):
+            # The durable store would absorb the whole file into SQLite. Skip
+            # the durable preimage; the in-memory journal still records a
+            # hash-only mutation so concurrent modification is detected.
+            return ""
         return self._runtime.begin_file_operation(path, operation_group=operation_group)
+
+    def _preimage_exceeds_blob_limit(self, path: Path) -> bool:
+        if self._runtime is None:
+            return False
+        try:
+            return path.is_file() and path.stat().st_size > self._journal.blob_limit
+        except OSError:
+            return False
+
+    def _durable_skip_note(self) -> str:
+        return (
+            f" (durable rollback skipped: preimage exceeds "
+            f"{self._journal.blob_limit} bytes)"
+        )
 
     def _complete_durable_file_operation(self, operation_id: str, path: Path) -> None:
         if operation_id and self._runtime is not None:
@@ -909,9 +1006,11 @@ class WorkspaceTools(Skill):
         digest = self._hash_path(resolved)
         if digest is None:
             return
-        if len(self._read_fingerprints) > 512:
-            # Conservative bound: forget everything and require fresh reads.
-            self._read_fingerprints.clear()
+        while len(self._read_fingerprints) > 512:
+            # Bound the table by evicting the oldest entry, not by clearing
+            # everything (which would needlessly invalidate fresh anchors).
+            oldest = next(iter(self._read_fingerprints))
+            del self._read_fingerprints[oldest]
         self._read_fingerprints[str(resolved)] = digest
 
     @staticmethod
@@ -920,6 +1019,76 @@ class WorkspaceTools(Skill):
             return hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError:
             return None
+
+    def _verify_anchor_fresh(self, resolved: Path, match: Match) -> None:
+        """Content-based staleness check for anchors that bypassed read()."""
+        rel = self._workspace.relpath(resolved)
+        try:
+            data = resolved.read_bytes()
+        except OSError as exc:
+            raise ValueError(
+                f"stale edit anchor: cannot re-read {rel}; call read() again to refresh the Match"
+            ) from exc
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = data.decode("latin-1")
+        all_lines = text.splitlines(keepends=True)
+        start = max(1, int(match.start))
+        end = min(len(all_lines), int(match.end))
+        region = "".join(all_lines[start - 1 : end]) if start <= len(all_lines) else ""
+        if region == match.text:
+            return
+        # Anchors harvested by grep/run() pass through universal-newline
+        # decoding, so tolerate newline-convention differences only.
+        if _normalize_newlines(region) == _normalize_newlines(match.text):
+            return
+        raise ValueError(
+            f"stale edit anchor: {rel} changed since the Match was captured; "
+            "call read() again to refresh the Match"
+        )
+
+    def _native_replace_string(
+        self, resolved: Path, path_display: str, old: str, new: str
+    ) -> FileWrite:
+        """Unique-string splice on raw bytes with an atomic commit.
+
+        The upstream string form read_text()+write_text()s the whole file,
+        silently converting CRLF files to LF and leaving a truncated file
+        if the process dies mid-write. This decodes without newline
+        translation, requires exactly one occurrence, and commits via
+        temp+fsync+rename.
+        """
+
+        data = resolved.read_bytes()
+        if b"\0" in data:
+            raise ValueError("binary files are not editable via replace()")
+        codec = "utf-8"
+        try:
+            text = data.decode(codec)
+        except UnicodeDecodeError:
+            codec = "latin-1"  # byte-lossless fallback for legacy encodings
+            text = data.decode(codec)
+        count = text.count(old)
+        if count == 0:
+            raise ValueError(
+                f"old text not found in {path_display}. "
+                "It must match exactly once — check whitespace and indentation."
+            )
+        if count > 1:
+            raise ValueError(
+                f"old text matched {count} times in {path_display}. "
+                "It must match exactly once — add surrounding context to make it unique."
+            )
+        new_content = text.replace(old, new, 1)
+        mode = resolved.stat().st_mode & 0o7777
+        self._atomic_write_bytes(resolved, new_content.encode(codec), new_content, mode=mode)
+        return FileWrite(
+            path=path_display,
+            message=f"Edited {path_display}",
+            diff=f"--- a/{path_display}\n+++ b/{path_display}",
+            new_text=new,
+        )
 
     def _native_replace_match(
         self, resolved: Path, match: Match, new_text: str
@@ -987,6 +1156,10 @@ class WorkspaceTools(Skill):
                 os.fsync(stream.fileno())
             if mode is not None:
                 os.chmod(temp_name, mode)
+            else:
+                # mkstemp creates 0600; a brand-new file should get the
+                # umask-default mode a normal create would produce.
+                os.chmod(temp_name, self._default_file_mode())
             os.replace(temp_name, resolved)
             self._fsync_directory(resolved.parent)
         finally:
@@ -1002,6 +1175,14 @@ class WorkspaceTools(Skill):
         )
 
     @staticmethod
+    def _default_file_mode() -> int:
+        """0666 minus the process umask, like a normal ``open(..., "w")`` create."""
+
+        umask = os.umask(0)
+        os.umask(umask)
+        return 0o666 & ~umask
+
+    @staticmethod
     def _fsync_directory(path: Path) -> None:
         """Make a completed rename durable across sudden power loss."""
 
@@ -1012,6 +1193,27 @@ class WorkspaceTools(Skill):
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+
+    def _absolutize_harvested_matches(self, result: ShellResult) -> None:
+        """Pin grep-harvested anchors to their absolute harvest-time paths.
+
+        NOOA attaches Match anchors whose ``path`` is relative to the shell's
+        cwd when the search ran. After a model-driven ``cd`` such an anchor
+        would later resolve against the workspace root and edit the wrong
+        file, so rewrite it against the cwd known at harvest time.
+        """
+
+        matches = result.matches
+        if not matches:
+            return
+        base = Path(self._shell.cwd).resolve()
+        rewritten: list[Match] = []
+        for match in matches:
+            candidate = Path(match.path)
+            if not candidate.is_absolute():
+                candidate = (base / candidate).resolve()
+            rewritten.append(Match(str(candidate), match.start, match.end, match.text))
+        result.matches = rewritten
 
     def _cap_shell_result(self, result: ShellResult) -> ShellResult:
         stdout = self._bound(result.stdout)

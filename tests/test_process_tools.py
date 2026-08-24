@@ -29,6 +29,7 @@ def _manager(
     *,
     auto: bool = False,
     runtime: RuntimeStateStore | None = None,
+    max_log_bytes: int = 4_000_000,
 ) -> ProcessTools:
     workspace = Workspace(tmp_path.resolve())
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=auto)
@@ -44,6 +45,7 @@ def _manager(
     return ProcessTools(
         tools,
         max_runtime_seconds=5,
+        max_log_bytes=max_log_bytes,
         stop_grace_seconds=0.2,
         runtime=runtime,
     )
@@ -131,3 +133,63 @@ async def test_background_job_status_and_logs_survive_manager_restart(tmp_path: 
         assert "durable output" in await reopened.logs(job_id)
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_log_is_capped_and_keeps_latest_lines(tmp_path: Path) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+    manager = _manager(tmp_path, runtime=runtime, max_log_bytes=2_000)
+    command = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote(
+        "for i in range(400): print(f'line-{i:04d}-' + 'x' * 40)"
+    )
+    started = await manager.start(command, name="spammy")
+    job_id = started.split()[1]
+    try:
+        async with asyncio.timeout(5):
+            while "completed" not in await manager.status(job_id):
+                await asyncio.sleep(0.02)
+    finally:
+        await manager.close()
+
+    log_path = runtime.process_log_dir / f"{job_id}.jsonl"
+    raw = log_path.read_text()
+    assert "truncated" in raw
+    assert log_path.stat().st_size <= 2_000 + 8_192
+
+    reopened = _manager(tmp_path, runtime=RuntimeStateStore(tmp_path / "session"))
+    try:
+        output = await reopened.logs(job_id, cursor=0)
+        assert "line-0399" in output
+        assert "next_cursor=" in output
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_event_fires_when_runtime_update_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+    manager = _manager(tmp_path, runtime=runtime)
+    events: list[tuple] = []
+    manager.set_lifecycle_handler(lambda *args: events.append(args))
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated SQLite failure")
+
+    monkeypatch.setattr(runtime, "update_job", boom)
+    try:
+        command = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote("print('hi')")
+        started = await manager.start(command, name="fragile")
+        job_id = started.split()[1]
+        async with asyncio.timeout(5):
+            while not any(len(event) >= 4 and event[3] for event in events):
+                await asyncio.sleep(0.02)
+        terminal = [event for event in events if len(event) >= 4 and event[3]]
+        assert any("completed" in event[2] for event in terminal)
+        async with asyncio.timeout(5):
+            while manager._jobs[job_id].state == "running":
+                await asyncio.sleep(0.02)
+        assert manager._jobs[job_id].returncode == 0
+    finally:
+        await manager.close()

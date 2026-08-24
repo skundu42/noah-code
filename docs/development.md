@@ -12,7 +12,8 @@ uv run pytest tests
 uv build
 ```
 
-The default test suite is hermetic and does not require network access or provider keys. A single
+The default test suite is hermetic and does not require network access or provider keys; pytest-socket
+blocks network sockets outright (only local AF_UNIX sockets, e.g. asyncio's self-pipe, stay open). A single
 opt-in test performs a live HTTP fetch; run it explicitly on a connected machine:
 
 ```bash
@@ -25,7 +26,7 @@ Measure coverage (a 70% total gate runs in CI):
 uv run pytest tests --cov=noah_code --cov-report=term-missing
 ```
 
-Optional git hooks mirror the lint gate:
+Optional git hooks mirror the lint, type-check, and lockfile gates:
 
 ```bash
 uvx pre-commit install
@@ -37,16 +38,19 @@ tool output, and estimated cost.
 ## CI
 
 GitHub Actions runs the complete test suite on Python 3.12 and 3.13, plus platform smoke tests on
-Linux and macOS for arm64 and x86_64. Every pull request and push to `main` must pass lint, static
-type checking (mypy), tests with a 70% coverage floor, lockfile validation, and a package build.
-Concurrent runs for the same reference are cancelled automatically.
+Linux and macOS for arm64 and x86_64. Every pull request, push to `main`, and `v*` tag must pass lint,
+static type checking (mypy), tests with a 70% coverage floor (measured on Ubuntu; the macOS smoke jobs
+also collect coverage, without a gate, to include mac-only paths), lockfile validation, and a package
+build. A separate job runs the network-dependent integration tests and is allowed to fail, since live
+network calls can flake for reasons unrelated to the code. Concurrent runs for the same reference are
+cancelled automatically.
 
 ## Releases
 
 A `v*` tag starts the release pipeline, which:
 
 1. Verifies that the tag, `pyproject.toml`, and package versions match.
-2. Reruns tests and builds the wheel and source distribution.
+2. Reruns lint, type checks, and tests, then builds the wheel and source distribution.
 3. Validates distribution metadata and generates SHA-256 checksums.
 4. Publishes to PyPI using short-lived OIDC credentials.
 5. Creates provenance attestations and a GitHub release with the artifacts.

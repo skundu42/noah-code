@@ -12,6 +12,7 @@ import click
 
 from noah_code import __version__
 from noah_code.config import (
+    ConfigError,
     NoahCodeConfig,
     config_sources,
     load_config,
@@ -22,7 +23,13 @@ from noah_code.config import (
 from noah_code.host import AgentHost
 from noah_code.sessions import SessionError, SessionStore
 from noah_code.ui.console import ConsoleUI
-from noah_code.updates import UpdateError, check_for_update, maybe_auto_update, upgrade
+from noah_code.updates import (
+    UpdateError,
+    check_for_update,
+    maybe_auto_update,
+    maybe_check_for_update,
+    upgrade,
+)
 from noah_code.workspace import WorkspaceError, open_workspace
 
 EXIT_OK = 0
@@ -48,7 +55,16 @@ _AUTO_UPDATE_CHECKED = False
 
 
 def _run_async(coro):  # noqa: ANN001
-    return asyncio.run(coro)
+    try:
+        return asyncio.run(coro)
+    except KeyboardInterrupt:
+        # Since 3.11 asyncio.Runner cancels the main task on SIGINT and
+        # re-raises KeyboardInterrupt out of asyncio.run; the coroutine's own
+        # KeyboardInterrupt handlers never see it.
+        return EXIT_SIGINT
+    except ConfigError as exc:
+        click.echo(f"error: {exc}", err=True)
+        return EXIT_CONFIG
 
 
 def _common_options(fn):  # noqa: ANN001
@@ -145,6 +161,8 @@ def interactive_cmd(
 
     Default UI is the Textual TUI. Pass --console for the classic line UI.
     """
+    if continue_session and session_id:
+        raise click.UsageError("--continue and --session cannot be used together")
     code = _run_async(
         _interactive(
             path=path,
@@ -214,7 +232,7 @@ def checkpoints_list(session_id: str | None, path: str | None) -> None:
     try:
         workspace = open_workspace(path)
         config = load_config(workspace.root)
-    except WorkspaceError as exc:
+    except (WorkspaceError, ConfigError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
     target_session = session_id
@@ -252,7 +270,7 @@ def checkpoints_restore(ref: str, path: str | None) -> None:
     try:
         workspace = open_workspace(path)
         config = load_config(workspace.root)
-    except WorkspaceError as exc:
+    except (WorkspaceError, ConfigError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
     target_session = session_id_from_checkpoint_ref(ref)
@@ -290,7 +308,7 @@ def sessions_list(path: str | None) -> None:
                 f"{s.session_id}\t{s.mode}\t{s.model}\t{s.title}\t{s.workspace_path}"
                 + (f"\t{s.worktree_name}" if s.worktree_name else "")
             )
-    except (WorkspaceError, SessionError) as exc:
+    except (WorkspaceError, SessionError, ConfigError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
 
@@ -304,7 +322,7 @@ def sessions_show(session_id: str) -> None:
         store = SessionStore(config.session_dir)
         meta = store.load_meta(session_id)
         click.echo(meta.to_json())
-    except (WorkspaceError, SessionError) as exc:
+    except (WorkspaceError, SessionError, ConfigError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
 
@@ -318,7 +336,7 @@ def sessions_delete(session_id: str) -> None:
         store = SessionStore(config.session_dir)
         store.delete(session_id)
         click.echo(f"deleted {session_id}")
-    except (WorkspaceError, SessionError) as exc:
+    except (WorkspaceError, SessionError, ConfigError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
 
@@ -346,7 +364,7 @@ def worktree_create(name: str | None, path: str | None) -> None:
 
     try:
         info = _worktree_manager(path).create(name)
-    except (WorkspaceError, WorktreeError) as exc:
+    except (WorkspaceError, WorktreeError, ConfigError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
     click.echo(f"{info.name}\t{info.branch}\t{info.directory}")
@@ -359,7 +377,7 @@ def worktree_list(path: str | None) -> None:
 
     try:
         rows = _worktree_manager(path).list()
-    except (WorkspaceError, WorktreeError) as exc:
+    except (WorkspaceError, WorktreeError, ConfigError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
     if not rows:
@@ -383,7 +401,7 @@ def worktree_remove(name: str, path: str | None) -> None:
         if matches and matches[0].directory.resolve() == Path.cwd().resolve():
             raise WorktreeError("switch away from this worktree before removing it")
         info = manager.remove(name)
-    except (WorkspaceError, WorktreeError) as exc:
+    except (WorkspaceError, WorktreeError, ConfigError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
     click.echo(f"removed {info.name}")
@@ -501,7 +519,11 @@ def doctor(path: str | None) -> None:
         click.echo(f"workspace: FAIL ({exc})", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
     click.echo(f"workspace: ok ({workspace.root})")
-    config = load_config(workspace.root)
+    try:
+        config = load_config(workspace.root)
+    except ConfigError as exc:
+        click.echo(f"config: FAIL ({exc})", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
     sources = config_sources(workspace.root)
     click.echo(f"user config: {sources['user'] or '(none)'}")
     click.echo(f"project config: {sources['project'] or '(none)'}")
@@ -564,7 +586,11 @@ def config_cmd(action: str, path: str | None, model: str | None, auto: bool) -> 
         overrides["model"] = model
     if auto:
         overrides["auto_approve"] = True
-    config = load_config(workspace.root, cli_overrides=overrides)
+    try:
+        config = load_config(workspace.root, cli_overrides=overrides)
+    except ConfigError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
     click.echo(config_json(config))
 
 
@@ -579,7 +605,11 @@ def providers_list() -> None:
 
     from noah_code.providers import format_providers
 
-    click.echo(format_providers(user_default_model() or ""))
+    try:
+        click.echo(format_providers(user_default_model() or ""))
+    except ConfigError as exc:
+        click.echo(f"error: {exc}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
 
 
 @providers_group.command("add")
@@ -734,6 +764,29 @@ async def _maybe_auto_update(config: Any) -> bool:
     return False
 
 
+async def _maybe_update_notice(config: Any) -> None:
+    """Print an update notice without installing; used by non-interactive runs."""
+
+    global _AUTO_UPDATE_CHECKED
+    if _AUTO_UPDATE_CHECKED or not config.updates.auto_install:
+        return
+    _AUTO_UPDATE_CHECKED = True
+    try:
+        status = await asyncio.to_thread(
+            maybe_check_for_update,
+            interval_hours=config.updates.interval_hours,
+            timeout=config.updates.check_timeout_seconds,
+        )
+    except Exception:  # noqa: BLE001 - update checks must never break a run
+        return
+    if status is not None:
+        click.echo(
+            f"update available: {status.current} -> {status.latest} "
+            "(install with `noah update`)",
+            err=True,
+        )
+
+
 async def _prepare(
     *,
     path: str | None,
@@ -745,6 +798,7 @@ async def _prepare(
     session_id: str | None = None,
     frontend: Literal["tui", "console"] | None = None,
     unsafe_inprocess_code_execution: bool = False,
+    allow_auto_install: bool = True,
 ):
     try:
         workspace = open_workspace(path)
@@ -766,8 +820,13 @@ async def _prepare(
     if unsafe_inprocess_code_execution:
         overrides["unsafe_inprocess_code_execution"] = True
     config = load_config(workspace.root, cli_overrides=overrides)
-    if await _maybe_auto_update(config):
-        return None, EXIT_OK
+    if allow_auto_install:
+        if await _maybe_auto_update(config):
+            return None, EXIT_OK
+    else:
+        # Non-interactive runs must never stop to self-update; they print a
+        # notice and proceed with the requested task.
+        await _maybe_update_notice(config)
     store = SessionStore(config.session_dir)
 
     meta = None
@@ -907,6 +966,7 @@ async def _run_session(
         session_id=session_id,
         frontend="console",
         unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
+        allow_auto_install=False,
     )
     if prepared is None:
         return code

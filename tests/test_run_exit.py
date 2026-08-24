@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from nooa.unifiedllm import FakeLLMClient, LLMResponse, ToolCall
 
+from noah_code.cli import EXIT_SIGINT, _run_async
 from noah_code.config import load_config
 from noah_code.host import AgentHost
 from noah_code.sessions import SessionStore
@@ -101,3 +102,12 @@ async def test_inline_respond_reason_finishes_in_one_llm_call(tmp_path: Path) ->
     assert result.exit_code == 0
     assert result.explanation == "completed without a recovery turn"
     assert llm.call_count == 1
+
+
+def test_run_async_returns_sigint_on_keyboard_interrupt() -> None:
+    """Ctrl+C re-raised out of asyncio.run becomes EXIT_SIGINT, not a traceback."""
+
+    async def interrupted() -> int:
+        raise KeyboardInterrupt
+
+    assert _run_async(interrupted()) == EXIT_SIGINT

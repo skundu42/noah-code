@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from rich.console import Console
-from textual.selection import SELECT_ALL
+from textual.selection import SELECT_ALL, Selection
+from textual.widgets import Input
 
 from noah_code.approvals import ApprovalChoice, ApprovalRequest
 from noah_code.config import NoahCodeConfig
@@ -18,6 +19,7 @@ from noah_code.events import HostEvent, HostEventKind
 from noah_code.permissions import PermissionDecision
 from noah_code.sessions import SessionEventRecord
 from noah_code.steer import SteerQueue
+from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt
 from noah_code.ui.textual_app import (
     MAX_TRANSCRIPT_LINES,
     WORKING_PATH_FRAMES,
@@ -27,7 +29,9 @@ from noah_code.ui.textual_app import (
     DiffReviewScreen,
     FilteredPicker,
     NoahCodeApp,
+    QuestionModal,
     RepositorySnapshot,
+    TextPromptModal,
     TextualUI,
     _coalesce_activity_text,
     _completed_activity_label,
@@ -192,6 +196,84 @@ async def test_transcript_selection_and_copy_shortcuts_are_useful(tmp_path: Path
         await pilot.pause()
         await pilot.press("ctrl+shift+c")
         assert app.clipboard == "latest answer"
+
+
+@pytest.mark.asyncio
+async def test_composer_keyboard_selection_copies_via_app_action(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.render(HostEvent(HostEventKind.MESSAGE, "latest answer"))
+        await pilot.pause()
+
+        composer = app.query_one("#composer")
+        composer.focus()
+        composer.text = "keyboard selection"
+        composer.selection = Selection((0, 0), (0, len("keyboard selection")))
+
+        app.action_copy_selection()
+        assert app.clipboard == "keyboard selection"
+
+        await pilot.press("ctrl+shift+c")
+        assert app.clipboard == "keyboard selection"
+
+        # Cmd+C reaches the TextArea's own copy binding now that the app-level
+        # binding no longer shadows it with priority.
+        await pilot.press("super+c")
+        assert app.clipboard == "keyboard selection"
+
+
+@pytest.mark.asyncio
+async def test_end_and_ctrl_k_keep_text_area_behavior(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.focus()
+        composer.text = "hello world"
+        composer.cursor_location = (0, 0)
+
+        # End moves the cursor to the end of the line instead of scrolling
+        # the conversation; ctrl+] is the scroll-to-live-bottom shortcut.
+        await pilot.press("end")
+        await pilot.pause()
+        assert composer.cursor_location == (0, len("hello world"))
+        assert not isinstance(app.screen, FilteredPicker)
+
+        # Ctrl+K deletes to the end of the line instead of opening the
+        # skills palette, which moved to ctrl+g.
+        composer.cursor_location = (0, len("hello"))
+        await pilot.press("ctrl+k")
+        await pilot.pause()
+        assert composer.text == "hello"
+        assert not isinstance(app.screen, FilteredPicker)
+
+
+@pytest.mark.asyncio
+async def test_cancel_renders_single_host_status_entry(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.render(HostEvent(HostEventKind.MESSAGE, "working on it"))
+        await pilot.pause()
+        ui.set_busy(True)
+        app._turn_task = asyncio.current_task()
+
+        app.action_cancel_or_quit()
+
+        host.cancel_active_turn.assert_called_once()
+        assert ui.busy is False
+        assert app._interrupt_count == 0
+        assert "cancelled" not in _log_text(app.query_one("#conversation"))
+
+        # The host-rendered STATUS event is the only "turn cancelled" entry.
+        ui.render(HostEvent(HostEventKind.STATUS, "turn cancelled"))
+        await pilot.pause()
+        rendered = _log_text(app.query_one("#conversation"))
+        assert rendered.count("turn cancelled") == 1
 
 
 @pytest.mark.asyncio
@@ -789,7 +871,7 @@ async def test_skills_have_dedicated_search_and_insert_selected_skill(tmp_path: 
     app = NoahCodeApp(host, TextualUI())
 
     async with app.run_test() as pilot:
-        await pilot.press("ctrl+k")
+        await pilot.press("ctrl+g")
         await pilot.pause()
         assert isinstance(app.screen, FilteredPicker)
         picker = app.screen
@@ -1254,7 +1336,7 @@ async def test_scrolled_transcript_counts_new_output_until_end(tmp_path: Path) -
 
         assert app._unread_count == 1
         assert log.is_vertical_scroll_end is False
-        await pilot.press("end")
+        await pilot.press("ctrl+]")
         await pilot.pause()
         assert app._unread_count == 0
         assert log.is_vertical_scroll_end is True
@@ -1311,6 +1393,77 @@ async def test_approval_modal_reject_is_safe_default(tmp_path: Path) -> None:
                 break
             await pilot.pause()
         assert result_box == [ApprovalChoice.ONCE]
+
+
+@pytest.mark.asyncio
+async def test_question_modal_other_collects_free_text_answer(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    prompt = QuestionPrompt(
+        header="Approach",
+        prompt="Which approach should the fix take?",
+        options=("safe", "fast"),
+    )
+    result_box: list[QuestionAnswer] = []
+
+    async with app.run_test() as pilot:
+
+        async def _ask() -> None:
+            result_box.append(await app.request_questions([prompt]))
+
+        app.run_worker(_ask)
+        await pilot.pause()
+        assert isinstance(app.screen, QuestionModal)
+
+        # "Other" chains a free-text prompt instead of submitting "other".
+        await pilot.press("0")
+        await pilot.pause()
+        assert isinstance(app.screen, TextPromptModal)
+
+        app.screen.query_one("#prompt-input", Input).value = "custom plan"
+        await pilot.press("enter")
+        for _ in range(40):
+            if result_box:
+                break
+            await pilot.pause()
+        assert result_box == [QuestionAnswer(selections=[], custom="custom plan")]
+
+
+@pytest.mark.asyncio
+async def test_question_modal_other_escape_returns_to_choices(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    prompt = QuestionPrompt(
+        header="Approach",
+        prompt="Which approach should the fix take?",
+        options=("safe", "fast"),
+    )
+    result_box: list[QuestionAnswer] = []
+
+    async with app.run_test() as pilot:
+
+        async def _ask() -> None:
+            result_box.append(await app.request_questions([prompt]))
+
+        app.run_worker(_ask)
+        await pilot.pause()
+        await pilot.press("0")
+        await pilot.pause()
+        assert isinstance(app.screen, TextPromptModal)
+
+        # Cancelling the free-text prompt goes back to the option list.
+        await pilot.press("escape")
+        await pilot.pause()
+        assert isinstance(app.screen, QuestionModal)
+
+        await pilot.press("down", "enter")
+        for _ in range(40):
+            if result_box:
+                break
+            await pilot.pause()
+        assert result_box == [QuestionAnswer(selections=["fast"], custom="")]
 
 
 @pytest.mark.asyncio
