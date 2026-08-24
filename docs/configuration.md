@@ -169,7 +169,6 @@ fallback_models = []
 theme = "atom-one-dark" # atom-one-dark, noah-ocean, graphite, or high-contrast
 frontend = "tui"       # "tui" or "console"
 markdown = true
-stream_shell = true
 show_reasoning = false
 
 [summarization]
@@ -180,7 +179,6 @@ target_chars = 2500
 
 [tracing]
 enabled = true
-viewer = true
 # By default JSONL traces live inside each session directory.
 # jsonl_dir = "~/.local/share/noah-code/traces"
 

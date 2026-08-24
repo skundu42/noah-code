@@ -118,15 +118,46 @@ def _apply_resource_limits(*, max_memory_mb: int, max_cpu_seconds: int) -> None:
         resource.setrlimit(resource.RLIMIT_CPU, (limit, limit))
 
 
+def _ensure_return_result(init: dict[str, Any]) -> None:
+    """Rebind CodeAct's nested ``return_result`` after the pipe handshake."""
+
+    builtins = init.setdefault("framework_builtins", {})
+    if callable(builtins.get("return_result")):
+        return
+    call = builtins.get("_call")
+    from nooa.strategies.codeact import _ReturnResultSignal
+
+    def return_result(*args: Any, **kwargs: Any) -> None:
+        if args:
+            if len(args) > 1:
+                raise ValueError("return_result() takes at most 1 positional argument")
+            if kwargs:
+                model_fields = getattr(getattr(call, "return_type", None), "model_fields", {})
+                if "kind" not in model_fields:
+                    raise ValueError("Cannot mix positional and keyword arguments")
+                if "kind" in kwargs:
+                    raise ValueError("return_result() got kind both positionally and by keyword")
+                result = dict(kwargs)
+                result["kind"] = args[0]
+                raise _ReturnResultSignal(result=result)
+            raise _ReturnResultSignal(result={"result": args[0]})
+        raise _ReturnResultSignal(result=kwargs)
+
+    builtins["return_result"] = return_result
+
+
 def macos_worker_main(
     conn: Connection,
-    init: dict[str, Any],
     profile: str,
     max_memory_mb: int,
     max_cpu_seconds: int,
-) -> None:  # pragma: no cover - executed in a forked worker
-    """Install irreversible guards, then enter NOOA's normal worker loop."""
+) -> None:  # pragma: no cover - executed in a spawned worker
+    """Recv init after spawn, install irreversible guards, then enter NOOA's loop."""
     try:
+        init = conn.recv()
+        if not isinstance(init, dict):
+            raise TypeError(f"sandbox worker init must be a dict, got {type(init).__name__}")
+        _ensure_return_result(init)
         _apply_resource_limits(
             max_memory_mb=max_memory_mb,
             max_cpu_seconds=max_cpu_seconds,

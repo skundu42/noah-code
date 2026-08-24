@@ -15,7 +15,6 @@ class CommandSpec:
     name: str
     description: str
     usage: str | None = None
-    host_only: bool = False
 
     @property
     def invocation(self) -> str:
@@ -29,73 +28,61 @@ class CommandSuggestion:
 
 
 BUILTIN_COMMANDS: list[CommandSpec] = [
-    CommandSpec("help", "Show available commands", host_only=True),
-    CommandSpec("config", "Show every resolved setting or one path", "config [PATH]", True),
-    CommandSpec("theme", "Show or switch the interface theme", "theme [NAME]", True),
-    CommandSpec("mode", "Show or switch the active mode", "mode [build|plan]", True),
-    CommandSpec(
-        "model", "Configure a provider or switch this session's model", "model [MODEL]", True
-    ),
+    CommandSpec("help", "Show available commands"),
+    CommandSpec("config", "Show every resolved setting or one path", "config [PATH]"),
+    CommandSpec("theme", "Show or switch the interface theme", "theme [NAME]"),
+    CommandSpec("mode", "Show or switch the active mode", "mode [build|plan]"),
+    CommandSpec("model", "Configure a provider or switch this session's model", "model [MODEL]"),
     CommandSpec(
         "reasoning",
         "Show or set reasoning effort for compatible models",
         "reasoning [default|none|minimal|low|medium|high|xhigh]",
-        True,
     ),
     CommandSpec(
         "providers",
         "Search and configure API providers",
         "providers [use PROVIDER MODEL]",
-        True,
     ),
-    CommandSpec("session", "Show current session", host_only=True),
-    CommandSpec("sessions", "List or switch sessions", "sessions [SESSION_ID]", True),
-    CommandSpec("new", "Start a new session", host_only=True),
+    CommandSpec("session", "Show current session"),
+    CommandSpec("sessions", "List or switch sessions", "sessions [SESSION_ID]"),
+    CommandSpec("new", "Start a new session"),
     CommandSpec(
         "worktree",
         "Create, list, or remove an isolated git worktree session",
         "worktree [create|list|remove]",
-        True,
     ),
     CommandSpec(
         "pr",
         "List, view, create, push, checkout, or comment on a GitHub pull request",
         "pr [list|view|create|push|checkout|comment]",
-        True,
     ),
-    CommandSpec("plan", "Show or clear the pinned plan file", "plan [clear]", True),
+    CommandSpec("plan", "Show or clear the pinned plan file", "plan [clear]"),
     CommandSpec(
         "memory",
         "Show, save, forget, or clear project conventions",
         "memory [save|forget|clear]",
-        True,
     ),
-    CommandSpec("continue", "Resume most recent session", host_only=True),
-    CommandSpec("compact", "Trigger history summarization", host_only=True),
-    CommandSpec("todos", "Show todo list", host_only=True),
-    CommandSpec("status", "Show mode/model/session/context", host_only=True),
-    CommandSpec("health", "Show durable runtime health", host_only=True),
-    CommandSpec("checkpoints", "List rolling Git worktree checkpoints", host_only=True),
-    CommandSpec("tokens", "Show token, cache, cost, and latency usage", host_only=True),
+    CommandSpec("continue", "Resume most recent session"),
+    CommandSpec("compact", "Trigger history summarization"),
+    CommandSpec("todos", "Show todo list"),
+    CommandSpec("status", "Show mode/model/session/context"),
+    CommandSpec("health", "Show durable runtime health"),
+    CommandSpec("checkpoints", "List rolling Git worktree checkpoints"),
+    CommandSpec("tokens", "Show token, cache, cost, and latency usage"),
     CommandSpec(
         "efficiency",
         "Show or switch the token/latency profile",
         "efficiency [fast|balanced|deep]",
-        True,
     ),
-    CommandSpec("diff", "Review staged and unstaged changes", host_only=True),
-    CommandSpec("undo", "Undo last WorkspaceTools turn", host_only=True),
-    CommandSpec("redo", "Redo last undone turn", host_only=True),
-    CommandSpec("agents", "List built-in and markdown subagents", host_only=True),
-    CommandSpec(
-        "attach", "Attach a workspace file or image to the next turn", "attach [PATH]", True
-    ),
-    CommandSpec(
-        "skills", "Search skills or add a compatible skill folder", "skills [add PATH]", True
-    ),
-    CommandSpec("mcp", "Search, connect, or add MCP servers", "mcp [connect|add]", True),
-    CommandSpec("trace", "Show tracing destination", host_only=True),
-    CommandSpec("exit", "Exit Noah Code", host_only=True),
+    CommandSpec("diff", "Review staged and unstaged changes"),
+    CommandSpec("undo", "Undo last WorkspaceTools turn"),
+    CommandSpec("redo", "Redo last undone turn"),
+    CommandSpec("agents", "List built-in and markdown subagents"),
+    CommandSpec("attach", "Attach a workspace file or image to the next turn", "attach [PATH]"),
+    CommandSpec("skills", "Search skills or add a compatible skill folder", "skills [add PATH]"),
+    CommandSpec("mcp", "Search, connect, or add MCP servers", "mcp [connect|add]"),
+    CommandSpec("trace", "Show tracing destination"),
+    CommandSpec("exit", "Exit Noah Code"),
 ]
 
 

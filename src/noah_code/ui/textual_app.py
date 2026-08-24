@@ -74,17 +74,8 @@ WIDE_MIN_COLUMNS = 110
 COMPACT_MAX_ROWS = 25
 UPDATE_BANNER_SECONDS = 12.0
 
-# A traveling signal reads as ongoing work without pretending an indeterminate
-# task has a measurable percentage. The bounce makes the loop obvious at a
-# glance, while completed and pending waypoints suggest forward motion.
-WORKING_PATH_FRAMES = (
-    "◉ · · ·",
-    "━ ◉ · ·",
-    "━ ━ ◉ ·",
-    "━ ━ ━ ◉",
-    "━ ━ ◉ ·",
-    "━ ◉ · ·",
-)
+# A single traveling glyph. Multi-mark frames read as two loaders at once.
+WORKING_PATH_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧")
 
 NOAH_WORDMARK = (
     "███╗   ██╗ ██████╗  █████╗ ██╗  ██╗",
@@ -1618,13 +1609,13 @@ class NoahCodeApp(App[None]):
             banner.update(Text.assemble(*parts), layout=False)
             banner.styles.display = "block"
             with contextlib.suppress(Exception):
-                if self._active_activity_id and self._active_activity_id in self._activities:
+                if (
+                    self._active_activity_id
+                    and self._active_activity_id in self._activities
+                    and self._activities[self._active_activity_id].label not in _HIDDEN_ACTIVITY
+                ):
                     self.query_one("#activity-title", Static).update(
-                        Text.assemble(
-                            (f"{frame}  ", "bold #e6b673"),
-                            (label, "#d1d1d6"),
-                            (elapsed, "#777781"),
-                        ),
+                        Text.assemble((label, "#d1d1d6"), (elapsed, "#777781")),
                         layout=False,
                     )
 
@@ -2017,14 +2008,16 @@ class NoahCodeApp(App[None]):
         self._phase = record.label
         output = self.query_one("#activity-output", RichLog)
         output.clear()
-        frame = WORKING_PATH_FRAMES[self._spinner_index]
-        self.query_one("#activity-title", Static).update(
-            Text.assemble((f"{frame}  ", "bold #e6b673"), (record.label, "#d1d1d6")),
-            layout=False,
-        )
         live = self.query_one("#live-activity", Vertical)
-        live.styles.display = "block"
-        live.styles.height = 3
+        if record.label in _HIDDEN_ACTIVITY:
+            live.styles.display = "none"
+        else:
+            self.query_one("#activity-title", Static).update(
+                Text(record.label, style="#d1d1d6"),
+                layout=False,
+            )
+            live.styles.display = "block"
+            live.styles.height = 3
         self._update_working_banner()
 
     def _queue_activity_output(self, event: HostEvent) -> None:
@@ -2034,9 +2027,8 @@ class NoahCodeApp(App[None]):
             record = ActivityRecord(activity_id=activity_id, label="shell output", tool="shell")
             self._activities[activity_id] = record
             self._active_activity_id = activity_id
-        frame = WORKING_PATH_FRAMES[self._spinner_index]
         self.query_one("#activity-title", Static).update(
-            Text.assemble((f"{frame}  ", "bold #e6b673"), (record.label, "#d1d1d6")),
+            Text(record.label, style="#d1d1d6"),
             layout=False,
         )
         self.query_one("#live-activity", Vertical).styles.display = "block"

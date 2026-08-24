@@ -39,7 +39,6 @@ class PermissionRule(BaseModel):
 class TracingConfig(BaseModel):
     enabled: bool = True
     jsonl_dir: str | None = None
-    viewer: bool = True
 
 
 class SummarizationPolicy(BaseModel):
@@ -92,7 +91,6 @@ class UIConfig(BaseModel):
     theme: ThemeName = "atom-one-dark"
     show_reasoning: bool = False
     markdown: bool = True
-    stream_shell: bool = True
     frontend: Literal["tui", "console"] = "tui"
 
 

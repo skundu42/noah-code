@@ -982,9 +982,6 @@ mcp = [
 tracing = [
     { name = "nooa", extra = ["tracing"] },
 ]
-tui = [
-    { name = "textual" },
-]
 
 [package.dev-dependencies]
 dev = [
@@ -1010,9 +1007,8 @@ requires-dist = [
     { name = "rich", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8.0" },
     { name = "textual", specifier = ">=1.0.0" },
-    { name = "textual", marker = "extra == 'tui'", specifier = ">=1.0.0" },
 ]
-provides-extras = ["dev", "tui", "mcp", "tracing"]
+provides-extras = ["dev", "mcp", "tracing"]
 
 [package.metadata.requires-dev]
 dev = [

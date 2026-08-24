@@ -17,7 +17,6 @@ class HostEventKind(StrEnum):
     SHELL_CHUNK = "shell_chunk"
     ERROR = "error"
     SUMMARY = "summary"
-    APPROVAL = "approval"
     STATUS = "status"
     STOP = "stop"
     DIFF_REVIEW = "diff_review"

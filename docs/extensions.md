@@ -147,8 +147,8 @@ local executables; define them only in `~/.config/noah-code/config.toml`.
 
 ## Tracing
 
-Noah Code integrates with NOOA tracing. When a local viewer is available, spans can be exported
-to it. Tracing is enabled by default, and JSONL output goes into the active session directory unless
+Noah Code integrates with NOOA tracing. Tracing is enabled by default, and JSONL output goes into
+the active session directory unless
 `tracing.jsonl_dir` selects another trusted location. Use `/trace` to inspect the destination and
 `/health` to inspect bounded runtime-event and artifact state. Trace files count toward the total
 session-storage quota when they use the default location.

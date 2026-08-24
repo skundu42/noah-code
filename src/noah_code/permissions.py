@@ -208,10 +208,6 @@ class PermissionDecision:
     def denied(self) -> bool:
         return self.action == "deny"
 
-    @property
-    def needs_ask(self) -> bool:
-        return self.action == "ask"
-
 
 def is_secret_path(path: str | Path) -> bool:
     # Case-insensitive by design: default macOS/Windows filesystems are

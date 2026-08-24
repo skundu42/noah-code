@@ -473,14 +473,6 @@ class RuntimeStateStore:
                 if cursor.rowcount != 1:
                     raise RuntimeStateError(f"file operation is not active: {operation_id}")
 
-    def cancel_file_operation(self, operation_id: str) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE file_operations SET state='cancelled', pre_bytes=NULL, updated_at=? "
-                "WHERE operation_id=? AND state='started'",
-                (time.time(), operation_id),
-            )
-
     def rollback_file_operation(self, operation_id: str) -> None:
         """Restore one active operation's preimage and mark it rolled back."""
 

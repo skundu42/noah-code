@@ -252,12 +252,3 @@ def materialize_change(file_diff: FileDiff, current: str | None) -> DiffChange:
     if patched and ends_with_newline:
         patched += "\n"
     return DiffChange(path=file_diff.path, old=current, new=patched, operation="update")
-
-
-def diff_to_patch_changes(changes: list[DiffChange]) -> list[dict[str, str | None]]:
-    """Convert materialized changes into ``apply_patch`` input dicts."""
-
-    return [
-        {"path": change.path, "old": change.old, "new": change.new}
-        for change in changes
-    ]

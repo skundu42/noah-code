@@ -364,6 +364,7 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
         assert live.styles.display == "block"
         title = _rendered_text(app.query_one("#activity-title").content)
         assert "Inspecting repository" in title
+        assert not any(frame in title for frame in WORKING_PATH_FRAMES)
 
         ui.render(
             HostEvent(
@@ -386,6 +387,29 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
         await pilot.pause()
         assert banner.styles.display == "none"
         assert "Shift+Enter newline" in _rendered_text(app.query_one("#context-hint").content)
+
+
+@pytest.mark.asyncio
+async def test_internal_working_label_does_not_open_second_spinner(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test(size=(120, 30)) as pilot:
+        ui.set_busy(True)
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                "Working",
+                meta={"activity_id": "prefill-1", "tool": "execute_python"},
+            )
+        )
+        await pilot.pause()
+
+        banner = app.query_one("#working-banner")
+        assert banner.styles.display == "block"
+        assert "Working" in _rendered_text(banner.content)
+        assert any(frame in _rendered_text(banner.content) for frame in WORKING_PATH_FRAMES)
+        assert app.query_one("#live-activity").styles.display == "none"
 
 
 @pytest.mark.asyncio

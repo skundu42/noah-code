@@ -222,7 +222,7 @@ class AgentHost:
         self._checkpoints: Any = None
         self.last_checkpoint: dict[str, Any] | None = None
         self._post_hook_tasks: list[asyncio.Task[Any]] = []
-        self._trace_info = "auto (viewer if reachable)"
+        self._trace_info = "session jsonl"
         self._active_turn: asyncio.Task[Any] | None = None
         self._event_unsubs: list[Any] = []
         self._custom_commands: dict[str, CustomCommand] = {}
@@ -586,7 +586,6 @@ class AgentHost:
             HostEventKind.TOOL_FINISH,
             HostEventKind.ERROR,
             HostEventKind.STOP,
-            HostEventKind.APPROVAL,
         }:
             self._runtime.event(
                 f"host.{event.kind.value}",
@@ -839,13 +838,6 @@ class AgentHost:
             self.agent.journal.capture_post_bytes_before_undo(turn)
         undone = self.agent.journal.undo()
         return f"undid turn {undone.turn_id[:8]} ({len(undone.mutations)} files)"
-
-    def undo_last_turn(self) -> str:
-        """Undo the latest reversible checkpoint and persist it synchronously."""
-
-        status = self._undo_last_turn_state()
-        self._persist()
-        return status
 
     async def undo_last_turn_async(self) -> str:
         status = await asyncio.to_thread(self._undo_last_turn_state)
@@ -2382,9 +2374,7 @@ class AgentHost:
         try:
             from noah_code.ui.textual_app import NoahCodeApp, TextualUI
         except ImportError as exc:  # pragma: no cover
-            raise RuntimeError(
-                "Textual is required for the TUI. Install with: uv sync / pip install textual"
-            ) from exc
+            raise RuntimeError("Textual is required for the TUI but could not be imported.") from exc
 
         ui = TextualUI()
         self.ui = ui

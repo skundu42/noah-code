@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import platform
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +17,9 @@ from noah_code.agent import (
     _interpreter_read_rules,
     _MacOSPermissionSandboxedExecutor,
     _PermissionSandboxedExecutor,
+    _spawn_safe_framework_builtins,
+    _spawn_safe_local_agent,
+    _unique_spawn_passfds,
 )
 from noah_code.config import load_config
 from noah_code.macos_sandbox import build_macos_profile
@@ -97,3 +102,164 @@ async def test_macos_sandbox_blocks_unbrokered_file_and_network_access() -> None
     assert safe.error is None
     assert isinstance(blocked_file.error, PermissionError)
     assert isinstance(blocked_network.error, PermissionError)
+
+
+def test_spawn_safe_local_agent_drops_instance_file_descriptors() -> None:
+    live = SimpleNamespace(pipe=object(), ws="live")
+    stub = _spawn_safe_local_agent(live)
+    assert type(stub) is type(live)
+    assert not hasattr(stub, "pipe")
+    assert not hasattr(stub, "ws")
+
+
+def test_spawn_safe_framework_builtins_drop_modules_and_nested_functions() -> None:
+    import json as json_mod
+    import os as os_mod
+
+    def return_result(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    notification = {"user_messages": ["hi"]}
+    safe = _spawn_safe_framework_builtins(
+        {
+            "os": os_mod,
+            "json": json_mod,
+            "notification": notification,
+            "return_result": return_result,
+            "_call": SimpleNamespace(return_type=str, kwargs=notification),
+        }
+    )
+    assert "os" not in safe
+    assert "json" not in safe
+    assert "return_result" not in safe
+    assert safe["notification"] == {"user_messages": ["hi"]}
+    assert safe["_call"].kwargs == notification
+
+
+def test_unique_spawn_passfds_drops_duplicate_and_invalid_fds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, tuple[int, ...]] = {}
+
+    def fake_spawnv(_path: object, _args: object, passfds: object) -> int:
+        seen["fds"] = tuple(passfds)
+        return 0
+
+    monkeypatch.setattr("multiprocessing.util.spawnv_passfds", fake_spawnv)
+    with _unique_spawn_passfds():
+        import multiprocessing.util as util
+
+        util.spawnv_passfds("/bin/true", [], [2, 0, 2, -1, 1, 0, 1_000_000])
+    assert seen["fds"] == (0, 1, 2)
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="requires native macOS sandbox")
+@pytest.mark.asyncio
+async def test_macos_sandbox_spawn_ignores_live_agent_resources() -> None:
+    """The worker is spawn()'d from a multithreaded TUI that already holds pipes.
+
+    Pickling the live agent would register those FDs with CPython's
+    ``fds_to_keep`` list and raise ValueError on duplicate/stale descriptors.
+    """
+    child = subprocess.Popen(
+        ["cat"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    executor = _MacOSPermissionSandboxedExecutor(
+        SimpleNamespace(shell=child, also=child),
+        SandboxConfig(
+            filesystem=True,
+            allow=_interpreter_read_rules(),
+            system_paths=False,
+            network=False,
+            max_cpu_seconds=10,
+            require=True,
+        ),
+        cell_timeout=5,
+        restrictions=RestrictionsConfig(),
+    )
+    try:
+        result = await executor.run_cell("print(3 + 4)")
+    finally:
+        await executor.aclose()
+        child.kill()
+        child.wait()
+
+    assert result.error is None
+    assert result.stdout.strip() == "7"
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="requires native macOS sandbox")
+@pytest.mark.asyncio
+async def test_macos_sandbox_spawn_ignores_builtin_pipe_payload() -> None:
+    """CodeAct pickles ``_call`` / kwargs into the worker; those must not join spawn FDs."""
+
+    ctx = mp.get_context("spawn")
+    parent_end, child_end = ctx.Pipe(duplex=True)
+    executor = _MacOSPermissionSandboxedExecutor(
+        SimpleNamespace(),
+        SandboxConfig(
+            filesystem=True,
+            allow=_interpreter_read_rules(),
+            system_paths=False,
+            network=False,
+            max_cpu_seconds=10,
+            require=True,
+        ),
+        cell_timeout=5,
+        framework_builtins={"_call": SimpleNamespace(pipe=parent_end), "pipe": parent_end},
+        restrictions=RestrictionsConfig(),
+    )
+    try:
+        result = await executor.run_cell("print(5 + 2)")
+    finally:
+        await executor.aclose()
+        parent_end.close()
+        child_end.close()
+
+    assert result.error is None
+    assert result.stdout.strip() == "7"
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="requires native macOS sandbox")
+@pytest.mark.asyncio
+async def test_macos_sandbox_worker_accepts_codeact_module_builtins() -> None:
+    """CodeAct puts imported modules and a nested return_result in framework_builtins."""
+
+    import os as os_mod
+
+    def return_result(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    notification = {"user_messages": ["hi what is 1+4"]}
+    executor = _MacOSPermissionSandboxedExecutor(
+        SimpleNamespace(),
+        SandboxConfig(
+            filesystem=True,
+            allow=_interpreter_read_rules(),
+            system_paths=False,
+            network=False,
+            max_cpu_seconds=10,
+            require=True,
+        ),
+        cell_timeout=5,
+        framework_builtins={
+            "os": os_mod,
+            "notification": notification,
+            "return_result": return_result,
+            "_call": SimpleNamespace(return_type=None, kwargs=notification),
+        },
+        restrictions=RestrictionsConfig(),
+    )
+    try:
+        listed = await executor.run_cell("print(notification['user_messages'][0])")
+        signal = await executor.run_cell("assert callable(return_result)\nprint('ok')")
+    finally:
+        await executor.aclose()
+
+    assert listed.error is None, listed.error
+    assert listed.stdout.strip() == "hi what is 1+4"
+    assert signal.error is None, signal.error
+    assert signal.stdout.strip() == "ok"

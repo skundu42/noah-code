@@ -69,10 +69,6 @@ class ApprovalBroker:
 
         self._guard = guard
 
-    @property
-    def pending(self) -> dict[str, ApprovalRequest]:
-        return dict(self._pending)
-
     async def require(self, decision: PermissionDecision) -> None:
         """Raise PermissionError on deny; ask host on ask; no-op on allow."""
         if self._guard is not None:

@@ -106,9 +106,6 @@ class SnapshotJournal:
     def can_undo(self) -> bool:
         return bool(self._turns)
 
-    def can_redo(self) -> bool:
-        return bool(self._redo)
-
     def latest_turn(self) -> TurnJournal | None:
         """Most recent journaled turn, if any."""
 

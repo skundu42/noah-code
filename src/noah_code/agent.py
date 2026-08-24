@@ -8,7 +8,9 @@ import platform
 import site
 import sys
 import sysconfig
-from contextlib import suppress
+import types
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -169,6 +171,96 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
         return super()._walk_path(path)
 
 
+def _spawn_safe_local_agent(agent: Any) -> Any:
+    """Empty instance of ``type(agent)`` for the spawned worker's local ``self``.
+
+    The worker only needs the class (module globals and callable classification).
+    Pickling the live agent into ``multiprocessing`` spawn copies Textual, MCP,
+    and shell file descriptors into CPython's ``fds_to_keep`` list, which 3.12
+    rejects as ``ValueError: bad value(s) in fds_to_keep``.
+    """
+    cls: Any = type(agent)
+    try:
+        return object.__new__(cls)
+    except TypeError:
+        return cls.__new__(cls)
+
+
+_OMIT = object()
+
+
+def _pipe_picklable(value: Any) -> bool:
+    try:
+        from multiprocessing.reduction import ForkingPickler
+
+        ForkingPickler.dumps(value)
+    except Exception:
+        return False
+    return True
+
+
+def _spawn_safe_value(value: Any) -> Any:
+    """Drop modules and other objects that cannot cross a spawn pipe."""
+
+    if isinstance(value, types.ModuleType):
+        return _OMIT
+    if isinstance(value, dict):
+        return {
+            key: item
+            for key, item in ((name, _spawn_safe_value(item)) for name, item in value.items())
+            if item is not _OMIT
+        }
+    if isinstance(value, list | tuple):
+        items = [item for item in (_spawn_safe_value(item) for item in value) if item is not _OMIT]
+        return type(value)(items)
+    if _pipe_picklable(value):
+        return value
+    return _OMIT
+
+
+def _spawn_safe_framework_builtins(builtins: dict[str, Any]) -> dict[str, Any]:
+    """Keep only pipe-picklable CodeAct builtins.
+
+    ``filter_mro_module_globals(type(agent))`` rebuilds imported modules in the
+    worker. Nested ``return_result`` is rebound after the child receives init.
+    """
+    return {
+        name: item
+        for name, item in ((key, _spawn_safe_value(value)) for key, value in builtins.items())
+        if item is not _OMIT
+    }
+
+
+@contextmanager
+def _unique_spawn_passfds() -> Iterator[None]:
+    """Keep only open, unique inherit-FDs; CPython 3.12 rejects the rest."""
+    import multiprocessing.util as util
+    import os
+
+    original = util.spawnv_passfds
+
+    def _inherit_fds(passfds: Any) -> tuple[int, ...]:
+        kept: list[int] = []
+        for fd in sorted({int(fd) for fd in passfds}):
+            if fd < 0:
+                continue
+            try:
+                os.fstat(fd)
+            except OSError:
+                continue
+            kept.append(fd)
+        return tuple(kept)
+
+    def _spawnv(path: Any, args: Any, passfds: Any) -> Any:
+        return original(path, args, _inherit_fds(passfds))
+
+    util.spawnv_passfds = _spawnv
+    try:
+        yield
+    finally:
+        util.spawnv_passfds = original
+
+
 class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
     """NOOA brokered worker contained with macOS's native sandbox profile."""
 
@@ -215,17 +307,10 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
 
     def _start_worker(self) -> None:
         parent_conn, child_conn = self._ctx.Pipe(duplex=True)
-        init = {
-            "agent": self._agent,
-            "framework_builtins": self._framework_builtins,
-            "restrictions": self._restrictions,
-            "spec": self._spec,
-        }
         proc = self._ctx.Process(
             target=macos_worker_main,
             args=(
                 child_conn,
-                init,
                 self._macos_profile,
                 self._macos_max_memory_mb,
                 self._macos_max_cpu_seconds,
@@ -233,10 +318,28 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
             daemon=True,
             name="nooa-macos-sandbox-worker",
         )
-        proc.start()
+        with _unique_spawn_passfds():
+            proc.start()
         child_conn.close()
         self._conn = parent_conn
         self._proc = proc
+        try:
+            # Send the worker payload over the pipe after spawn. Pickling it as
+            # Process args registers every Connection/socket in CPython's
+            # fds_to_keep list (duplicates, closed handles, MCP stdio).
+            parent_conn.send(
+                {
+                    "agent": _spawn_safe_local_agent(self._agent),
+                    "framework_builtins": _spawn_safe_framework_builtins(
+                        self._framework_builtins
+                    ),
+                    "restrictions": self._restrictions,
+                    "spec": self._spec,
+                }
+            )
+        except Exception:
+            self._terminate_worker()
+            raise
 
 
 def _cache_first_block_order(base: list[str] | None) -> list[str]:

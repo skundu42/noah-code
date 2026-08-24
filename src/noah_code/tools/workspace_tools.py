@@ -180,10 +180,6 @@ class WorkspaceTools(Skill):
         # anchor fails loudly instead of corrupting a concurrently changed file.
         self._read_fingerprints: dict[str, str] = {}
 
-    def set_lsp(self, lsp: Any) -> None:
-        """Attach diagnostics after both services have been constructed."""
-        self._lsp = lsp
-
     def set_efficiency_profile(self, profile: str) -> None:
         """Adjust model-facing output limits for the current session."""
 
