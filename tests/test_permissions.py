@@ -779,3 +779,32 @@ def test_redirection_is_never_readonly() -> None:
         # uncertain, non-readonly commands into an auto-deny in --auto mode.
         plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
         assert plan.decide("bash", command).action == "deny", command
+
+
+def test_devnull_stream_discard_is_readonly() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    for command in (
+        "rg foo src 2>/dev/null",
+        "git log --oneline 2>/dev/null | head -5",
+        "ls 2>/dev/null | wc -l",
+        "find . -name '*.py' 2>/dev/null | head",
+        "git show HEAD:file 2>/dev/null | sed -n '1,5p'",
+        "rg -l foo src &>/dev/null",
+    ):
+        assert engine.is_readonly_command(command) is True, command
+        assert engine.is_uncertain_shell(command) is False, command
+        decision = PermissionEngine(
+            DEFAULT_PERMISSION_RULES, mode="build", auto_approve=True
+        ).decide("bash", command)
+        assert decision.action == "allow", command
+
+
+def test_devnull_discard_does_not_mask_real_redirection() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    for command in (
+        "ls > out.txt 2>/dev/null",
+        "grep foo src 2>/dev/null > leaked.txt",
+        "cat < secret.pem 2>/dev/null",
+    ):
+        assert engine.is_readonly_command(command) is False, command
+        assert engine.is_uncertain_shell(command) is True, command

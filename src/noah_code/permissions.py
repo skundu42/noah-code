@@ -83,6 +83,11 @@ _ALWAYS_ASK_BASH = (
 _MUTATING_GIT = re.compile(
     r"\bgit\s+(commit|add|push|pull|fetch|rebase|merge|reset|clean|checkout|stash|tag|remote)\b"
 )
+# Stream-discard redirections to /dev/null. These sink bytes harmlessly and are
+# treated as read-only: models routinely append "2>/dev/null" to silence noise
+# on otherwise read-only commands, and rejecting them blocked entire pipelines.
+# Only a redirection to a REAL file (< n, > out, >> log) is mutating.
+_DEVNULL_REDIRECT = re.compile(r"(?:\d|&)?[<>]{1,2}\s*/dev/null(?![\w/])")
 _READ_ONLY_PROGRAMS = frozenset(
     {
         "grep",
@@ -663,7 +668,9 @@ class PermissionEngine:
 
 def _is_compound(command: str) -> bool:
     """Detect pipes, chains, redirects, substitutions, heredocs."""
-    # Rough conservative scan - not a full shell parser.
+    # Rough conservative scan - not a full shell parser. /dev/null stream
+    # discards (2>/dev/null) are harmless and excluded.
+    command = _DEVNULL_REDIRECT.sub("", command)
     if _has_ambiguous_shell_expansion(command):
         return True
     specials = ("|", "&&", "||", ";", "&", "`", "$(", "${", ">", "<", ">>", "\n")
@@ -719,18 +726,22 @@ def _split_pipeline(command: str) -> list[str]:
 
 
 def _is_redirecting(command: str) -> bool:
-    """Return true when the command writes output or reads stdin via ``>``/``>>``.
+    """Return true when the command redraws to/from a real file (not /dev/null).
 
-    Redirection is never auto-approved: it can clobber files or read secrets
-    into a program, and a ``> file`` on an otherwise read-only pipeline is a
-    primary exfiltration/overwrite vector. Output capture is the responsibility
+    Discarding a stream to ``/dev/null`` (``2>/dev/null``, ``>/dev/null``,
+    ``&>/dev/null``) is harmless — it only sinks bytes, never clobbers a file or
+    reads a secret into a program — so it does NOT make a command mutating. Any
+    redirection to an actual file (``> out.txt``, ``>> log``) or reading a real
+    file via ``<`` (besides ``/dev/null``) is never auto-approved: it can
+    overwrite files or exfiltrate content. Output capture is the responsibility
     of the shell-tool wrapper, not the model's own redirection.
     """
+    stripped = _DEVNULL_REDIRECT.sub("", command)
     in_single = False
     in_double = False
     i = 0
-    while i < len(command):
-        ch = command[i]
+    while i < len(stripped):
+        ch = stripped[i]
         if ch == "'" and not in_double:
             in_single = not in_single
         elif ch == '"' and not in_single:
