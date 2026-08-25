@@ -526,6 +526,31 @@ async def test_streamed_cd_is_synchronized_before_pin_and_restore(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_run_read_only_delegates_to_trusted_readonly(tmp_path: Path, monkeypatch) -> None:
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        delegated: list[str] = []
+        original = ws.run_trusted_readonly
+
+        async def spy(command: str):
+            delegated.append(command)
+            return await original(command)
+
+        monkeypatch.setattr(ws, "run_trusted_readonly", spy)
+
+        result = await ws.run("pwd", read_only=True)
+
+        assert delegated == ["pwd"]
+        assert Path(result.stdout.strip()).resolve() == tmp_path.resolve()
+
+        with pytest.raises(PermissionError, match="not read-only"):
+            await ws.run(f"touch {shlex.quote(str(tmp_path / 'nope.txt'))}", read_only=True)
+        assert not (tmp_path / "nope.txt").exists()
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
 async def test_normal_shell_command_cannot_interleave_with_pinned_operation(
     tmp_path: Path, monkeypatch
 ) -> None:
