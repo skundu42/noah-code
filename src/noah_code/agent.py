@@ -956,6 +956,14 @@ class CodingAgent(InteractiveAgent):
         - DONE - request complete
         - NEED_INPUT - user input genuinely required
         - WAIT - a registered background job is still running
+
+        To end the turn, call ``return_result(RespondReason.DONE,
+        explanation="...")`` — ``return_result`` takes a ``RespondReason``
+        and an ``explanation`` string, NEVER a bare string as ``result=``
+        (that raises ``return_result validation error: 'result' has wrong
+        type``). To show the user text, call the synchronous
+        ``self.message("...")`` first (no ``await``), then
+        ``return_result(RespondReason.DONE, explanation="summary")``.
         """
         ...
 

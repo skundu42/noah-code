@@ -301,3 +301,12 @@ def test_prompt_marks_message_as_synchronous() -> None:
     assert "SYNCHRONOUS" in prompt
     assert "WITHOUT" in prompt and "await" in prompt
     assert "NoneType can't be used in 'await'" in prompt
+
+
+def test_prompt_documents_return_result_signature() -> None:
+    prompt = _handle_prompt()
+
+    assert "return_result(RespondReason.DONE" in prompt
+    assert "explanation" in prompt
+    assert "NEVER a bare string" in prompt
+    assert "wrong type" in prompt
