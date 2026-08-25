@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,16 +61,22 @@ class ToolOutputStore:
                 f"managed tool-output quota exceeded "
                 f"({used + len(encoded):,} > {self.max_total_bytes:,} bytes)"
             )
+        descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=self.root)
         try:
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            if path.read_bytes() != encoded:
-                raise RuntimeError(f"managed output hash collision: {output_id}") from None
-            return output_id
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Publish atomically: concurrent writers of identical content may
+            # both replace the target (same bytes), and readers of the
+            # content address never observe partial bytes.
+            os.replace(temp_name, path)
+        except OSError as exc:
+            # A failed write must not leave partial bytes at or near the
+            # content address: a truncated target would make every later
+            # retry report a bogus hash collision.
+            Path(temp_name).unlink(missing_ok=True)
+            raise RuntimeError(f"failed to persist managed output {output_id}: {exc}") from exc
         return output_id
 
     def read(self, output_id: str, lines: tuple[int, int] | None = None) -> str:
