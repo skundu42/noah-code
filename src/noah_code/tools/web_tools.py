@@ -181,24 +181,30 @@ class _PublicWebTransport:
 
 
 class _HTMLText(HTMLParser):
+    # Only script/style are CDATA-parsed; noscript content emits real start
+    # tags, so skipping must be depth-counted or nested tags would re-enable
+    # capture mid-block.
+    _SKIP_TAGS = frozenset({"script", "style", "noscript"})
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._chunks: list[str] = []
-        self._skip = False
+        self._skip_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self._skip = tag in {"script", "style", "noscript"}
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
         if tag in {"p", "div", "h1", "h2", "h3", "li", "br", "tr"}:
             self._chunks.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "style", "noscript"}:
-            self._skip = False
+        if tag in self._SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
         if tag in {"p", "div", "h1", "h2", "h3", "li"}:
             self._chunks.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if not self._skip:
+        if not self._skip_depth:
             self._chunks.append(data)
 
     def text(self) -> str:

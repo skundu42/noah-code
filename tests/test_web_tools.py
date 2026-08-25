@@ -364,3 +364,28 @@ def test_rate_limit_gives_up_after_bounded_retries(monkeypatch) -> None:
     with pytest.raises(OSError, match="rate limited"):
         _PublicWebTransport().fetch("http://public.example/api", timeout=0.5, max_bytes=100)
     assert state["count"] == _MAX_RATE_LIMIT_RETRIES + 1
+
+
+def test_html_text_drops_noscript_with_nested_tags() -> None:
+    from noah_code.tools.web_tools import _HTMLText
+
+    parser = _HTMLText()
+    parser.feed("<p>before</p><noscript><p>Please enable JavaScript.</p></noscript><p>after</p>")
+
+    text = parser.text()
+
+    assert "before" in text and "after" in text
+    assert "enable JavaScript" not in text
+
+
+def test_html_text_keeps_skipping_script_containing_markup_like_text() -> None:
+    from noah_code.tools.web_tools import _HTMLText
+
+    parser = _HTMLText()
+    parser.feed('<script>var a = "</p>";</script><style>p{color:red}</style><p>visible</p>')
+
+    text = parser.text()
+
+    assert "var a" not in text
+    assert "color:red" not in text
+    assert "visible" in text
