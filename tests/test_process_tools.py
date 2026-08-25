@@ -198,3 +198,142 @@ async def test_terminal_event_fires_when_runtime_update_fails(
         assert manager._jobs[job_id].returncode == 0
     finally:
         await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_empty_command_and_enforces_job_limit(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, max_jobs=1)
+    try:
+        with pytest.raises(ValueError, match="command is required"):
+            await manager.start("   ")
+        command = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote("import time; time.sleep(5)")
+        started = await manager.start(command, name="holder")
+        job_id = started.split()[1]
+        with pytest.raises(RuntimeError, match="job limit reached"):
+            await manager.start(command, name="extra")
+    finally:
+        await manager.stop(job_id)
+        await manager.close()
+    assert len(manager._jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_register_failure_cleans_up_process_log_and_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+    manager = _manager(tmp_path, runtime=runtime)
+
+    def boom(**_kwargs: object) -> None:
+        raise RuntimeError("simulated registration failure")
+
+    monkeypatch.setattr(runtime, "register_job", boom)
+    command = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote("print('never seen')")
+    with pytest.raises(RuntimeError, match="registration failure"):
+        await manager.start(command, name="ghost")
+    assert manager._jobs == {}
+    assert list(runtime.process_log_dir.glob("*.jsonl")) == []
+
+
+@pytest.mark.asyncio
+async def test_buffer_overflow_evicts_head_and_flags_expired_cursor(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, max_buffer_chars=300)
+    try:
+        script = (
+            "import time; print('head-marker', flush=True); time.sleep(0.15); "
+            "[print(f'y{i}-' + 'y' * 245, flush=True) or time.sleep(0.05) for i in range(5)]; "
+            "print('tail-marker', flush=True)"
+        )
+        command = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote(script)
+        started = await manager.start(command, name="chatty")
+        job_id = started.split()[1]
+        async with asyncio.timeout(5):
+            while "completed" not in await manager.status(job_id):
+                await asyncio.sleep(0.02)
+
+        job = manager._jobs[job_id]
+        assert job.event_chars <= 300
+        fresh = await manager.logs(job_id)
+        assert "tail-marker" in fresh
+        assert "head-marker" not in fresh
+        assert "y0-" not in fresh
+        assert "y4-" in fresh
+        expired = await manager.logs(job_id, cursor=2)
+        assert "earlier output expired" in expired
+        assert "tail-marker" in expired
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_timeout_expiry_terminates_job_without_zombie(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, max_runtime_seconds=0.3)
+    try:
+        command = (
+            f"{shlex.quote(sys.executable)} -u -c "
+            + shlex.quote("print('ready'); import time; time.sleep(30)")
+        )
+        started = await manager.start(command, name="forever")
+        job_id = started.split()[1]
+        async with asyncio.timeout(10):
+            while manager._jobs[job_id].returncode is None:
+                await asyncio.sleep(0.05)
+        job = manager._jobs[job_id]
+        assert "[timed_out]" in await manager.status(job_id)
+        assert job.returncode != 0
+        assert not manager.has_running()
+        logs = await manager.logs(job_id)
+        assert "timed_out" in logs
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_racing_a_fast_exit_stays_consistent(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    try:
+        command = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote("print('bye')")
+        started = await manager.start(command, name="racer")
+        job_id = started.split()[1]
+        stopped, status_text = await asyncio.gather(manager.stop(job_id), manager.status(job_id))
+        final = await manager.status(job_id)
+        for line in (stopped, status_text, final):
+            assert any(
+                f"[{state}]" in line for state in ("completed", "failed", "stopped", "stopping")
+            )
+        async with asyncio.timeout(5):
+            while manager.has_running():
+                await asyncio.sleep(0.02)
+        job = manager._jobs[job_id]
+        assert job.returncode is not None
+        assert job.finished_at is not None
+        assert job.process._transport.is_closing()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_input_after_process_death_reports_clean_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path)
+    try:
+        command = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote("print('alive')")
+        started = await manager.start(command, name="dying")
+        job_id = started.split()[1]
+        async with asyncio.timeout(5):
+            while "completed" not in await manager.status(job_id):
+                await asyncio.sleep(0.02)
+
+        # Simulate the race window: state still says running but the pipe died.
+        job = manager._jobs[job_id]
+        job.state = "running"
+
+        def reset(_data: bytes) -> None:
+            raise ConnectionResetError()
+
+        monkeypatch.setattr(job.process.stdin, "write", reset)
+        with pytest.raises(RuntimeError, match="not accepting input"):
+            await manager.input(job_id, "too late")
+    finally:
+        await manager.close()
