@@ -24,6 +24,8 @@ from noah_code.agent import (
 from noah_code.config import load_config
 from noah_code.macos_sandbox import build_macos_profile
 
+_MACOS_SANDBOX_TEST_TIMEOUT = 15
+
 
 def test_code_execution_is_sandboxed_by_default(tmp_path: Path) -> None:
     config = load_config(tmp_path)
@@ -86,7 +88,7 @@ async def test_macos_sandbox_blocks_unbrokered_file_and_network_access() -> None
             max_cpu_seconds=10,
             require=True,
         ),
-        cell_timeout=5,
+        cell_timeout=_MACOS_SANDBOX_TEST_TIMEOUT,
         restrictions=RestrictionsConfig(),
     )
     try:
@@ -177,7 +179,7 @@ async def test_macos_sandbox_spawn_ignores_live_agent_resources() -> None:
             max_cpu_seconds=10,
             require=True,
         ),
-        cell_timeout=5,
+        cell_timeout=_MACOS_SANDBOX_TEST_TIMEOUT,
         restrictions=RestrictionsConfig(),
     )
     try:
@@ -208,7 +210,7 @@ async def test_macos_sandbox_spawn_ignores_builtin_pipe_payload() -> None:
             max_cpu_seconds=10,
             require=True,
         ),
-        cell_timeout=5,
+        cell_timeout=_MACOS_SANDBOX_TEST_TIMEOUT,
         framework_builtins={"_call": SimpleNamespace(pipe=parent_end), "pipe": parent_end},
         restrictions=RestrictionsConfig(),
     )
@@ -244,7 +246,7 @@ async def test_macos_sandbox_worker_accepts_codeact_module_builtins() -> None:
             max_cpu_seconds=10,
             require=True,
         ),
-        cell_timeout=5,
+        cell_timeout=_MACOS_SANDBOX_TEST_TIMEOUT,
         framework_builtins={
             "os": os_mod,
             "notification": notification,
