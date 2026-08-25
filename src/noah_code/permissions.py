@@ -36,7 +36,12 @@ _ALWAYS_DENY_BASH = tuple(
     for pattern in (
         r"\brm\s+(-[^\s]*\s+)*-?[rR]?[fF]?[rR]?[fF]?\s+(/|\.|~|\*)",
         r"\brm\s+.*\s+(-[^\s]*r|-rf|-fr)\b",
-        r"\b(mkfs|dd\s+if=|/dev/sd|/dev/disk|shred\b|wipefs\b)\b",
+        # Per-alternative boundaries: a single trailing \b after the group is
+        # unsatisfiable for branches ending in non-word characters ("/dev/sd"),
+        # which silently turned those denies into dead patterns. ``dd`` with
+        # ordinary files stays on the elevated-risk ask floor below; only
+        # device targets are hard-denied.
+        r"\bmkfs\b|/dev/sd|/dev/disk|\bshred\b|\bwipefs\b",
         r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;:",  # fork bomb
         r"\bgit\s+push\b",
         r"\bgit\s+clean\b",
@@ -61,6 +66,7 @@ _ALWAYS_DENY_BASH = tuple(
 _ALWAYS_ASK_BASH = (
     re.compile(r"\brm\b"),
     re.compile(r"\bmv\b"),
+    re.compile(r"\bdd\b"),
     re.compile(r"\bchmod\b"),
     re.compile(r"\bchown\b"),
     re.compile(r"\bkill\b"),

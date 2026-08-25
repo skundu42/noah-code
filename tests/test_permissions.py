@@ -700,3 +700,25 @@ def test_rg_hostname_bin_is_not_readonly() -> None:
 
     plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
     assert plan.decide("bash", "rg --hostname-bin=/tmp/hostcat needle .").action == "deny"
+
+
+def test_disk_destruction_patterns_are_hard_denied() -> None:
+    for command in (
+        "dd if=/dev/zero of=/dev/sda",
+        "dd if=backup.img of=/dev/disk2",
+        "dd of=/dev/sda bs=1M",
+        "mkfs.ext4 /dev/sdb1",
+        "wipefs /dev/sdb",
+        "shred /dev/sda",
+    ):
+        engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+        decision = engine.decide("bash", command)
+        assert decision.action == "deny", command
+
+
+def test_dd_to_regular_files_hits_the_elevated_risk_floor() -> None:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    decision = engine.decide("bash", "dd if=a.img of=b.img bs=4M")
+    assert decision.action == "ask"
+    assert "elevated-risk" in decision.reason
+    assert decision.elevated_floor is True
