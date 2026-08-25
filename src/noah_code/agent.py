@@ -124,6 +124,7 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("ws", "read_output"),
             ("ws", "replace"),
             ("ws", "run"),
+            ("ws", "run_trusted_readonly"),
             ("ws", "search"),
             ("ws", "write"),
             ("ws", "write_file"),
@@ -878,6 +879,8 @@ class CodingAgent(InteractiveAgent):
           long-running commands. Consume logs by cursor; do not poll without new work.
         - ``result = await self.ws.run("pytest -q")`` runs validation; inspect
           ``result.returncode``, ``result.stdout``, and ``result.stderr``.
+          Pass ``read_only=True`` to skip approval for read-only commands
+          (equivalent to ``run_trusted_readonly``).
         - ``await self.web.fetch(url)`` reads a page; ``await self.web.search(query)``
           searches the public web. Both are read-only and allowed by default.
         - ``await self.github.list()`` / ``view(number)`` inspect pull requests.
