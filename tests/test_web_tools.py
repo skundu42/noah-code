@@ -14,6 +14,8 @@ from noah_code.tools.web_tools import (
     _MAX_RATE_LIMIT_RETRIES,
     _MAX_RETRY_AFTER_SECONDS,
     WebTools,
+    _PinnedHTTPConnection,
+    _PinnedHTTPSConnection,
     _PublicWebTransport,
     _validated_public_target,
 )
@@ -34,10 +36,12 @@ class _FakeTransport:
         self.responses = responses
         self.calls: list[str] = []
         self.timeouts: list[float] = []
+        self.max_bytes_values: list[int] = []
 
     def fetch(self, url: str, *, timeout: float, max_bytes: int) -> tuple[str, str]:
         self.calls.append(url)
         self.timeouts.append(timeout)
+        self.max_bytes_values.append(max_bytes)
         if url not in self.responses:
             raise LookupError(url)
         return self.responses[url]
@@ -389,3 +393,173 @@ def test_html_text_keeps_skipping_script_containing_markup_like_text() -> None:
     assert "var a" not in text
     assert "color:red" not in text
     assert "visible" in text
+
+
+# ---------------------------------------------------------------------------
+# WebTools-level contract tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_configured_timeout_and_max_bytes_reach_the_transport() -> None:
+    transport = _FakeTransport(
+        {
+            "https://example.com/docs": ("text/plain", "hello"),
+            "https://html.duckduckgo.com/html/?q=hi": ("text/plain", ""),
+        }
+    )
+    web = _web(transport=transport)
+    web._timeout = 3.25
+    web._max_bytes = 1234
+
+    await web.fetch("https://example.com/docs")
+    await web.search("hi")
+
+    assert transport.timeouts == [3.25, 3.25]
+    assert transport.max_bytes_values == [1234, 1234]
+
+
+def _plain_transport(text: str) -> _FakeTransport:
+    return _FakeTransport({"https://example.com/big": ("text/plain", text)})
+
+
+@pytest.mark.asyncio
+async def test_fetch_truncates_oversized_text_with_marker() -> None:
+    from noah_code.tools.web_tools import _MAX_CHARS
+
+    transport = _plain_transport("x" * (_MAX_CHARS + 500))
+    web = _web(transport=transport)
+
+    text = await web.fetch("https://example.com/big")
+
+    assert len(text) == _MAX_CHARS + len("\n...(truncated)...")
+    assert text.endswith("...(truncated)...")
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_empty_query() -> None:
+    web = _web(transport=_FakeTransport({}))
+
+    with pytest.raises(ValueError, match="query is required"):
+        await web.search("   ")
+
+
+def _search_html(links: list[tuple[str, str]]) -> str:
+    body = "".join(f'<a href="{href}">{label}</a>' for label, href in links)
+    return f"<html><body>{body}</body></html>"
+
+
+@pytest.mark.asyncio
+async def test_search_dedupes_urls() -> None:
+    html = _search_html(
+        [
+            ("first", "https://a.example/1"),
+            ("second", "https://a.example/1"),
+            ("third", "https://b.example/2"),
+        ]
+    )
+    transport = _FakeTransport({"https://html.duckduckgo.com/html/?q=x": ("text/html", html)})
+    web = _web(transport=transport)
+
+    text = await web.search("x")
+
+    assert text.count("https://a.example/1") == 1
+    assert "third" in text
+
+
+@pytest.mark.asyncio
+async def test_search_caps_results_at_eight() -> None:
+    links = [(f"label{i}", f"https://e.example/{i}") for i in range(12)]
+    transport = _FakeTransport(
+        {"https://html.duckduckgo.com/html/?q=x": ("text/html", _search_html(links))}
+    )
+    web = _web(transport=transport)
+
+    text = await web.search("x")
+    results = [line for line in text.splitlines() if line and line[0].isdigit()]
+    assert len(results) == 8
+    assert all(f"https://e.example/{i}" not in text for i in range(8, 12))
+
+
+@pytest.mark.asyncio
+async def test_search_reports_when_nothing_matches() -> None:
+    transport = _FakeTransport(
+        {"https://html.duckduckgo.com/html/?q=x": ("text/html", "<html></html>")}
+    )
+    web = _web(transport=transport)
+
+    assert await web.search("x") == "No search results for 'x'."
+
+
+# ---------------------------------------------------------------------------
+# URL validation and DNS-resolution defenses.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://exa\x00mple.com/",
+        "ftp://example.com/file",
+        "not a url",
+        "https://operator:pw@example.com/",
+        "https://example.com:70000/",
+        "https://example.com:notaport/",
+        "http://[fe80::1%25eth0]/",
+    ],
+)
+def test_require_http_url_rejects_malicious_and_malformed_urls(url: str) -> None:
+    from noah_code.tools.web_tools import _require_http_url
+
+    with pytest.raises(ValueError):
+        _require_http_url(url)
+
+
+def test_public_target_rejects_overlong_hostname_label() -> None:
+    with pytest.raises(ValueError, match="hostname is invalid"):
+        _validated_public_target("http://" + "a" * 64 + ".example.com/")
+
+
+def test_public_target_reports_unresolvable_host(monkeypatch) -> None:
+    def fail(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise socket.gaierror(-2, "Name or service not known")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail)
+
+    with pytest.raises(ValueError, match="could not be resolved"):
+        _validated_public_target("http://missing.example/page")
+
+
+def test_public_target_reports_empty_answer(monkeypatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [])
+
+    with pytest.raises(ValueError, match="could not be resolved"):
+        _validated_public_target("http://empty.example/page")
+
+
+def test_public_target_rejects_invalid_resolved_address(monkeypatch) -> None:
+    def junk(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("not-an-ip", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", junk)
+
+    with pytest.raises(ValueError, match="invalid address"):
+        _validated_public_target("http://junk.example/page")
+
+
+def test_open_pinned_connection_selects_scheme_without_connecting() -> None:
+    from dataclasses import replace as _replace
+
+    from noah_code.tools.web_tools import _HttpTarget, _open_pinned_connection
+
+    http_target = _HttpTarget(
+        scheme="http", host="example.com", port=80, request_target="/", addresses=("93.184.216.34",)
+    )
+    https_target = _replace(http_target, scheme="https")
+
+    assert isinstance(
+        _open_pinned_connection(http_target, "93.184.216.34", 0.1), _PinnedHTTPConnection
+    )
+    assert isinstance(
+        _open_pinned_connection(https_target, "93.184.216.34", 0.1), _PinnedHTTPSConnection
+    )
