@@ -260,3 +260,35 @@ def test_wrap_without_budget_still_observes_prefixes() -> None:
     # first call has no predecessor; the identical second call is append-only
     assert tracker.snapshot().prefix_calls == 2
     assert tracker.snapshot().prefix_append_only == 1
+
+
+# ---------------------------------------------------------------------------
+# handle() system-prompt contract (cache-stable tool guidance)
+# ---------------------------------------------------------------------------
+
+
+def _handle_prompt() -> str:
+    doc = CodingAgent.handle.__doc__ or ""
+    return " ".join(doc.split())
+
+
+def test_prompt_directs_verification_commands_through_read_only_run() -> None:
+    prompt = _handle_prompt()
+
+    assert "read_only=True" in prompt
+    assert "verification commands" in prompt
+    assert "approval gate" in prompt
+
+
+def test_prompt_documents_yolo_mode_scope() -> None:
+    prompt = _handle_prompt()
+
+    assert "--yolo" in prompt
+    assert "throwaway" in prompt
+
+
+def test_prompt_pins_edit_to_three_arguments() -> None:
+    prompt = _handle_prompt()
+
+    assert "exactly three arguments" in prompt
+    assert "two-argument calls are invalid" in prompt

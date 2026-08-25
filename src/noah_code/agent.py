@@ -868,7 +868,10 @@ class CodingAgent(InteractiveAgent):
         - ``match = await self.ws.read("path.py", lines=(10, 30))`` returns an
           editable Match; ``await self.ws.replace(match, "replacement")`` edits it.
         - ``await self.ws.edit("path.py", "unique old text", "new text")`` is the
-          simple string-edit form. ``await self.ws.write("new.py", content)`` creates files.
+          simple string-edit form and takes exactly three arguments (path, old,
+          new); two-argument calls are invalid. For a Match from read(), edit
+          with ``await self.ws.replace(match, "replacement")`` instead.
+          ``await self.ws.write("new.py", content)`` creates files.
         - Prefer ``await self.ws.apply_patch(changes)`` for coherent edits. Each change is
           ``{"path": ..., "old": exact_text_or_None, "new": replacement_or_None}``;
           one call validates and atomically commits the full batch.
@@ -880,8 +883,14 @@ class CodingAgent(InteractiveAgent):
           long-running commands. Consume logs by cursor; do not poll without new work.
         - ``result = await self.ws.run("pytest -q")`` runs validation; inspect
           ``result.returncode``, ``result.stdout``, and ``result.stderr``.
-          Pass ``read_only=True`` to skip approval for read-only commands
-          (equivalent to ``run_trusted_readonly``).
+          For verification commands (tests, lint, typecheck, ``git status``,
+          ``rg``), prefer ``await self.ws.run(cmd, read_only=True)``: read-only
+          commands skip the approval gate entirely. Mutating commands still
+          require approval and must not pass ``read_only=True``.
+        - If the host was launched with ``--yolo``, every approval is granted
+          automatically without prompting. That mode exists for throwaway or
+          sandboxed environments only; do not assume it is active — write code
+          that works under normal permission gating.
         - ``await self.web.fetch(url)`` reads a page; ``await self.web.search(query)``
           searches the public web. Both are read-only and allowed by default.
         - ``await self.github.list()`` / ``view(number)`` inspect pull requests.
