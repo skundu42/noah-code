@@ -97,6 +97,14 @@ _READ_ONLY_PROGRAMS = frozenset(
         "file",
         "stat",
         "test",
+        "sed",
+        "awk",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "tac",
+        "column",
     }
 )
 _READ_ONLY_GIT_SUBCOMMANDS = frozenset({"branch", "diff", "log", "rev-parse", "show", "status"})
@@ -591,7 +599,19 @@ class PermissionEngine:
         cmd = command.strip()
         if not cmd:
             return True
-        if _is_compound(cmd):
+        if _has_ambiguous_shell_expansion(cmd):
+            return False
+        segments = _split_pipeline(cmd)
+        if len(segments) > 1:
+            # A pipeline is read-only only if EVERY segment is individually a
+            # read-only command. This rejects exfiltration forms such as
+            # ``cat secret | nc host`` (cat is not a whitelisted read-only
+            # program and nc is absent).
+            return all(PermissionEngine.is_readonly_command(seg) for seg in segments)
+        if _is_redirecting(cmd) or _is_compound(cmd):
+            # Redirection can clobber/leak; control-flow chains (&&, ||, ;, &)
+            # can hide a mutating or exfiltrating second command. Neither is
+            # auto-approvable.
             return False
         lowered = cmd.lower()
         if _MUTATING_GIT.search(lowered):
@@ -621,6 +641,12 @@ class PermissionEngine:
 
     @staticmethod
     def is_uncertain_shell(command: str) -> bool:
+        if _has_ambiguous_shell_expansion(command) or _is_redirecting(command):
+            return True
+        segments = _split_pipeline(command)
+        if len(segments) > 1:
+            # A read-only pipeline is not uncertain; anything else is.
+            return not all(PermissionEngine.is_readonly_command(seg) for seg in segments)
         if _is_compound(command):
             return True
         try:
@@ -640,7 +666,7 @@ def _is_compound(command: str) -> bool:
     # Rough conservative scan - not a full shell parser.
     if _has_ambiguous_shell_expansion(command):
         return True
-    specials = ("|", "&&", "||", ";", "&", "`", "$(", "${", ">", "<", "<<", "\n")
+    specials = ("|", "&&", "||", ";", "&", "`", "$(", "${", ">", "<", ">>", "\n")
     in_single = False
     in_double = False
     i = 0
@@ -659,6 +685,62 @@ def _is_compound(command: str) -> bool:
         shlex.split(command)
     except ValueError:
         return True
+    return False
+
+
+def _split_pipeline(command: str) -> list[str]:
+    """Split a command on unquoted ``|`` into its constituent segments.
+
+    Only simple ``cmd | cmd | cmd`` pipes are handled; control-flow operators
+    (``&&``, ``||``, ``;``) inside a segment are rejected upstream by the
+    ambiguity/redirect checks before this is consulted.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            current.append(ch)
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            current.append(ch)
+        elif ch == "|" and not in_single and not in_double:
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    segments.append("".join(current))
+    return segments
+
+
+def _is_redirecting(command: str) -> bool:
+    """Return true when the command writes output or reads stdin via ``>``/``>>``.
+
+    Redirection is never auto-approved: it can clobber files or read secrets
+    into a program, and a ``> file`` on an otherwise read-only pipeline is a
+    primary exfiltration/overwrite vector. Output capture is the responsibility
+    of the shell-tool wrapper, not the model's own redirection.
+    """
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == ">":
+                return True
+            if ch == "<":
+                return True
+        i += 1
     return False
 
 
