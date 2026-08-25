@@ -10,8 +10,41 @@ from typing import Annotated, Any
 from nooa import Skill, spec
 
 from noah_code.approvals import ApprovalBroker
-from noah_code.github import GithubManager, PullRequestInfo
+from noah_code.github import GithubError, GithubManager, PullRequestInfo
 from noah_code.permissions import PermissionCategory, PermissionEngine
+
+_AUTH_MARKERS = (
+    "http 401",
+    "http 403",
+    "bad credentials",
+    "unauthorized",
+    "not authenticated",
+    "authentication",
+)
+
+_NETWORK_MARKERS = (
+    "dial tcp",
+    "connection refused",
+    "connection reset",
+    "could not resolve host",
+    "no such host",
+    "network is unreachable",
+    "i/o timeout",
+    "tls handshake timeout",
+    "temporary failure in name resolution",
+)
+
+
+def _user_facing(raw: str) -> str | None:
+    """Translate gh-reported auth or connectivity failures into guidance."""
+
+    text = raw.strip()
+    lowered = text.lower()
+    if any(marker in lowered for marker in _AUTH_MARKERS):
+        return f"github auth failed ({text}); run `gh auth login` and retry"
+    if any(marker in lowered for marker in _NETWORK_MARKERS):
+        return f"github is unreachable ({text}); check network connectivity and retry"
+    return None
 
 
 class GithubTools(Skill):
@@ -36,7 +69,7 @@ class GithubTools(Skill):
         """List open pull requests for this repository."""
 
         await self._approve("list")
-        rows = await asyncio.to_thread(self._manager.list)
+        rows = await self._call(self._manager.list)
         return "\n".join(item.format_row() for item in rows) or "(none)"
 
     async def view(
@@ -46,7 +79,7 @@ class GithubTools(Skill):
         """Show one pull request."""
 
         await self._approve("view")
-        return await asyncio.to_thread(self._manager.view, number)
+        return await self._call(lambda: self._manager.view(number))
 
     async def create(
         self,
@@ -113,19 +146,32 @@ class GithubTools(Skill):
         operation: Callable[[bool], str],
     ) -> str:
         if self._runtime is None:
-            return await asyncio.to_thread(operation, False)
+            return await self._call(lambda: operation(False))
         effect_key, cached, result, recovering = self._runtime.begin_effect(
             kind, target, request
         )
         if cached:
             return str(result or "completed")
         try:
-            value = await asyncio.to_thread(operation, recovering)
+            value = await self._call(lambda: operation(recovering))
         except Exception as exc:
             self._runtime.fail_effect(effect_key, str(exc))
             raise
         self._runtime.complete_effect(effect_key, value)
         return value
+
+    async def _call(self, func: Callable[[], Any]) -> Any:
+        try:
+            return await asyncio.to_thread(func)
+        except GithubError as exc:
+            friendly = _user_facing(str(exc))
+            if friendly is None:
+                raise
+            raise GithubError(friendly) from exc
+        except ConnectionError as exc:
+            raise GithubError(
+                f"github is unreachable ({exc}); check network connectivity and retry"
+            ) from exc
 
     async def _approve(self, operation: str) -> None:
         await self._approvals.require(

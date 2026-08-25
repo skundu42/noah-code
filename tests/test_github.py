@@ -237,3 +237,55 @@ async def test_github_effect_result_is_cached_after_success(tmp_path: Path) -> N
     assert await tools.push() == "pushed once"
     assert await tools.push() == "pushed once"
     assert manager.calls == 1
+
+
+def _auto_tools(tmp_path: Path, manager: object) -> GithubTools:
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    return GithubTools(
+        tmp_path,
+        engine,
+        ApprovalBroker(engine),
+        manager=manager,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_github_tools_translate_network_errors(tmp_path: Path) -> None:
+    class Manager:
+        def list(self):
+            raise GithubError("dial tcp 140.82.112.3:443: connection refused")
+
+    with pytest.raises(GithubError, match="unreachable"):
+        await _auto_tools(tmp_path, Manager()).list()
+
+
+@pytest.mark.asyncio
+async def test_github_tools_translate_auth_failures(tmp_path: Path) -> None:
+    class Manager:
+        def view(self, number: int | None = None):
+            raise GithubError("HTTP 401: Bad credentials")
+
+    with pytest.raises(GithubError, match=r"gh auth login") as caught:
+        await _auto_tools(tmp_path, Manager()).view()
+    assert isinstance(caught.value.__cause__, GithubError)
+
+
+@pytest.mark.asyncio
+async def test_github_tools_translate_connection_errors(tmp_path: Path) -> None:
+    class Manager:
+        def push(self) -> str:
+            raise ConnectionRefusedError("git daemon down")
+
+    with pytest.raises(GithubError, match="unreachable"):
+        await _auto_tools(tmp_path, Manager()).push()
+
+
+@pytest.mark.asyncio
+async def test_github_tools_keep_other_errors_untouched(tmp_path: Path) -> None:
+    class Manager:
+        def push(self) -> str:
+            raise GithubError("pull request title is required")
+
+    with pytest.raises(GithubError, match="title is required") as caught:
+        await _auto_tools(tmp_path, Manager()).push()
+    assert not isinstance(caught.value.__cause__, GithubError)
