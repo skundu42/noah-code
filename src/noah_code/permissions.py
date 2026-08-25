@@ -293,10 +293,12 @@ class PermissionEngine:
         *,
         mode: Literal["build", "plan"] = "build",
         auto_approve: bool = False,
+        yolo: bool = False,
     ) -> None:
         self.rules: list[PermissionRule] = list(rules or [])
         self.mode = mode
         self.auto_approve = auto_approve
+        self.yolo = yolo
         self._session_rules: list[PermissionRule] = []
 
     def add_session_rule(self, rule: PermissionRule) -> None:
@@ -313,6 +315,15 @@ class PermissionEngine:
         return replace(decision, tool=tool) if tool else decision
 
     def _decide(self, category: str, target: str) -> PermissionDecision:
+        if self.yolo:
+            return PermissionDecision(
+                category=category,
+                target=target.strip() or "*",
+                action="allow",
+                matching_rule=None,
+                reason="YOLO mode: all operations allowed",
+                remember_pattern="*",
+            )
         normalized = target.strip() or "*"
         # Hard denies for secrets on read/edit.
         if category in {PermissionCategory.READ, PermissionCategory.EDIT} and is_secret_path(

@@ -470,6 +470,7 @@ class CodingAgent(InteractiveAgent):
             config.permission_rules,
             mode=config.mode,
             auto_approve=config.auto_approve,
+            yolo=config.yolo,
         )
         self._engine.mode = config.mode
         self._approvals = approvals or ApprovalBroker(

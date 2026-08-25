@@ -237,6 +237,7 @@ class NoahCodeConfig(BaseModel):
     )
     permission_rules: list[PermissionRule] = Field(default_factory=list)
     auto_approve: bool = False
+    yolo: bool = False
     enabled_skills: list[str] = Field(default_factory=list)
     mcp: dict[str, Any] = Field(default_factory=dict)
     ui: UIConfig = Field(default_factory=UIConfig)

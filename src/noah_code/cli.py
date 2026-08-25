@@ -79,6 +79,11 @@ def _common_options(fn):  # noqa: ANN001
         is_flag=True,
         help="Auto-approve routine asks (never overrides deny or elevated-risk approval)",
     )(fn)
+    fn = click.option(
+        "--yolo",
+        is_flag=True,
+        help="Skip all approvals and permission checks (dangerous; for isolated/throwaway environments)",
+    )(fn)
     fn = click.option("--model", "model", default=None, help="Override the model for this launch")(
         fn
     )
@@ -151,6 +156,7 @@ def interactive_cmd(
     model: str | None,
     reasoning_effort: str | None,
     auto: bool,
+    yolo: bool,
     mode: str | None,
     continue_session: bool,
     session_id: str | None,
@@ -169,6 +175,7 @@ def interactive_cmd(
             model=model,
             reasoning_effort=reasoning_effort,
             auto=auto,
+            yolo=yolo,
             continue_session=continue_session,
             session_id=session_id,
             mode=mode,
@@ -196,6 +203,7 @@ def run_cmd(
     model: str | None,
     reasoning_effort: str | None,
     auto: bool,
+    yolo: bool,
     mode: str | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
@@ -208,6 +216,7 @@ def run_cmd(
             model=model,
             reasoning_effort=reasoning_effort,
             auto=auto,
+            yolo=yolo,
             mode=mode,
             session_id=session_id,
             unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
@@ -793,6 +802,7 @@ async def _prepare(
     model: str | None,
     reasoning_effort: str | None,
     auto: bool,
+    yolo: bool,
     mode: str | None,
     continue_session: bool = False,
     session_id: str | None = None,
@@ -813,6 +823,8 @@ async def _prepare(
         overrides["reasoning_effort"] = reasoning_effort
     if auto:
         overrides["auto_approve"] = True
+    if yolo:
+        overrides["yolo"] = True
     if mode:
         overrides["mode"] = mode
     if frontend is not None:
@@ -859,6 +871,7 @@ async def _interactive(
     model: str | None,
     reasoning_effort: str | None,
     auto: bool,
+    yolo: bool,
     continue_session: bool,
     session_id: str | None,
     mode: str | None,
@@ -882,6 +895,7 @@ async def _interactive(
         model=model,
         reasoning_effort=reasoning_effort,
         auto=auto,
+        yolo=yolo,
         mode=mode,
         continue_session=continue_session,
         session_id=session_id,
@@ -906,6 +920,7 @@ async def _interactive(
             model=model,
             reasoning_effort=reasoning_effort,
             auto=auto,
+            yolo=yolo,
             mode=mode,
             continue_session=continue_session,
             session_id=session_id,
@@ -959,6 +974,7 @@ async def _run_session(
     model: str | None,
     reasoning_effort: str | None,
     auto: bool,
+    yolo: bool,
     mode: str | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
@@ -970,6 +986,7 @@ async def _run_session(
         model=model,
         reasoning_effort=reasoning_effort,
         auto=auto,
+        yolo=yolo,
         mode=mode,
         session_id=session_id,
         frontend="console",
