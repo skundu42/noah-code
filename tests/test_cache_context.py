@@ -276,8 +276,9 @@ def test_prompt_directs_verification_commands_through_read_only_run() -> None:
     prompt = _handle_prompt()
 
     assert "read_only=True" in prompt
-    assert "verification commands" in prompt
-    assert "approval gate" in prompt
+    assert "recognizes as read-only" in prompt
+    assert "REJECTED" in prompt
+    assert "pytest" in prompt and "uv" in prompt
 
 
 def test_prompt_documents_yolo_mode_scope() -> None:

@@ -888,10 +888,15 @@ class CodingAgent(InteractiveAgent):
           long-running commands. Consume logs by cursor; do not poll without new work.
         - ``result = await self.ws.run("pytest -q")`` runs validation; inspect
           ``result.returncode``, ``result.stdout``, and ``result.stderr``.
-          For verification commands (tests, lint, typecheck, ``git status``,
-          ``rg``), prefer ``await self.ws.run(cmd, read_only=True)``: read-only
-          commands skip the approval gate entirely. Mutating commands still
-          require approval and must not pass ``read_only=True``.
+          ``read_only=True`` skips approval ONLY for commands the engine
+          recognizes as read-only (``git status/log/diff/show``, ``rg``,
+          ``grep``, ``ls``, ``find`` (no -delete/-exec), ``head``, ``tail``,
+          ``wc``, ``sed``, ``awk``, ``sort``, ``uniq``, ``cut``, ``tr``,
+          ``tac``, ``column``, ``pwd``, ``file``, ``stat``, ``test``). It is
+          REJECTED for anything else — including ``pytest``, ``uv``, ``python``,
+          and build commands — so do NOT pass ``read_only=True`` for those; run
+          them with plain ``await self.ws.run(cmd)`` (YOLO auto-approves;
+          ``--auto`` prompts).
         - If the host was launched with ``--yolo``, every approval is granted
           automatically without prompting. That mode exists for throwaway or
           sandboxed environments only; do not assume it is active — write code

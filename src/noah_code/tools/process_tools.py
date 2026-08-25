@@ -231,8 +231,14 @@ class ProcessTools(Skill):
         if job.state != "running" or job.process.stdin is None:
             raise RuntimeError(f"job {job.id} is not accepting input ({job.state})")
         payload = text + ("\n" if newline else "")
-        job.process.stdin.write(payload.encode())
-        await job.process.stdin.drain()
+        try:
+            job.process.stdin.write(payload.encode())
+            await job.process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            # The process exited after the running-state check above; report
+            # the same condition the state guard produces instead of leaking
+            # a transport error.
+            raise RuntimeError(f"job {job.id} is not accepting input ({job.state})") from exc
         return f"sent {len(payload.encode())} bytes to job {job.id}"
 
     async def stop(

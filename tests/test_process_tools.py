@@ -30,6 +30,9 @@ def _manager(
     auto: bool = False,
     runtime: RuntimeStateStore | None = None,
     max_log_bytes: int = 4_000_000,
+    max_jobs: int = 8,
+    max_buffer_chars: int = 64_000,
+    max_runtime_seconds: float = 5,
 ) -> ProcessTools:
     workspace = Workspace(tmp_path.resolve())
     engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=auto)
@@ -44,7 +47,9 @@ def _manager(
     )
     return ProcessTools(
         tools,
-        max_runtime_seconds=5,
+        max_jobs=max_jobs,
+        max_runtime_seconds=max_runtime_seconds,
+        max_buffer_chars=max_buffer_chars,
         max_log_bytes=max_log_bytes,
         stop_grace_seconds=0.2,
         runtime=runtime,
