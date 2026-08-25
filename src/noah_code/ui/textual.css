@@ -1,12 +1,12 @@
 Screen {
     background: $nc-canvas;
     color: $nc-text;
-}
 
-Screen > .screen--selection {
-    background: $nc-accent;
-    color: $nc-canvas;
-    text-style: bold;
+    & > .screen--selection {
+        background: $nc-accent;
+        color: $nc-canvas;
+        text-style: bold;
+    }
 }
 
 #header {

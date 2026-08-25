@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -16,16 +18,20 @@ from typing import TYPE_CHECKING, Any
 
 from rich.console import Group
 from rich.markdown import Markdown
+from rich.measure import measure_renderables
 from rich.padding import Padding
+from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.geometry import Offset
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.selection import Selection
+from textual.strip import Strip
 from textual.timer import Timer
 from textual.widgets import Button, Input, Label, OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
@@ -59,7 +65,7 @@ def _text_area_theme(theme: ThemePalette) -> TextAreaTheme:
         cursor_style=Style(color=theme.canvas, bgcolor=theme.accent),
         cursor_line_style=Style(bgcolor=theme.raised),
         bracket_matching_style=Style(color=theme.warning, bold=True),
-        selection_style=Style(bgcolor=theme.border),
+        selection_style=Style(color=theme.canvas, bgcolor=theme.accent),
     )
 
 
@@ -73,6 +79,11 @@ STREAM_FLUSH_SECONDS = 0.05
 WIDE_MIN_COLUMNS = 110
 COMPACT_MAX_ROWS = 25
 UPDATE_BANNER_SECONDS = 12.0
+
+# Terminals parse OSC 52 payloads into a fixed buffer; oversized sequences get
+# truncated into visual garbage or dropped. Native tools handle any size, so
+# only emit the escape sequence for payloads that fit comfortably.
+OSC_52_MAX_BYTES = 32_768
 
 # A single traveling glyph. Multi-mark frames read as two loaders at once.
 WORKING_PATH_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧")
@@ -95,14 +106,241 @@ class UIStateChanged(Message):
     """Busy/status state changed outside the widget tree."""
 
 
+def _running_in_wsl() -> bool:
+    """Detect WSL so the Windows ``clip.exe`` bridge can be used."""
+
+    try:
+        with open("/proc/version", encoding="utf-8", errors="replace") as handle:
+            return "microsoft" in handle.read().lower()
+    except OSError:
+        return False
+
+
+def _clipboard_commands() -> list[tuple[list[str], str]]:
+    """Return ``(command, payload_encoding)`` pairs, best candidate first.
+
+    ``clip.exe`` (Windows and WSL) interprets stdin as UTF-16, while the Unix
+    tools take the terminal's usual UTF-8 bytes.
+    """
+
+    if sys.platform == "darwin":
+        return [(["pbcopy"], "utf-8")]
+    if sys.platform == "win32":
+        return [(["clip"], "utf-16")]
+    unix_tools = [
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+        ["termux-clipboard-set"],
+    ]
+    if _running_in_wsl():
+        return [(["clip.exe"], "utf-16"), *[(tool, "utf-8") for tool in unix_tools]]
+    return [(tool, "utf-8") for tool in unix_tools]
+
+
+def _clipboard_read_commands() -> list[tuple[list[str], str]]:
+    """Return native clipboard read commands, best candidate first."""
+
+    if sys.platform == "darwin":
+        return [(["pbpaste"], "utf-8")]
+    if sys.platform == "win32":
+        return [
+            (
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw",
+                ],
+                "utf-8",
+            )
+        ]
+    unix_tools = [
+        ["wl-paste", "--no-newline"],
+        ["xclip", "-selection", "clipboard", "-out"],
+        ["xsel", "--clipboard", "--output"],
+        ["termux-clipboard-get"],
+    ]
+    if _running_in_wsl():
+        powershell = [
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw",
+        ]
+        return [(powershell, "utf-8"), *[(tool, "utf-8") for tool in unix_tools]]
+    return [(tool, "utf-8") for tool in unix_tools]
+
+
+def write_os_clipboard(text: str) -> bool:
+    """Write *text* to the native OS clipboard.
+
+    Textual's ``copy_to_clipboard`` only emits OSC 52. macOS Terminal, Cursor
+    and VS Code terminals, default iTerm2, and tmux often drop that sequence,
+    so paste gets whatever was already on the clipboard. ``pbcopy`` / ``wl-copy``
+    / ``xclip`` actually update the system clipboard.
+
+    Returns whether some tool accepted the payload. Never raises.
+    """
+
+    if not text:
+        return False
+    if os.environ.get("PYTEST_CURRENT_TEST") and os.environ.get("NOAH_TEST_OS_CLIPBOARD") != "1":
+        return False
+
+    for command, encoding in _clipboard_commands():
+        try:
+            payload = text.encode(encoding)
+        except UnicodeEncodeError:
+            continue
+        try:
+            completed = subprocess.run(
+                command,
+                input=payload,
+                timeout=2,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            continue
+        if completed.returncode == 0:
+            return True
+    return False
+
+
+def read_os_clipboard() -> str | None:
+    """Read text from the native OS clipboard without raising.
+
+    The caller is responsible for moving this blocking operation off the UI
+    thread. ``None`` means that no clipboard helper was available; an empty
+    string is a valid clipboard value.
+    """
+
+    if os.environ.get("PYTEST_CURRENT_TEST") and os.environ.get("NOAH_TEST_OS_CLIPBOARD") != "1":
+        return None
+
+    for command, encoding in _clipboard_read_commands():
+        try:
+            completed = subprocess.run(
+                command,
+                timeout=2,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            continue
+        if completed.returncode != 0:
+            continue
+        try:
+            return completed.stdout.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _copy_shortcut_label() -> str:
+    return "Cmd+C" if sys.platform == "darwin" else "Ctrl+Shift+C"
+
+
+def _overlay_style(existing: Style | None, overlay: Style) -> Style:
+    """Layer *overlay* colors onto *existing* without losing selection meta."""
+
+    base = existing or Style()
+    return Style(
+        color=overlay.color if overlay.color is not None else base.color,
+        bgcolor=overlay.bgcolor if overlay.bgcolor is not None else base.bgcolor,
+        bold=True if overlay.bold else base.bold,
+        italic=base.italic,
+        dim=base.dim,
+        underline=base.underline,
+        strike=base.strike,
+        reverse=True if overlay.reverse else base.reverse,
+        meta=base.meta,
+    )
+
+
+def _style_strip_span(strip: Strip, start: int, end: int, style: Style) -> Strip:
+    """Apply *style* to a cell range of *strip*, replacing color and background."""
+
+    length = strip.cell_length
+    if length <= 0:
+        return strip
+    if end < 0:
+        end = length
+    start = max(0, min(start, length))
+    end = max(start, min(end, length))
+    if end <= start:
+        return strip
+    chunks: list[Strip] = []
+    if start:
+        chunks.append(strip.crop(0, start))
+    middle = strip.crop(start, end)
+    chunks.append(
+        Strip(
+            [
+                Segment(text, _overlay_style(segment_style, style), control)
+                for text, segment_style, control in middle
+            ],
+            middle.cell_length,
+        )
+    )
+    if end < length:
+        chunks.append(strip.crop(end, length))
+    if len(chunks) == 1:
+        return chunks[0]
+    segments = [segment for chunk in chunks for segment in chunk]
+    return Strip(segments, length)
+
+
 class SelectableRichLog(RichLog):
     """A RichLog whose rendered lines participate in Textual text selection."""
 
     def get_selection(self, selection: Selection) -> tuple[str, str]:
         # RichLog stores rendered strips rather than a single Text visual, so
         # Widget.get_selection cannot extract its contents automatically.
-        text = "\n".join(line.text.rstrip() for line in self.lines)
-        return selection.extract(text), "\n"
+        # Keep padding until after extract so column offsets match the visual
+        # cells the pointer selected; then strip trailing pad spaces.
+        if not self.lines:
+            return "", "\n"
+        # Selections can point past the log after max_lines eviction or widget
+        # clears; clamp so extraction never raises.
+        last_row = len(self.lines) - 1
+
+        def clamped(point: Offset | None) -> Offset | None:
+            if point is None:
+                return None
+            return Offset(max(point.x, 0), min(max(point.y, 0), last_row))
+
+        selection = Selection(clamped(selection.start), clamped(selection.end))
+        text = "\n".join(line.text for line in self.lines)
+        extracted = selection.extract(text)
+        cleaned = "\n".join(part.rstrip() for part in extracted.split("\n"))
+        return cleaned, "\n"
+
+    def render_line(self, y: int) -> Strip:
+        strip = super().render_line(y)
+        scroll_x, scroll_y = self.scroll_offset
+        line_y = scroll_y + y
+        strip = strip.apply_offsets(scroll_x, line_y)
+        selection = self.text_selection
+        if selection is None:
+            return strip
+        span = selection.get_span(line_y)
+        if span is None:
+            return strip
+        start, end = span
+        palette = getattr(self.app, "theme_palette", None)
+        canvas = getattr(palette, "canvas", "#101012")
+        accent = getattr(palette, "accent", "#b8a9ff")
+        highlight = Style(color=canvas, bgcolor=accent, bold=True)
+        return _style_strip_span(
+            strip,
+            start - scroll_x,
+            end if end < 0 else end - scroll_x,
+            highlight,
+        )
 
 
 @dataclass(frozen=True)
@@ -159,8 +397,7 @@ def _parse_git_status(output: str) -> RepositorySnapshot | None:
         if worktree_state not in {" ", "?"}:
             modified += 1
         skip_rename_source = nul_delimited and (
-            "R" in {index_state, worktree_state}
-            or "C" in {index_state, worktree_state}
+            "R" in {index_state, worktree_state} or "C" in {index_state, worktree_state}
         )
     return RepositorySnapshot(branch, staged, modified, untracked)
 
@@ -286,9 +523,7 @@ def _normalize_markdown(text: str) -> str:
     return cleaned
 
 
-_HIDDEN_ACTIVITY = frozenset(
-    {"Think", "Thinking", "Preparing", "Preparing response", "Working"}
-)
+_HIDDEN_ACTIVITY = frozenset({"Think", "Thinking", "Preparing", "Preparing response", "Working"})
 _PROGRESSIVE_ACTIVITY = (
     ("Reading ", "Read "),
     ("Writing ", "Write "),
@@ -1322,7 +1557,8 @@ class NoahCodeApp(App[None]):
     BINDINGS = [
         Binding("ctrl+q", "quit_app", "Quit", show=True),
         Binding("ctrl+c", "cancel_or_quit", "Cancel", show=True),
-        Binding("ctrl+shift+c", "copy_selection", "Copy", show=True, priority=True),
+        Binding("super+c,ctrl+shift+c", "copy_selection", "Copy", show=True, priority=True),
+        Binding("ctrl+v,super+v", "paste_clipboard", "Paste", show=False, priority=True),
         Binding("ctrl+p", "palette", "Commands", show=True),
         Binding("ctrl+g", "skills", "Skills", show=True),
         Binding("ctrl+o", "sessions", "Sessions", show=True),
@@ -1365,6 +1601,8 @@ class NoahCodeApp(App[None]):
         self._spinner_timer: Timer | None = None
         self._stream_timer: Timer | None = None
         self._notice_timer: Timer | None = None
+        self._native_clipboard_task: asyncio.Task[None] | None = None
+        self._pending_native_clipboard: str | None = None
         self._available_update: UpdateStatus | None = None
         self._stream_fragments: list[tuple[str, str]] = []
         self._activities: dict[str, ActivityRecord] = {}
@@ -1373,6 +1611,9 @@ class NoahCodeApp(App[None]):
         self._last_thought: str = ""
         self._transcript_entries: list[TranscriptEntry] = []
         self._transcript_event_ids: set[str] = set()
+        # Visual row counts parallel to _transcript_entries; together they map
+        # a mouse selection's line range back to pristine entry text.
+        self._transcript_line_counts: list[int] = []
         self._unread_count = 0
         self._follow_batch: bool | None = None
         self._suggestion_matches: list[CommandSuggestion] = []
@@ -1679,9 +1920,11 @@ class NoahCodeApp(App[None]):
                 self.query_one("#header", Static).update(header, layout=False)
 
         hint = (
-            "Enter queue follow-up · Ctrl+C cancel · drag select · Ctrl+Shift+C copy · F2 activity"
+            "Enter queue follow-up · Ctrl+C cancel · drag select · "
+            f"{_copy_shortcut_label()} copy · F2 activity"
             if self.ui.busy and self._agent_ready
-            else "Enter send · Shift+Enter newline · drag select · Ctrl+Shift+C copy · / commands"
+            else "Enter send · Shift+Enter newline · drag select · "
+            f"{_copy_shortcut_label()} copy · / commands"
         )
         if force or hint != self._hint_text:
             self._hint_text = hint
@@ -1728,7 +1971,9 @@ class NoahCodeApp(App[None]):
         text.append("\n\nCHANGES\n", style=f"bold {palette.accent}")
         snapshot = self._repository_snapshot
         if snapshot is None:
-            message = "Not a Git worktree" if self._repository_status_loaded else "Reading Git status…"
+            message = (
+                "Not a Git worktree" if self._repository_status_loaded else "Reading Git status…"
+            )
             text.append(message, style=palette.muted)
         else:
             text.append(f"{snapshot.branch}\n", style=palette.text)
@@ -1844,10 +2089,16 @@ class NoahCodeApp(App[None]):
         self._transcript_entries.append(entry)
         if len(self._transcript_entries) > 500:
             self._transcript_entries = self._transcript_entries[-500:]
-        self.query_one("#conversation", RichLog).write(
+            del self._transcript_line_counts[: max(len(self._transcript_line_counts) - 500, 0)]
+        log = self.query_one("#conversation", SelectableRichLog)
+        rows_before = len(log.lines)
+        log.write(
             _role_renderable(entry),
             scroll_end=at_end,
         )
+        # Deferred pre-mount renders report no new rows; the entry simply stays
+        # unselectable until the next full rerender rebuilds the table.
+        self._transcript_line_counts.append(max(len(log.lines) - rows_before, 0))
         if not at_end:
             self._unread_count += 1
             self.update_chrome()
@@ -1860,10 +2111,14 @@ class NoahCodeApp(App[None]):
             self.query_one("#conversation", RichLog).styles.display = "block"
 
     def _rerender_transcript(self) -> None:
-        log = self.query_one("#conversation", RichLog)
+        log = self.query_one("#conversation", SelectableRichLog)
         log.clear()
+        counts: list[int] = []
         for entry in self._transcript_entries:
+            rows_before = len(log.lines)
             log.write(_role_renderable(entry), scroll_end=False)
+            counts.append(max(len(log.lines) - rows_before, 0))
+        self._transcript_line_counts = counts
         log.scroll_end(animate=False)
 
     @work(exclusive=True, group="recent-history")
@@ -2692,8 +2947,7 @@ class NoahCodeApp(App[None]):
 
         try:
             rows = [
-                (f"theme:{theme.name}", theme.label, theme.description)
-                for theme in THEMES.values()
+                (f"theme:{theme.name}", theme.label, theme.description) for theme in THEMES.values()
             ]
             rows.sort(key=lambda row: row[0] != f"theme:{self._theme_name}")
             choice = await self.push_screen_wait(
@@ -2917,6 +3171,7 @@ class NoahCodeApp(App[None]):
             return
         self._transcript_entries.clear()
         self._transcript_event_ids.clear()
+        self._transcript_line_counts.clear()
         self.query_one("#conversation", RichLog).clear()
         self.query_one("#conversation", RichLog).styles.display = "none"
         self.query_one("#welcome", Static).styles.display = "block"
@@ -2948,22 +3203,181 @@ class NoahCodeApp(App[None]):
     def action_quit_app(self) -> None:
         self.exit()
 
+    def _emit_osc52(self, text: str) -> None:
+        """Write the terminal OSC 52 sequence (mirrors Textual's App behavior)."""
+
+        import base64
+
+        if self._driver is None:
+            return
+        base64_text = base64.b64encode(text.encode("utf-8")).decode("utf-8")
+        self._driver.write(f"\x1b]52;c;{base64_text}\a")
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """Copy to the native OS clipboard without blocking the UI.
+
+        Native helpers are preferred because sending OSC 52 as well can make
+        some terminals visibly flicker. Rapid copies are coalesced, which also
+        prevents an older, slower helper from overwriting a newer copy.
+        """
+
+        if not text:
+            return
+        self._clipboard = text
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            if (
+                not write_os_clipboard(text)
+                and len(text.encode("utf-8", errors="replace")) <= OSC_52_MAX_BYTES
+            ):
+                self._emit_osc52(text)
+            return
+        self._pending_native_clipboard = text
+        if self._native_clipboard_task is None or self._native_clipboard_task.done():
+            self._native_clipboard_task = loop.create_task(self._drain_native_clipboard())
+
+    async def _drain_native_clipboard(self) -> None:
+        """Write the newest queued copy, serially, with OSC 52 as fallback."""
+
+        while self._pending_native_clipboard is not None:
+            text = self._pending_native_clipboard
+            self._pending_native_clipboard = None
+            copied = await asyncio.to_thread(write_os_clipboard, text)
+            if (
+                not copied
+                and self._pending_native_clipboard is None
+                and self._clipboard == text
+                and len(text.encode("utf-8", errors="replace")) <= OSC_52_MAX_BYTES
+            ):
+                self._emit_osc52(text)
+
+    def _recount_transcript_rows(self) -> bool:
+        """Rebuild entry→row counts by rendering offline.
+
+        RichLog defers writes made before the first layout, so the row delta
+        captured at write time can under-count. Mirror ``RichLog.write``'s
+        width logic to recover exact counts without disturbing scroll state.
+        """
+
+        try:
+            log = self.query_one("#conversation", SelectableRichLog)
+            width = log.scrollable_content_region.width
+            if width <= 0:
+                return False
+            console = self.app.console
+            base_options = console.options
+            counts: list[int] = []
+            for entry in self._transcript_entries:
+                renderable = _role_renderable(entry)
+                measured = measure_renderables(console, base_options, [renderable]).maximum
+                render_width = min(measured, width)
+                segments = console.render(
+                    renderable,
+                    base_options.update_width(max(render_width, log.min_width)),
+                )
+                counts.append(sum(1 for _ in Segment.split_lines(segments)))
+        except Exception:  # noqa: BLE001 - counting is best-effort
+            return False
+        self._transcript_line_counts = counts
+        return True
+
+    def _conversation_selection_text(self, selection: Selection) -> str | None:
+        """Pristine source text behind a mouse selection over the transcript.
+
+        Rendered strips mangle copies: padding indents every line, soft wraps
+        become hard newlines, and Markdown turns into its rendered form. The
+        app keeps the untouched entry text, so map the selected row range back
+        to entries and copy those instead. Any entry whose rows intersect the
+        selection is copied whole.
+        """
+
+        try:
+            log = self.query_one("#conversation", SelectableRichLog)
+        except Exception:  # noqa: BLE001 - screen may be tearing down
+            return None
+        counts = self._transcript_line_counts
+        # Fewer counted rows than live rows means writes were deferred before
+        # layout; recover the table before mapping anything.
+        if len(counts) != len(self._transcript_entries) or sum(counts) < len(log.lines):
+            if not self._recount_transcript_rows():
+                return None
+            counts = self._transcript_line_counts
+        if selection.start is None and selection.end is None:
+            first_row, last_row = 0, max(len(log.lines) - 1, 0)
+        else:
+            points = [point for point in (selection.start, selection.end) if point is not None]
+            if not points or selection.start == selection.end:
+                # A click without a drag selects nothing copyable.
+                return None
+            ys = [point.y for point in points]
+            first_row, last_row = min(ys), max(ys)
+        # Rows evicted by max_lines shift live rows toward the front.
+        evicted = max(sum(counts) - len(log.lines), 0)
+        picked: list[str] = []
+        offset = 0
+        for entry, count in zip(self._transcript_entries, counts, strict=False):
+            start = offset - evicted
+            end = start + count
+            offset += count
+            if end <= first_row:
+                continue
+            if start > last_row:
+                break
+            picked.append(entry.text)
+        if not picked:
+            return None
+        return "\n".join(picked)
+
+    def _mouse_selection_text(self) -> str | None:
+        """Combined selection text across widgets, transcript-aware.
+
+        Other selectable panes (diff review, activity output) still extract
+        from their rendered strips; only the transcript gets source fidelity.
+        """
+
+        parts: list[str] = []
+        conversation = None
+        with contextlib.suppress(Exception):
+            conversation = self.query_one("#conversation", SelectableRichLog)
+        for widget, selection in self.screen.selections.items():
+            if widget is conversation:
+                part = self._conversation_selection_text(selection)
+            elif widget.is_attached:
+                extracted = getattr(widget, "get_selection", None)
+                result = extracted(selection) if callable(extracted) else None
+                part = result[0] if isinstance(result, tuple) else None
+            else:
+                part = None
+            if part and part.strip():
+                parts.append(part)
+        if not parts:
+            return None
+        return "\n".join(parts)
+
+    @staticmethod
+    def _copied_notice(text: str) -> str:
+        lines = len(text.splitlines()) or 1
+        return f"Copied {lines} {'line' if lines == 1 else 'lines'}"
+
     def action_copy_selection(self) -> None:
         """Copy selected text, or the latest Noah reply when nothing is selected."""
 
         focused = self.focused
-        if isinstance(focused, TextArea):
-            # Shift-arrow selections live inside the TextArea and are invisible
-            # to screen.get_selected_text(), which only sees mouse drags.
-            composer_selection = focused.selected_text
-            if composer_selection:
-                self.copy_to_clipboard(composer_selection)
-                self._show_notice("Copied selected text", temporary=True)
+        if isinstance(focused, (Input, TextArea)):
+            # Keyboard selections inside editable fields are invisible to
+            # screen.get_selected_text(), which only sees mouse drags.
+            field_selection = focused.selected_text
+            if field_selection:
+                self.copy_to_clipboard(field_selection)
+                self._show_notice(self._copied_notice(field_selection), temporary=True)
                 return
-        selected = self.screen.get_selected_text()
-        if selected:
+        selected = self._mouse_selection_text()
+        if not selected:
+            selected = self.screen.get_selected_text() or ""
+        if selected.strip():
             self.copy_to_clipboard(selected)
-            self._show_notice("Copied selected text", temporary=True)
+            self._show_notice(self._copied_notice(selected), temporary=True)
             return
         latest_reply = next(
             (entry.text for entry in reversed(self._transcript_entries) if entry.role == "NOAH"),
@@ -2975,10 +3389,34 @@ class NoahCodeApp(App[None]):
             return
         self._show_notice("Select text or wait for a Noah reply to copy", temporary=True)
 
+    def action_paste_clipboard(self) -> None:
+        """Paste the native clipboard into the currently focused editable field."""
+
+        target = self.focused
+        if not isinstance(target, (Input, TextArea)):
+            return
+        self.run_worker(
+            self._paste_native_clipboard(target),
+            name="native clipboard paste",
+            group="clipboard-paste",
+            exclusive=True,
+        )
+
+    async def _paste_native_clipboard(self, target: Input | TextArea) -> None:
+        pasted = await asyncio.to_thread(read_os_clipboard)
+        if pasted is None:
+            pasted = self.clipboard
+        if pasted and target.is_attached:
+            handled = target._on_paste(events.Paste(pasted))  # noqa: SLF001
+            if inspect.isawaitable(handled):
+                await handled
+
     def action_cancel_or_quit(self) -> None:
         # Ctrl+C follows terminal muscle memory: copy an active mouse selection;
         # otherwise retain Noah's cancel / double-press-to-quit behavior.
-        if self.screen.get_selected_text():
+        focused = self.focused
+        has_field_selection = isinstance(focused, (Input, TextArea)) and bool(focused.selected_text)
+        if has_field_selection or self.screen.get_selected_text():
             self.action_copy_selection()
             return
         if self.ui.busy and self._turn_task and not self._turn_task.done():

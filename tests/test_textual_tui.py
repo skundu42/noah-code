@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import time
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from rich.console import Console
+from textual.geometry import Offset
 from textual.selection import SELECT_ALL, Selection
 from textual.widgets import Input
 
@@ -19,7 +22,9 @@ from noah_code.events import HostEvent, HostEventKind
 from noah_code.permissions import PermissionDecision
 from noah_code.sessions import SessionEventRecord
 from noah_code.steer import SteerQueue
+from noah_code.themes import THEMES
 from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt
+from noah_code.ui import textual_app as textual_app_module
 from noah_code.ui.textual_app import (
     MAX_TRANSCRIPT_LINES,
     WORKING_PATH_FRAMES,
@@ -38,6 +43,10 @@ from noah_code.ui.textual_app import (
     _normalize_markdown,
     _parse_git_status,
     _record_to_entries,
+    _style_strip_span,
+    _text_area_theme,
+    read_os_clipboard,
+    write_os_clipboard,
 )
 from noah_code.updates import UpdateStatus
 from noah_code.usage import UsageSnapshot
@@ -101,6 +110,31 @@ def _rendered_text(renderable) -> str:
 
 def _log_text(log) -> str:
     return "\n".join(strip.text for strip in log.lines)
+
+
+def _strip_text(strip) -> str:
+    return "".join(segment.text for segment in strip)
+
+
+def _strip_backgrounds(strip) -> list[object]:
+    return [
+        segment.style.bgcolor
+        for segment in strip
+        if segment.style is not None and segment.style.bgcolor is not None
+    ]
+
+
+def _first_visible_line(widget, needle: str):
+    for y in range(max(widget.size.height, 1)):
+        strip = widget.render_line(y)
+        if needle in _strip_text(strip):
+            return y, strip
+    raise AssertionError(f"visible line containing {needle!r} not found")
+
+
+def _strip_has_background(strip, hex_color: str) -> bool:
+    needle = hex_color.lower().lstrip("#")
+    return any(needle in str(color).lower() for color in _strip_backgrounds(strip))
 
 
 def test_markdown_normalization_repairs_indented_model_output() -> None:
@@ -187,13 +221,103 @@ async def test_transcript_selection_and_copy_shortcuts_are_useful(tmp_path: Path
         app.screen.selections = {transcript: SELECT_ALL}
         assert "select this answer" in (app.screen.get_selected_text() or "")
 
-        app.action_cancel_or_quit()
+        await pilot.press("ctrl+c")
         assert "select this answer" in app.clipboard
         assert app._interrupt_count == 0
+
+        composer = app.query_one("#composer")
+        composer.focus()
+        composer.text = ""
+        await pilot.press("ctrl+v")
+        assert "select this answer" in composer.text
 
         app.screen.clear_selection()
         ui.render(HostEvent(HostEventKind.MESSAGE, "latest answer"))
         await pilot.pause()
+        await pilot.press("ctrl+shift+c")
+        assert app.clipboard == "latest answer"
+
+
+@pytest.mark.asyncio
+async def test_copy_preserves_source_text_not_rendered_output(tmp_path: Path) -> None:
+    """Copies must be byte-identical to what Noah wrote, not the rendered strips.
+
+    Rendering mangles text: soft wraps become hard newlines, Markdown turns
+    dashes into bullets and drops code fences, and padding indents every line.
+    """
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    long_sentence = (
+        "This is a deliberately long reply sentence that will definitely wrap "
+        "across several narrow terminal rows once the renderer lays it out."
+    )
+    message = (
+        "# Plan\n\n"
+        "- first bullet stays a dash\n"
+        "- second bullet stays a dash\n\n"
+        "```\nkeep_code_block_verbatim\n```\n\n"
+        f"{long_sentence}\n"
+    )
+    async with app.run_test(size=(64, 40)) as pilot:
+        ui.render(HostEvent(HostEventKind.MESSAGE, message))
+        await pilot.pause()
+
+        # Sanity: the renderer really did mangle this text into wrapped,
+        # bulleted visual rows before the fix.
+        transcript = app.query_one("#conversation")
+        rendered = "\n".join(strip.text.rstrip() for strip in transcript.lines)
+        assert "•" in rendered
+        assert any(
+            len(line) < len(long_sentence) and long_sentence.startswith(line[:20])
+            for line in rendered.splitlines()
+        )
+
+        app.screen.selections = {transcript: SELECT_ALL}
+        await pilot.press("ctrl+shift+c")
+        # Byte-identical to the canonical transcript text (the pipeline
+        # rstrips trailing newlines when journaling events).
+        assert app.clipboard == message.rstrip()
+
+
+@pytest.mark.asyncio
+async def test_partial_drag_copies_only_touched_entries(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.render(HostEvent(HostEventKind.MESSAGE, "first reply"))
+        ui.render(HostEvent(HostEventKind.MESSAGE, "second reply"))
+        await pilot.pause()
+
+        transcript = app.query_one("#conversation")
+        # Anchor to live rendered rows: entry labels mark each message start,
+        # independent of whether writes were counted or deferred pre-layout.
+        labels = [y for y, strip in enumerate(transcript.lines) if "▌ Noah" in strip.text]
+        assert len(labels) == 2
+        app.screen.selections = {
+            transcript: Selection(
+                Offset(0, labels[1]),
+                Offset(0, len(transcript.lines) - 1),
+            )
+        }
+        await pilot.press("ctrl+shift+c")
+        assert app.clipboard == "second reply"
+
+
+@pytest.mark.asyncio
+async def test_collapsed_click_does_not_shadow_reply_fallback(tmp_path: Path) -> None:
+    """A stray click without a drag must not hijack Cmd+C away from the fallback."""
+
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.render(HostEvent(HostEventKind.MESSAGE, "latest answer"))
+        await pilot.pause()
+
+        transcript = app.query_one("#conversation")
+        app.screen.selections = {transcript: Selection(Offset(2, 3), Offset(2, 3))}
         await pilot.press("ctrl+shift+c")
         assert app.clipboard == "latest answer"
 
@@ -218,10 +342,262 @@ async def test_composer_keyboard_selection_copies_via_app_action(tmp_path: Path)
         await pilot.press("ctrl+shift+c")
         assert app.clipboard == "keyboard selection"
 
-        # Cmd+C reaches the TextArea's own copy binding now that the app-level
-        # binding no longer shadows it with priority.
         await pilot.press("super+c")
         assert app.clipboard == "keyboard selection"
+
+
+@pytest.mark.asyncio
+async def test_transcript_drag_selection_is_highlighted(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test(size=(100, 40)) as pilot:
+        ui.render(HostEvent(HostEventKind.MESSAGE, "highlight this answer"))
+        await pilot.pause()
+
+        transcript = app.query_one("#conversation")
+        y, before = _first_visible_line(transcript, "highlight this answer")
+        accent = THEMES["atom-one-dark"].accent
+        assert not _strip_has_background(before, accent)
+        assert any(
+            segment.style is not None and "offset" in segment.style.meta
+            for segment in before
+            if segment.style is not None
+        )
+
+        app.screen.selections = {transcript: SELECT_ALL}
+        await pilot.pause()
+        after = transcript.render_line(y)
+        assert "highlight this answer" in _strip_text(after)
+        assert _strip_has_background(after, accent)
+
+
+def test_style_strip_span_replaces_background() -> None:
+    from rich.segment import Segment
+    from rich.style import Style
+    from textual.strip import Strip
+
+    original = Strip([Segment("hello", Style(color="#e0e0e0", bgcolor="#101012"))], 5)
+    styled = _style_strip_span(
+        original, 0, -1, Style(color="#101012", bgcolor="#b8a9ff", bold=True)
+    )
+    assert _strip_has_background(styled, "#b8a9ff")
+
+
+def test_composer_selection_style_uses_accent() -> None:
+    theme = THEMES["atom-one-dark"]
+    area_theme = _text_area_theme(theme)
+    assert area_theme.selection_style is not None
+    assert theme.accent.lstrip("#").lower() in str(area_theme.selection_style.bgcolor).lower()
+    assert theme.canvas.lstrip("#").lower() in str(area_theme.selection_style.color).lower()
+
+
+def test_write_os_clipboard_uses_pbcopy_on_macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[list[str], bytes]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append((list(cmd), kwargs.get("input") or b""))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setenv("NOAH_TEST_OS_CLIPBOARD", "1")
+    monkeypatch.setattr(textual_app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(textual_app_module.subprocess, "run", fake_run)
+
+    assert write_os_clipboard("hello from noah")
+    assert calls == [(["pbcopy"], b"hello from noah")]
+
+
+def test_write_os_clipboard_is_a_noop_during_pytest(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("tests must not invoke the real OS clipboard")
+
+    monkeypatch.delenv("NOAH_TEST_OS_CLIPBOARD", raising=False)
+    monkeypatch.setattr(textual_app_module.subprocess, "run", boom)
+    assert write_os_clipboard("do not copy") is False
+
+
+def test_read_os_clipboard_uses_pbpaste_on_macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"hello from macOS")
+
+    monkeypatch.setenv("NOAH_TEST_OS_CLIPBOARD", "1")
+    monkeypatch.setattr(textual_app_module.sys, "platform", "darwin")
+    monkeypatch.setattr(textual_app_module.subprocess, "run", fake_run)
+
+    assert read_os_clipboard() == "hello from macOS"
+    assert calls == [["pbpaste"]]
+
+
+def test_clipboard_commands_prefer_wsl_bridge_and_termux_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(textual_app_module.sys, "platform", "linux")
+    monkeypatch.setattr(textual_app_module, "_running_in_wsl", lambda: True)
+    wsl_commands = [command for command, _ in textual_app_module._clipboard_commands()]
+    assert wsl_commands[0] == ["clip.exe"]
+    assert any(command == ["wl-copy"] for command in wsl_commands)
+
+    monkeypatch.setattr(textual_app_module, "_running_in_wsl", lambda: False)
+    linux_commands = [command for command, _ in textual_app_module._clipboard_commands()]
+    assert linux_commands[-1] == ["termux-clipboard-set"]
+    assert all(encoding == "utf-8" for _, encoding in textual_app_module._clipboard_commands())
+
+    monkeypatch.setattr(textual_app_module.sys, "platform", "win32")
+    windows_commands = textual_app_module._clipboard_commands()
+    assert windows_commands == [(["clip"], "utf-16")]
+
+
+@pytest.mark.asyncio
+async def test_copy_to_clipboard_writes_os_clipboard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        textual_app_module,
+        "write_os_clipboard",
+        lambda text: recorded.append(text) or True,
+    )
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test():
+        app.copy_to_clipboard("native clipboard text")
+        assert app.clipboard == "native clipboard text"
+        await app._native_clipboard_task
+        assert recorded == ["native clipboard text"]
+
+
+@pytest.mark.asyncio
+async def test_ctrl_v_reads_native_clipboard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(textual_app_module, "read_os_clipboard", lambda: "external text")
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.focus()
+        await pilot.press("ctrl+v")
+        await pilot.pause()
+        assert composer.text == "external text"
+
+
+@pytest.mark.asyncio
+async def test_ctrl_copy_and_paste_work_in_single_line_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(textual_app_module, "read_os_clipboard", lambda: "native value")
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        field = Input(value="copy me", id="test-clipboard-input")
+        await app.screen.mount(field)
+        field.focus()
+        field.selection = Selection(0, len(field.value))
+
+        await pilot.press("ctrl+c")
+        assert app.clipboard == "copy me"
+        assert app._interrupt_count == 0
+
+        field.value = ""
+        await pilot.press("ctrl+v")
+        await pilot.pause()
+        assert field.value == "native value"
+
+
+@pytest.mark.asyncio
+async def test_copy_survives_slow_native_clipboard_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hung pbcopy must not freeze the UI; the copy still lands in App state."""
+
+    def slow_clipboard(text: str) -> bool:
+        time.sleep(0.5)
+        return True
+
+    monkeypatch.setattr(textual_app_module, "write_os_clipboard", slow_clipboard)
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        started = time.perf_counter()
+        app.copy_to_clipboard("slow clipboard payload")
+        elapsed = time.perf_counter() - started
+        assert elapsed < 0.25, "native clipboard write blocked the UI thread"
+        assert app.clipboard == "slow clipboard payload"
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_copy_uses_native_clipboard_without_duplicate_osc52(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        textual_app_module,
+        "write_os_clipboard",
+        lambda text: recorded.append(text) or True,
+    )
+    emitted: list[str] = []
+
+    def fake_emit(self: object, text: str) -> None:
+        emitted.append(text)
+
+    monkeypatch.setattr(NoahCodeApp, "_emit_osc52", fake_emit)
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test():
+        small_payload = "small"
+        app.copy_to_clipboard(small_payload)
+        assert app.clipboard == small_payload
+        assert app._native_clipboard_task is not None
+        await app._native_clipboard_task
+        assert recorded == [small_payload]
+        assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_copy_falls_back_to_osc52_when_native_clipboard_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(textual_app_module, "write_os_clipboard", lambda _text: False)
+    emitted: list[str] = []
+    monkeypatch.setattr(NoahCodeApp, "_emit_osc52", lambda _self, text: emitted.append(text))
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test():
+        app.copy_to_clipboard("fallback text")
+        assert app._native_clipboard_task is not None
+        await app._native_clipboard_task
+        assert emitted == ["fallback text"]
+
+
+@pytest.mark.asyncio
+async def test_cmd_c_copies_transcript_when_composer_has_no_selection(
+    tmp_path: Path,
+) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.render(HostEvent(HostEventKind.MESSAGE, "copy this reply"))
+        await pilot.pause()
+        transcript = app.query_one("#conversation")
+        app.screen.selections = {transcript: SELECT_ALL}
+        composer = app.query_one("#composer")
+        composer.focus()
+        composer.text = "draft prompt"
+        composer.selection = Selection(Offset(0, 0), Offset(0, 0))
+
+        await pilot.press("super+c")
+        assert "copy this reply" in app.clipboard
 
 
 @pytest.mark.asyncio
@@ -1164,7 +1540,9 @@ async def test_adaptive_layout_breakpoints(
 
 def test_completed_activity_label_keeps_file_paths() -> None:
     assert _completed_activity_label("Read src/parser.py", failed=False) == "✓ Read src/parser.py"
-    assert _completed_activity_label("Reading src/parser.py", failed=False) == "✓ Read src/parser.py"
+    assert (
+        _completed_activity_label("Reading src/parser.py", failed=False) == "✓ Read src/parser.py"
+    )
     assert _completed_activity_label("Write src/parser.py", failed=False) == "✓ Write src/parser.py"
     assert (
         _completed_activity_label("Reading src/a.py · Writing src/b.py", failed=False)
@@ -1177,13 +1555,18 @@ def test_completed_activity_label_keeps_file_paths() -> None:
 
 
 def test_consecutive_file_activity_compacts_into_one_line() -> None:
-    assert _coalesce_activity_text("✓ Read src/a.py", "✓ Read src/b.py") == "✓ Read src/a.py, src/b.py"
+    assert (
+        _coalesce_activity_text("✓ Read src/a.py", "✓ Read src/b.py") == "✓ Read src/a.py, src/b.py"
+    )
     assert (
         _coalesce_activity_text("✓ Read src/a.py, src/b.py", "✓ Read src/c.py")
         == "✓ Read src/a.py, src/b.py +1"
     )
     assert _coalesce_activity_text("✓ Read src/a.py", "✓ Write src/b.py") is None
-    assert _coalesce_activity_text("✓ Wrote src/a.py", "✓ Write src/b.py") == "✓ Write src/a.py, src/b.py"
+    assert (
+        _coalesce_activity_text("✓ Wrote src/a.py", "✓ Write src/b.py")
+        == "✓ Write src/a.py, src/b.py"
+    )
 
 
 @pytest.mark.asyncio

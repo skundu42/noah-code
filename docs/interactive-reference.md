@@ -41,7 +41,14 @@ their transcript normally.
 
 Drag across transcript, activity, diff, or history text to select it. `Cmd+C` on macOS or
 `Ctrl+Shift+C` in other terminals copies the selection; when there is no selection, the same
-shortcut copies Noah's latest reply. Inside the composer, `Cmd+C`/`Ctrl+C` copies the composer's
+shortcut copies Noah's latest reply. Transcript copies are taken from the original message text,
+not the rendered screen rows, so soft-wrapped paragraphs stay one line, Markdown keeps its dashes
+and code fences, and no padding indents sneak into copied code. A stray click without a drag is
+ignored, so the fallback applies. Copy writes to the system clipboard (`pbcopy` on macOS),
+with OSC 52 used only as a fallback, so paste works without sending duplicate escape sequences that
+can make some terminals flicker. Clipboard helpers run off the UI thread, rapid copies are
+coalesced, and `Ctrl+V` reads the system clipboard rather than Textual's private clipboard cache.
+Inside the composer, `Cmd+C`/`Ctrl+C` copies the composer's
 own selection; `Ctrl+C` with no composer selection keeps its cancel-turn behavior. Selection uses a
 high-contrast highlight in every Noah theme.
 
