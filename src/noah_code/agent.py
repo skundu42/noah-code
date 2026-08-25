@@ -861,6 +861,11 @@ class CodingAgent(InteractiveAgent):
         in the notification. Understand the requested end state before acting.
         Conversational questions are first-class: answer them with
         ``self.message(...)`` then return DONE. Do not emit bare assistant prose.
+        IMPORTANT: ``self.message(...)`` is SYNCHRONOUS — call it WITHOUT
+        ``await`` (``self.message("...")``). Prefixing ``await`` raises
+        ``TypeError: object NoneType can't be used in 'await' expression``
+        because it returns ``None``. All ``self.ws.*``, ``self.web.*``,
+        ``self.lsp.*``, ``self.processes.*`` calls ARE async and need ``await``.
 
         Minimal tool cookbook:
         - ``await self.ws.list("**/*.py")`` lists files.

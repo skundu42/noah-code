@@ -292,3 +292,11 @@ def test_prompt_pins_edit_to_three_arguments() -> None:
 
     assert "exactly three arguments" in prompt
     assert "two-argument calls are invalid" in prompt
+
+
+def test_prompt_marks_message_as_synchronous() -> None:
+    prompt = _handle_prompt()
+
+    assert "SYNCHRONOUS" in prompt
+    assert "WITHOUT" in prompt and "await" in prompt
+    assert "NoneType can't be used in 'await'" in prompt
