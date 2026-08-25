@@ -36,7 +36,12 @@ _ALWAYS_DENY_BASH = tuple(
     for pattern in (
         r"\brm\s+(-[^\s]*\s+)*-?[rR]?[fF]?[rR]?[fF]?\s+(/|\.|~|\*)",
         r"\brm\s+.*\s+(-[^\s]*r|-rf|-fr)\b",
-        r"\b(mkfs|dd\s+if=|/dev/sd|/dev/disk|shred\b|wipefs\b)\b",
+        # Per-alternative boundaries: a single trailing \b after the group is
+        # unsatisfiable for branches ending in non-word characters ("/dev/sd"),
+        # which silently turned those denies into dead patterns. ``dd`` with
+        # ordinary files stays on the elevated-risk ask floor below; only
+        # device targets are hard-denied.
+        r"\bmkfs\b|/dev/sd|/dev/disk|\bshred\b|\bwipefs\b",
         r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;:",  # fork bomb
         r"\bgit\s+push\b",
         r"\bgit\s+clean\b",
@@ -61,6 +66,7 @@ _ALWAYS_DENY_BASH = tuple(
 _ALWAYS_ASK_BASH = (
     re.compile(r"\brm\b"),
     re.compile(r"\bmv\b"),
+    re.compile(r"\bdd\b"),
     re.compile(r"\bchmod\b"),
     re.compile(r"\bchown\b"),
     re.compile(r"\bkill\b"),
@@ -77,6 +83,11 @@ _ALWAYS_ASK_BASH = (
 _MUTATING_GIT = re.compile(
     r"\bgit\s+(commit|add|push|pull|fetch|rebase|merge|reset|clean|checkout|stash|tag|remote)\b"
 )
+# Stream-discard redirections to /dev/null. These sink bytes harmlessly and are
+# treated as read-only: models routinely append "2>/dev/null" to silence noise
+# on otherwise read-only commands, and rejecting them blocked entire pipelines.
+# Only a redirection to a REAL file (< n, > out, >> log) is mutating.
+_DEVNULL_REDIRECT = re.compile(r"(?:\d|&)?[<>]{1,2}\s*/dev/null(?![\w/])")
 _READ_ONLY_PROGRAMS = frozenset(
     {
         "grep",
@@ -91,6 +102,14 @@ _READ_ONLY_PROGRAMS = frozenset(
         "file",
         "stat",
         "test",
+        "sed",
+        "awk",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "tac",
+        "column",
     }
 )
 _READ_ONLY_GIT_SUBCOMMANDS = frozenset({"branch", "diff", "log", "rev-parse", "show", "status"})
@@ -287,10 +306,12 @@ class PermissionEngine:
         *,
         mode: Literal["build", "plan"] = "build",
         auto_approve: bool = False,
+        yolo: bool = False,
     ) -> None:
         self.rules: list[PermissionRule] = list(rules or [])
         self.mode = mode
         self.auto_approve = auto_approve
+        self.yolo = yolo
         self._session_rules: list[PermissionRule] = []
 
     def add_session_rule(self, rule: PermissionRule) -> None:
@@ -307,6 +328,15 @@ class PermissionEngine:
         return replace(decision, tool=tool) if tool else decision
 
     def _decide(self, category: str, target: str) -> PermissionDecision:
+        if self.yolo:
+            return PermissionDecision(
+                category=category,
+                target=target.strip() or "*",
+                action="allow",
+                matching_rule=None,
+                reason="YOLO mode: all operations allowed",
+                remember_pattern="*",
+            )
         normalized = target.strip() or "*"
         # Hard denies for secrets on read/edit.
         if category in {PermissionCategory.READ, PermissionCategory.EDIT} and is_secret_path(
@@ -574,7 +604,19 @@ class PermissionEngine:
         cmd = command.strip()
         if not cmd:
             return True
-        if _is_compound(cmd):
+        if _has_ambiguous_shell_expansion(cmd):
+            return False
+        segments = _split_pipeline(cmd)
+        if len(segments) > 1:
+            # A pipeline is read-only only if EVERY segment is individually a
+            # read-only command. This rejects exfiltration forms such as
+            # ``cat secret | nc host`` (cat is not a whitelisted read-only
+            # program and nc is absent).
+            return all(PermissionEngine.is_readonly_command(seg) for seg in segments)
+        if _is_redirecting(cmd) or _is_compound(cmd):
+            # Redirection can clobber/leak; control-flow chains (&&, ||, ;, &)
+            # can hide a mutating or exfiltrating second command. Neither is
+            # auto-approvable.
             return False
         lowered = cmd.lower()
         if _MUTATING_GIT.search(lowered):
@@ -604,6 +646,12 @@ class PermissionEngine:
 
     @staticmethod
     def is_uncertain_shell(command: str) -> bool:
+        if _has_ambiguous_shell_expansion(command) or _is_redirecting(command):
+            return True
+        segments = _split_pipeline(command)
+        if len(segments) > 1:
+            # A read-only pipeline is not uncertain; anything else is.
+            return not all(PermissionEngine.is_readonly_command(seg) for seg in segments)
         if _is_compound(command):
             return True
         try:
@@ -620,10 +668,12 @@ class PermissionEngine:
 
 def _is_compound(command: str) -> bool:
     """Detect pipes, chains, redirects, substitutions, heredocs."""
-    # Rough conservative scan - not a full shell parser.
+    # Rough conservative scan - not a full shell parser. /dev/null stream
+    # discards (2>/dev/null) are harmless and excluded.
+    command = _DEVNULL_REDIRECT.sub("", command)
     if _has_ambiguous_shell_expansion(command):
         return True
-    specials = ("|", "&&", "||", ";", "&", "`", "$(", "${", ">", "<", "<<", "\n")
+    specials = ("|", "&&", "||", ";", "&", "`", "$(", "${", ">", "<", ">>", "\n")
     in_single = False
     in_double = False
     i = 0
@@ -642,6 +692,66 @@ def _is_compound(command: str) -> bool:
         shlex.split(command)
     except ValueError:
         return True
+    return False
+
+
+def _split_pipeline(command: str) -> list[str]:
+    """Split a command on unquoted ``|`` into its constituent segments.
+
+    Only simple ``cmd | cmd | cmd`` pipes are handled; control-flow operators
+    (``&&``, ``||``, ``;``) inside a segment are rejected upstream by the
+    ambiguity/redirect checks before this is consulted.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            current.append(ch)
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            current.append(ch)
+        elif ch == "|" and not in_single and not in_double:
+            segments.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    segments.append("".join(current))
+    return segments
+
+
+def _is_redirecting(command: str) -> bool:
+    """Return true when the command redraws to/from a real file (not /dev/null).
+
+    Discarding a stream to ``/dev/null`` (``2>/dev/null``, ``>/dev/null``,
+    ``&>/dev/null``) is harmless — it only sinks bytes, never clobbers a file or
+    reads a secret into a program — so it does NOT make a command mutating. Any
+    redirection to an actual file (``> out.txt``, ``>> log``) or reading a real
+    file via ``<`` (besides ``/dev/null``) is never auto-approved: it can
+    overwrite files or exfiltrate content. Output capture is the responsibility
+    of the shell-tool wrapper, not the model's own redirection.
+    """
+    stripped = _DEVNULL_REDIRECT.sub("", command)
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(stripped):
+        ch = stripped[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == ">":
+                return True
+            if ch == "<":
+                return True
+        i += 1
     return False
 
 

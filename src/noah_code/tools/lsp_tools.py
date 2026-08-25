@@ -135,18 +135,53 @@ class _LSPClient:
         self._open_documents: dict[str, tuple[int, int]] = {}
         self._closed = False
 
+    def _healthy(self) -> bool:
+        """True only while the transport can still deliver responses."""
+
+        return (
+            self.process is not None
+            and self.process.returncode is None
+            and self._reader_task is not None
+            and not self._reader_task.done()
+        )
+
+    async def _terminate(self, process: asyncio.subprocess.Process) -> None:
+        """Kill a process and its whole session group, then reap it."""
+
+        if process.returncode is None:
+            with contextlib.suppress(OSError):
+                if os.name != "nt":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+
+    async def _cancel_pump_tasks(self) -> None:
+        reader, self._reader_task = self._reader_task, None
+        stderr, self._stderr_task = self._stderr_task, None
+        for task in (reader, stderr):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
     async def start(self) -> None:
         if self._closed:
             raise RuntimeError("LSP client is closed")
-        if self.process is not None and self.process.returncode is None:
+        if self._healthy():
             return
         async with self._start_lock:
-            if self.process is not None and self.process.returncode is None:
+            if self._healthy():
                 return
-            self.process = None
+            stale, self.process = self.process, None
+            await self._cancel_pump_tasks()
             self._open_documents.clear()
             self._diagnostics.clear()
             self._diagnostic_events.clear()
+            if stale is not None:
+                # Never drop a live handle: the old server would leak.
+                await self._terminate(stale)
             self.process = await asyncio.create_subprocess_exec(
                 *self.command,
                 cwd=self.root,
@@ -186,9 +221,9 @@ class _LSPClient:
                 await self._notify_started("initialized", {})
             except Exception:
                 process, self.process = self.process, None
-                if process is not None and process.returncode is None:
-                    process.kill()
-                    await process.wait()
+                if process is not None:
+                    await self._terminate(process)
+                await self._cancel_pump_tasks()
                 raise
 
     async def request(
@@ -198,7 +233,7 @@ class _LSPClient:
         try:
             return await self._request_started(method, params, timeout=timeout)
         except (BrokenPipeError, ConnectionResetError, RuntimeError):
-            if self.process is not None and self.process.returncode is None:
+            if self._healthy():
                 raise
             await self.start()
             return await self._request_started(method, params, timeout=timeout)
@@ -293,19 +328,7 @@ class _LSPClient:
                 if length <= 0:
                     continue
                 message = json.loads(await stream.readexactly(length))
-                if (
-                    "id" in message
-                    and (future := self._pending.get(int(message["id"]))) is not None
-                ):
-                    if "error" in message:
-                        future.set_exception(RuntimeError(str(message["error"])))
-                    else:
-                        future.set_result(message.get("result"))
-                elif message.get("method") == "textDocument/publishDiagnostics":
-                    params = message.get("params", {})
-                    uri = str(params.get("uri", ""))
-                    self._diagnostics[uri] = list(params.get("diagnostics") or [])
-                    self._diagnostic_events.setdefault(uri, asyncio.Event()).set()
+                self._handle_message(message)
         except (EOFError, asyncio.CancelledError):
             pass
         except Exception as exc:  # noqa: BLE001
@@ -317,9 +340,36 @@ class _LSPClient:
                 if not future.done():
                     future.set_exception(RuntimeError("LSP server closed"))
 
+    def _handle_message(self, message: dict[str, Any]) -> None:
+        try:
+            request_id = int(message["id"])
+        except (KeyError, TypeError, ValueError):
+            request_id = None
+        future = self._pending.pop(request_id, None) if request_id is not None else None
+        if future is not None:
+            # wait_for cancels the future on timeout before the caller can pop
+            # it; a response landing in that window must not crash the loop.
+            if future.done():
+                return
+            if "error" in message:
+                future.set_exception(RuntimeError(str(message["error"])))
+            else:
+                future.set_result(message.get("result"))
+            return
+        if message.get("method") == "textDocument/publishDiagnostics":
+            params = message.get("params", {})
+            uri = str(params.get("uri", ""))
+            self._diagnostics[uri] = list(params.get("diagnostics") or [])
+            self._diagnostic_events.setdefault(uri, asyncio.Event()).set()
+
     async def _drain_stderr(self) -> None:
         assert self.process is not None and self.process.stderr is not None
-        while await self.process.stderr.read(4096):
+        try:
+            while await self.process.stderr.read(4096):
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - draining is best-effort
             pass
 
     async def close(self) -> None:
@@ -335,21 +385,18 @@ class _LSPClient:
                 await self._notify_started("exit", {})
         self._closed = True
         if self.process is not None and self.process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
+            with contextlib.suppress(OSError):
                 if os.name != "nt":
                     os.killpg(self.process.pid, signal.SIGTERM)
                 else:
                     self.process.terminate()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self.process.wait(), timeout=1.0)
-            if self.process.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    self.process.kill()
-        for task in (self._reader_task, self._stderr_task):
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+        if self.process is not None:
+            # Escalate to a process-group SIGKILL and reap; the server may have
+            # spawned children of its own that would otherwise linger.
+            await self._terminate(self.process)
+        await self._cancel_pump_tasks()
 
 
 class RepositoryMap:

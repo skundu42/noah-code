@@ -11,8 +11,10 @@ import pytest
 from click.testing import CliRunner
 
 from noah_code.cli import (
-    EXIT_OK,
+    EXIT_CONFIG,
+    EXIT_SIGINT,
     _configure_first_run_model,
+    _interactive,
     _prepare,
     cli_group,
     interactive_cmd,
@@ -373,8 +375,59 @@ async def test_prepare_interactive_still_auto_installs(monkeypatch, tmp_path: Pa
     monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))
 
     prepared, code = await _prepare(
-        path=str(tmp_path), model=None, reasoning_effort=None, auto=False, mode=None
+        path=str(tmp_path), model=None, reasoning_effort=None, auto=False, yolo=False, mode=None
     )
 
     assert prepared is None
-    assert code == EXIT_OK
+
+
+class _CloseTrackingHost:
+    closed: list[str] = []
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self._ui = kwargs.get("ui")
+
+    async def run_interactive(self) -> int:
+        raise KeyboardInterrupt
+
+    async def run_tui(self, *, onboarding_required: bool = False) -> int:
+        raise RuntimeError("Textual is required for the TUI but could not be imported.")
+
+    async def close(self) -> None:
+        _CloseTrackingHost.closed.append("tui" if self._ui is None else "console")
+
+
+def _interactive_kwargs(tmp_path: Path) -> dict[str, object]:
+    return {
+        "path": str(tmp_path),
+        "model": None,
+        "reasoning_effort": None,
+        "auto": False,
+        "yolo": False,
+        "mode": None,
+        "max_iterations": None,
+        "continue_session": False,
+        "session_id": None,
+        "unsafe_inprocess_code_execution": False,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_console", [True, False])
+async def test_interactive_closes_host_on_all_exit_paths(
+    monkeypatch, tmp_path: Path, use_console: bool
+) -> None:
+    """KeyboardInterrupt and TUI-import failures still close the host."""
+
+    _CloseTrackingHost.closed = []
+    monkeypatch.setattr("noah_code.cli.user_default_model", lambda: "openai/gpt")
+    monkeypatch.setattr("noah_code.cli.AgentHost", _CloseTrackingHost)
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: tmp_path / "missing.toml")
+    monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))
+
+    console_exit = await _interactive(use_console=True, **_interactive_kwargs(tmp_path))  # type: ignore[arg-type]
+    tui_exit = await _interactive(use_console=False, **_interactive_kwargs(tmp_path))  # type: ignore[arg-type]
+
+    assert console_exit == EXIT_SIGINT
+    assert tui_exit == EXIT_CONFIG
+    assert sorted(_CloseTrackingHost.closed) == ["console", "tui"]

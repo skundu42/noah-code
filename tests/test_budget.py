@@ -239,3 +239,46 @@ def test_status_reports_limits_and_totals() -> None:
     assert status["total_tokens"] == 150
     assert status["limits"]["max_tokens"] == 1000
     assert status["exceeded"] is None
+
+
+def test_nan_cost_cannot_disable_the_cap() -> None:
+    guard = BudgetGuard(BudgetConfig(max_cost_usd=1.0))
+    guard.add_usage(cost_usd=float("nan"))
+    assert guard.status()["cost_usd"] == 0.0
+
+    guard.add_usage(cost_usd=0.5)
+    with pytest.raises(BudgetExceeded, match="cost limit exceeded"):
+        guard.sync_cost_usd(1.25)
+
+
+def test_infinite_reported_cost_fails_closed() -> None:
+    guard = BudgetGuard(BudgetConfig(max_cost_usd=1.0))
+    guard.add_usage(cost_usd=float("inf"))
+    with pytest.raises(BudgetExceeded, match="cost limit exceeded"):
+        guard.enforce()
+
+
+def test_non_finite_token_counts_do_not_crash_accounting() -> None:
+    guard = BudgetGuard(BudgetConfig(max_tokens=100))
+    guard.add_usage(prompt_tokens=float("nan"), completion_tokens=float("inf"))
+    assert guard.total_tokens == 0
+
+
+def test_load_state_ignores_non_finite_cost() -> None:
+    guard = BudgetGuard(BudgetConfig(max_cost_usd=1.0))
+    guard.load_state({"cost_usd": float("nan"), "prompt_tokens": 10})
+    assert guard.status()["cost_usd"] == 0.0
+    assert guard.status()["prompt_tokens"] == 10
+
+
+def test_response_cost_nan_is_stamped_as_zero() -> None:
+    llm = FakeLLM(
+        responses=[FakeResponse(usage={"prompt_tokens": 2, "cost_usd": float("nan")})]
+    )
+    client, guard = wrap_with_budget(llm, BudgetConfig(max_cost_usd=1.0))
+
+    response = asyncio.run(client.acall([]))
+
+    assert response.usage is not None
+    assert response.usage["cost_usd"] == 0.0
+    assert guard.status()["cost_usd"] == 0.0

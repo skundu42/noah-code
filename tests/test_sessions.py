@@ -182,6 +182,69 @@ def test_embedded_session_id_must_match_directory(tmp_path: Path) -> None:
         store.load_meta(meta.session_id)
 
 
+@pytest.mark.parametrize("payload", ["null", "[]", '"a string"', "123"])
+def test_non_object_meta_raises_session_error(tmp_path: Path, payload: str) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    store = SessionStore(tmp_path / "sessions")
+    meta = store.create(workspace, model="m")
+    (store.session_dir / meta.session_id / "meta.json").write_text(payload)
+
+    with pytest.raises(SessionError, match="damaged session metadata"):
+        store.load_meta(meta.session_id)
+
+
+def test_listing_skips_sessions_with_non_object_meta(tmp_path: Path) -> None:
+    good = Workspace(root=(tmp_path / "good").resolve())
+    (tmp_path / "good").mkdir()
+    store = SessionStore(tmp_path / "sessions")
+    healthy = store.create(good, model="m")
+
+    corrupt_dir = store.session_dir / "deadbeefcafe"
+    corrupt_dir.mkdir()
+    (corrupt_dir / "meta.json").write_text("null")
+
+    ids = [item.session_id for item in store.list_sessions()]
+    assert ids == [healthy.session_id]
+
+
+def test_load_meta_wraps_unreadable_file_as_session_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pathlib import Path as _Path
+
+    workspace = Workspace(root=tmp_path.resolve())
+    store = SessionStore(tmp_path / "sessions")
+    meta = store.create(workspace, model="m")
+
+    def broken_read_text(self: _Path, *args: object, **kwargs: object) -> str:
+        raise OSError("simulated read failure")
+
+    monkeypatch.setattr(_Path, "read_text", broken_read_text)
+    with pytest.raises(SessionError, match="cannot read session metadata"):
+        store.load_meta(meta.session_id)
+
+
+def test_session_size_ignores_files_that_vanish_mid_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pathlib import Path as _Path
+
+    workspace = Workspace(root=tmp_path.resolve())
+    store = SessionStore(tmp_path / "sessions")
+    meta = store.create(workspace, model="m")
+    base_size = store.session_size(meta.session_id)
+
+    session_path = store.session_dir / meta.session_id
+    original_rglob = session_path.rglob
+
+    def rglob_with_ghost(self: _Path, pattern: str) -> object:
+        yield from original_rglob(pattern)
+        yield session_path / "ghost.db"
+
+    monkeypatch.setattr(_Path, "rglob", rglob_with_ghost)
+    assert store.session_size(meta.session_id) == base_size
+
+
 def test_load_event_page_is_chronological_and_paginated(tmp_path: Path) -> None:
     workspace = Workspace(root=tmp_path.resolve())
     store = SessionStore(tmp_path / "sessions")

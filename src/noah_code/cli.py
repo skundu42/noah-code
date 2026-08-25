@@ -79,6 +79,11 @@ def _common_options(fn):  # noqa: ANN001
         is_flag=True,
         help="Auto-approve routine asks (never overrides deny or elevated-risk approval)",
     )(fn)
+    fn = click.option(
+        "--yolo",
+        is_flag=True,
+        help="Skip all approvals and permission checks (dangerous; for isolated/throwaway environments)",
+    )(fn)
     fn = click.option("--model", "model", default=None, help="Override the model for this launch")(
         fn
     )
@@ -87,6 +92,13 @@ def _common_options(fn):  # noqa: ANN001
         type=click.Choice(["default", "none", "minimal", "low", "medium", "high", "xhigh"]),
         default=None,
         help="Reasoning effort for compatible models; default lets the provider decide",
+    )(fn)
+    fn = click.option(
+        "--max-iterations",
+        "max_iterations",
+        type=click.IntRange(min=1),
+        default=None,
+        help="Cap model tool-call turns per user request (default 40; budgets still brake)",
     )(fn)
     return fn
 
@@ -151,7 +163,9 @@ def interactive_cmd(
     model: str | None,
     reasoning_effort: str | None,
     auto: bool,
+    yolo: bool,
     mode: str | None,
+    max_iterations: int | None,
     continue_session: bool,
     session_id: str | None,
     use_console: bool,
@@ -169,9 +183,11 @@ def interactive_cmd(
             model=model,
             reasoning_effort=reasoning_effort,
             auto=auto,
+            yolo=yolo,
+            mode=mode,
+            max_iterations=max_iterations,
             continue_session=continue_session,
             session_id=session_id,
-            mode=mode,
             use_console=use_console,
             unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
         )
@@ -196,7 +212,9 @@ def run_cmd(
     model: str | None,
     reasoning_effort: str | None,
     auto: bool,
+    yolo: bool,
     mode: str | None,
+    max_iterations: int | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
 ) -> None:
@@ -208,7 +226,9 @@ def run_cmd(
             model=model,
             reasoning_effort=reasoning_effort,
             auto=auto,
+            yolo=yolo,
             mode=mode,
+            max_iterations=max_iterations,
             session_id=session_id,
             unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
         )
@@ -793,7 +813,9 @@ async def _prepare(
     model: str | None,
     reasoning_effort: str | None,
     auto: bool,
+    yolo: bool,
     mode: str | None,
+    max_iterations: int | None = None,
     continue_session: bool = False,
     session_id: str | None = None,
     frontend: Literal["tui", "console"] | None = None,
@@ -813,6 +835,10 @@ async def _prepare(
         overrides["reasoning_effort"] = reasoning_effort
     if auto:
         overrides["auto_approve"] = True
+    if yolo:
+        overrides["yolo"] = True
+    if max_iterations is not None:
+        overrides["max_iterations"] = max_iterations
     if mode:
         overrides["mode"] = mode
     if frontend is not None:
@@ -859,9 +885,11 @@ async def _interactive(
     model: str | None,
     reasoning_effort: str | None,
     auto: bool,
+    yolo: bool,
+    mode: str | None,
+    max_iterations: int | None,
     continue_session: bool,
     session_id: str | None,
-    mode: str | None,
     use_console: bool,
     unsafe_inprocess_code_execution: bool,
 ) -> int:
@@ -882,7 +910,9 @@ async def _interactive(
         model=model,
         reasoning_effort=reasoning_effort,
         auto=auto,
+        yolo=yolo,
         mode=mode,
+        max_iterations=max_iterations,
         continue_session=continue_session,
         session_id=session_id,
         frontend=frontend,
@@ -906,7 +936,9 @@ async def _interactive(
             model=model,
             reasoning_effort=reasoning_effort,
             auto=auto,
+            yolo=yolo,
             mode=mode,
+            max_iterations=max_iterations,
             continue_session=continue_session,
             session_id=session_id,
             frontend=frontend,
@@ -925,12 +957,17 @@ async def _interactive(
             and config.model == NoahCodeConfig().model
         )
         try:
-            return await host.run_tui(onboarding_required=onboarding_required)
-        except RuntimeError as exc:
-            click.echo(f"error: {exc}", err=True)
-            return EXIT_CONFIG
-        except KeyboardInterrupt:
-            return EXIT_SIGINT
+            try:
+                return await host.run_tui(onboarding_required=onboarding_required)
+            except RuntimeError as exc:
+                click.echo(f"error: {exc}", err=True)
+                return EXIT_CONFIG
+            except KeyboardInterrupt:
+                return EXIT_SIGINT
+        finally:
+            # run_tui closes itself, but an import failure or a close that was
+            # cut short by cancellation must not leak leases, storage, or tools.
+            await host.close()
     host = AgentHost(
         workspace,
         config,
@@ -939,9 +976,12 @@ async def _interactive(
         ui=ConsoleUI(markdown=config.ui.markdown),
     )
     try:
-        return await host.run_interactive()
-    except KeyboardInterrupt:
-        return EXIT_SIGINT
+        try:
+            return await host.run_interactive()
+        except KeyboardInterrupt:
+            return EXIT_SIGINT
+    finally:
+        await host.close()
 
 
 async def _run_session(
@@ -951,7 +991,9 @@ async def _run_session(
     model: str | None,
     reasoning_effort: str | None,
     auto: bool,
+    yolo: bool,
     mode: str | None,
+    max_iterations: int | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
 ) -> int:
@@ -962,7 +1004,9 @@ async def _run_session(
         model=model,
         reasoning_effort=reasoning_effort,
         auto=auto,
+        yolo=yolo,
         mode=mode,
+        max_iterations=max_iterations,
         session_id=session_id,
         frontend="console",
         unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,

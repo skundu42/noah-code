@@ -247,12 +247,29 @@ class SnapshotJournal:
         }
 
     def load_dict(self, data: dict | None) -> None:
-        if not data:
-            self._turns = []
-            self._redo = []
-            return
-        self._turns = [self._turn_from_dict(t) for t in data.get("turns", [])]
-        self._redo = [self._turn_from_dict(t) for t in data.get("redo", [])]
+        """Restore a journal, dropping individually corrupted turns.
+
+        A persisted journal can be partially corrupted (truncated base64,
+        missing fields). Undo is all-or-nothing per turn, so discarding a
+        damaged turn keeps the remaining turns internally consistent instead
+        of crashing on load.
+        """
+
+        turns = self._load_turns(data.get("turns") if isinstance(data, dict) else None)
+        redo = self._load_turns(data.get("redo") if isinstance(data, dict) else None)
+        self._turns = turns
+        self._redo = redo
+
+    def _load_turns(self, entries: object) -> list[TurnJournal]:
+        if not isinstance(entries, list):
+            return []
+        loaded: list[TurnJournal] = []
+        for entry in entries:
+            try:
+                loaded.append(self._turn_from_dict(entry))
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+        return loaded
 
     @staticmethod
     def _turn_to_dict(turn: TurnJournal) -> dict:

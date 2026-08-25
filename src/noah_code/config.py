@@ -237,6 +237,7 @@ class NoahCodeConfig(BaseModel):
     )
     permission_rules: list[PermissionRule] = Field(default_factory=list)
     auto_approve: bool = False
+    yolo: bool = False
     enabled_skills: list[str] = Field(default_factory=list)
     mcp: dict[str, Any] = Field(default_factory=dict)
     ui: UIConfig = Field(default_factory=UIConfig)
@@ -634,6 +635,13 @@ def _env_overrides() -> dict[str, Any]:
         out["updates"] = {"auto_install": auto_update.lower() in {"1", "true", "yes", "on"}}
     if efficiency_profile := os.environ.get("NOAH_CODE_EFFICIENCY"):
         out["efficiency"] = {"profile": efficiency_profile.lower()}
+    if max_iterations := os.environ.get("NOAH_CODE_MAX_ITERATIONS"):
+        try:
+            out["max_iterations"] = int(max_iterations)
+        except ValueError:
+            raise ConfigError(
+                "NOAH_CODE_MAX_ITERATIONS must be an integer >= 1"
+            ) from None
     return out
 
 

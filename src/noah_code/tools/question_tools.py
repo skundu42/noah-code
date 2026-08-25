@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -85,10 +86,7 @@ class QuestionTools(Skill):
             )
         try:
             async with self._ui_lock:
-                answer = await asyncio.wait_for(
-                    self._handler([item]),
-                    timeout=self._timeout_seconds,
-                )
+                answer = await self._await_handler([item])
         except asyncio.CancelledError:
             if interaction_id:
                 assert runtime is not None
@@ -118,6 +116,23 @@ class QuestionTools(Skill):
                 {"selections": chosen, "custom": custom},
             )
         return "\n".join(part for part in parts if part).strip()
+
+    async def _await_handler(self, prompts: list[QuestionPrompt]) -> QuestionAnswer:
+        """Await the handler, never discarding a result that arrived at timeout."""
+
+        assert self._handler is not None
+        task = asyncio.ensure_future(self._handler(prompts))
+        try:
+            await asyncio.wait({task}, timeout=self._timeout_seconds)
+            if not task.done():
+                raise TimeoutError("user question timed out")
+            return task.result()
+        except BaseException:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            raise
 
 
 async def console_question_handler(

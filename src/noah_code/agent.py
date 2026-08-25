@@ -124,6 +124,7 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("ws", "read_output"),
             ("ws", "replace"),
             ("ws", "run"),
+            ("ws", "run_trusted_readonly"),
             ("ws", "search"),
             ("ws", "write"),
             ("ws", "write_file"),
@@ -469,6 +470,7 @@ class CodingAgent(InteractiveAgent):
             config.permission_rules,
             mode=config.mode,
             auto_approve=config.auto_approve,
+            yolo=config.yolo,
         )
         self._engine.mode = config.mode
         self._approvals = approvals or ApprovalBroker(
@@ -859,6 +861,11 @@ class CodingAgent(InteractiveAgent):
         in the notification. Understand the requested end state before acting.
         Conversational questions are first-class: answer them with
         ``self.message(...)`` then return DONE. Do not emit bare assistant prose.
+        IMPORTANT: ``self.message(...)`` is SYNCHRONOUS — call it WITHOUT
+        ``await`` (``self.message("...")``). Prefixing ``await`` raises
+        ``TypeError: object NoneType can't be used in 'await' expression``
+        because it returns ``None``. All ``self.ws.*``, ``self.web.*``,
+        ``self.lsp.*``, ``self.processes.*`` calls ARE async and need ``await``.
 
         Minimal tool cookbook:
         - ``await self.ws.list("**/*.py")`` lists files.
@@ -866,7 +873,10 @@ class CodingAgent(InteractiveAgent):
         - ``match = await self.ws.read("path.py", lines=(10, 30))`` returns an
           editable Match; ``await self.ws.replace(match, "replacement")`` edits it.
         - ``await self.ws.edit("path.py", "unique old text", "new text")`` is the
-          simple string-edit form. ``await self.ws.write("new.py", content)`` creates files.
+          simple string-edit form and takes exactly three arguments (path, old,
+          new); two-argument calls are invalid. For a Match from read(), edit
+          with ``await self.ws.replace(match, "replacement")`` instead.
+          ``await self.ws.write("new.py", content)`` creates files.
         - Prefer ``await self.ws.apply_patch(changes)`` for coherent edits. Each change is
           ``{"path": ..., "old": exact_text_or_None, "new": replacement_or_None}``;
           one call validates and atomically commits the full batch.
@@ -878,6 +888,19 @@ class CodingAgent(InteractiveAgent):
           long-running commands. Consume logs by cursor; do not poll without new work.
         - ``result = await self.ws.run("pytest -q")`` runs validation; inspect
           ``result.returncode``, ``result.stdout``, and ``result.stderr``.
+          ``read_only=True`` skips approval ONLY for commands the engine
+          recognizes as read-only (``git status/log/diff/show``, ``rg``,
+          ``grep``, ``ls``, ``find`` (no -delete/-exec), ``head``, ``tail``,
+          ``wc``, ``sed``, ``awk``, ``sort``, ``uniq``, ``cut``, ``tr``,
+          ``tac``, ``column``, ``pwd``, ``file``, ``stat``, ``test``). It is
+          REJECTED for anything else — including ``pytest``, ``uv``, ``python``,
+          and build commands — so do NOT pass ``read_only=True`` for those; run
+          them with plain ``await self.ws.run(cmd)`` (YOLO auto-approves;
+          ``--auto`` prompts).
+        - If the host was launched with ``--yolo``, every approval is granted
+          automatically without prompting. That mode exists for throwaway or
+          sandboxed environments only; do not assume it is active — write code
+          that works under normal permission gating.
         - ``await self.web.fetch(url)`` reads a page; ``await self.web.search(query)``
           searches the public web. Both are read-only and allowed by default.
         - ``await self.github.list()`` / ``view(number)`` inspect pull requests.
@@ -919,10 +942,28 @@ class CodingAgent(InteractiveAgent):
           or mutating ``gh pr`` through the shell.
         - Do not read secrets or expose sensitive environment values.
 
+        Forbidden inside sandboxed code cells (do NOT attempt - they always fail
+        and burn turns): ``import os``, ``import sys``, ``import subprocess``,
+        ``import shutil``, ``import nooa``, ``import noah_code``, and any of
+        ``eval()``, ``exec()``, ``compile()``, ``__import__()``. If you need to
+        run shell logic or a host feature, do it with ``self.ws.run(...)``
+        (read-only shell is auto-approved), ``self.web``, ``self.lsp``, or the
+        dedicated tools - never by importing a blocked module. Use
+        ``self.ws.inspect(...)`` on Python data; do not try to reach host
+        objects from a cell.
+
         Return exactly one valid RespondResult:
         - DONE - request complete
         - NEED_INPUT - user input genuinely required
         - WAIT - a registered background job is still running
+
+        To end the turn, call ``return_result(RespondReason.DONE,
+        explanation="...")`` — ``return_result`` takes a ``RespondReason``
+        and an ``explanation`` string, NEVER a bare string as ``result=``
+        (that raises ``return_result validation error: 'result' has wrong
+        type``). To show the user text, call the synchronous
+        ``self.message("...")`` first (no ``await``), then
+        ``return_result(RespondReason.DONE, explanation="summary")``.
         """
         ...
 

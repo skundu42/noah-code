@@ -208,14 +208,31 @@ class GitTools(Skill):
 
     async def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
         def run() -> subprocess.CompletedProcess[str]:
-            return subprocess.run(
-                ["git", *args],
-                cwd=self._ws._workspace.root,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
+            try:
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=self._ws._workspace.root,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                # Callers already branch on returncode/stderr; a synthetic
+                # result keeps every path (review/revert/patch) uniform.
+                return subprocess.CompletedProcess(
+                    args,
+                    returncode=124,
+                    stdout="",
+                    stderr=f"git {args[0]!r} timed out after 10s",
+                )
+            except FileNotFoundError:
+                return subprocess.CompletedProcess(
+                    args,
+                    returncode=127,
+                    stdout="",
+                    stderr="git is not installed or not on PATH",
+                )
 
         return await asyncio.to_thread(run)
 

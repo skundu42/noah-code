@@ -14,6 +14,7 @@ Enforcement points:
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
 from typing import Any
@@ -23,6 +24,30 @@ from noah_code.config import BudgetConfig
 
 class BudgetExceeded(RuntimeError):
     """Raised when a configured session cap would be exceeded."""
+
+
+def _sanitize_tokens(value: Any) -> int:
+    """Garbage-proof a token count; providers occasionally report NaN/inf."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number):
+        return 0
+    return max(int(number), 0)
+
+
+def _sanitize_cost(value: Any) -> float:
+    """Drop NaN/garbage cost, keep +inf so a broken pricing feed fails closed."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(number):
+        return 0.0
+    return max(number, 0.0)
 
 
 class BudgetGuard:
@@ -66,9 +91,9 @@ class BudgetGuard:
         cost_usd: float = 0.0,
     ) -> None:
         with self._lock:
-            self._prompt_tokens += max(int(prompt_tokens), 0)
-            self._completion_tokens += max(int(completion_tokens), 0)
-            self._cost_usd += max(float(cost_usd), 0.0)
+            self._prompt_tokens += _sanitize_tokens(prompt_tokens)
+            self._completion_tokens += _sanitize_tokens(completion_tokens)
+            self._cost_usd += _sanitize_cost(cost_usd)
 
     def enforce(self) -> None:
         """Raise BudgetExceeded when any configured cap is breached."""
@@ -92,7 +117,7 @@ class BudgetGuard:
         """
 
         with self._lock:
-            self._cost_usd = max(self._cost_usd, max(float(total_cost_usd), 0.0))
+            self._cost_usd = max(self._cost_usd, _sanitize_cost(total_cost_usd))
         self.enforce()
 
     def observe_cost_usd(self, total_cost_usd: float) -> None:
@@ -104,7 +129,7 @@ class BudgetGuard:
         """
 
         with self._lock:
-            self._cost_usd = max(self._cost_usd, max(float(total_cost_usd), 0.0))
+            self._cost_usd = max(self._cost_usd, _sanitize_cost(total_cost_usd))
             if self.exceeded is None:
                 self.exceeded = self._breach()
 
@@ -143,9 +168,9 @@ class BudgetGuard:
         if not data:
             return
         with self._lock:
-            self._prompt_tokens = max(int(data.get("prompt_tokens", 0)), 0)
-            self._completion_tokens = max(int(data.get("completion_tokens", 0)), 0)
-            self._cost_usd = max(float(data.get("cost_usd", 0.0)), 0.0)
+            self._prompt_tokens = _sanitize_tokens(data.get("prompt_tokens", 0))
+            self._completion_tokens = _sanitize_tokens(data.get("completion_tokens", 0))
+            self._cost_usd = _sanitize_cost(data.get("cost_usd", 0.0))
             started_at = float(data.get("started_at", time.time()))
             self._started_wall = min(started_at, time.time())
             elapsed = max(time.time() - self._started_wall, 0.0)
@@ -176,7 +201,7 @@ def _cost_from_response(response: Any, usage: dict[str, Any]) -> float:
             import litellm
 
             cost = litellm.completion_cost(completion_response=raw)
-        return max(float(cost or 0.0), 0.0)
+        return _sanitize_cost(cost)
     except Exception:  # noqa: BLE001 - pricing must never break a turn
         return 0.0
 
@@ -192,12 +217,19 @@ def _usage_from_response(response: Any) -> tuple[int, int, float]:
 
     usage = getattr(response, "usage", None)
     usage_dict = usage if isinstance(usage, dict) else {}
-    prompt = int(usage_dict.get("prompt_tokens") or usage_dict.get("input_tokens") or 0)
-    completion = int(usage_dict.get("completion_tokens") or usage_dict.get("output_tokens") or 0)
+    prompt = _sanitize_tokens(usage_dict.get("prompt_tokens") or usage_dict.get("input_tokens"))
+    completion = _sanitize_tokens(
+        usage_dict.get("completion_tokens") or usage_dict.get("output_tokens")
+    )
     cost = _cost_from_response(response, usage_dict)
     try:
         if isinstance(usage, dict):
-            usage.setdefault("cost_usd", cost)
+            existing = usage.get("cost_usd")
+            if existing is None or not math.isfinite(float(existing)):
+                # Never leave provider-reported NaN/inf on the telemetry seam.
+                usage["cost_usd"] = cost
+            else:
+                usage.setdefault("cost_usd", cost)
         elif cost > 0.0:
             response.usage = {"cost_usd": cost}
     except Exception:  # noqa: BLE001 - telemetry must never break a turn

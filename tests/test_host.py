@@ -25,7 +25,7 @@ from noah_code.host import (
 )
 from noah_code.mcp_setup import MCPInstallResult
 from noah_code.permissions import PermissionEngine
-from noah_code.sessions import SessionStore
+from noah_code.sessions import SessionError, SessionStore
 from noah_code.workspace import Workspace
 from noah_code.worktree import WorktreeError
 
@@ -140,7 +140,8 @@ def test_iteration_limit_error_recommends_narrower_follow_up() -> None:
 
     assert text == (
         "Reached the iteration limit (40/40 turns). "
-        "Continue with a narrower follow-up."
+        "Continue with a narrower follow-up, or relaunch with "
+        "`--max-iterations N` / NOAH_CODE_MAX_ITERATIONS to raise the cap."
     )
 
 
@@ -1278,6 +1279,63 @@ async def test_session_switch_clears_steer_queue(tmp_path: Path) -> None:
     await host.start_new_session()
     assert len(host.steer_queue) == 0
     await host.close()
+
+
+async def test_failed_switch_session_leaves_current_session_intact(
+    tmp_path: Path,
+) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    (tmp_path / "other").mkdir()
+    config = load_config(
+        workspace.root, cli_overrides={"session_dir": str(tmp_path / "sessions")}
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    meta = await host.start()
+    agent_before = host.agent
+
+    with pytest.raises(SessionError, match="invalid session id"):
+        await host.switch_session("nope-not-valid")
+    assert host.meta.session_id == meta.session_id
+    assert host.agent is agent_before
+    assert host._storage is not None
+    assert host._workspace_lease is not None
+
+    foreign_meta = host.store.create(Workspace(root=(tmp_path / "other").resolve()), model="m")
+    with pytest.raises(SessionError, match="belongs to"):
+        await host.switch_session(foreign_meta.session_id)
+    assert host.meta.session_id == meta.session_id
+    assert host.agent is agent_before
+    assert host._storage is not None
+    assert host._workspace_lease is not None
+
+    await host.close()
+
+
+async def test_close_completes_teardown_when_cancelled_mid_finally(
+    tmp_path: Path,
+) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root, cli_overrides={"session_dir": str(tmp_path / "sessions")}
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    assert host._workspace_lease is not None
+
+    async def cancel_during_teardown() -> None:
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+
+    host._cancel_background_tasks = cancel_during_teardown  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await host.close()
+
+    # Cancellation must not skip any teardown step.
+    assert host._agent is None
+    assert host._runtime is None
+    assert host._storage is None
+    assert host._workspace_lease is None
 
 
 @pytest.mark.asyncio
