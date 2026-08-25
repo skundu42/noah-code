@@ -925,12 +925,17 @@ async def _interactive(
             and config.model == NoahCodeConfig().model
         )
         try:
-            return await host.run_tui(onboarding_required=onboarding_required)
-        except RuntimeError as exc:
-            click.echo(f"error: {exc}", err=True)
-            return EXIT_CONFIG
-        except KeyboardInterrupt:
-            return EXIT_SIGINT
+            try:
+                return await host.run_tui(onboarding_required=onboarding_required)
+            except RuntimeError as exc:
+                click.echo(f"error: {exc}", err=True)
+                return EXIT_CONFIG
+            except KeyboardInterrupt:
+                return EXIT_SIGINT
+        finally:
+            # run_tui closes itself, but an import failure or a close that was
+            # cut short by cancellation must not leak leases, storage, or tools.
+            await host.close()
     host = AgentHost(
         workspace,
         config,
@@ -939,9 +944,12 @@ async def _interactive(
         ui=ConsoleUI(markdown=config.ui.markdown),
     )
     try:
-        return await host.run_interactive()
-    except KeyboardInterrupt:
-        return EXIT_SIGINT
+        try:
+            return await host.run_interactive()
+        except KeyboardInterrupt:
+            return EXIT_SIGINT
+    finally:
+        await host.close()
 
 
 async def _run_session(
