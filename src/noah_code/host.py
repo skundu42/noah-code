@@ -734,13 +734,15 @@ class AgentHost:
             await self._persist_async()
         finally:
             # Also cover cancellation/failure before the normal drain above.
-            await self._cancel_background_tasks()
+            # Each step suppresses fresh cancellation so one delivery cannot
+            # skip the rest: that would leak storage, LSP servers, telemetry,
+            # and most importantly the workspace lease.
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._cancel_background_tasks()
             self._teardown_event_bridge()
             if self._agent is not None:
-                try:
+                with contextlib.suppress(Exception, asyncio.CancelledError):
                     await self._agent.close_tools()
-                except Exception:  # noqa: BLE001
-                    logger.debug("shell close failed", exc_info=True)
             if self._storage is not None:
                 self._storage.close()
                 self._storage = None
@@ -751,7 +753,8 @@ class AgentHost:
                     flush_traces()
                 except Exception:  # noqa: BLE001
                     logger.debug("trace flush failed", exc_info=True)
-            await asyncio.to_thread(self._telemetry.shutdown)
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.to_thread(self._telemetry.shutdown)
             self._agent = None
             self._runtime = None
             self._release_workspace_lease()
@@ -869,6 +872,10 @@ class AgentHost:
     async def switch_session(self, session_id: str) -> SessionMeta:
         """Persist current session and resume another."""
         self._require_idle_turn()
+        # Validate the target before tearing anything down so a failed resume
+        # leaves the current session fully intact.
+        meta = self.store.load_meta(session_id)
+        rebound = self.store.workspace_for_resume(meta, self.workspace)
         self._clear_steer_state()
         await self._cancel_background_tasks()
         await self._persist_async()
@@ -883,8 +890,7 @@ class AgentHost:
         self._runtime = None
         self._release_workspace_lease()
         self._usage = UsageTracker()
-        meta = self.store.load_meta(session_id)
-        self.workspace = self.store.workspace_for_resume(meta, self.workspace)
+        self.workspace = rebound
         self.meta = meta
         self._exit_requested = False
         return await self.start()
