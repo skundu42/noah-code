@@ -65,6 +65,8 @@ class SessionMeta:
     @classmethod
     def from_json(cls, raw: str) -> SessionMeta:
         data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError(f"meta payload must be a JSON object, got {type(data).__name__}")
         allowed = {item.name for item in fields(cls)}
         return cls(**{key: value for key, value in data.items() if key in allowed})
 
@@ -115,7 +117,15 @@ class SessionStore:
 
     def session_size(self, session_id: str) -> int:
         path = self._session_path(session_id)
-        return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+        total = 0
+        for item in path.rglob("*"):
+            try:
+                if item.is_file():
+                    total += item.stat().st_size
+            except OSError:
+                # A file can vanish between listing and stat (journal rewrite).
+                continue
+        return total
 
     def acquire_workspace_lease(
         self, session_id: str, workspace: Workspace
@@ -213,10 +223,14 @@ class SessionStore:
             raise SessionError(f"session not found: {session_id}")
         try:
             meta = SessionMeta.from_json(path.read_text())
-        except (json.JSONDecodeError, TypeError, KeyError) as exc:
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError) as exc:
             raise SessionError(
                 f"damaged session metadata for {session_id}: {exc}. "
                 f"Delete with: noah-code sessions delete {session_id}"
+            ) from exc
+        except OSError as exc:
+            raise SessionError(
+                f"cannot read session metadata for {session_id}: {exc}"
             ) from exc
         if meta.session_id != session_id:
             raise SessionError(
@@ -261,7 +275,8 @@ class SessionStore:
                 continue
             try:
                 meta = SessionMeta.from_json(meta_path.read_text())
-            except (json.JSONDecodeError, TypeError, KeyError):
+            except (json.JSONDecodeError, ValueError, TypeError, KeyError, OSError):
+                # Damaged or unreadable metadata must not break the listing.
                 continue
             if (
                 meta.session_id != child.name
