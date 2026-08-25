@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import http.client
 import json
 import os
 import shutil
@@ -10,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
+import typing
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ from noah_code import __version__
 
 PACKAGE_NAME = "noah-code"
 PYPI_METADATA_URL = "https://pypi.org/pypi/noah-code/json"
+AUTO_UPDATE_LOCK_STALE_SECONDS = 3600.0
 
 
 class UpdateError(RuntimeError):
@@ -41,8 +43,8 @@ class UpdateStatus:
 
 
 def _state_path() -> Path:
-    root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return root.expanduser() / "noah-code" / "update.json"
+    root = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(root).expanduser() / "noah-code" / "update.json"
 
 
 def _read_state() -> dict[str, object]:
@@ -70,6 +72,53 @@ def _write_state(state: dict[str, object]) -> None:
     finally:
         with contextlib.suppress(FileNotFoundError):
             Path(temporary).unlink()
+
+
+def _lock_path() -> Path:
+    return _state_path().parent / "auto-update.lock"
+
+
+def _acquire_auto_update_lock(
+    *, stale_after: float = AUTO_UPDATE_LOCK_STALE_SECONDS
+) -> typing.IO[str] | None:
+    """Claim the auto-update slot for this process, or None if someone else holds it.
+
+    Guards against two concurrent processes both passing the interval check and
+    running `uv tool upgrade` at the same time. A lock older than `stale_after`
+    is treated as abandoned and taken over.
+    """
+
+    path = _lock_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.parent.chmod(0o700)
+    except OSError:
+        return None
+    for _ in range(2):
+        try:
+            handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - path.stat().st_mtime <= stale_after:
+                    return None
+            except OSError:
+                return None
+            with contextlib.suppress(OSError):
+                path.unlink()
+            continue
+        except OSError:
+            return None
+        return os.fdopen(handle, "w")
+    return None
+
+
+def _release_auto_update_lock(handle: typing.IO[str] | None) -> None:
+    if handle is None:
+        return
+    with contextlib.suppress(OSError):
+        handle.close()
+    with contextlib.suppress(OSError):
+        _lock_path().unlink()
 
 
 def find_uv() -> Path | None:
@@ -112,7 +161,7 @@ def check_for_update(*, timeout: float = 5.0) -> UpdateStatus:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
             raw = response.read(1_000_001)
-    except (OSError, urllib.error.URLError) as exc:
+    except (OSError, http.client.HTTPException) as exc:
         raise UpdateError(f"could not query PyPI: {exc}") from exc
     if len(raw) > 1_000_000:
         raise UpdateError("PyPI response exceeded 1 MB")
@@ -164,24 +213,30 @@ def maybe_auto_update(*, interval_hours: int, timeout: float) -> str | None:
     if isinstance(checked_at, int | float) and now - checked_at < interval_hours * 3600:
         return None
 
-    next_state: dict[str, object] = {"checked_at": now, "current": __version__}
+    lock = _acquire_auto_update_lock()
+    if lock is None:
+        return None  # another process is already updating
     try:
-        status = check_for_update(timeout=timeout)
-        next_state["latest"] = status.latest
-        if not status.available:
+        next_state: dict[str, object] = {"checked_at": now, "current": __version__}
+        try:
+            status = check_for_update(timeout=timeout)
+            next_state["latest"] = status.latest
+            if not status.available:
+                _write_state(next_state)
+                return None
+            output = upgrade(uv=uv)
+            next_state["updated_to"] = status.latest
+            _write_state(next_state)
+            return (
+                f"noah-code {status.current} was updated to {status.latest}; "
+                "rerun your command to use the new version\n" + output
+            )
+        except UpdateError as exc:
+            next_state["error"] = str(exc)
             _write_state(next_state)
             return None
-        output = upgrade(uv=uv)
-        next_state["updated_to"] = status.latest
-        _write_state(next_state)
-        return (
-            f"noah-code {status.current} was updated to {status.latest}; "
-            "rerun your command to use the new version\n" + output
-        )
-    except UpdateError as exc:
-        next_state["error"] = str(exc)
-        _write_state(next_state)
-        return None
+    finally:
+        _release_auto_update_lock(lock)
 
 
 def maybe_check_for_update(*, interval_hours: int, timeout: float) -> UpdateStatus | None:
