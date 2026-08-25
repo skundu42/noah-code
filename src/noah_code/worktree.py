@@ -204,9 +204,16 @@ class WorktreeManager:
             raise WorktreeError(f"not a Noah worktree: {directory}")
         listed = {item.directory: item for item in self.list()}
         info = listed.get(directory, owned)
-        removed = _git(self.checkout, "worktree", "remove", "--force", str(directory))
-        if removed.returncode != 0:
-            raise WorktreeError(_git_message(removed))
+        if directory.exists():
+            removed = _git(self.checkout, "worktree", "remove", "--force", str(directory))
+            if removed.returncode != 0:
+                raise WorktreeError(_git_message(removed))
+        else:
+            # The directory vanished (crash or manual deletion); only a prune
+            # can drop the stale registration.
+            pruned = _git(self.checkout, "worktree", "prune", "--verbose")
+            if pruned.returncode != 0:
+                raise WorktreeError(_git_message(pruned))
         if info.branch:
             _git(self.checkout, "branch", "-D", info.branch)
         if directory.exists():
