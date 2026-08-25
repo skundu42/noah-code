@@ -9,6 +9,7 @@ import ipaddress
 import re
 import socket
 import ssl
+import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Protocol
@@ -27,6 +28,13 @@ _USER_AGENT = "noah-code/0.2 (+https://github.com/skundu42/noah-code)"
 _MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+_RATE_LIMIT_STATUS = 429
+_MAX_RATE_LIMIT_RETRIES = 2
+_DEFAULT_BACKOFF_SECONDS = 0.5
+_MAX_RETRY_AFTER_SECONDS = 5.0
+
+# Module level so tests can stub time without real delays.
+_sleep = time.sleep
 
 
 class WebTransport(Protocol):
@@ -95,7 +103,7 @@ def _request_pinned(
     *,
     timeout: float,
     max_bytes: int,
-) -> tuple[int, str | None, str, bytes]:
+) -> tuple[int, str | None, str | None, str, bytes]:
     connection = _open_pinned_connection(target, address, timeout)
     try:
         connection.request(
@@ -111,6 +119,7 @@ def _request_pinned(
         return (
             response.status,
             response.getheader("Location"),
+            response.getheader("Retry-After"),
             str(response.getheader("Content-Type") or "text/plain"),
             response.read(max_bytes + 1),
         )
@@ -123,9 +132,11 @@ class _PublicWebTransport:
 
     def fetch(self, url: str, *, timeout: float, max_bytes: int) -> tuple[str, str]:
         current_url = _require_http_url(url)
-        for redirect_count in range(_MAX_REDIRECTS + 1):
+        redirects = 0
+        rate_limit_retries = 0
+        while True:
             target = _validated_public_target(current_url)
-            payload: tuple[int, str | None, str, bytes] | None = None
+            payload: tuple[int, str | None, str | None, str, bytes] | None = None
             connection_error: OSError | None = None
             for address in target.addresses:
                 try:
@@ -144,10 +155,17 @@ class _PublicWebTransport:
                     raise connection_error
                 raise OSError(f"could not connect to public URL: {target.host}")
 
-            status, location, content_type, body = payload
+            status, location, retry_after, content_type, body = payload
+            if status == _RATE_LIMIT_STATUS:
+                if rate_limit_retries >= _MAX_RATE_LIMIT_RETRIES:
+                    raise OSError(f"web rate limited by {target.host}")
+                rate_limit_retries += 1
+                _sleep(min(_retry_after_seconds(retry_after), _MAX_RETRY_AFTER_SECONDS))
+                continue
             if status in _REDIRECT_STATUSES and location:
-                if redirect_count >= _MAX_REDIRECTS:
+                if redirects >= _MAX_REDIRECTS:
                     raise ValueError(f"web redirect limit exceeded ({_MAX_REDIRECTS})")
+                redirects += 1
                 current_url = _require_http_url(urljoin(current_url, location))
                 continue
 
@@ -160,7 +178,6 @@ class _PublicWebTransport:
                 return content_type, body.decode(charset, errors="replace")
             except LookupError:
                 return content_type, body.decode("utf-8", errors="replace")
-        raise ValueError(f"web redirect limit exceeded ({_MAX_REDIRECTS})")
 
 
 class _HTMLText(HTMLParser):
@@ -292,6 +309,21 @@ class WebTools(Skill):
         for index, (title, href) in enumerate(unique, start=1):
             lines.append(f"{index}. {title}\n   {href}")
         return "\n".join(lines)
+
+
+def _retry_after_seconds(header: str | None) -> float:
+    """Parse a numeric ``Retry-After`` value; fall back to the default backoff.
+
+    HTTP-date forms are not honored (they would require a clock read); the
+    default backoff keeps behavior bounded either way.
+    """
+
+    if not header:
+        return _DEFAULT_BACKOFF_SECONDS
+    try:
+        return max(0.0, float(header.strip()))
+    except ValueError:
+        return _DEFAULT_BACKOFF_SECONDS
 
 
 def _require_http_url(url: str) -> str:

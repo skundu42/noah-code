@@ -9,7 +9,14 @@ import pytest
 from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.config import DEFAULT_PERMISSION_RULES
 from noah_code.permissions import PermissionEngine
-from noah_code.tools.web_tools import WebTools, _PublicWebTransport, _validated_public_target
+from noah_code.tools.web_tools import (
+    _DEFAULT_BACKOFF_SECONDS,
+    _MAX_RATE_LIMIT_RETRIES,
+    _MAX_RETRY_AFTER_SECONDS,
+    WebTools,
+    _PublicWebTransport,
+    _validated_public_target,
+)
 
 
 async def _always_once(_req):
@@ -26,10 +33,11 @@ class _FakeTransport:
     def __init__(self, responses: dict[str, tuple[str, str]]) -> None:
         self.responses = responses
         self.calls: list[str] = []
+        self.timeouts: list[float] = []
 
     def fetch(self, url: str, *, timeout: float, max_bytes: int) -> tuple[str, str]:
         self.calls.append(url)
-        _ = timeout, max_bytes
+        self.timeouts.append(timeout)
         if url not in self.responses:
             raise LookupError(url)
         return self.responses[url]
@@ -164,3 +172,195 @@ async def test_search_returns_ranked_results() -> None:
     assert "asyncio" in text
     assert "docs.python.org" in text
     assert "json" in text
+
+
+# ---------------------------------------------------------------------------
+# Scripted HTTP transport harness (no real sockets).
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedResponse:
+    def __init__(self, status: int, headers: dict[str, str], body: bytes) -> None:
+        self.status = status
+        self._headers = {key.lower(): value for key, value in headers.items()}
+        self._body = body
+
+    def getheader(self, name: str):  # noqa: ANN201
+        return self._headers.get(name.lower())
+
+    def read(self, limit: int) -> bytes:
+        return self._body[:limit]
+
+
+_PUBLIC_DNS = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 80))]
+
+
+def _install_scripted_http(monkeypatch, handler) -> list[tuple[str, float]]:
+    """Serve responses from ``handler(connection)`` for every pinned request.
+
+    Returns the request targets observed, paired with the timeout each
+    connection was constructed with.
+    """
+
+    observed: list[tuple[str, float]] = []
+
+    class ScriptedConnection:
+        def __init__(self, target, address, timeout) -> None:  # noqa: ANN001
+            self.target = target
+            self.timeout = timeout
+
+        def request(self, *_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+            return None
+
+        def getresponse(self) -> _ScriptedResponse:
+            observed.append((self.target.request_target, self.timeout))
+            status, headers, body = handler(self)
+            return _ScriptedResponse(status, headers, body)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: list(_PUBLIC_DNS))
+    monkeypatch.setattr(
+        "noah_code.tools.web_tools._open_pinned_connection",
+        lambda target, address, timeout: ScriptedConnection(target, address, timeout),
+    )
+    return observed
+
+
+def test_public_transport_follows_relative_redirect(monkeypatch) -> None:
+    seen = _install_scripted_http(
+        monkeypatch,
+        lambda conn: (
+            (302, {"Location": "/next?page=1"}, b"")
+            if conn.target.request_target == "/start"
+            else (200, {"Content-Type": "text/plain"}, b"final page")
+        ),
+    )
+
+    content_type, body = _PublicWebTransport().fetch(
+        "http://public.example/start", timeout=0.5, max_bytes=1000
+    )
+
+    assert content_type == "text/plain"
+    assert body == "final page"
+    assert [target for target, _timeout in seen] == ["/start", "/next?page=1"]
+
+
+def test_public_transport_redirect_loop_hits_limit(monkeypatch) -> None:
+    _install_scripted_http(
+        monkeypatch,
+        lambda conn: (302, {"Location": "/loop"}, b""),
+    )
+
+    with pytest.raises(ValueError, match="redirect limit exceeded"):
+        _PublicWebTransport().fetch("http://public.example/loop", timeout=0.5, max_bytes=100)
+
+
+def test_public_transport_raises_last_connection_error(monkeypatch) -> None:
+    _install_scripted_http(monkeypatch, lambda conn: (_ for _ in ()).throw(OSError("refused")))
+
+    with pytest.raises(OSError, match="refused"):
+        _PublicWebTransport().fetch("http://public.example/x", timeout=0.5, max_bytes=100)
+
+
+def test_public_transport_truncates_body_to_max_bytes(monkeypatch) -> None:
+    _install_scripted_http(
+        monkeypatch,
+        lambda conn: (200, {"Content-Type": "text/plain"}, b"0123456789"),
+    )
+
+    _content_type, body = _PublicWebTransport().fetch(
+        "http://public.example/big", timeout=0.5, max_bytes=4
+    )
+
+    assert body == "0123"
+
+
+@pytest.mark.parametrize(
+    ("content_type", "expected"),
+    [
+        ("text/plain; charset=utf-99", "héllo"),
+        ("text/plain; charset=", "héllo"),
+    ],
+)
+def test_public_transport_bad_charset_falls_back_to_utf8(
+    monkeypatch, content_type, expected
+) -> None:
+    _install_scripted_http(
+        monkeypatch,
+        lambda conn: (200, {"Content-Type": content_type}, expected.encode("utf-8")),
+    )
+
+    _content_type, body = _PublicWebTransport().fetch(
+        "http://public.example/i18n", timeout=0.5, max_bytes=100
+    )
+
+    assert body == expected
+
+
+def _rate_limited_handler(state: dict[str, int], retry_after: str | None, final_ok: bool):
+    def handler(conn):  # noqa: ANN001, ANN202
+        state["count"] += 1
+        if state["count"] <= state["limit"]:
+            headers = {"Retry-After": retry_after} if retry_after is not None else {}
+            return (429, headers, b"slow down")
+        if final_ok:
+            return (200, {"Content-Type": "text/plain"}, b"recovered")
+        return (429, {}, b"still limited")
+
+    return handler
+
+
+def test_rate_limit_backs_off_then_recovers(monkeypatch) -> None:
+    state = {"count": 0, "limit": 1}
+    _install_scripted_http(monkeypatch, _rate_limited_handler(state, "1.5", final_ok=True))
+    sleeps: list[float] = []
+    monkeypatch.setattr("noah_code.tools.web_tools._sleep", sleeps.append)
+
+    content_type, body = _PublicWebTransport().fetch(
+        "http://public.example/api", timeout=0.5, max_bytes=100
+    )
+
+    assert body == "recovered"
+    assert sleeps == [1.5]
+    assert state["count"] == 2
+
+
+def test_rate_limit_caps_retry_after(monkeypatch) -> None:
+    state = {"count": 0, "limit": 1}
+    _install_scripted_http(monkeypatch, _rate_limited_handler(state, "9999", final_ok=True))
+    sleeps: list[float] = []
+    monkeypatch.setattr("noah_code.tools.web_tools._sleep", sleeps.append)
+
+    _PublicWebTransport().fetch("http://public.example/api", timeout=0.5, max_bytes=100)
+
+    assert sleeps == [_MAX_RETRY_AFTER_SECONDS]
+
+
+def test_rate_limit_default_backoff_when_header_missing_or_invalid(monkeypatch) -> None:
+    state = {"count": 0, "limit": 1}
+    _install_scripted_http(monkeypatch, _rate_limited_handler(state, None, final_ok=True))
+    sleeps: list[float] = []
+    monkeypatch.setattr("noah_code.tools.web_tools._sleep", sleeps.append)
+
+    _PublicWebTransport().fetch("http://public.example/api", timeout=0.5, max_bytes=100)
+
+    assert sleeps == [_DEFAULT_BACKOFF_SECONDS]
+
+    state = {"count": 0, "limit": 1}
+    _install_scripted_http(monkeypatch, _rate_limited_handler(state, "later", final_ok=True))
+    sleeps.clear()
+    _PublicWebTransport().fetch("http://public.example/api", timeout=0.5, max_bytes=100)
+
+    assert sleeps == [_DEFAULT_BACKOFF_SECONDS]
+
+
+def test_rate_limit_gives_up_after_bounded_retries(monkeypatch) -> None:
+    state = {"count": 0, "limit": 99}
+    _install_scripted_http(monkeypatch, _rate_limited_handler(state, "1", final_ok=False))
+    monkeypatch.setattr("noah_code.tools.web_tools._sleep", lambda _seconds: None)
+
+    with pytest.raises(OSError, match="rate limited"):
+        _PublicWebTransport().fetch("http://public.example/api", timeout=0.5, max_bytes=100)
+    assert state["count"] == _MAX_RATE_LIMIT_RETRIES + 1
