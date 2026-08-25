@@ -348,9 +348,13 @@ class ProcessTools(Skill):
         retained: list[bytes] = []
         retained_bytes = 0
         for line in reversed(lines):
-            # Always keep the newest line, then as many whole older lines as
-            # fit (a single event line can exceed ``keep``).
-            if retained and retained_bytes + len(line) > keep:
+            # A pipe read may deliver only the final bytes of an output line
+            # as a tiny last event. When that newest record is below the
+            # retention target, keep its predecessor too so rotation does not
+            # preserve only a dangling tail while dropping the line prefix.
+            # After that, retain older whole records only while they fit.
+            minimum_records = 2 if retained_bytes < keep else 1
+            if len(retained) >= minimum_records and retained_bytes + len(line) > keep:
                 break
             retained.append(line)
             retained_bytes += len(line)

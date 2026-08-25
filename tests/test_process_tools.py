@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ from noah_code.config import DEFAULT_PERMISSION_RULES
 from noah_code.permissions import PermissionEngine
 from noah_code.runtime_state import RuntimeStateStore
 from noah_code.snapshots import SnapshotJournal
-from noah_code.tools.process_tools import ProcessTools
+from noah_code.tools.process_tools import BackgroundJob, ProcessTools
 from noah_code.tools.workspace_tools import WorkspaceTools
 from noah_code.workspace import Workspace
 
@@ -168,6 +169,27 @@ async def test_durable_log_is_capped_and_keeps_latest_lines(tmp_path: Path) -> N
         assert "next_cursor=" in output
     finally:
         await reopened.close()
+
+
+def test_durable_log_rotation_keeps_predecessor_of_tiny_tail(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, max_log_bytes=2_000)
+    log_path = tmp_path / "durable.jsonl"
+    log_path.touch()
+    job = BackgroundJob(
+        id="fixture",
+        name="fixture",
+        command="fixture",
+        process=None,  # type: ignore[arg-type]
+        log_path=log_path,
+    )
+
+    manager._append(job, "stdout", "x" * 4_000 + "line-0399-")
+    manager._append(job, "stdout", "xx\n")
+
+    events = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any("line-0399" in event["text"] for event in events)
+    assert events[-1]["text"] == "xx\n"
+    assert log_path.stat().st_size <= 2_000 + 8_192
 
 
 @pytest.mark.asyncio
