@@ -375,7 +375,7 @@ async def test_prepare_interactive_still_auto_installs(monkeypatch, tmp_path: Pa
     monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))
 
     prepared, code = await _prepare(
-        path=str(tmp_path), model=None, reasoning_effort=None, auto=False, mode=None
+        path=str(tmp_path), model=None, reasoning_effort=None, auto=False, yolo=False, mode=None
     )
 
     assert prepared is None
@@ -403,6 +403,7 @@ def _interactive_kwargs(tmp_path: Path) -> dict[str, object]:
         "model": None,
         "reasoning_effort": None,
         "auto": False,
+        "yolo": False,
         "continue_session": False,
         "session_id": None,
         "mode": None,
