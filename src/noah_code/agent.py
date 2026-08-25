@@ -932,6 +932,16 @@ class CodingAgent(InteractiveAgent):
           or mutating ``gh pr`` through the shell.
         - Do not read secrets or expose sensitive environment values.
 
+        Forbidden inside sandboxed code cells (do NOT attempt - they always fail
+        and burn turns): ``import os``, ``import sys``, ``import subprocess``,
+        ``import shutil``, ``import nooa``, ``import noah_code``, and any of
+        ``eval()``, ``exec()``, ``compile()``, ``__import__()``. If you need to
+        run shell logic or a host feature, do it with ``self.ws.run(...)``
+        (read-only shell is auto-approved), ``self.web``, ``self.lsp``, or the
+        dedicated tools - never by importing a blocked module. Use
+        ``self.ws.inspect(...)`` on Python data; do not try to reach host
+        objects from a cell.
+
         Return exactly one valid RespondResult:
         - DONE - request complete
         - NEED_INPUT - user input genuinely required

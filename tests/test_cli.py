@@ -404,9 +404,10 @@ def _interactive_kwargs(tmp_path: Path) -> dict[str, object]:
         "reasoning_effort": None,
         "auto": False,
         "yolo": False,
+        "mode": None,
+        "max_iterations": None,
         "continue_session": False,
         "session_id": None,
-        "mode": None,
         "unsafe_inprocess_code_execution": False,
     }
 

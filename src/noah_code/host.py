@@ -53,7 +53,8 @@ def _friendly_agent_error(exc: Exception) -> str:
         used, limit = iteration.groups()
         return (
             f"Reached the iteration limit ({used}/{limit} turns). "
-            "Continue with a narrower follow-up."
+            "Continue with a narrower follow-up, or relaunch with "
+            "`--max-iterations N` / NOAH_CODE_MAX_ITERATIONS to raise the cap."
         )
     retries = re.search(r"Generation failed after (\d+) errors", raw)
     if retries:

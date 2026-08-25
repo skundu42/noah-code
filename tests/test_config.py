@@ -86,6 +86,27 @@ def test_auto_update_environment_override(tmp_path: Path, monkeypatch) -> None:
     assert load_config(tmp_path).updates.auto_install is False
 
 
+def test_max_iterations_environment_override(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("NOAH_CODE_MAX_ITERATIONS", raising=False)
+    assert load_config(tmp_path).max_iterations == 40
+    monkeypatch.setenv("NOAH_CODE_MAX_ITERATIONS", "120")
+    assert load_config(tmp_path).max_iterations == 120
+
+
+def test_max_iterations_cli_override(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("NOAH_CODE_MAX_ITERATIONS", raising=False)
+    cfg = load_config(tmp_path, cli_overrides={"max_iterations": 80})
+    assert cfg.max_iterations == 80
+
+
+def test_max_iterations_invalid_environment_value_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("NOAH_CODE_MAX_ITERATIONS", "not-a-number")
+    with pytest.raises(ConfigError, match="integer"):
+        load_config(tmp_path)
+
+
 def test_config_command_lists_nested_settings_and_redacts_secrets() -> None:
     config = NoahCodeConfig(
         summarization={"max_tokens": 123},

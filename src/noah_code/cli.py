@@ -93,6 +93,13 @@ def _common_options(fn):  # noqa: ANN001
         default=None,
         help="Reasoning effort for compatible models; default lets the provider decide",
     )(fn)
+    fn = click.option(
+        "--max-iterations",
+        "max_iterations",
+        type=click.IntRange(min=1),
+        default=None,
+        help="Cap model tool-call turns per user request (default 40; budgets still brake)",
+    )(fn)
     return fn
 
 
@@ -158,6 +165,7 @@ def interactive_cmd(
     auto: bool,
     yolo: bool,
     mode: str | None,
+    max_iterations: int | None,
     continue_session: bool,
     session_id: str | None,
     use_console: bool,
@@ -176,9 +184,10 @@ def interactive_cmd(
             reasoning_effort=reasoning_effort,
             auto=auto,
             yolo=yolo,
+            mode=mode,
+            max_iterations=max_iterations,
             continue_session=continue_session,
             session_id=session_id,
-            mode=mode,
             use_console=use_console,
             unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
         )
@@ -205,6 +214,7 @@ def run_cmd(
     auto: bool,
     yolo: bool,
     mode: str | None,
+    max_iterations: int | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
 ) -> None:
@@ -218,6 +228,7 @@ def run_cmd(
             auto=auto,
             yolo=yolo,
             mode=mode,
+            max_iterations=max_iterations,
             session_id=session_id,
             unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
         )
@@ -804,6 +815,7 @@ async def _prepare(
     auto: bool,
     yolo: bool,
     mode: str | None,
+    max_iterations: int | None = None,
     continue_session: bool = False,
     session_id: str | None = None,
     frontend: Literal["tui", "console"] | None = None,
@@ -825,6 +837,8 @@ async def _prepare(
         overrides["auto_approve"] = True
     if yolo:
         overrides["yolo"] = True
+    if max_iterations is not None:
+        overrides["max_iterations"] = max_iterations
     if mode:
         overrides["mode"] = mode
     if frontend is not None:
@@ -872,9 +886,10 @@ async def _interactive(
     reasoning_effort: str | None,
     auto: bool,
     yolo: bool,
+    mode: str | None,
+    max_iterations: int | None,
     continue_session: bool,
     session_id: str | None,
-    mode: str | None,
     use_console: bool,
     unsafe_inprocess_code_execution: bool,
 ) -> int:
@@ -897,6 +912,7 @@ async def _interactive(
         auto=auto,
         yolo=yolo,
         mode=mode,
+        max_iterations=max_iterations,
         continue_session=continue_session,
         session_id=session_id,
         frontend=frontend,
@@ -922,6 +938,7 @@ async def _interactive(
             auto=auto,
             yolo=yolo,
             mode=mode,
+            max_iterations=max_iterations,
             continue_session=continue_session,
             session_id=session_id,
             frontend=frontend,
@@ -976,6 +993,7 @@ async def _run_session(
     auto: bool,
     yolo: bool,
     mode: str | None,
+    max_iterations: int | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
 ) -> int:
@@ -988,6 +1006,7 @@ async def _run_session(
         auto=auto,
         yolo=yolo,
         mode=mode,
+        max_iterations=max_iterations,
         session_id=session_id,
         frontend="console",
         unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,

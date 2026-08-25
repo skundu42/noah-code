@@ -140,7 +140,8 @@ def test_iteration_limit_error_recommends_narrower_follow_up() -> None:
 
     assert text == (
         "Reached the iteration limit (40/40 turns). "
-        "Continue with a narrower follow-up."
+        "Continue with a narrower follow-up, or relaunch with "
+        "`--max-iterations N` / NOAH_CODE_MAX_ITERATIONS to raise the cap."
     )
 
 

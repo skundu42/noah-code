@@ -635,6 +635,13 @@ def _env_overrides() -> dict[str, Any]:
         out["updates"] = {"auto_install": auto_update.lower() in {"1", "true", "yes", "on"}}
     if efficiency_profile := os.environ.get("NOAH_CODE_EFFICIENCY"):
         out["efficiency"] = {"profile": efficiency_profile.lower()}
+    if max_iterations := os.environ.get("NOAH_CODE_MAX_ITERATIONS"):
+        try:
+            out["max_iterations"] = int(max_iterations)
+        except ValueError:
+            raise ConfigError(
+                "NOAH_CODE_MAX_ITERATIONS must be an integer >= 1"
+            ) from None
     return out
 
 
