@@ -85,15 +85,6 @@ class ApprovalBroker:
             raise PermissionError(
                 f"rejected [{decision.category}] {decision.target}: {decision.reason}"
             )
-        if choice == ApprovalChoice.SESSION:
-            self._engine.add_session_rule(
-                PermissionRule(
-                    category=decision.category,
-                    pattern=decision.remember_pattern,
-                    action="allow",
-                    reason="remembered for session",
-                )
-            )
 
     async def _ask(self, decision: PermissionDecision) -> ApprovalChoice:
         req_id = str(uuid.uuid4())
@@ -128,7 +119,28 @@ class ApprovalBroker:
             async def _resolve() -> None:
                 try:
                     async with self._ui_lock:
-                        choice = await handler(request)
+                        # A concurrent twin of this request may have just been
+                        # granted a session-wide allow. Re-check before putting
+                        # a second identical prompt in front of the user, and
+                        # register new session rules inside the same critical
+                        # section so queued twins observe them immediately.
+                        fresh = self._engine.decide(decision.category, decision.target)
+                        if fresh.allowed:
+                            choice = ApprovalChoice.ONCE
+                        else:
+                            choice = await handler(request)
+                            if (
+                                choice == ApprovalChoice.SESSION
+                                and not fut.done()
+                            ):
+                                self._engine.add_session_rule(
+                                    PermissionRule(
+                                        category=decision.category,
+                                        pattern=decision.remember_pattern,
+                                        action="allow",
+                                        reason="remembered for session",
+                                    )
+                                )
                 except Exception as exc:
                     if not fut.done():
                         fut.set_exception(exc)
