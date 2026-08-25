@@ -30,6 +30,7 @@ from noah_code.events import HostEvent, HostEventKind
 from noah_code.redaction import safe_error_message
 from noah_code.sessions import SessionEventRecord, SessionMeta, SessionStore
 from noah_code.steer import SAFE_SLASH_WHILE_BUSY, SteerQueue, expansion_failed
+from noah_code.telemetry import AgentTelemetry, setup_agent_telemetry
 from noah_code.themes import THEME_NAMES, get_theme
 from noah_code.ui.console import ConsoleUI
 from noah_code.ui.protocol import HostUI
@@ -223,6 +224,7 @@ class AgentHost:
         self.last_checkpoint: dict[str, Any] | None = None
         self._post_hook_tasks: list[asyncio.Task[Any]] = []
         self._trace_info = "session jsonl"
+        self._telemetry = AgentTelemetry()
         self._active_turn: asyncio.Task[Any] | None = None
         self._event_unsubs: list[Any] = []
         self._custom_commands: dict[str, CustomCommand] = {}
@@ -247,12 +249,7 @@ class AgentHost:
         return self._agent
 
     def _setup_tracing(self, session_id: str) -> None:
-        if not self.config.tracing.enabled:
-            return
-        from nooa.tracing import enable_tracing, exporters, set_session
-
-        set_session(session_id)
-        exps = []
+        self._telemetry.shutdown(self.config.tracing.export_timeout_millis)
         path = (
             Path(self.config.tracing.jsonl_dir).expanduser()
             if self.config.tracing.jsonl_dir
@@ -262,10 +259,14 @@ class AgentHost:
         )
         if path is not None:
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
-            exps.append(exporters.jsonl(trace_dir=str(path)))
-            self._trace_info = str(path / f"{session_id}.jsonl")
-        if exps:
-            enable_tracing(exporters=exps)
+        model = self.meta.model if self.meta is not None else self.config.model
+        self._telemetry = setup_agent_telemetry(
+            self.config.tracing,
+            session_id=session_id,
+            model=model,
+            jsonl_dir=str(path) if path is not None else None,
+        )
+        self._trace_info = self._telemetry.info
 
     async def start(self) -> SessionMeta:
         from noah_code.worktree import infer_worktree_name, repo_id_for, worktree_storage_root
@@ -497,6 +498,7 @@ class AgentHost:
             self._emit_with_hooks,
             self._usage,
             self._budget_guard,
+            self._telemetry,
         )
 
         self._custom_commands = discover_custom_commands(self.workspace.root)
@@ -749,6 +751,7 @@ class AgentHost:
                     flush_traces()
                 except Exception:  # noqa: BLE001
                     logger.debug("trace flush failed", exc_info=True)
+            await asyncio.to_thread(self._telemetry.shutdown)
             self._agent = None
             self._runtime = None
             self._release_workspace_lease()
@@ -1876,6 +1879,7 @@ class AgentHost:
 
         if self._runtime is not None:
             self._runtime.event("llm.retry", payload)
+        self._telemetry.retry(payload)
 
     def _wrap_resilient(
         self,
@@ -1961,6 +1965,7 @@ class AgentHost:
             llm,
             lightweight_follows_main=not bool(self.config.lightweight_model),
         )
+        self._telemetry.model = model
         if self.meta:
             self.meta.model = model
             self.meta.reasoning_effort = effort
@@ -2066,10 +2071,16 @@ class AgentHost:
             else:
                 runtime.transition_run(run_id, "recovering" if recovery else "running")
         self._current_run_id = run_id
+        turn_observation = self._telemetry.start_turn(
+            run_id=run_id,
+            mode=agent.mode,
+            recovery=recovery,
+        )
 
         exit_code = 0
         explanation = ""
         run_state: Any = "running"
+        telemetry_error_type = ""
         try:
             agent.journal.begin_turn()
             if recovery:
@@ -2157,6 +2168,7 @@ class AgentHost:
                 except PermissionError as exc:
                     exit_code = 3
                     run_state = "failed"
+                    telemetry_error_type = type(exc).__name__
                     explanation = str(exc)
                     self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
                 except asyncio.CancelledError:
@@ -2169,6 +2181,7 @@ class AgentHost:
                 except Exception as exc:
                     exit_code = 1
                     run_state = "failed"
+                    telemetry_error_type = type(exc).__name__
                     explanation = _friendly_agent_error(exc)
                     self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
                     logger.debug("handle() failed", exc_info=True)
@@ -2221,11 +2234,22 @@ class AgentHost:
                         error=explanation if run_state == "failed" else "",
                     )
             except Exception as persist_error:
+                run_state = "failed"
+                telemetry_error_type = type(persist_error).__name__
                 if runtime is not None and run_id is not None:
                     with contextlib.suppress(Exception):
                         runtime.transition_run(run_id, "failed", error=str(persist_error))
                 raise
             finally:
+                outcome = str(run_state)
+                if outcome == "running":
+                    outcome = "failed"
+                    telemetry_error_type = telemetry_error_type or "AgentTurnError"
+                self._telemetry.end_turn(
+                    turn_observation,
+                    outcome=outcome,
+                    error_type=telemetry_error_type,
+                )
                 self._current_run_id = None
         return HostResult(
             exit_code=exit_code,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 from collections.abc import Callable
 from typing import Any
@@ -208,6 +209,7 @@ def install_event_bridge(
     emit: EmitFn,
     usage: Any | None = None,
     budget_guard: Any | None = None,
+    telemetry: Any | None = None,
 ) -> list[Unsubscribe]:
     """Subscribe to agent.event_manager and forward useful events to the UI.
 
@@ -215,6 +217,12 @@ def install_event_bridge(
     """
     em = agent.event_manager
     unsubs: list[Unsubscribe] = []
+
+    def observe(method: str, *args: Any) -> None:
+        if telemetry is None:
+            return
+        with contextlib.suppress(Exception):
+            getattr(telemetry, method)(*args)
 
     def on_tool_call(event: Any) -> None:
         # Fresh ToolCallEvent has result=None; updates do not re-emit.
@@ -229,6 +237,7 @@ def install_event_bridge(
             cleaned = name.replace("_", " ").strip().capitalize() or "Working"
             text = f"{cleaned}{(' · ' + _brief_args(args)) if args else ''}"
         activity_id = str(getattr(event, "tool_call_id", "") or getattr(event, "id", ""))
+        observe("tool_start", str(name), activity_id)
         emit(
             HostEvent(
                 HostEventKind.TOOL_START,
@@ -259,6 +268,7 @@ def install_event_bridge(
             line = stdout.splitlines()[0][:80]
             parts.append(line)
         activity_id = str(getattr(event, "tool_call_id", "") or getattr(event, "id", ""))
+        observe("tool_finish", "execute_python", activity_id, str(status_value).lower())
         # Stream truncated stdout/stderr as shell-like chunks when present.
         if stdout:
             emit(
@@ -308,6 +318,7 @@ def install_event_bridge(
     def on_llm_start(event: Any) -> None:
         if usage is not None:
             usage.llm_start(event)
+        observe("llm_start", event)
         method = getattr(event, "method_name", "")
         turn = getattr(event, "turn_number", "")
         emit(
@@ -321,6 +332,7 @@ def install_event_bridge(
     def on_llm_end(event: Any) -> None:
         if usage is not None:
             usage.llm_end(event)
+        observe("llm_end", event)
         ok = getattr(event, "success", True)
         emit(
             HostEvent(
@@ -338,6 +350,7 @@ def install_event_bridge(
                 # their exceptions. Record a sticky breach here; the outer
                 # BudgetedLLM rejects the next call before it reaches a provider.
                 budget_guard.observe_cost_usd(usage.snapshot().cost_usd)
+        observe("llm_complete", event)
 
     def on_reasoning(event: Any) -> None:
         text = str(getattr(event, "content", "") or "").strip()

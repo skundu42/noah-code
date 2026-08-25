@@ -149,8 +149,47 @@ local executables; define them only in `~/.config/noah-code/config.toml`.
 
 ## Tracing
 
-Noah Code integrates with NOOA tracing. Tracing is enabled by default, and JSONL output goes into
-the active session directory unless
-`tracing.jsonl_dir` selects another trusted location. Use `/trace` to inspect the destination and
-`/health` to inspect bounded runtime-event and artifact state. Trace files count toward the total
-session-storage quota when they use the default location.
+Noah Code emits OpenTelemetry traces for the complete agent invocation and NOOA/OpenInference child
+spans for model generations and tool execution. Local JSONL traces are enabled by default and go
+into the active session directory unless `tracing.jsonl_dir` selects another trusted location.
+Use `/trace` to inspect active destinations and `/health` to inspect bounded runtime-event and
+artifact state. Trace files count toward the session-storage quota when they use the default path.
+
+Set an OTLP/HTTP collector endpoint to additionally export batched traces, metrics, and structured
+logs:
+
+```toml
+[tracing]
+otlp_endpoint = "http://localhost:4318"
+logs_enabled = true
+metrics_enabled = true
+capture_content = false
+```
+
+Install the `tracing` extra when Noah was installed without the standard installer. Configured
+remote endpoints must use HTTPS; plain HTTP is accepted only for a loopback collector.
+
+Or use standard OpenTelemetry environment configuration:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.com
+export OTEL_EXPORTER_OTLP_HEADERS='authorization=Bearer%20...'
+```
+
+Operational telemetry includes agent/LLM/tool duration, token usage, cached and reasoning token
+counts, estimated cost, retries, outcomes, model/provider names, and trace-correlated lifecycle
+events. Metric labels deliberately exclude session IDs, run IDs, workspace paths, prompts, and tool
+targets to avoid high-cardinality series.
+
+Content capture is off by default. Prompt and response messages, reasoning, generated code, tool
+arguments/results, exception messages, stack traces, and file contents are removed at the exporter
+boundary. `capture_content = true` is intended only for controlled development environments; values
+and span attribute counts remain bounded, and NOOA's secret scrubber still runs before export. For
+production, keep content disabled and apply an allowlist/redaction processor in the collector as a
+second boundary.
+
+The emitted standard instruments include `gen_ai.invoke_agent.duration`,
+`gen_ai.client.operation.duration`, and `gen_ai.client.token.usage`. Noah-specific instruments cover
+estimated cost, retries, and tool execution counts/duration. Export is best-effort and batched;
+collector failure never blocks or fails an agent turn, and providers are flushed during orderly
+shutdown.

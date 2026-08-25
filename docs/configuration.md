@@ -179,8 +179,19 @@ target_chars = 2500
 
 [tracing]
 enabled = true
-# By default JSONL traces live inside each session directory.
+# Local traces remain available without a collector.
+jsonl_enabled = true
 # jsonl_dir = "~/.local/share/noah-code/traces"
+# Send traces, metrics, and structured logs over OTLP/HTTP.
+# otlp_endpoint = "http://localhost:4318"
+logs_enabled = true
+metrics_enabled = true
+# Sensitive agent content is excluded unless explicitly opted in.
+capture_content = false
+max_span_attributes = 256
+max_attribute_length = 4096
+metric_export_interval_millis = 30000
+export_timeout_millis = 5000
 
 [updates]
 auto_install = false
@@ -198,6 +209,12 @@ Supported environment overrides include:
 - `NOAH_CODE_EFFICIENCY`
 - `NOAH_CODE_UNSAFE_INPROCESS`
 - `NOAH_CODE_AUTO_UPDATE`
+
+OpenTelemetry's standard environment variables are also honored. In particular,
+`OTEL_EXPORTER_OTLP_ENDPOINT` enables remote traces, metrics, and logs without storing an endpoint
+in Noah configuration. Signal-specific endpoint variables and `OTEL_EXPORTER_OTLP_HEADERS` are
+supported by the OTLP exporters; keep authentication headers in the environment or a collector
+secret store rather than TOML.
 
 Repository-controlled configuration cannot weaken the host trust boundary. Project config is
 ignored for `auto_approve`, `budget`, `efficiency`, `enabled_skills`, `hooks`, `lsp`, `mcp`,

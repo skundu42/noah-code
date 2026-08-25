@@ -57,6 +57,7 @@ mcp = [
 ]
 tracing = [
     "nooa[tracing]==0.0.9",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0,<2.0.0",
 ]
 
 [project.scripts]

@@ -9,6 +9,7 @@ import tempfile
 import tomllib
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -17,6 +18,7 @@ from noah_code.themes import ThemeName, get_theme
 
 class ConfigError(Exception):
     """Configuration could not be parsed or validated."""
+
 
 PermissionAction = Literal["allow", "ask", "deny"]
 ReasoningEffort = Literal["default", "none", "minimal", "low", "medium", "high", "xhigh"]
@@ -46,7 +48,30 @@ class TracingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
+    jsonl_enabled: bool = True
     jsonl_dir: str | None = None
+    otlp_endpoint: str | None = None
+    logs_enabled: bool = True
+    metrics_enabled: bool = True
+    capture_content: bool = False
+    max_span_attributes: int = Field(default=256, ge=32, le=4096)
+    max_attribute_length: int = Field(default=4096, ge=256, le=1_000_000)
+    metric_export_interval_millis: int = Field(default=30_000, ge=1000, le=300_000)
+    export_timeout_millis: int = Field(default=5000, ge=100, le=60_000)
+
+    @field_validator("otlp_endpoint")
+    @classmethod
+    def _validate_otlp_endpoint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("must be an absolute HTTP(S) URL")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("must not contain credentials, a query, or a fragment")
+        if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError("must use HTTPS unless the collector is on loopback")
+        return value.rstrip("/")
 
 
 class SummarizationPolicy(BaseModel):

@@ -52,6 +52,55 @@ def test_event_bridge_correlates_tool_output_and_finish() -> None:
     assert "execute_python" not in emitted[0].text
 
 
+def test_event_bridge_forwards_safe_lifecycle_telemetry() -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        def __getattr__(self, name: str):
+            return lambda *args: self.calls.append((name, args))
+
+    manager = FakeEventManager()
+    telemetry = Recorder()
+    install_event_bridge(
+        SimpleNamespace(event_manager=manager),
+        lambda _event: None,
+        telemetry=telemetry,
+    )
+    llm_event = SimpleNamespace(generation_id="generation-1", turn_number=1)
+
+    manager.handlers["LLMCallStart"](llm_event)
+    manager.handlers["LLMCallEnd"](
+        SimpleNamespace(**vars(llm_event), success=True, exception_type=None)
+    )
+    manager.handlers["LLMComplete"](SimpleNamespace(**vars(llm_event), model_name="openai/test"))
+    manager.handlers["ToolCallEvent"](
+        SimpleNamespace(
+            id="event-1",
+            tool_call_id="call-1",
+            name="execute_python",
+            arguments={"code": "private generated code"},
+            result=None,
+        )
+    )
+    manager.handlers["PythonOutput"](
+        SimpleNamespace(
+            id="event-2",
+            tool_call_id="call-1",
+            execution_status=SimpleNamespace(value="complete"),
+            error="",
+            stdout="private output",
+            stderr="",
+        )
+    )
+
+    names = [name for name, _args in telemetry.calls]
+    assert names == ["llm_start", "llm_end", "llm_complete", "tool_start", "tool_finish"]
+    flattened = repr(telemetry.calls)
+    assert "private generated code" not in flattened
+    assert "private output" not in flattened
+
+
 def test_code_activity_labels_describe_intent_not_framework_internals() -> None:
     assert _describe_code_activity('files = await self.ws.list("**/*.py")') == "Glob **/*.py"
     assert _describe_code_activity('await self.ws.run("pytest -q")') == "Bash pytest -q"
@@ -96,10 +145,7 @@ def test_code_activity_labels_cover_git_web_task_and_shell() -> None:
         _describe_code_activity('hits = await self.web.search("asyncio run")')
         == "Search asyncio run"
     )
-    assert (
-        _describe_code_activity('await self.task.run("explore", "find auth")')
-        == "Task explore"
-    )
+    assert _describe_code_activity('await self.task.run("explore", "find auth")') == "Task explore"
     assert (
         _describe_code_activity('await self.filesystem.read_file({"path": "README.md"})')
         == "MCP filesystem.read_file"
