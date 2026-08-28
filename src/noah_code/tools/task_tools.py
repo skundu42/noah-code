@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import contextlib
+import time
+import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from nooa import Skill
@@ -18,6 +23,37 @@ from noah_code.workspace import Workspace
 TaskRunner = Callable[[AgentSpec, str], Awaitable[str]]
 
 _DISTILL_INPUT_LIMIT = 24_000
+
+
+@dataclass
+class TaskActivity:
+    """Presentation-safe lifecycle record for one delegated assignment."""
+
+    task_id: str
+    agent: str
+    prompt: str
+    mode: str
+    readonly: bool
+    state: str = "queued"
+    result_preview: str = ""
+    started_at: float = field(default_factory=time.monotonic)
+    finished_at: float | None = None
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, (self.finished_at or time.monotonic()) - self.started_at)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.task_id,
+            "agent": self.agent,
+            "prompt": self.prompt,
+            "mode": self.mode,
+            "readonly": self.readonly,
+            "state": self.state,
+            "result_preview": self.result_preview,
+            "duration": self.duration,
+        }
 
 
 class TaskTools(Skill):
@@ -39,6 +75,9 @@ class TaskTools(Skill):
         self._runner = runner
         self._parent = parent
         self._mutation_lock = asyncio.Lock()
+        self._activities: dict[str, TaskActivity] = {}
+        self._history: deque[TaskActivity] = deque(maxlen=50)
+        self._on_lifecycle: Any = None
 
     def list(self) -> str:
         """List built-in and markdown agents available to ``run``."""
@@ -63,8 +102,7 @@ class TaskTools(Skill):
         runner = self._runner or _default_runner(self._parent)
         if runner is None:
             raise RuntimeError("subagent runner is not configured")
-        async with self._agent_lane(spec):
-            return await runner(spec, assignment)
+        return await self._execute(spec, assignment, runner)
 
     async def run_many(self, assignments: Sequence[tuple[str, str]]) -> str:
         """Run independent subagent assignments concurrently.
@@ -75,24 +113,70 @@ class TaskTools(Skill):
         that section instead of failing the whole batch.
         """
 
+        resolved = await self._prepare(assignments)
+        return await self._run_many_resolved(resolved)
+
+    async def collaborate(
+        self,
+        objective: str,
+        assignments: Sequence[tuple[str, str]],
+        lead: str = "general",
+    ) -> str:
+        """Fan out assignments, then hand their reports to one lead agent.
+
+        All participants are resolved and authorized before work begins. Read-only
+        contributors can run concurrently; mutating contributors still share the
+        workspace mutation lane. The lead receives bounded teammate reports and
+        returns the single result consumed by the parent agent.
+        """
+
+        goal = objective.strip()
+        if not goal:
+            raise ValueError("collaboration objective is required")
+        resolved = await self._prepare(assignments)
+        lead_spec = self._resolve(lead)
+        await self._authorize(lead_spec, goal)
+        reports = await self._run_many_resolved(resolved)
+        synthesis = (
+            "Act as the lead for this delegated team. Synthesize the reports, resolve "
+            "conflicts, and complete the objective. Clearly distinguish verified facts "
+            "from recommendations.\n\n"
+            f"Objective:\n{goal}\n\nTeammate reports:\n{reports}"
+        )
+        if len(synthesis) > _DISTILL_INPUT_LIMIT:
+            synthesis = synthesis[: _DISTILL_INPUT_LIMIT - 20].rstrip() + "\n… reports bounded"
+        runner = self._runner or _default_runner(self._parent)
+        if runner is None:
+            raise RuntimeError("subagent runner is not configured")
+        result = await self._execute(lead_spec, synthesis, runner)
+        contributors = ", ".join(spec.name for spec, _prompt in resolved)
+        return f"## Team lead · {lead_spec.name}\n{result}\n\nInputs: {contributors}"
+
+    async def _prepare(
+        self, assignments: Sequence[tuple[str, str]]
+    ) -> builtins.list[tuple[AgentSpec, str]]:
         if not assignments:
             raise ValueError("at least one assignment is required")
-        resolved: list[tuple[AgentSpec, str]] = []
+        resolved: builtins.list[tuple[AgentSpec, str]] = []
         for name, prompt in assignments:
             spec = self._resolve(name)
             text = str(prompt).strip()
             await self._authorize(spec, text)
             resolved.append((spec, text))
+        return resolved
+
+    async def _run_many_resolved(
+        self, resolved: builtins.list[tuple[AgentSpec, str]]
+    ) -> str:
+        runner = self._runner or _default_runner(self._parent)
+        if runner is None:
+            raise RuntimeError("subagent runner is not configured")
 
         semaphore = asyncio.Semaphore(self._max_concurrent())
 
         async def _one(spec: AgentSpec, prompt: str) -> str:
             try:
-                async with semaphore, self._agent_lane(spec):
-                    runner = self._runner or _default_runner(self._parent)
-                    if runner is None:
-                        raise RuntimeError("subagent runner is not configured")
-                    return await runner(spec, prompt)
+                return await self._execute(spec, prompt, runner, semaphore=semaphore)
             except Exception as exc:  # noqa: BLE001 - one failure must not sink the batch
                 return f"error: {type(exc).__name__}: {exc}"
 
@@ -102,6 +186,72 @@ class TaskTools(Skill):
             for (spec, _prompt), result in zip(resolved, results, strict=True)
         ]
         return "\n\n".join(sections)
+
+    async def _execute(
+        self,
+        spec: AgentSpec,
+        prompt: str,
+        runner: TaskRunner,
+        *,
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> str:
+        activity = TaskActivity(
+            task_id=uuid.uuid4().hex[:8],
+            agent=spec.name,
+            prompt=" ".join(prompt.split())[:500],
+            mode=spec.mode,
+            readonly=spec.readonly,
+        )
+        self._activities[activity.task_id] = activity
+        self._emit(activity)
+        try:
+            if semaphore is None:
+                result = await self._run_activity(activity, spec, prompt, runner)
+            else:
+                async with semaphore:
+                    result = await self._run_activity(activity, spec, prompt, runner)
+            activity.state = "completed"
+            activity.result_preview = " ".join(str(result).split())[:500]
+            return result
+        except asyncio.CancelledError:
+            activity.state = "cancelled"
+            activity.result_preview = "cancelled"
+            raise
+        except Exception as exc:
+            activity.state = "failed"
+            activity.result_preview = f"{type(exc).__name__}: {exc}"[:500]
+            raise
+        finally:
+            activity.finished_at = time.monotonic()
+            self._activities.pop(activity.task_id, None)
+            self._history.append(activity)
+            self._emit(activity)
+
+    async def _run_activity(
+        self,
+        activity: TaskActivity,
+        spec: AgentSpec,
+        prompt: str,
+        runner: TaskRunner,
+    ) -> str:
+        async with self._agent_lane(spec):
+            activity.state = "running"
+            self._emit(activity)
+            return await runner(spec, prompt)
+
+    def set_lifecycle_handler(self, handler: Any) -> None:
+        self._on_lifecycle = handler
+
+    def snapshot(self, *, limit: int = 20) -> builtins.list[dict[str, Any]]:
+        history = builtins.list(self._history)[-limit:] if limit > 0 else []
+        active = builtins.list(self._activities.values())
+        return [activity.to_dict() for activity in [*history, *active]]
+
+    def _emit(self, activity: TaskActivity) -> None:
+        if self._on_lifecycle is None:
+            return
+        with contextlib.suppress(Exception):
+            self._on_lifecycle(activity.to_dict())
 
     async def _authorize(self, spec: AgentSpec, assignment: str) -> None:
         if not assignment:

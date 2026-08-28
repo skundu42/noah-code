@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -230,6 +231,40 @@ def test_generic_agent_error_is_single_line_and_bounded() -> None:
 
     assert "\n" not in text
     assert len(text) <= 700
+
+
+@pytest.mark.asyncio
+async def test_start_overlaps_runtime_import_with_recovery(tmp_path: Path, monkeypatch) -> None:
+    from noah_code.host import _load_agent_runtime
+    from noah_code.runtime_state import RuntimeStateStore
+
+    import_started = threading.Event()
+    release_import = threading.Event()
+
+    def delayed_import():
+        import_started.set()
+        assert release_import.wait(timeout=2), "recovery did not overlap the runtime import"
+        return _load_agent_runtime()
+
+    def recovery_after_import_started(_store):
+        overlapped = import_started.wait(timeout=2)
+        release_import.set()
+        assert overlapped, "runtime import did not start before recovery"
+        return []
+
+    monkeypatch.setattr("noah_code.host._load_agent_runtime", delayed_import)
+    monkeypatch.setattr(RuntimeStateStore, "recover_file_operations", recovery_after_import_started)
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+
+    await host.start()
+
+    assert import_started.is_set()
+    await host.close()
 
 
 @pytest.mark.asyncio
@@ -864,6 +899,30 @@ async def test_agents_command_lists_builtins(tmp_path: Path) -> None:
     await host.close()
 
 
+@pytest.mark.asyncio
+async def test_work_and_terminals_commands_are_actionable(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+
+    assert await host.handle_line("/work") == "handled"
+    work = host.ui.render.call_args.args[0].text
+    assert "Work ledger" in work
+    assert "task.collaborate" in work
+    assert "processes.open_terminal" in work
+
+    assert await host.handle_line("/terminals") == "handled"
+    terminals = host.ui.render.call_args.args[0].text
+    assert "no terminal sessions" in terminals
+    assert "open_terminal" in terminals
+    await host.close()
+
+
 async def _host_for_steer(tmp_path: Path, monkeypatch, **cli_overrides):
     workspace = Workspace(root=tmp_path.resolve())
     config = load_config(
@@ -1105,6 +1164,7 @@ async def test_waiting_run_resumes_when_background_job_finishes(
     assert result.exit_code == 0
     assert handles["n"] == 2
     assert races["n"] == 2
+    assert not host._wake_event.is_set()  # noqa: SLF001
     assert host._runtime.latest_incomplete_run() is None  # noqa: SLF001
     await host.close()
 
@@ -1130,6 +1190,46 @@ async def test_wait_with_latched_terminal_emit_does_not_fail(
             return SimpleNamespace(kind=RespondReason.WAIT, explanation="waiting for tests")
         return SimpleNamespace(kind=RespondReason.DONE, explanation="tests passed")
 
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    result = await asyncio.wait_for(host._run_user_turn("run the full suite"), timeout=3)
+
+    assert result.exit_code == 0
+    assert handles["n"] == 2
+    assert host._runtime.latest_incomplete_run() is None  # noqa: SLF001
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_terminal_emit_between_clear_and_persist_does_not_fail(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A terminal emit while persisting WAIT must survive until the waiter sees it."""
+
+    from types import SimpleNamespace
+
+    from nooa.interactive import RespondReason
+
+    host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+    running = {"value": True}
+    host.agent.processes.has_running = lambda: running["value"]
+    handles = {"n": 0}
+
+    async def handle(_agent, _notification, render=None):  # noqa: ANN001
+        handles["n"] += 1
+        if handles["n"] == 1:
+            return SimpleNamespace(kind=RespondReason.WAIT, explanation="waiting for tests")
+        return SimpleNamespace(kind=RespondReason.DONE, explanation="tests passed")
+
+    assert host._runtime is not None  # noqa: SLF001
+    original_transition = host._runtime.transition_run  # noqa: SLF001
+
+    def transition(run_id, state, **kwargs):  # noqa: ANN001
+        original_transition(run_id, state, **kwargs)
+        if state == "waiting_process":
+            running["value"] = False
+            host._wake_event.set()  # noqa: SLF001
+
+    host._runtime.transition_run = transition  # type: ignore[method-assign]  # noqa: SLF001
     monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
     result = await asyncio.wait_for(host._run_user_turn("run the full suite"), timeout=3)
 

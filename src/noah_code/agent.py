@@ -886,6 +886,12 @@ class CodingAgent(InteractiveAgent):
           diagnostics, rename previews, and compact repository maps before broad searches.
         - Use ``self.processes.start/logs/status/input/stop`` for servers, watchers, and
           long-running commands. Consume logs by cursor; do not poll without new work.
+        - Use ``await self.processes.open_terminal(name)``,
+          ``await self.processes.terminal_run(name, command)``,
+          ``await self.processes.terminal_status()``, and
+          ``await self.processes.close_terminal(name)`` for
+          multiple named persistent shells. Every terminal command is permission-checked;
+          raw ``input`` is intentionally blocked for managed terminals.
         - ``result = await self.ws.run("pytest -q")`` runs validation; inspect
           ``result.returncode``, ``result.stdout``, and ``result.stderr``.
           ``read_only=True`` skips approval ONLY for commands the engine
@@ -917,6 +923,8 @@ class CodingAgent(InteractiveAgent):
           NOOA subagent with isolated history; results arrive condensed. Use
           ``await self.task.run_many([("explore", "..."), ...])`` to fan out
           bounded independent units concurrently.
+          ``await self.task.collaborate(objective, assignments, lead="general")`` fans
+          out research and hands the bounded reports to one lead for synthesis.
         - ``self.task.list()`` shows markdown agents.
         - If ``self.media.pending()`` is non-empty, ``show()`` each ``self.media.consume()``
           image before reasoning. ``show`` is a CodeAct builtin; do not import ``nooa``.

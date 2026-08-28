@@ -1033,6 +1033,162 @@ class TextPromptModal(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class WorkLedgerScreen(ModalScreen[None]):
+    """Live operator view of delegated agents, terminals, and background jobs."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=True),
+        Binding("r", "refresh", "Refresh", show=True),
+    ]
+
+    def __init__(self, host: AgentHost) -> None:
+        super().__init__()
+        self.host = host
+        self._records: dict[str, dict[str, Any]] = {}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="work-dialog"):
+            yield Label("LIVE WORK LEDGER", id="work-title")
+            yield Static("", id="work-summary")
+            with Horizontal(id="work-body"):
+                yield OptionList(id="work-list", compact=True)
+                yield SelectableRichLog(
+                    id="work-detail",
+                    markup=False,
+                    highlight=False,
+                    wrap=True,
+                    min_width=0,
+                    max_lines=500,
+                )
+            yield Static(
+                "R refresh · /work console view · /terminals terminal list · Esc close",
+                id="work-hint",
+            )
+
+    def on_mount(self) -> None:
+        self._refresh()
+        self.set_interval(1.0, self._refresh)
+
+    def _refresh(self) -> None:
+        snapshot = self.host.work_snapshot()
+        records: list[tuple[str, dict[str, Any]]] = []
+        for item in snapshot["agents"]:
+            records.append((f"agent:{item['id']}", {"unit": "agent", **item}))
+        for item in snapshot["jobs"]:
+            records.append((f"job:{item['id']}", {"unit": "job", **item}))
+        active = sum(
+            item.get("state") in {"queued", "running", "stopping"}
+            for _key, item in records
+        )
+        terminals = sum(item.get("kind") == "terminal" for _key, item in records)
+        self.query_one("#work-summary", Static).update(
+            Text.assemble(
+                (f"{active} active", "bold #e6b673" if active else "#777781"),
+                (f"   {len(snapshot['agents'])} agent records", "#d1d1d6"),
+                (f"   {terminals} terminals", "#7dc4e4"),
+                ("   newest work appears last", "#777781"),
+            ),
+            layout=False,
+        )
+        option_list = self.query_one("#work-list", OptionList)
+        selected_id = None
+        if option_list.highlighted is not None and option_list.highlighted < len(option_list.options):
+            selected_id = option_list.get_option_at_index(option_list.highlighted).id
+        option_list.clear_options()
+        self._records = dict(records)
+        options: list[Option] = []
+        for key, item in records:
+            state = str(item.get("state", "unknown"))
+            running = state in {"queued", "running", "stopping"}
+            state_style = (
+                "#e6b673"
+                if running
+                else "#8bd5ca"
+                if state in {"completed", "stopped"}
+                else "#777781"
+                if state == "cancelled"
+                else "#ed8796"
+            )
+            if item["unit"] == "agent":
+                title = f"agent · {item.get('agent', 'unknown')}"
+                elapsed = float(item.get("duration", 0.0))
+            else:
+                kind = "terminal" if item.get("kind") == "terminal" else "job"
+                title = f"{kind} · {item.get('name', 'unknown')}"
+                elapsed = float(item.get("elapsed", 0.0))
+            prompt = Text()
+            prompt.append(f"{state.upper():<10}", style=f"bold {state_style}")
+            prompt.append(f"{title}\n", style="#d1d1d6")
+            prompt.append(f"   {elapsed:.1f}s  {str(item.get('id', ''))}", style="#777781")
+            options.append(Option(prompt, id=key))
+        if not options:
+            option_list.add_option(
+                Option(
+                    Text("No delegated work or terminal sessions", style="#777781"),
+                    disabled=True,
+                )
+            )
+            detail = self.query_one("#work-detail", RichLog)
+            detail.clear()
+            detail.write(
+                Text(
+                    "Noah opens named terminals with processes.open_terminal() and coordinates "
+                    "teams with task.collaborate(). Work will appear here as it starts.",
+                    style="#d1d1d6",
+                )
+            )
+            return
+        option_list.add_options(options)
+        index = next(
+            (index for index, option in enumerate(options) if option.id == selected_id),
+            len(options) - 1,
+        )
+        option_list.highlighted = index
+        if not option_list.has_focus:
+            option_list.focus()
+        self._show(records[index][1])
+
+    @on(OptionList.OptionHighlighted, "#work-list")
+    def _highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option.id and event.option.id in self._records:
+            self._show(self._records[event.option.id])
+
+    def _show(self, item: dict[str, Any]) -> None:
+        detail = self.query_one("#work-detail", RichLog)
+        detail.clear()
+        text = Text()
+        if item["unit"] == "agent":
+            text.append(f"{item.get('agent', 'agent')}\n", style="bold #b8a9ff")
+            text.append(
+                f"{item.get('state')} · {item.get('mode')} · "
+                f"{'read-only' if item.get('readonly') else 'workspace writer'} · "
+                f"{float(item.get('duration', 0.0)):.1f}s\n\n",
+                style="#777781",
+            )
+            text.append("ASSIGNMENT\n", style="bold #7dc4e4")
+            text.append(str(item.get("prompt") or "No assignment text"), style="#d1d1d6")
+            if item.get("result_preview"):
+                text.append("\n\nRESULT\n", style="bold #8bd5ca")
+                text.append(str(item["result_preview"]), style="#d1d1d6")
+        else:
+            kind = "terminal" if item.get("kind") == "terminal" else "background job"
+            text.append(f"{item.get('name', kind)}\n", style="bold #b8a9ff")
+            text.append(
+                f"{kind} · {item.get('state')} · {float(item.get('elapsed', 0.0)):.1f}s · "
+                f"cursor {item.get('cursor', 0)}\n\n",
+                style="#777781",
+            )
+            text.append("COMMAND\n", style="bold #7dc4e4")
+            text.append(str(item.get("command") or "Persistent shell"), style="#d1d1d6")
+        detail.write(text)
+
+    def action_refresh(self) -> None:
+        self._refresh()
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class ActivityHistoryScreen(ModalScreen[None]):
     """Expandable inspector for agent thoughts, actions, and full output."""
 
@@ -1567,6 +1723,7 @@ class NoahCodeApp(App[None]):
         Binding("f1", "show_help", "Help", show=True),
         Binding("f2", "activity_history", "Activity", show=True),
         Binding("f3", "conversation_history", "History", show=True),
+        Binding("f4", "work_ledger", "Work", show=True),
         Binding("ctrl+]", "scroll_live", "Latest", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
     ]
@@ -1670,7 +1827,7 @@ class NoahCodeApp(App[None]):
                     )
             yield Static("", id="context-rail")
         yield Static("", id="command-suggestions")
-        yield Static("Enter send · Shift+Enter newline · / commands", id="context-hint")
+        yield Static("Enter send · Shift+Enter newline · / commands · F4 work", id="context-hint")
         yield ComposerTextArea(
             id="composer",
             language=None,
@@ -1921,10 +2078,10 @@ class NoahCodeApp(App[None]):
 
         hint = (
             "Enter queue follow-up · Ctrl+C cancel · drag select · "
-            f"{_copy_shortcut_label()} copy · F2 activity"
+            f"{_copy_shortcut_label()} copy · F2 activity · F4 work"
             if self.ui.busy and self._agent_ready
             else "Enter send · Shift+Enter newline · drag select · "
-            f"{_copy_shortcut_label()} copy · / commands"
+            f"{_copy_shortcut_label()} copy · / commands · F4 work"
         )
         if force or hint != self._hint_text:
             self._hint_text = hint
@@ -1967,6 +2124,41 @@ class NoahCodeApp(App[None]):
             text.append(f"\n{_truncate_middle(thought, 62)}", style=palette.muted)
         if queued:
             text.append(f"\n{queued}", style=palette.warning)
+
+        work = self.host.work_snapshot()
+        agents = work["agents"]
+        jobs = work["jobs"]
+        active_agents = [
+            item for item in agents if item.get("state") in {"queued", "running"}
+        ]
+        active_jobs = [
+            item for item in jobs if item.get("state") in {"running", "stopping"}
+        ]
+        text.append("\n\nWORK\n", style=f"bold {palette.accent}")
+        if not active_agents and not active_jobs:
+            completed = len(agents) + sum(
+                item.get("state") not in {"running", "stopping"} for item in jobs
+            )
+            message = f"{completed} recent · F4 details" if completed else "No delegated work · F4 details"
+            text.append(message, style=palette.muted)
+        else:
+            for item in active_agents[:3]:
+                state = str(item.get("state", "running"))
+                text.append(f"{state} · ", style=palette.warning)
+                text.append(
+                    f"{str(item.get('agent', 'agent'))} · "
+                    f"{float(item.get('duration', 0.0)):.1f}s\n",
+                    style=palette.text,
+                )
+            for item in active_jobs[:3]:
+                kind = "terminal" if item.get("kind") == "terminal" else "job"
+                text.append(f"{kind} · ", style="#7dc4e4")
+                text.append(
+                    f"{str(item.get('name', 'work'))} · "
+                    f"{float(item.get('elapsed', 0.0)):.1f}s\n",
+                    style=palette.text,
+                )
+            text.append("F4 opens live ledger", style=palette.muted)
 
         text.append("\n\nCHANGES\n", style=f"bold {palette.accent}")
         snapshot = self._repository_snapshot
@@ -2220,6 +2412,14 @@ class NoahCodeApp(App[None]):
             kind = event.meta.get("kind")
             if kind == "theme":
                 self.apply_theme(str(event.meta.get("theme", self._theme_name)))
+            elif kind == "subagent":
+                state = str(event.meta.get("state", "running"))
+                if state == "running":
+                    self._phase = f"agent {event.meta.get('agent', '')}".strip()
+                if state in {"queued", "completed", "failed", "cancelled"}:
+                    self._append_entry(TranscriptEntry("ACTIVITY", text))
+            elif kind == "background_job":
+                self._append_entry(TranscriptEntry("ACTIVITY", text))
             elif kind == "llm_start":
                 self._phase = "thinking"
             elif kind == "llm_end":
@@ -2459,7 +2659,7 @@ class NoahCodeApp(App[None]):
             widget.update("")
             widget.styles.display = "none"
             self.query_one("#context-hint", Static).update(
-                "Enter send · Shift+Enter newline · Tab build/plan · / commands · F2 activity",
+                "Enter send · Shift+Enter newline · Tab build/plan · / commands · F4 work",
                 layout=False,
             )
             return
@@ -3191,6 +3391,9 @@ class NoahCodeApp(App[None]):
 
     def action_activity_history(self) -> None:
         self.push_screen(ActivityHistoryScreen(list(self._activity_history)))
+
+    def action_work_ledger(self) -> None:
+        self.push_screen(WorkLedgerScreen(self.host))
 
     def action_conversation_history(self) -> None:
         self.push_screen(ConversationHistoryScreen(self.host))

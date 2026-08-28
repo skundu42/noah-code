@@ -118,6 +118,60 @@ async def test_background_job_accepts_input_and_stop_owns_process_group(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_named_terminals_keep_independent_shell_state(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, auto=True)
+    try:
+        first = await manager.open_terminal("build", shell="/bin/sh")
+        second = await manager.open_terminal("tests", shell="/bin/sh")
+        assert "terminal build opened" in first
+        assert "terminal tests opened" in second
+
+        build_dir = tmp_path / "build-dir"
+        tests_dir = tmp_path / "tests-dir"
+        build_dir.mkdir()
+        tests_dir.mkdir()
+        await manager.terminal_run("build", f"cd {shlex.quote(str(build_dir))}")
+        await manager.terminal_run("tests", f"cd {shlex.quote(str(tests_dir))}")
+        build = await manager.terminal_run("build", "pwd")
+        tests = await manager.terminal_run("tests", "pwd")
+
+        assert str(build_dir) in build and "exit=0" in build
+        assert str(tests_dir) in tests and "exit=0" in tests
+        assert (await manager.terminal_status()).count("terminal ·") == 2
+        snapshot = manager.snapshot()
+        assert {item["name"] for item in snapshot if item["kind"] == "terminal"} == {
+            "build",
+            "tests",
+        }
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_blocks_unapproved_raw_input_and_supports_named_close(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, auto=True)
+    try:
+        opened = await manager.open_terminal("server", shell="/bin/sh")
+        job_id = opened.split("id=", 1)[1].split(" ·", 1)[0]
+        with pytest.raises(RuntimeError, match="use terminal_run"):
+            await manager.input(job_id, "echo bypass")
+        with pytest.raises(PermissionError, match="denied"):
+            await manager.terminal_run("server", "rm -rf /")
+        with pytest.raises(ValueError, match="already exists"):
+            await manager.open_terminal("server", shell="/bin/sh")
+
+        closed = await manager.close_terminal("server")
+        assert "terminal server closed" in closed
+        assert "[stopped]" in closed
+        reopened = await manager.open_terminal("server", shell="/bin/sh")
+        assert "terminal server opened" in reopened
+        with pytest.raises(ValueError, match="terminal name"):
+            await manager.open_terminal("bad name", shell="/bin/sh")
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_background_job_status_and_logs_survive_manager_restart(tmp_path: Path) -> None:
     runtime = RuntimeStateStore(tmp_path / "session")
     manager = _manager(tmp_path, runtime=runtime)
@@ -233,6 +287,9 @@ async def test_start_rejects_empty_command_and_enforces_job_limit(tmp_path: Path
         job_id = started.split()[1]
         with pytest.raises(RuntimeError, match="job limit reached"):
             await manager.start(command, name="extra")
+        manager._jobs[job_id].state = "stopping"
+        with pytest.raises(RuntimeError, match="job limit reached"):
+            await manager.start(command, name="extra-while-stopping")
     finally:
         await manager.stop(job_id)
         await manager.close()
@@ -253,6 +310,42 @@ async def test_register_failure_cleans_up_process_log_and_job(
     command = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote("print('never seen')")
     with pytest.raises(RuntimeError, match="registration failure"):
         await manager.start(command, name="ghost")
+    assert manager._jobs == {}
+    assert list(runtime.process_log_dir.glob("*.jsonl")) == []
+
+
+@pytest.mark.asyncio
+async def test_log_creation_failure_terminates_unregistered_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+    manager = _manager(tmp_path, runtime=runtime)
+    created: list[asyncio.subprocess.Process] = []
+    original_spawn = asyncio.create_subprocess_exec
+    original_touch = Path.touch
+
+    async def capture_spawn(*args, **kwargs):  # noqa: ANN002, ANN003
+        process = await original_spawn(*args, **kwargs)
+        created.append(process)
+        return process
+
+    def fail_process_log(path: Path, *args, **kwargs):  # noqa: ANN002, ANN003
+        if path.parent == runtime.process_log_dir:
+            raise OSError("simulated log creation failure")
+        return original_touch(path, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_spawn)
+    monkeypatch.setattr(Path, "touch", fail_process_log)
+    command = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote(
+        "import time; time.sleep(30)"
+    )
+
+    with pytest.raises(OSError, match="log creation failure"):
+        await manager.start(command, name="unlogged")
+
+    assert len(created) == 1
+    assert created[0].returncode is not None
+    assert created[0]._transport.is_closing()
     assert manager._jobs == {}
     assert list(runtime.process_log_dir.glob("*.jsonl")) == []
 

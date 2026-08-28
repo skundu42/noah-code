@@ -269,6 +269,78 @@ async def test_run_many_validates_before_spawning(tmp_path: Path) -> None:
         await tasks.run_many([])
 
 
+@pytest.mark.asyncio
+async def test_task_lifecycle_snapshot_exposes_live_and_completed_work(tmp_path: Path) -> None:
+    import asyncio
+
+    workspace = Workspace(root=tmp_path.resolve())
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    events: list[dict] = []
+
+    async def runner(_spec, _prompt: str) -> str:
+        started.set()
+        await release.wait()
+        return "found parser.py"
+
+    tasks = TaskTools(
+        workspace,
+        engine,
+        ApprovalBroker(engine, handler=_always_once),
+        runner=runner,
+    )
+    tasks.set_lifecycle_handler(lambda activity: events.append(activity))
+    pending = asyncio.create_task(tasks.run("explore", "find the parser"))
+    await started.wait()
+
+    live = tasks.snapshot()
+    assert len(live) == 1
+    assert live[0]["agent"] == "explore"
+    assert live[0]["state"] == "running"
+    assert live[0]["readonly"] is True
+
+    release.set()
+    assert await pending == "found parser.py"
+    completed = tasks.snapshot()
+    assert completed[-1]["state"] == "completed"
+    assert completed[-1]["result_preview"] == "found parser.py"
+    assert [event["state"] for event in events] == ["queued", "running", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_collaborate_fans_out_then_hands_reports_to_lead(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    calls: list[tuple[str, str]] = []
+
+    async def runner(spec, prompt: str) -> str:
+        calls.append((spec.name, prompt))
+        if spec.name == "general":
+            assert "Teammate reports" in prompt
+            assert "parser report" in prompt
+            assert "tests report" in prompt
+            return "ship the parser fix"
+        return "parser report" if "parser" in prompt else "tests report"
+
+    tasks = TaskTools(
+        workspace,
+        engine,
+        ApprovalBroker(engine, handler=_always_once),
+        runner=runner,
+    )
+
+    result = await tasks.collaborate(
+        "Fix the parser safely",
+        [("explore", "inspect parser"), ("explore", "inspect tests")],
+    )
+
+    assert [name for name, _prompt in calls].count("explore") == 2
+    assert calls[-1][0] == "general"
+    assert "Team lead · general" in result
+    assert "ship the parser fix" in result
+
+
 # ---------------------------------------------------------------------------
 # Engine isolation
 # ---------------------------------------------------------------------------

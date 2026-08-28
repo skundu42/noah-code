@@ -7,6 +7,8 @@ import codecs
 import contextlib
 import json
 import os
+import re
+import shutil
 import signal
 import tempfile
 import time
@@ -24,6 +26,10 @@ if TYPE_CHECKING:
     from noah_code.runtime_state import RuntimeStateStore
 
 
+_TERMINAL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
+_POSIX_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+
+
 @dataclass(frozen=True)
 class ProcessEvent:
     sequence: int
@@ -39,6 +45,7 @@ class BackgroundJob:
     command: str
     process: asyncio.subprocess.Process
     log_path: Path | None = None
+    kind: str = "process"
     started_at: float = field(default_factory=time.monotonic)
     finished_at: float | None = None
     returncode: int | None = None
@@ -47,6 +54,8 @@ class BackgroundJob:
     event_chars: int = 0
     next_sequence: int = 1
     tasks: list[asyncio.Task[Any]] = field(default_factory=list)
+    command_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    output_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
     def elapsed(self) -> float:
@@ -91,13 +100,6 @@ class ProcessTools(Skill):
         command = command.strip()
         if not command:
             raise ValueError("command is required")
-        running = sum(job.state == "running" for job in self._jobs.values())
-        if running >= self._max_jobs:
-            raise RuntimeError(f"background job limit reached ({self._max_jobs})")
-        if len(self._jobs) >= self._max_jobs * 4:
-            finished = [job_id for job_id, job in self._jobs.items() if job.state != "running"]
-            for job_id in finished[: max(1, len(self._jobs) - self._max_jobs * 3)]:
-                self._jobs.pop(job_id, None)
         decision = self._ws._shell_decision(command, tool="processes_start")
         await self._ws._approvals.require(decision)
         if not self._ws._engine.is_readonly_command(command):
@@ -110,28 +112,164 @@ class ProcessTools(Skill):
             argv: tuple[str, ...] = ("cmd.exe", "/d", "/s", "/c", command)
         else:
             argv = (os.environ.get("SHELL") or "/bin/sh", "-lc", command)
+        job = await self._launch(
+            argv,
+            command=command,
+            name=(name.strip() or command.split()[0])[:60],
+            runtime=runtime,
+        )
+        return f"job {job.id} started · {job.name} · cursor=0 · timeout={runtime:g}s"
+
+    async def open_terminal(
+        self,
+        name: Annotated[str, spec(description="Unique terminal session name")] = "",
+        shell: Annotated[str, spec(description="Optional shell executable path or name")] = "",
+        timeout: Annotated[
+            float | None,
+            spec(description="Maximum terminal lifetime; bounded by session configuration"),
+        ] = None,
+    ) -> str:
+        """Open a named persistent terminal; commands remain permission-gated."""
+
+        label = name.strip() or f"terminal-{self._terminal_count() + 1}"
+        if _TERMINAL_NAME.fullmatch(label) is None:
+            raise ValueError(
+                "terminal name must be 1-40 letters, numbers, dots, underscores, or hyphens"
+            )
+        if any(
+            job.kind == "terminal"
+            and job.name == label
+            and job.state in {"running", "stopping"}
+            for job in self._jobs.values()
+        ):
+            raise ValueError(f"terminal name already exists: {label}")
+        requested = shell.strip() or ("cmd.exe" if os.name == "nt" else os.environ.get("SHELL", ""))
+        requested = requested or ("cmd.exe" if os.name == "nt" else "/bin/sh")
+        executable = shutil.which(requested)
+        if executable is None:
+            raise ValueError(f"shell executable not found: {requested}")
+        shell_name = Path(executable).name.lower()
+        if os.name != "nt" and shell_name not in _POSIX_SHELLS:
+            supported = ", ".join(sorted(_POSIX_SHELLS))
+            raise ValueError(f"unsupported terminal shell {shell_name!r}; use one of: {supported}")
+        if os.name == "nt" and shell_name not in {"cmd", "cmd.exe"}:
+            raise ValueError("managed terminals currently support cmd.exe on Windows")
+        await self._ws._approvals.require(
+            self._ws._engine.decide("task", f"terminal:{label}", tool="terminal_open")
+        )
+        runtime = min(timeout or self._max_runtime, self._max_runtime)
+        if runtime <= 0:
+            raise ValueError("timeout must be positive")
+        argv = (executable,) if os.name == "nt" else (executable, "-l")
+        job = await self._launch(
+            argv,
+            command=f"[terminal] {executable}",
+            name=label[:60],
+            runtime=runtime,
+            kind="terminal",
+        )
+        return (
+            f"terminal {job.name} opened · id={job.id} · shell={executable} · "
+            f"cursor=0 · timeout={runtime:g}s"
+        )
+
+    async def terminal_run(
+        self,
+        name: Annotated[str, spec(description="Terminal session name or id")],
+        command: Annotated[str, spec(description="Command to run in the persistent terminal")],
+        timeout: Annotated[float, spec(description="Maximum command wait in seconds")] = 60.0,
+    ) -> str:
+        """Run one permission-checked command and return output plus exit status."""
+
+        job = self._terminal_job(name)
+        command = command.strip()
+        if not command:
+            raise ValueError("command is required")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        wait_timeout = min(timeout, self._max_runtime)
+        decision = self._ws._shell_decision(command, tool="terminal_run")
+        await self._ws._approvals.require(decision)
+        if not self._ws._engine.is_readonly_command(command):
+            await self._ws.checkpoint_before_shell(command)
+            self._ws._journal.mark_shell_bypass()
+        async with job.command_lock:
+            cursor = job.next_sequence - 1
+            marker = f"__NOAH_TERMINAL_{uuid.uuid4().hex}__"
+            if os.name == "nt":
+                payload = f"{command}\r\necho {marker}:%errorlevel%\r\n"
+            else:
+                payload = f"{command}\nprintf '\\n{marker}:%s\\n' \"$?\"\n"
+            await self._write_input(job, payload)
+            output, returncode = await self._wait_for_terminal_marker(
+                job,
+                cursor=cursor,
+                marker=marker,
+                timeout=wait_timeout,
+            )
+        bounded = output.strip()
+        if len(bounded) > 32_000:
+            bounded = bounded[:16_000] + "\n… terminal output bounded …\n" + bounded[-16_000:]
+        return f"{bounded or '(no output)'}\n\nterminal {job.name} · exit={returncode}"
+
+    async def close_terminal(
+        self,
+        name: Annotated[str, spec(description="Terminal session name or id")],
+    ) -> str:
+        """Close a named persistent terminal session."""
+
+        job = self._terminal_job(name)
+        result = await self.stop(job.id)
+        return f"terminal {job.name} closed · {result}"
+
+    async def terminal_status(
+        self,
+        name: Annotated[str, spec(description="Optional terminal name or id")] = "",
+    ) -> str:
+        """List persistent terminals or show one terminal's state."""
+
+        if name.strip():
+            return self._status_line(self._terminal_job(name))
+        terminals = [job for job in self._jobs.values() if job.kind == "terminal"]
+        if not terminals:
+            return "(no terminal sessions; use open_terminal to create one)"
+        return "\n".join(self._status_line(job) for job in terminals)
+
+    async def _launch(
+        self,
+        argv: tuple[str, ...],
+        *,
+        command: str,
+        name: str,
+        runtime: float,
+        kind: str = "process",
+    ) -> BackgroundJob:
+        self._ensure_capacity()
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=self._ws._workspace.root,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=(
+                asyncio.subprocess.STDOUT if kind == "terminal" else asyncio.subprocess.PIPE
+            ),
             start_new_session=os.name != "nt",
         )
         job_id = uuid.uuid4().hex[:8]
         log_path = self._runtime.process_log_dir / f"{job_id}.jsonl" if self._runtime else None
-        if log_path is not None:
-            log_path.touch(mode=0o600, exist_ok=False)
         job = BackgroundJob(
             id=job_id,
-            name=(name.strip() or command.split()[0])[:60],
+            name=name,
             command=command,
             process=process,
             log_path=log_path,
+            kind=kind,
         )
-        self._jobs[job_id] = job
-        if self._runtime is not None:
-            try:
+        try:
+            if log_path is not None:
+                log_path.touch(mode=0o600, exist_ok=False)
+            self._jobs[job_id] = job
+            if self._runtime is not None:
                 self._runtime.register_job(
                     job_id=job_id,
                     name=job.name,
@@ -140,12 +278,15 @@ class ProcessTools(Skill):
                     timeout_seconds=runtime,
                     log_path=log_path or self._runtime.process_log_dir / f"{job_id}.jsonl",
                 )
-            except Exception:
+        except Exception:
+            with contextlib.suppress(Exception):
                 await self._terminate(job)
-                self._jobs.pop(job_id, None)
-                if log_path is not None:
+            self._close_transport(process)
+            self._jobs.pop(job_id, None)
+            if log_path is not None:
+                with contextlib.suppress(OSError):
                     log_path.unlink(missing_ok=True)
-                raise
+            raise
         readers = (
             asyncio.create_task(
                 self._read(job, "stdout", process.stdout), name=f"noah-job-{job_id}-out"
@@ -160,7 +301,7 @@ class ProcessTools(Skill):
             asyncio.create_task(self._expire(job, runtime), name=f"noah-job-{job_id}-timeout"),
         ]
         self._emit(job, f"started pid={process.pid}")
-        return f"job {job_id} started · {job.name} · cursor=0 · timeout={runtime:g}s"
+        return job
 
     async def logs(
         self,
@@ -228,9 +369,17 @@ class ProcessTools(Skill):
     ) -> str:
         """Write input to a running job."""
         job = self._job(job_id)
+        if job.kind == "terminal":
+            raise RuntimeError(
+                f"job {job.id} is a managed terminal; use terminal_run so commands are approved"
+            )
+        payload = text + ("\n" if newline else "")
+        await self._write_input(job, payload)
+        return f"sent {len(payload.encode())} bytes to job {job.id}"
+
+    async def _write_input(self, job: BackgroundJob, payload: str) -> None:
         if job.state != "running" or job.process.stdin is None:
             raise RuntimeError(f"job {job.id} is not accepting input ({job.state})")
-        payload = text + ("\n" if newline else "")
         try:
             job.process.stdin.write(payload.encode())
             await job.process.stdin.drain()
@@ -239,7 +388,6 @@ class ProcessTools(Skill):
             # the same condition the state guard produces instead of leaking
             # a transport error.
             raise RuntimeError(f"job {job.id} is not accepting input ({job.state})") from exc
-        return f"sent {len(payload.encode())} bytes to job {job.id}"
 
     async def stop(
         self,
@@ -269,11 +417,106 @@ class ProcessTools(Skill):
         lines.extend(self._status_line(job) for job in recent)
         return "\n".join(lines)
 
+    def snapshot(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        jobs = list(self._jobs.values())[-limit:] if limit > 0 else []
+        return [
+            {
+                "id": job.id,
+                "name": job.name,
+                "kind": job.kind,
+                "state": job.state,
+                "command": job.command,
+                "elapsed": job.elapsed,
+                "returncode": job.returncode,
+                "cursor": job.next_sequence - 1,
+            }
+            for job in jobs
+        ]
+
     def has_running(self) -> bool:
         return any(job.state in {"running", "stopping"} for job in self._jobs.values())
 
     def set_lifecycle_handler(self, handler: Any) -> None:
         self._on_lifecycle = handler
+
+    def _ensure_capacity(self) -> None:
+        active = sum(job.state in {"running", "stopping"} for job in self._jobs.values())
+        if active >= self._max_jobs:
+            raise RuntimeError(f"background job limit reached ({self._max_jobs})")
+        if len(self._jobs) < self._max_jobs * 4:
+            return
+        finished = [
+            job_id
+            for job_id, job in self._jobs.items()
+            if job.state not in {"running", "stopping"}
+        ]
+        for job_id in finished[: max(1, len(self._jobs) - self._max_jobs * 3)]:
+            self._jobs.pop(job_id, None)
+
+    def _terminal_count(self) -> int:
+        return sum(
+            job.kind == "terminal" and job.state in {"running", "stopping"}
+            for job in self._jobs.values()
+        )
+
+    def _terminal_job(self, name: str) -> BackgroundJob:
+        selected = name.strip()
+        matches = [
+            job
+            for job in self._jobs.values()
+            if job.kind == "terminal" and selected in {job.id, job.name}
+        ]
+        if not matches:
+            raise KeyError(f"unknown terminal session: {selected}")
+        return next(
+            (
+                job
+                for job in reversed(matches)
+                if job.state in {"running", "stopping"}
+            ),
+            matches[-1],
+        )
+
+    async def _wait_for_terminal_marker(
+        self,
+        job: BackgroundJob,
+        *,
+        cursor: int,
+        marker: str,
+        timeout: float,
+    ) -> tuple[str, int]:
+        deadline = asyncio.get_running_loop().time() + timeout
+        collected = ""
+        next_cursor = cursor
+        while True:
+            events = [event for event in job.events if event.sequence > next_cursor]
+            if events:
+                collected += "".join(event.text for event in events)
+                next_cursor = events[-1].sequence
+                marker_at = collected.find(marker + ":")
+                if marker_at >= 0:
+                    suffix = collected[marker_at + len(marker) + 1 :]
+                    code_text = suffix.splitlines()[0].strip() if suffix else ""
+                    try:
+                        return collected[:marker_at], int(code_text)
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            f"terminal {job.name} returned an invalid exit marker"
+                        ) from exc
+            if job.state != "running":
+                raise RuntimeError(f"terminal {job.name} exited before the command completed")
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"terminal command timed out after {timeout:g}s; session {job.name} is still open"
+                )
+            job.output_event.clear()
+            try:
+                await asyncio.wait_for(job.output_event.wait(), timeout=remaining)
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"terminal command timed out after {timeout:g}s; session {job.name} is still open"
+                ) from exc
 
     async def _read(
         self,
@@ -302,6 +545,7 @@ class ProcessTools(Skill):
         job.next_sequence += 1
         job.events.append(event)
         job.event_chars += len(text)
+        job.output_event.set()
         while job.events and job.event_chars > self._max_buffer:
             removed = job.events.popleft()
             job.event_chars -= len(removed.text)
@@ -474,7 +718,8 @@ class ProcessTools(Skill):
     @staticmethod
     def _status_line(job: BackgroundJob) -> str:
         exit_text = "" if job.returncode is None else f" exit={job.returncode}"
-        return f"{job.id} [{job.state}] {job.name} · {job.elapsed:.1f}s{exit_text}"
+        kind = "terminal · " if job.kind == "terminal" else ""
+        return f"{job.id} [{job.state}] {kind}{job.name} · {job.elapsed:.1f}s{exit_text}"
 
     @staticmethod
     def _durable_status_line(record: dict[str, Any]) -> str:

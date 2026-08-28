@@ -128,6 +128,7 @@ Type `/` to search the full command and configuration reference. The most common
 | `Tab` | Switch between build and plan mode |
 | `F2` | Open execution activity |
 | `F3` | Open paginated conversation history |
+| `F4` | Open the live agent, terminal, and job ledger |
 | `/model` | Configure a provider or switch the session model |
 | `/theme` | Choose Atom One Dark, Noah Ocean, Graphite, or High Contrast |
 | `/diff` | Review staged and unstaged changes |
@@ -137,8 +138,8 @@ Type `/` to search the full command and configuration reference. The most common
 | `/tokens` | Inspect tokens, cache usage, prefix stability, model wait, and tool output |
 | `/efficiency` | Switch between `fast`, `balanced`, and `deep` budgets |
 
-On wide terminals, the side rail prioritizes the active operation, Git branch and change counts,
-session, model usage, update state, and plan. Git status is refreshed in the background at turn
+On wide terminals, the side rail prioritizes the active operation, delegated agents, named
+terminals, Git branch and change counts, session, model usage, update state, and plan. Git status is refreshed in the background at turn
 boundaries, so the animated working state stays responsive. The main pane remains centered on the
 large Noah wordmark until the first prompt, then becomes the conversation and execution timeline.
 

@@ -312,28 +312,47 @@ class AgentHost:
             self.meta.session_id,
             max_events=self.config.reliability.max_runtime_events,
         )
-        checkpoint = await asyncio.to_thread(self._runtime.load_checkpoint)
-        usage_state = await asyncio.to_thread(
-            self._runtime.get_state,
-            "live:usage",
-            checkpoint.get("usage"),
+        # Cold NOOA/LiteLLM import is independent of durable recovery. Start it
+        # now so provider initialization overlaps SQLite and process cleanup.
+        runtime_loader = asyncio.create_task(
+            asyncio.to_thread(_load_agent_runtime),
+            name="noah-runtime-loader",
         )
-        if isinstance(usage_state, dict):
-            self._usage.load_dict(usage_state)
-        persisted_meta = checkpoint.get("meta")
-        if isinstance(persisted_meta, dict) and persisted_meta.get("session_id") == self.meta.session_id:
-            recovered_meta = SessionMeta.from_json(json.dumps(persisted_meta))
-            # The runtime checkpoint is written as one generation and is the
-            # authoritative host-state view when JSON sidecars lag a crash.
-            self.meta = recovered_meta
-        recovered_files = await asyncio.to_thread(self._runtime.recover_file_operations)
-        recovered_jobs = await asyncio.to_thread(
-            self._runtime.recover_orphan_jobs,
-            grace_seconds=self.config.processes.stop_grace_seconds,
-        )
-        interrupted_interactions = await asyncio.to_thread(
-            self._runtime.interrupt_pending_interactions
-        )
+        try:
+            checkpoint = await asyncio.to_thread(self._runtime.load_checkpoint)
+            usage_state = await asyncio.to_thread(
+                self._runtime.get_state,
+                "live:usage",
+                checkpoint.get("usage"),
+            )
+            if isinstance(usage_state, dict):
+                self._usage.load_dict(usage_state)
+            persisted_meta = checkpoint.get("meta")
+            if (
+                isinstance(persisted_meta, dict)
+                and persisted_meta.get("session_id") == self.meta.session_id
+            ):
+                recovered_meta = SessionMeta.from_json(json.dumps(persisted_meta))
+                # The runtime checkpoint is written as one generation and is the
+                # authoritative host-state view when JSON sidecars lag a crash.
+                self.meta = recovered_meta
+            recovered_files = await asyncio.to_thread(self._runtime.recover_file_operations)
+            recovered_jobs = await asyncio.to_thread(
+                self._runtime.recover_orphan_jobs,
+                grace_seconds=self.config.processes.stop_grace_seconds,
+            )
+            interrupted_interactions = await asyncio.to_thread(
+                self._runtime.interrupt_pending_interactions
+            )
+            self._interrupted_run = await asyncio.to_thread(
+                self._runtime.latest_incomplete_run
+            )
+            agent_class, get_llm_client = await runtime_loader
+        except BaseException:
+            runtime_loader.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await runtime_loader
+            raise
         if recovered_files:
             self.ui.render(
                 HostEvent(
@@ -355,12 +374,6 @@ class AgentHost:
                     f"expired {interrupted_interactions} interrupted interaction(s)",
                 )
             )
-        self._interrupted_run = await asyncio.to_thread(self._runtime.latest_incomplete_run)
-
-        # Python's first NOOA import initializes LiteLLM's provider registry and
-        # is by far the largest cold-start cost. Do it in a worker thread so the
-        # Textual shell can paint and remain responsive meanwhile.
-        agent_class, get_llm_client = await asyncio.to_thread(_load_agent_runtime)
         from noah_code.llm import reasoning_overrides, sampling_overrides
 
         client_kwargs: dict[str, Any] = {}
@@ -460,6 +473,8 @@ class AgentHost:
         agent._render_message = self._on_agent_message
         agent.ws.set_shell_chunk_handler(self._on_shell_chunk)
         agent.processes.set_lifecycle_handler(self._on_process_lifecycle)
+        if getattr(agent, "task", None) is not None:
+            agent.task.set_lifecycle_handler(self._on_subagent_lifecycle)
 
         from noah_code.checkpoints import CheckpointManager
         from noah_code.hooks import HookRunner
@@ -658,15 +673,52 @@ class AgentHost:
     ) -> None:
         """Push lifecycle changes to the UI without streaming logs into model context."""
 
+        record: dict[str, Any] = {}
+        if self._agent is not None:
+            with contextlib.suppress(Exception):
+                record = next(
+                    (
+                        item
+                        for item in self.agent.processes.snapshot()
+                        if item.get("id") == job_id
+                    ),
+                    {},
+                )
+        kind = str(record.get("kind", "process"))
+        label = "terminal" if kind == "terminal" else "background job"
         self.ui.render(
             HostEvent(
                 HostEventKind.STATUS,
-                f"background job {job_id} · {name} · {message}",
-                meta={"kind": "background_job", "job_id": job_id},
+                f"{label} {name} · {message}",
+                meta={
+                    "kind": "background_job",
+                    "job_id": job_id,
+                    "job_kind": kind,
+                    "name": name,
+                    "state": record.get("state", "completed" if terminal else "running"),
+                    "terminal": terminal,
+                },
             )
         )
         if terminal:
             self._wake_event.set()
+
+    def _on_subagent_lifecycle(self, activity: dict[str, Any]) -> None:
+        """Expose delegated work as structured UI events and console-readable text."""
+
+        state = str(activity.get("state", "running"))
+        agent = str(activity.get("agent", "agent"))
+        prompt = " ".join(str(activity.get("prompt", "")).split())[:80]
+        duration = float(activity.get("duration", 0.0) or 0.0)
+        detail = f" · {prompt}" if prompt else ""
+        elapsed = f" · {duration:.1f}s" if state in {"completed", "failed", "cancelled"} else ""
+        self.ui.render(
+            HostEvent(
+                HostEventKind.STATUS,
+                f"agent {agent} · {state}{elapsed}{detail}",
+                meta={"kind": "subagent", **activity},
+            )
+        )
 
     def _on_agent_message(self, text: str, **_kwargs: Any) -> None:
         self.ui.render(HostEvent(HostEventKind.MESSAGE, text))
@@ -789,6 +841,47 @@ class AgentHost:
 
     def usage_snapshot(self) -> UsageSnapshot:
         return self._usage.snapshot()
+
+    def work_snapshot(self) -> dict[str, list[dict[str, Any]]]:
+        """Return presentation-safe live/recent agent and process work."""
+
+        if self._agent is None:
+            return {"agents": [], "jobs": []}
+        agents: list[dict[str, Any]] = []
+        task = getattr(self.agent, "task", None)
+        if task is not None:
+            with contextlib.suppress(Exception):
+                agents = task.snapshot(limit=20)
+        jobs: list[dict[str, Any]] = []
+        with contextlib.suppress(Exception):
+            jobs = self.agent.processes.snapshot(limit=20)
+        return {"agents": agents, "jobs": jobs}
+
+    def work_status_text(self) -> str:
+        snapshot = self.work_snapshot()
+        agents = snapshot["agents"]
+        jobs = snapshot["jobs"]
+        lines = ["Work ledger", "", "Agents"]
+        if not agents:
+            lines.append("  No delegated work yet. Noah can use task.run_many or task.collaborate.")
+        for item in agents:
+            mode = "read" if item.get("readonly") else "write"
+            lines.append(
+                f"  {item['id']}  [{item['state']:<9}] {item['agent']} · {mode} · "
+                f"{float(item.get('duration', 0.0)):.1f}s"
+            )
+            if item.get("prompt"):
+                lines.append(f"    {str(item['prompt'])[:100]}")
+        lines.extend(["", "Terminals and jobs"])
+        if not jobs:
+            lines.append("  No sessions. Noah can use processes.open_terminal or processes.start.")
+        for item in jobs:
+            kind = "terminal" if item.get("kind") == "terminal" else "job"
+            lines.append(
+                f"  {item['id']}  [{item['state']:<9}] {kind} · {item['name']} · "
+                f"{float(item.get('elapsed', 0.0)):.1f}s"
+            )
+        return "\n".join(lines)
 
     async def diff_review(self) -> Any:
         """Build a Git review model and enrich changed files with diagnostics."""
@@ -1694,6 +1787,12 @@ class AgentHost:
             )
             self.ui.render(_command_output(listing))
             return "handled"
+        if name == "work":
+            self.ui.render(_command_output(self.work_status_text()))
+            return "handled"
+        if name == "terminals":
+            self.ui.render(_command_output(await agent.processes.terminal_status()))
+            return "handled"
         if name == "attach":
             raw = args.strip().strip("\"'")
             if not raw:
@@ -2023,21 +2122,28 @@ class AgentHost:
     async def _wait_for_wake(self, agent: Any, *, latched: bool = False) -> bool:
         """Bounded poll for a background-job terminal wake.
 
-        Returns True on a normal wake. A latched event with no running
-        jobs is also a normal wake: the job's terminal emit raced the
-        initial ``clear()``. Returns False when nothing is running and
-        no wake ever arrived, so the caller fails the run instead of
-        hanging the turn until Ctrl-C.
+        Wake events are consumed here so a completed job cannot spuriously
+        wake a later WAIT. ``latched`` preserves an event that arrived before
+        the caller's initial ``clear()`` when no jobs remain. Returns False
+        when nothing is running and no wake ever arrived, so the caller fails
+        the run instead of hanging the turn until Ctrl-C.
         """
 
         while True:
             if not agent.processes.has_running():
-                return latched or self._wake_event.is_set()
+                if latched or self._wake_event.is_set():
+                    self._wake_event.clear()
+                    return True
+                return False
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                return True
             try:
                 await asyncio.wait_for(
                     self._wake_event.wait(),
                     timeout=self._wake_timeout_seconds,
                 )
+                self._wake_event.clear()
                 return True
             except TimeoutError:
                 continue
@@ -2146,7 +2252,6 @@ class AgentHost:
                                 wake_kind="process",
                                 wake_ref=explanation,
                             )
-                        self._wake_event.clear()
                         woken = await self._wait_for_wake(agent, latched=latched)
                         if not woken:
                             exit_code = 1

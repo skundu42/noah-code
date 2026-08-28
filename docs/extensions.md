@@ -36,6 +36,11 @@ oversized transcripts are condensed by the lightweight model (fallback: truncati
 pointer) before they enter the parent's context. Tune with `subagent_result_max_chars` and
 `max_concurrent_subagents` under `[efficiency]`. Add project or user markdown agents:
 
+Use `self.task.collaborate(objective, assignments, lead="general")` when parallel findings need a
+deliberate handoff. Contributors run under the same concurrency and mutation-lane rules, then the
+lead receives their bounded reports and returns one synthesized result. Live queued, running,
+completed, failed, and cancelled states are visible in the TUI work ledger (`F4`) and `/work`.
+
 - `~/.config/noah-code/agents/*.md`
 - `.noah-code/agents/*.md`
 

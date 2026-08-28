@@ -78,6 +78,8 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("undo", "Undo last WorkspaceTools turn"),
     CommandSpec("redo", "Redo last undone turn"),
     CommandSpec("agents", "List built-in and markdown subagents"),
+    CommandSpec("work", "Show live agent, terminal, and background-job work"),
+    CommandSpec("terminals", "List persistent terminal sessions"),
     CommandSpec("attach", "Attach a workspace file or image to the next turn", "attach [PATH]"),
     CommandSpec("skills", "Search skills or add a compatible skill folder", "skills [add PATH]"),
     CommandSpec("mcp", "Search, connect, or add MCP servers", "mcp [connect|add]"),

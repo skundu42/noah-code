@@ -11,7 +11,7 @@ from typing import Any
 STEER_QUEUE_CAP = 100
 
 SAFE_SLASH_WHILE_BUSY = frozenset(
-    {"status", "health", "tokens", "todos", "help", "trace"}
+    {"status", "health", "tokens", "todos", "help", "trace", "work", "terminals"}
 )
 
 

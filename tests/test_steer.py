@@ -62,7 +62,7 @@ def test_push_keeps_attach_paths() -> None:
 
 def test_safe_slash_allowlist_matches_spec() -> None:
     assert frozenset(
-        {"status", "health", "tokens", "todos", "help", "trace"}
+        {"status", "health", "tokens", "todos", "help", "trace", "work", "terminals"}
     ) == SAFE_SLASH_WHILE_BUSY
 
 

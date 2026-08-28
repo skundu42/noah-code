@@ -16,6 +16,7 @@
 | `F1` or `?` | Show help |
 | `F2` | Open recent activity and full captured output |
 | `F3` | Open paginated persisted conversation history |
+| `F4` | Open the live work ledger for agents, terminals, and background jobs |
 | `Ctrl+]` | Return to live transcript output and clear the new-output counter |
 
 At an approval prompt, press `1` to approve once, `2` to remember the approval for the current
@@ -69,7 +70,7 @@ clears it.
 Approval and `ask.question` modals keep the composer. Queueing resumes after the modal closes.
 
 These slash commands still run while a turn is in progress: `/status`, `/tokens`, `/todos`,
-`/health`, `/help`, `/trace`. `/attach PATH` remembers the file for the next queued follow-up.
+`/health`, `/help`, `/trace`, `/work`, and `/terminals`. `/attach PATH` remembers the file for the next queued follow-up.
 `/exit` cancels the turn (and the queue) then leaves. Mutating commands wait until the turn
 finishes, including `/undo`, `/redo`, `/mode`, `/model`, `/diff`, `/new`, `/sessions`, `/worktree`,
 `/pr`, `/plan`, `/memory`, and `/compact`.
@@ -107,6 +108,8 @@ compact. `F2` retains the latest 100 activity records, bounded by the configured
 | `/todos` | Show the agent's current task list |
 | `/health` | Show durable run, job, inbox, interaction, event, database, and artifact health |
 | `/agents` | List built-in and markdown subagents |
+| `/work` | Show live and recent subagent, terminal, and background-job work |
+| `/terminals` | List named persistent terminal sessions |
 | `/attach PATH` | Attach a workspace file or image to the next turn |
 | `/status` | Inspect the current session and repository state |
 | `/diff` | Review staged and unstaged files, patches, diagnostics, and changed symbols |
@@ -215,6 +218,13 @@ output, including output from jobs recovered after restart. Lifecycle updates ap
 without copying continuous logs into model context. An agent waiting for a job wakes and continues
 the same turn when the job finishes.
 
+For command sequences that benefit from retained shell state, the agent can open multiple named
+sessions with `self.processes.open_terminal(name)`, run commands with `terminal_run`, inspect them
+with `terminal_status`, and close them with `close_terminal`. Each command passes through the same
+permission and checkpoint policy as an ordinary shell command; raw `input` is blocked for managed
+terminals so an approved shell cannot become a permission bypass. Terminal stderr is merged into
+its ordered output stream, and session state such as the current directory persists between calls.
+
 ### Subagents, web, questions, and attachments
 
 The parent agent can run isolated NOOA subagents with `self.task.run("explore", ...)` or
@@ -224,6 +234,10 @@ them with `/agents`. Repository files cannot replace the built-in `explore` or `
 and unsafe linked or oversized repository definitions are ignored. Plan mode can run read-only
 agents only. Read-only agents may run concurrently; mutating agents share one serialized mutation
 lane so parallel delegation cannot corrupt the checkout.
+For coordinated work, `self.task.collaborate(objective, assignments, lead="general")` fans out
+bounded assignments and then hands all reports to one lead agent for conflict resolution and a
+single synthesis. Agent lifecycle records and terminal/job state appear in the context rail and
+the live `F4` work ledger; `/work` provides the same information in console-friendly text.
 
 `self.web.fetch(url)` and `self.web.search(query)` are read-only and allowed by default. Fetch
 follows a bounded number of redirects and accepts only public HTTP(S) destinations; private,

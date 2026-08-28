@@ -38,6 +38,7 @@ from noah_code.ui.textual_app import (
     RepositorySnapshot,
     TextPromptModal,
     TextualUI,
+    WorkLedgerScreen,
     _coalesce_activity_text,
     _completed_activity_label,
     _normalize_markdown,
@@ -79,6 +80,7 @@ def _fake_host(tmp_path: Path):
     host._mcp_attached = set()
     host.steer_queue = SteerQueue()
     host._pending_attach_paths = []
+    host.work_snapshot.return_value = {"agents": [], "jobs": []}
 
     def take_pending_attaches():
         paths, host._pending_attach_paths = host._pending_attach_paths, []
@@ -720,6 +722,49 @@ async def test_active_context_rail_shows_semantic_tool_state_not_code(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_work_ledger_shows_agents_and_named_terminals(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host.work_snapshot.return_value = {
+        "agents": [
+            {
+                "id": "agent123",
+                "agent": "explore",
+                "prompt": "Trace the parser failure",
+                "mode": "plan",
+                "readonly": True,
+                "state": "running",
+                "result_preview": "",
+                "duration": 2.5,
+            }
+        ],
+        "jobs": [
+            {
+                "id": "term1234",
+                "name": "tests",
+                "kind": "terminal",
+                "state": "running",
+                "command": "[terminal] /bin/sh",
+                "elapsed": 4.0,
+                "returncode": None,
+                "cursor": 3,
+            }
+        ],
+    }
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("f4")
+        await pilot.pause()
+
+        assert isinstance(app.screen, WorkLedgerScreen)
+        summary = _rendered_text(app.screen.query_one("#work-summary").content)
+        assert "2 active" in summary
+        assert "1 terminals" in summary
+        detail = _log_text(app.screen.query_one("#work-detail"))
+        assert "tests" in detail
+        assert "terminal" in detail
+
+
+@pytest.mark.asyncio
 async def test_context_rail_prioritizes_changes_session_and_usage(
     tmp_path: Path,
     monkeypatch,
@@ -1212,13 +1257,13 @@ async def test_slash_suggestion_selection_remains_visible_after_first_page(
         await pilot.pause()
 
         rendered = _rendered_text(suggestions.content)
-        assert "1–5 of 33" in rendered
+        assert "1–5 of 35" in rendered
         assert "› /help" in rendered
 
         await pilot.press("down", "down", "down", "down", "down")
         rendered = _rendered_text(suggestions.content)
 
-        assert "2–6 of 33" in rendered
+        assert "2–6 of 35" in rendered
         assert "› /reasoning" in rendered
         assert "/help" not in rendered
 
