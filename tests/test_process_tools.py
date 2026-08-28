@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -167,6 +168,28 @@ async def test_terminal_blocks_unapproved_raw_input_and_supports_named_close(tmp
         assert "terminal server opened" in reopened
         with pytest.raises(ValueError, match="terminal name"):
             await manager.open_terminal("bad name", shell="/bin/sh")
+    finally:
+        await manager.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX-only")
+@pytest.mark.asyncio
+async def test_terminal_close_falls_back_when_group_signal_is_denied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path, auto=True)
+    try:
+        await manager.open_terminal("server", shell="/bin/sh")
+
+        def deny_group_signal(_pid: int, _signal: int) -> None:
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "killpg", deny_group_signal)
+
+        closed = await manager.close_terminal("server")
+
+        assert "terminal server closed" in closed
+        assert "[stopped]" in closed
     finally:
         await manager.close()
 

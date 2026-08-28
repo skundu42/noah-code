@@ -665,7 +665,12 @@ class ProcessTools(Skill):
             return
         with contextlib.suppress(ProcessLookupError):
             if os.name != "nt":
-                os.killpg(job.process.pid, signal.SIGTERM)
+                try:
+                    os.killpg(job.process.pid, signal.SIGTERM)
+                except PermissionError:
+                    # Some macOS runners deny process-group signals even for
+                    # an owned child. Terminate the direct child instead.
+                    job.process.terminate()
             else:
                 job.process.terminate()
         try:
@@ -673,7 +678,10 @@ class ProcessTools(Skill):
         except TimeoutError:
             with contextlib.suppress(ProcessLookupError):
                 if os.name != "nt":
-                    os.killpg(job.process.pid, signal.SIGKILL)
+                    try:
+                        os.killpg(job.process.pid, signal.SIGKILL)
+                    except PermissionError:
+                        job.process.kill()
                 else:
                     job.process.kill()
             await job.process.wait()

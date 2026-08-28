@@ -1066,7 +1066,11 @@ async def test_live_output_pauses_following_and_reports_new_lines(tmp_path: Path
         app._flush_stream()
         log = app.query_one("#activity-output")
         log.scroll_home(animate=False)
-        await pilot.pause()
+        for _ in range(10):
+            await pilot.pause()
+            if not log.is_vertical_scroll_end:
+                break
+        assert not log.is_vertical_scroll_end
 
         ui.render(
             HostEvent(
