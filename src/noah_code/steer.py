@@ -11,7 +11,7 @@ from typing import Any
 STEER_QUEUE_CAP = 100
 
 SAFE_SLASH_WHILE_BUSY = frozenset(
-    {"status", "health", "tokens", "todos", "help", "trace", "work", "terminals"}
+    {"status", "health", "tokens", "todos", "help", "trace", "work", "queue", "terminals"}
 )
 
 
@@ -90,6 +90,38 @@ class SteerQueue:
                 return {"count": 0, "preview": None}
             preview = " ".join(self._items[0].text.split())[:60]
             return {"count": len(self._items), "preview": preview}
+
+    def items(self) -> list[SteerItem]:
+        """Return a stable copy of queued prompts in delivery order."""
+
+        with self._lock:
+            return list(self._items)
+
+    def remove(self, index: int) -> SteerItem | None:
+        """Remove one zero-based queue item."""
+
+        with self._lock:
+            if index < 0 or index >= len(self._items):
+                return None
+            items = list(self._items)
+            removed = items.pop(index)
+            self._items = deque(items)
+            return removed
+
+    def move(self, index: int, delta: int) -> bool:
+        """Move one item within the current in-memory delivery order."""
+
+        with self._lock:
+            if index < 0 or index >= len(self._items):
+                return False
+            destination = min(max(index + delta, 0), len(self._items) - 1)
+            if destination == index:
+                return False
+            items = list(self._items)
+            item = items.pop(index)
+            items.insert(destination, item)
+            self._items = deque(items)
+            return True
 
     def __len__(self) -> int:
         with self._lock:

@@ -62,8 +62,22 @@ def test_push_keeps_attach_paths() -> None:
 
 def test_safe_slash_allowlist_matches_spec() -> None:
     assert frozenset(
-        {"status", "health", "tokens", "todos", "help", "trace", "work", "terminals"}
+        {"status", "health", "tokens", "todos", "help", "trace", "work", "queue", "terminals"}
     ) == SAFE_SLASH_WHILE_BUSY
+
+
+def test_queue_items_can_be_reordered_and_removed() -> None:
+    queue = SteerQueue()
+    queue.push("first")
+    queue.push("second")
+    queue.push("third")
+
+    assert queue.move(2, -2) is True
+    assert [item.text for item in queue.items()] == ["third", "first", "second"]
+    removed = queue.remove(1)
+
+    assert removed is not None and removed.text == "first"
+    assert [item.text for item in queue.items()] == ["third", "second"]
 
 
 def test_expansion_failed_only_when_mentions_or_attaches_resolve_nothing() -> None:

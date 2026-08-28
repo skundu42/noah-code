@@ -13,6 +13,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -80,6 +81,7 @@ BUSY_REFRESH_SECONDS = 0.08
 WIDE_MIN_COLUMNS = 110
 COMPACT_MAX_ROWS = 25
 UPDATE_BANNER_SECONDS = 12.0
+STATUS_REFRESH_SECONDS = 1.0
 
 # Terminals parse OSC 52 payloads into a fixed buffer; oversized sequences get
 # truncated into visual garbage or dropped. Native tools handle any size, so
@@ -100,6 +102,62 @@ WORKING_COMET_FRAMES = (
     "     ·•◈◆ ",
     "      ·•◈◆",
 )
+
+
+class AgentDisplayState(StrEnum):
+    """Small, explicit user-facing state machine for the TUI."""
+
+    READY = "ready"
+    SETUP_REQUIRED = "setup_required"
+    STARTING = "starting"
+    QUEUED = "queued"
+    THINKING = "thinking"
+    RUNNING = "running"
+    WAITING_APPROVAL = "waiting_approval"
+    WAITING_INPUT = "waiting_input"
+    WAITING = "waiting"
+    RETRYING = "retrying"
+    COMPACTING = "compacting"
+    CANCELLING = "cancelling"
+    ERROR = "error"
+
+
+_STATE_LABELS = {
+    AgentDisplayState.READY: "ready",
+    AgentDisplayState.SETUP_REQUIRED: "setup needed",
+    AgentDisplayState.STARTING: "starting",
+    AgentDisplayState.QUEUED: "queued",
+    AgentDisplayState.THINKING: "thinking",
+    AgentDisplayState.RUNNING: "working",
+    AgentDisplayState.WAITING_APPROVAL: "approval needed",
+    AgentDisplayState.WAITING_INPUT: "input needed",
+    AgentDisplayState.WAITING: "waiting",
+    AgentDisplayState.RETRYING: "retrying",
+    AgentDisplayState.COMPACTING: "compacting",
+    AgentDisplayState.CANCELLING: "cancelling",
+    AgentDisplayState.ERROR: "error",
+}
+_ANIMATED_STATES = frozenset(
+    {
+        AgentDisplayState.STARTING,
+        AgentDisplayState.QUEUED,
+        AgentDisplayState.THINKING,
+        AgentDisplayState.RUNNING,
+        AgentDisplayState.RETRYING,
+        AgentDisplayState.COMPACTING,
+    }
+)
+_PERSISTENT_STATES = frozenset(
+    {
+        AgentDisplayState.SETUP_REQUIRED,
+        AgentDisplayState.WAITING_APPROVAL,
+        AgentDisplayState.WAITING_INPUT,
+        AgentDisplayState.WAITING,
+        AgentDisplayState.CANCELLING,
+        AgentDisplayState.ERROR,
+    }
+)
+_STATUS_LANE_STATES = _PERSISTENT_STATES - {AgentDisplayState.ERROR}
 
 NOAH_WORDMARK = (
     "███╗   ██╗ ██████╗  █████╗ ██╗  ██╗",
@@ -495,6 +553,7 @@ def _role_renderable(entry: TranscriptEntry) -> Group:
         "ERROR": "#ed8796",
         "SUMMARY": "#c6a0f6",
         "STATUS": "#777781",
+        "RECEIPT": "#8bd5ca",
     }
     labels = {
         "YOU": "▌ You",
@@ -504,8 +563,9 @@ def _role_renderable(entry: TranscriptEntry) -> Group:
         "ERROR": "▌ Error",
         "SUMMARY": "▌ Summary",
         "STATUS": "  ·",
+        "RECEIPT": "  ✓",
     }
-    if entry.role in {"ACTIVITY", "STATUS"}:
+    if entry.role in {"ACTIVITY", "STATUS", "RECEIPT"}:
         return Group(Padding(Text(entry.text, style=colors[entry.role]), (0, 0, 1, 2)))
     label = Text(
         labels.get(entry.role, entry.role),
@@ -1043,6 +1103,227 @@ class TextPromptModal(ModalScreen[str | None]):
             self.dismiss(value)
 
     def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ConfirmationModal(ModalScreen[bool]):
+    """Explicit confirmation with a safe default for destructive actions."""
+
+    BINDINGS = [
+        Binding("y", "confirm", "Confirm", show=True),
+        Binding("escape,n", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(self, title: str, body: str, confirm_label: str) -> None:
+        super().__init__()
+        self.confirmation_title = title
+        self.body = body
+        self.confirm_label = confirm_label
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirmation-dialog"):
+            yield Label(self.confirmation_title.upper(), id="confirmation-title")
+            yield Static(self.body, id="confirmation-body")
+            with Horizontal(id="confirmation-buttons"):
+                yield Button("Cancel  [Esc]", id="confirmation-cancel")
+                yield Button(f"{self.confirm_label}  [Y]", id="confirmation-accept", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#confirmation-cancel", Button).focus()
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#confirmation-accept")
+    def _confirmed(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#confirmation-cancel")
+    def _cancelled(self) -> None:
+        self.dismiss(False)
+
+
+def _undo_preview(host: AgentHost) -> str:
+    """Describe the exact journal scope before an undo is authorized."""
+
+    journal = getattr(getattr(host, "agent", None), "journal", None)
+    latest = getattr(journal, "latest_turn", None)
+    turn = latest() if callable(latest) else None
+    if turn is None:
+        return "There is no reversible WorkspaceTools turn to undo."
+    paths = list(dict.fromkeys(str(item.path) for item in turn.mutations))
+    root = Path(host.workspace.root)
+    display_paths = []
+    for value in paths[:8]:
+        path = Path(value)
+        with contextlib.suppress(ValueError):
+            path = path.relative_to(root)
+        display_paths.append(str(path))
+    body = [f"Restore {len(paths)} file(s) from turn {turn.turn_id[:8]}:"]
+    body.extend(f"  • {path}" for path in display_paths)
+    if len(paths) > len(display_paths):
+        body.append(f"  • … and {len(paths) - len(display_paths)} more")
+    if turn.shell_may_bypass:
+        body.extend(
+            [
+                "",
+                "This turn used shell mutations outside the file journal, so full undo is unavailable.",
+            ]
+        )
+    else:
+        body.extend(["", "Files changed after the turn will be refused, not overwritten."])
+    return "\n".join(body)
+
+
+class NoticeDetailsScreen(ModalScreen[None]):
+    """Scrollable details for notices that do not fit in the status lane."""
+
+    BINDINGS = [Binding("escape,f6", "close", "Close", show=True)]
+
+    def __init__(self, title: str, detail: str) -> None:
+        super().__init__()
+        self.notice_title = title
+        self.detail = detail
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="notice-detail-dialog"):
+            yield Label(self.notice_title.upper(), id="notice-detail-title")
+            yield SelectableRichLog(
+                id="notice-detail-body",
+                markup=False,
+                highlight=False,
+                wrap=True,
+                min_width=0,
+                max_lines=2_000,
+            )
+            yield Static("Page Up/Down inspect · F6 or Esc close", id="notice-detail-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#notice-detail-body", RichLog).write(Text(self.detail, style="#d1d1d6"))
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class QueueManagerScreen(ModalScreen[None]):
+    """Manage pending attachments and mid-turn follow-up prompts."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=True),
+        Binding("d,delete", "remove", "Remove", show=True),
+        Binding("u,shift+up", "move_up", "Move up", show=True),
+        Binding("j,shift+down", "move_down", "Move down", show=True),
+    ]
+
+    def __init__(self, host: AgentHost) -> None:
+        super().__init__()
+        self.host = host
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="queue-dialog"):
+            yield Label("INPUT QUEUE", id="queue-title")
+            yield Static("", id="queue-summary")
+            yield OptionList(id="queue-list", compact=True)
+            yield Static(
+                "↑/↓ select · U/J reorder prompts · D remove · Esc close",
+                id="queue-hint",
+            )
+
+    def on_mount(self) -> None:
+        self._refresh()
+
+    def _pending_paths(self) -> tuple[Path, ...]:
+        getter = getattr(self.host, "pending_attach_paths", None)
+        if callable(getter):
+            return tuple(getter())
+        return tuple(getattr(self.host, "_pending_attach_paths", ()))
+
+    def _queued_items(self) -> list[Any]:
+        queue = getattr(self.host, "steer_queue", None)
+        getter = getattr(queue, "items", None)
+        return list(getter()) if callable(getter) else []
+
+    def _refresh(self, *, highlighted: int | None = None) -> None:
+        paths = self._pending_paths()
+        queued = self._queued_items()
+        self.query_one("#queue-summary", Static).update(
+            f"{len(paths)} attachment(s) waiting · {len(queued)} queued prompt(s)",
+            layout=False,
+        )
+        option_list = self.query_one("#queue-list", OptionList)
+        option_list.clear_options()
+        options: list[Option] = []
+        for index, path in enumerate(paths):
+            options.append(Option(Text(f"ATTACH  {path}", style="#7dc4e4"), id=f"attach:{index}"))
+        for index, item in enumerate(queued):
+            preview = " ".join(str(item.text).split())[:100]
+            suffix = f"  · {len(item.attach_paths)} file(s)" if item.attach_paths else ""
+            options.append(
+                Option(
+                    Text.assemble(
+                        (f"{index + 1:>2}. ", "bold #e6b673"),
+                        (preview, "#d1d1d6"),
+                        (suffix, "#777781"),
+                    ),
+                    id=f"queue:{index}",
+                )
+            )
+        if not options:
+            option_list.add_option(
+                Option(Text("Nothing queued or attached", style="#777781"), disabled=True)
+            )
+            return
+        option_list.add_options(options)
+        option_list.highlighted = min(highlighted or 0, len(options) - 1)
+        option_list.focus()
+
+    def _selected(self) -> tuple[str, int] | None:
+        option_list = self.query_one("#queue-list", OptionList)
+        if option_list.highlighted is None:
+            return None
+        option = option_list.get_option_at_index(option_list.highlighted)
+        if not option.id or ":" not in option.id:
+            return None
+        kind, raw_index = option.id.split(":", 1)
+        return kind, int(raw_index)
+
+    def action_remove(self) -> None:
+        selected = self._selected()
+        if selected is None:
+            return
+        kind, index = selected
+        if kind == "attach":
+            remover = getattr(self.host, "remove_pending_attach", None)
+        else:
+            remover = getattr(self.host, "remove_queued_steer", None)
+        if callable(remover):
+            remover(index)
+        self._refresh()
+
+    def _move(self, delta: int) -> None:
+        selected = self._selected()
+        if selected is None or selected[0] != "queue":
+            return
+        index = selected[1]
+        mover = getattr(self.host, "move_queued_steer", None)
+        if callable(mover) and mover(index, delta):
+            attachments = len(self._pending_paths())
+            self._refresh(highlighted=attachments + min(max(index + delta, 0), len(self._queued_items()) - 1))
+
+    def action_move_up(self) -> None:
+        self._move(-1)
+
+    def action_move_down(self) -> None:
+        self._move(1)
+
+    def action_close(self) -> None:
+        with contextlib.suppress(Exception):
+            updater = getattr(self.app, "update_chrome", None)
+            if callable(updater):
+                updater(force=True)
         self.dismiss(None)
 
 
@@ -1634,6 +1915,20 @@ class DiffReviewScreen(ModalScreen[None]):
 
     @work(exclusive=True, group="diff-mutation")
     async def action_undo(self) -> None:
+        preview = _undo_preview(self.host)
+        if preview.startswith("There is no reversible") or "full undo is unavailable" in preview:
+            self.query_one("#diff-status", Static).update(
+                "Nothing to undo"
+                if preview.startswith("There is no reversible")
+                else "Undo unavailable after shell mutations"
+            )
+            return
+        confirmed = await self.app.push_screen_wait(
+            ConfirmationModal("Undo last turn?", preview, "Undo turn")
+        )
+        if not confirmed:
+            self.query_one("#diff-status", Static).update("Undo cancelled")
+            return
         try:
             status = await self.host.undo_last_turn_async()
             self.review = await self.host.diff_review()
@@ -1737,6 +2032,8 @@ class NoahCodeApp(App[None]):
         Binding("f2", "activity_history", "Activity", show=True),
         Binding("f3", "conversation_history", "History", show=True),
         Binding("f4", "work_ledger", "Work", show=True),
+        Binding("f5", "queue_manager", "Queue", show=True),
+        Binding("f6", "notice_details", "Details", show=True),
         Binding("ctrl+]", "scroll_live", "Latest", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
     ]
@@ -1766,15 +2063,22 @@ class NoahCodeApp(App[None]):
         self._rail_dirty = True
         self._repository_snapshot: RepositorySnapshot | None = None
         self._repository_status_loaded = False
-        self._phase = "ready"
+        self._agent_state = (
+            AgentDisplayState.SETUP_REQUIRED if onboarding_required else AgentDisplayState.READY
+        )
+        self._state_detail = ""
+        self._phase = self._agent_state.value
         self._loader_index = 0
         self._loader_timer: Timer | None = None
+        self._status_timer: Timer | None = None
         self._working_loader_signature: str | None = None
         self._working_status_signature: tuple[str, ...] | None = None
         self._working_banner_visible = False
         self._activity_title_signature: tuple[str, ...] | None = None
         self._stream_timer: Timer | None = None
         self._notice_timer: Timer | None = None
+        self._last_notice_title = "Notice"
+        self._last_notice_detail = ""
         self._native_clipboard_task: asyncio.Task[None] | None = None
         self._pending_native_clipboard: str | None = None
         self._available_update: UpdateStatus | None = None
@@ -1789,13 +2093,16 @@ class NoahCodeApp(App[None]):
         # a mouse selection's line range back to pristine entry text.
         self._transcript_line_counts: list[int] = []
         self._unread_count = 0
+        self._activity_unread_lines = 0
         self._follow_batch: bool | None = None
         self._suggestion_matches: list[CommandSuggestion] = []
         self._suggestion_index = 0
         self._skip_suggestion_text: str | None = None
         self._base_commands = all_command_suggestions(host._custom_commands)
+        self._recent_commands: deque[str] = deque(maxlen=8)
         self._config_commands: list[CommandSuggestion] | None = None
         self._composer_rows = 4
+        self._input_context_signature = ""
         self._app_mounted = False
         host.on_session_changed = lambda _meta: self.call_later(self._session_changed)
 
@@ -1846,6 +2153,7 @@ class NoahCodeApp(App[None]):
                     )
             yield Static("", id="context-rail")
         yield Static("", id="command-suggestions")
+        yield Static("", id="input-context")
         yield Static("Enter send · Shift+Enter newline · / commands · F4 work", id="context-hint")
         yield ComposerTextArea(
             id="composer",
@@ -1866,18 +2174,23 @@ class NoahCodeApp(App[None]):
         self._loader_timer = self.set_interval(
             BUSY_REFRESH_SECONDS,
             self._advance_working_loader,
-            pause=not self.ui.busy and self._agent_ready,
+            pause=not self._animation_active(),
+        )
+        self._status_timer = self.set_interval(
+            STATUS_REFRESH_SECONDS,
+            self._refresh_working_status,
+            pause=not self._working_state_visible(),
         )
         self.update_chrome(force=True)
         self._refresh_repository_snapshot()
         self._check_update_notice()
         if self._onboarding_required:
-            self._phase = "setup required"
+            self._set_agent_state(AgentDisplayState.SETUP_REQUIRED)
             self.call_after_refresh(self.action_model_setup)
         elif self._agent_ready:
             self._load_recent_history()
         else:
-            self._phase = "starting"
+            self._set_agent_state(AgentDisplayState.STARTING)
             self._pre_prompt_status = "Starting Noah…"
             self.ui.set_busy(True)
             self._start_host()
@@ -1921,11 +2234,27 @@ class NoahCodeApp(App[None]):
         *,
         kind: str = "info",
         temporary: bool = False,
+        detail: str | None = None,
     ) -> None:
         banner = self.query_one("#notice-banner", Static)
+        self._last_notice_title = "Error details" if kind == "error" else "Notice details"
+        self._last_notice_detail = detail or message
+        compact = " ".join(message.split())
+        available = max(min(self.size.width - 18, 140), 40)
+        expandable = kind == "error" or "\n" in message or len(compact) > available
+        suffix = "  · F6 details" if expandable else ""
+        if len(compact) + len(suffix) > available:
+            tail = compact.rsplit(" · ", 1)[-1] if " · " in compact else ""
+            if "open /model" in tail:
+                tail = "open /model to retry"
+            if tail and len(tail) + len(suffix) + 6 < available:
+                head_limit = available - len(tail) - len(suffix) - 4
+                compact = compact[:head_limit].rstrip() + f"… · {tail}"
+            else:
+                compact = compact[: max(available - len(suffix) - 1, 1)].rstrip() + "…"
         banner.remove_class("info", "update", "error")
         banner.add_class(kind)
-        banner.update(message, layout=False)
+        banner.update(compact + suffix, layout=False)
         banner.styles.display = "block"
         if self._notice_timer is not None:
             self._notice_timer.stop()
@@ -1938,6 +2267,12 @@ class NoahCodeApp(App[None]):
         with contextlib.suppress(Exception):
             self.query_one("#notice-banner", Static).styles.display = "none"
 
+    def action_notice_details(self) -> None:
+        if self._last_notice_detail:
+            self.push_screen(
+                NoticeDetailsScreen(self._last_notice_title, self._last_notice_detail)
+            )
+
     @work(exclusive=True, group="startup")
     async def _start_host(self) -> None:
         """Warm the agent after the first frame instead of blocking launch."""
@@ -1945,7 +2280,7 @@ class NoahCodeApp(App[None]):
         try:
             await self.host.start()
         except Exception as exc:  # noqa: BLE001
-            self._phase = "startup failed"
+            self._set_agent_state(AgentDisplayState.ERROR, "Startup failed")
             self._pre_prompt_status = "Startup failed · open /model to retry"
             self._show_notice(
                 f"Agent could not start: {exc} · open /model to configure a provider and retry",
@@ -1959,7 +2294,7 @@ class NoahCodeApp(App[None]):
                     await pending_resume
             self._agent_ready = True
             self._onboarding_required = False
-            self._phase = "ready"
+            self._set_agent_state(AgentDisplayState.READY)
             self._pre_prompt_status = "Ready for your first prompt"
             self._base_commands = all_command_suggestions(self.host._custom_commands)
             self.query_one("#welcome", Static).update(
@@ -1985,12 +2320,53 @@ class NoahCodeApp(App[None]):
             self.query_one("#composer", ComposerTextArea).text if self._app_mounted else ""
         )
 
+    def _set_agent_state(self, state: AgentDisplayState, detail: str = "") -> None:
+        """Set semantic state while retaining ``_phase`` for compatibility."""
+
+        self._agent_state = state
+        self._state_detail = " ".join(detail.split())
+        if state == AgentDisplayState.ERROR and self._state_detail.lower().startswith("startup"):
+            self._phase = "startup failed"
+        elif state == AgentDisplayState.RUNNING and self._state_detail:
+            self._phase = self._state_detail
+        else:
+            self._phase = state.value.replace("_", " ")
+        self._sync_status_timers()
+
+    def _working_state_visible(self) -> bool:
+        return self.ui.busy or self._agent_state in _STATUS_LANE_STATES
+
+    def _animation_active(self) -> bool:
+        return (
+            bool(self.host.config.ui.animations)
+            and self.ui.busy
+            and self._agent_state in _ANIMATED_STATES
+        )
+
+    def _sync_status_timers(self) -> None:
+        if self._loader_timer is not None:
+            (self._loader_timer.resume if self._animation_active() else self._loader_timer.pause)()
+        if self._status_timer is not None:
+            (
+                self._status_timer.resume
+                if self._working_state_visible()
+                else self._status_timer.pause
+            )()
+
     def _advance_working_loader(self) -> None:
-        if not self.ui.busy:
+        if not self._animation_active():
             return
         self._loader_index = (self._loader_index + 1) % len(WORKING_COMET_FRAMES)
         # The 80 ms animation tick invalidates only this fixed-width widget.
         self._update_working_loader()
+
+    def _refresh_working_status(self) -> None:
+        """Refresh elapsed time at 1 Hz without touching the animated loader."""
+
+        if not self._working_state_visible():
+            return
+        self._update_working_status()
+        self._update_activity_title()
 
     @work(exclusive=True, group="repository-status")
     async def _refresh_repository_snapshot(self) -> None:
@@ -2010,62 +2386,110 @@ class NoahCodeApp(App[None]):
 
         with contextlib.suppress(Exception):
             banner = self.query_one("#working-banner", Horizontal)
-            if not self.ui.busy:
+            if not self._working_state_visible():
                 if self._working_banner_visible:
                     banner.styles.display = "none"
                     self._working_banner_visible = False
                 self._working_loader_signature = None
                 self._working_status_signature = None
                 return
-            label = "Thinking"
-            elapsed = ""
-            if self._active_activity_id and self._active_activity_id in self._activities:
-                record = self._activities[self._active_activity_id]
-                label = record.label
-                seconds = int(record.duration)
-                if seconds >= 1:
-                    elapsed = f"  {seconds}s"
-            elif self._phase not in {"ready", "thinking"}:
-                label = self._phase.replace("_", " ").strip().capitalize()
-            parts: list[tuple[str, str]] = [
-                (label, "#d1d1d6"),
-                (elapsed, "#777781"),
-            ]
-            thought = " ".join(self._last_thought.split())
-            if thought:
-                if len(thought) > 60:
-                    thought = thought[:57] + "…"
-                parts.append((f"  ↳  {thought}", "#777781"))
-            signature = (label, elapsed, thought)
-            if signature != self._working_status_signature:
-                self.query_one("#working-status", Static).update(
-                    Text.assemble(*parts), layout=False
-                )
-                self._working_status_signature = signature
+            self._update_working_status()
             self._update_working_loader()
             if not self._working_banner_visible:
                 banner.styles.display = "block"
                 self._working_banner_visible = True
-            with contextlib.suppress(Exception):
-                if (
-                    self._active_activity_id
-                    and self._active_activity_id in self._activities
-                    and self._activities[self._active_activity_id].label not in _HIDDEN_ACTIVITY
-                ):
-                    title_signature = (self._active_activity_id, label, elapsed)
-                    if title_signature != self._activity_title_signature:
-                        self.query_one("#activity-title", Static).update(
-                            Text.assemble((label, "#d1d1d6"), (elapsed, "#777781")),
-                            layout=False,
-                        )
-                        self._activity_title_signature = title_signature
+            self._update_activity_title()
+
+    def _working_status_content(self) -> tuple[str, str, str]:
+        label = self._state_detail or _STATE_LABELS[self._agent_state].capitalize()
+        elapsed = ""
+        if self._active_activity_id and self._active_activity_id in self._activities:
+            record = self._activities[self._active_activity_id]
+            label = record.label
+            seconds = int(record.duration)
+            if seconds >= 1:
+                elapsed = f"  {seconds}s"
+        thought = ""
+        if self._agent_state in _ANIMATED_STATES:
+            thought = " ".join(self._last_thought.split())
+            if len(thought) > 60:
+                thought = thought[:57] + "…"
+        return label, elapsed, thought
+
+    def _update_working_status(self) -> None:
+        label, elapsed, thought = self._working_status_content()
+        signature = (label, elapsed, thought)
+        if signature == self._working_status_signature:
+            return
+        parts: list[tuple[str, str]] = [
+            (label, "#d1d1d6"),
+            (elapsed, "#777781"),
+        ]
+        if thought:
+            parts.append((f"  ↳  {thought}", "#777781"))
+        self.query_one("#working-status", Static).update(Text.assemble(*parts), layout=False)
+        self._working_status_signature = signature
+
+    def _update_activity_title(self) -> None:
+        activity_id = self._active_activity_id
+        if not activity_id or activity_id not in self._activities:
+            return
+        record = self._activities[activity_id]
+        if record.label in _HIDDEN_ACTIVITY:
+            return
+        seconds = int(record.duration)
+        elapsed = f"  {seconds}s" if seconds >= 1 else ""
+        unread = (
+            f"  · {self._activity_unread_lines} new · Ctrl+] latest"
+            if self._activity_unread_lines
+            else ""
+        )
+        signature = (activity_id, record.label, elapsed, unread)
+        if signature == self._activity_title_signature:
+            return
+        self.query_one("#activity-title", Static).update(
+            Text.assemble(
+                (record.label, "#d1d1d6"),
+                (elapsed, "#777781"),
+                (unread, "#e6b673"),
+            ),
+            layout=False,
+        )
+        self._activity_title_signature = signature
 
     def _update_working_loader(self) -> None:
         """Render one loader frame without invalidating status or surrounding chrome."""
 
-        if not self.ui.busy:
+        if not self._working_state_visible():
             return
-        frame = WORKING_COMET_FRAMES[self._loader_index]
+        animations_enabled = bool(self.host.config.ui.animations)
+        if self._animation_active():
+            frame = WORKING_COMET_FRAMES[self._loader_index]
+        elif not animations_enabled:
+            frame = (
+                "!         "
+                if self._agent_state
+                in {
+                    AgentDisplayState.WAITING_APPROVAL,
+                    AgentDisplayState.WAITING_INPUT,
+                    AgentDisplayState.WAITING,
+                    AgentDisplayState.SETUP_REQUIRED,
+                }
+                else "x         "
+                if self._agent_state in {AgentDisplayState.ERROR, AgentDisplayState.CANCELLING}
+                else "*         "
+            )
+        elif self._agent_state in {
+            AgentDisplayState.WAITING_APPROVAL,
+            AgentDisplayState.WAITING_INPUT,
+            AgentDisplayState.WAITING,
+            AgentDisplayState.SETUP_REQUIRED,
+        }:
+            frame = "!         "
+        elif self._agent_state in {AgentDisplayState.ERROR, AgentDisplayState.CANCELLING}:
+            frame = "×         "
+        else:
+            frame = "◆         "
         if frame == self._working_loader_signature:
             return
         loader_styles = {
@@ -2073,6 +2497,10 @@ class NoahCodeApp(App[None]):
             "◈": "#e6b673",
             "•": "#8bd5ca",
             "·": "#777781",
+            "!": "bold #e6b673",
+            "×": "bold #ed8796",
+            "*": "bold #ffd08a",
+            "x": "bold #ed8796",
             " ": "#777781",
         }
         self.query_one("#working-loader", Static).update(
@@ -2097,10 +2525,7 @@ class NoahCodeApp(App[None]):
         repository = self.host.workspace.root.name or str(self.host.workspace.root)
         if meta and meta.worktree_name:
             repository = f"{repository} · {meta.worktree_name}"
-        state = self._phase
-        if self.ui.busy:
-            verb = "starting" if not self._agent_ready else "working"
-            state = verb
+        state = _STATE_LABELS[self._agent_state]
         unread = f"  {self._unread_count} new" if self._unread_count else ""
         queued = self._steer_queued_label()
         queued_bit = f"  {queued}" if queued else ""
@@ -2122,7 +2547,13 @@ class NoahCodeApp(App[None]):
                 header.append(f" · r:{effort_label}", style=palette.muted)
             header.append(
                 f"   {state}",
-                style=palette.warning if self.ui.busy else palette.muted,
+                style=(
+                    palette.error
+                    if self._agent_state == AgentDisplayState.ERROR
+                    else palette.warning
+                    if self._working_state_visible()
+                    else palette.muted
+                ),
             )
             if queued_bit:
                 header.append(queued_bit, style=palette.warning)
@@ -2131,13 +2562,23 @@ class NoahCodeApp(App[None]):
             with contextlib.suppress(Exception):
                 self.query_one("#header", Static).update(header, layout=False)
 
-        hint = (
-            "Enter queue follow-up · Ctrl+C cancel · drag select · "
-            f"{_copy_shortcut_label()} copy · F2 activity · F4 work"
-            if self.ui.busy and self._agent_ready
-            else "Enter send · Shift+Enter newline · drag select · "
-            f"{_copy_shortcut_label()} copy · / commands · F4 work"
-        )
+        compact = False
+        with contextlib.suppress(Exception):
+            compact = self.screen.has_class("compact")
+        if self.ui.busy and self._agent_ready:
+            hint = (
+                "Enter queue · Ctrl+C cancel · Ctrl+] latest · F5 queue"
+                if compact
+                else "Enter queue follow-up · Ctrl+C cancel · drag select · "
+                f"{_copy_shortcut_label()} copy · Ctrl+] latest · F5 queue"
+            )
+        else:
+            hint = (
+                "Enter send · / commands · F4 work · F5 queue"
+                if compact
+                else "Enter send · Shift+Enter newline · drag select · "
+                f"{_copy_shortcut_label()} copy · / commands · F4 work"
+            )
         if force or hint != self._hint_text:
             self._hint_text = hint
             with contextlib.suppress(Exception):
@@ -2150,7 +2591,39 @@ class NoahCodeApp(App[None]):
                 with contextlib.suppress(Exception):
                     self.query_one("#context-rail", Static).update(rail, layout=False)
             self._rail_dirty = False
+        self._update_input_context()
         self._update_working_banner()
+
+    def _update_input_context(self) -> None:
+        """Show pending files and queued prompts immediately above the composer."""
+
+        pending_getter = getattr(self.host, "pending_attach_paths", None)
+        if callable(pending_getter):
+            pending = tuple(pending_getter())
+        else:
+            pending = tuple(getattr(self.host, "_pending_attach_paths", ()))
+        queue = getattr(self.host, "steer_queue", None)
+        queue_items_getter = getattr(queue, "items", None)
+        queued = list(queue_items_getter()) if callable(queue_items_getter) else []
+        parts: list[str] = []
+        if pending:
+            names = ", ".join(path.name for path in pending[:3])
+            if len(pending) > 3:
+                names += f" +{len(pending) - 3}"
+            parts.append(f"ATTACHED  {names}")
+        if queued:
+            preview = " ".join(str(queued[0].text).split())[:44]
+            parts.append(f"QUEUED  {len(queued)} · {preview}")
+        value = "   ".join(parts)
+        if value:
+            value += "   F5 manage"
+        if value == self._input_context_signature:
+            return
+        self._input_context_signature = value
+        with contextlib.suppress(Exception):
+            widget = self.query_one("#input-context", Static)
+            widget.update(value, layout=False)
+            widget.styles.display = "block" if value else "none"
 
     def update_status_bar(self) -> None:
         """Compatibility shim for callers of the original TUI API."""
@@ -2172,6 +2645,10 @@ class NoahCodeApp(App[None]):
             text.append(_truncate_middle(record.label, 31), style=palette.text)
         elif not self._session_has_prompt and self._pre_prompt_status:
             text.append(self._pre_prompt_status, style=palette.muted)
+        elif self._agent_state in _PERSISTENT_STATES:
+            text.append(_STATE_LABELS[self._agent_state].capitalize(), style=palette.warning)
+            if self._state_detail:
+                text.append(f"\n{_truncate_middle(self._state_detail, 62)}", style=palette.text)
         else:
             text.append("Waiting for your next turn", style=palette.muted)
         thought = " ".join(self._last_thought.split())
@@ -2419,11 +2896,15 @@ class NoahCodeApp(App[None]):
 
     @on(UIStateChanged)
     def _ui_state_changed(self) -> None:
-        if self._loader_timer is not None:
-            if self.ui.busy:
-                self._loader_timer.resume()
-            else:
-                self._loader_timer.pause()
+        if self.ui.busy and self._agent_state == AgentDisplayState.READY:
+            self._set_agent_state(AgentDisplayState.THINKING)
+        elif (
+            not self.ui.busy
+            and self._agent_state in _ANIMATED_STATES
+            and self._turn_task is None
+        ):
+            self._set_agent_state(AgentDisplayState.READY)
+        self._sync_status_timers()
         self._rail_dirty = True
         self.update_chrome()
 
@@ -2444,6 +2925,7 @@ class NoahCodeApp(App[None]):
                 )
             )
         elif event.kind == HostEventKind.REASONING:
+            self._set_agent_state(AgentDisplayState.THINKING)
             self._attach_thought(text)
             if self.host.config.ui.show_reasoning:
                 self._append_entry(TranscriptEntry("STATUS", f"Thinking: {text}"))
@@ -2456,6 +2938,9 @@ class NoahCodeApp(App[None]):
             self._finish_activity(event)
         elif event.kind == HostEventKind.ERROR:
             self._finish_orphan_activity(state="error")
+            self._set_agent_state(AgentDisplayState.ERROR, "Action failed")
+            self._last_notice_title = "Error details"
+            self._last_notice_detail = text
             if self._session_has_prompt:
                 self._append_entry(TranscriptEntry("ERROR", text))
             else:
@@ -2467,23 +2952,34 @@ class NoahCodeApp(App[None]):
             kind = event.meta.get("kind")
             if kind == "theme":
                 self.apply_theme(str(event.meta.get("theme", self._theme_name)))
+            elif kind == "animations":
+                self.host.config.ui.animations = bool(event.meta.get("enabled", True))
+                self._working_loader_signature = None
+                self._sync_status_timers()
             elif kind == "checkpoint":
                 self._append_entry(TranscriptEntry("ACTIVITY", text or "◆"))
             elif kind == "subagent":
                 state = str(event.meta.get("state", "running"))
                 if state == "running":
-                    self._phase = f"agent {event.meta.get('agent', '')}".strip()
+                    self._set_agent_state(
+                        AgentDisplayState.RUNNING,
+                        f"Agent {event.meta.get('agent', '')}".strip(),
+                    )
                 if state in {"queued", "completed", "failed", "cancelled"}:
                     self._append_entry(TranscriptEntry("ACTIVITY", text))
             elif kind == "background_job":
                 self._append_entry(TranscriptEntry("ACTIVITY", text))
             elif kind == "llm_start":
-                self._phase = "thinking"
+                self._set_agent_state(AgentDisplayState.THINKING)
             elif kind == "llm_end":
                 self._finish_orphan_activity()
-                self._phase = "ready"
+                self._set_agent_state(AgentDisplayState.RUNNING, "Finishing response")
             elif text.startswith("mode set to "):
-                self._phase = "ready"
+                self._set_agent_state(AgentDisplayState.READY)
+            elif "retry" in text.casefold():
+                self._set_agent_state(AgentDisplayState.RETRYING, text)
+            elif "compact" in text.casefold():
+                self._set_agent_state(AgentDisplayState.COMPACTING, text)
             elif not self._session_has_prompt:
                 if text.startswith("session="):
                     self._pre_prompt_status = "Ready for your first prompt"
@@ -2495,8 +2991,13 @@ class NoahCodeApp(App[None]):
                 self._append_entry(TranscriptEntry("STATUS", text))
         elif event.kind == HostEventKind.STOP:
             self._finish_orphan_activity()
-            self._phase = "ready"
             reason = str(event.meta.get("reason", "")).upper()
+            if reason in {"NEED_INPUT", "GET_USER_INPUT"}:
+                self._set_agent_state(AgentDisplayState.WAITING_INPUT, text or "Input needed")
+            elif reason == "WAIT":
+                self._set_agent_state(AgentDisplayState.WAITING, text or "Waiting")
+            else:
+                self._set_agent_state(AgentDisplayState.READY)
             # DONE explanations are internal protocol summaries, not user
             # messages. Keep actionable wait/input states in the transcript.
             if reason != "DONE" and not text.casefold().startswith("completed"):
@@ -2534,7 +3035,8 @@ class NoahCodeApp(App[None]):
         self._activities[activity_id] = record
         self._active_activity_id = activity_id
         self._last_thought = ""
-        self._phase = record.label
+        self._activity_unread_lines = 0
+        self._set_agent_state(AgentDisplayState.RUNNING, record.label)
         output = self.query_one("#activity-output", RichLog)
         output.clear()
         live = self.query_one("#live-activity", Vertical)
@@ -2557,15 +3059,8 @@ class NoahCodeApp(App[None]):
             record = ActivityRecord(activity_id=activity_id, label="shell output", tool="shell")
             self._activities[activity_id] = record
             self._active_activity_id = activity_id
-        seconds = int(record.duration)
-        elapsed = f"  {seconds}s" if seconds >= 1 else ""
-        title_signature = (activity_id, record.label, elapsed)
-        if title_signature != self._activity_title_signature:
-            self.query_one("#activity-title", Static).update(
-                Text.assemble((record.label, "#d1d1d6"), (elapsed, "#777781")),
-                layout=False,
-            )
-            self._activity_title_signature = title_signature
+            self._set_agent_state(AgentDisplayState.RUNNING, record.label)
+        self._update_activity_title()
         live = self.query_one("#live-activity", Vertical)
         if live.styles.display != "block":
             live.styles.display = "block"
@@ -2587,9 +3082,16 @@ class NoahCodeApp(App[None]):
                 grouped.append((stream, [fragment]))
         self._stream_fragments.clear()
         log = self.query_one("#activity-output", RichLog)
+        follow = log.is_vertical_scroll_end or len(log.lines) == 0
+        new_lines = 0
         for stream, fragments in grouped:
             color = "#ed8796" if stream == "stderr" else "#d1d1d6"
-            log.write(Text("".join(fragments), style=color), scroll_end=True)
+            chunk = "".join(fragments)
+            new_lines += chunk.count("\n") + (0 if chunk.endswith("\n") else 1)
+            log.write(Text(chunk, style=color), scroll_end=follow)
+        if not follow:
+            self._activity_unread_lines += new_lines
+            self._update_activity_title()
         if self._active_activity_id and self._active_activity_id in self._activities:
             lines = self._activities[self._active_activity_id].line_count
             self.query_one("#live-activity", Vertical).styles.height = min(max(lines + 2, 4), 7)
@@ -2624,7 +3126,11 @@ class NoahCodeApp(App[None]):
         if completion and not duplicate:
             self._append_entry(TranscriptEntry("ACTIVITY", completion))
         self.query_one("#live-activity", Vertical).styles.display = "none"
-        self._phase = "ready"
+        self._activity_unread_lines = 0
+        if self.ui.busy:
+            self._set_agent_state(AgentDisplayState.THINKING)
+        else:
+            self._set_agent_state(AgentDisplayState.READY)
         self._update_working_banner()
 
     def _finish_orphan_activity(self, *, state: str = "complete") -> None:
@@ -2654,15 +3160,18 @@ class NoahCodeApp(App[None]):
         mention = _active_mention(text)
         if mention is not None:
             matches = mention_suggestions(Path(self.host.workspace.root), mention)
-            return [CommandSuggestion(f"@{path}", "Attach workspace file") for path in matches]
+            return [
+                CommandSuggestion(f"@{path}", "Attach workspace file", "Project")
+                for path in matches
+            ]
         if not query.startswith("/"):
             return []
         raw_lowered = text.lstrip().lower()
         if raw_lowered.startswith("/mode "):
             mode_query = raw_lowered.removeprefix("/mode ").strip()
             mode_options = [
-                CommandSuggestion("/mode build", "Switch to build mode"),
-                CommandSuggestion("/mode plan", "Switch to plan mode"),
+                CommandSuggestion("/mode build", "Switch to build mode", "Agent"),
+                CommandSuggestion("/mode plan", "Switch to plan mode", "Agent"),
             ]
             if not mode_query:
                 return mode_options
@@ -2671,11 +3180,26 @@ class NoahCodeApp(App[None]):
                 for item in mode_options
                 if item.invocation.rsplit(" ", 1)[-1].startswith(mode_query)
             ]
+        if raw_lowered.startswith("/animations "):
+            animation_query = raw_lowered.removeprefix("/animations ").strip()
+            animation_options = [
+                CommandSuggestion("/animations on", "Enable interface motion", "Settings"),
+                CommandSuggestion(
+                    "/animations off", "Use a static ASCII activity indicator", "Settings"
+                ),
+            ]
+            if not animation_query:
+                return animation_options
+            return [
+                item
+                for item in animation_options
+                if item.invocation.rsplit(" ", 1)[-1].startswith(animation_query)
+            ]
         if raw_lowered.startswith("/plan "):
             plan_query = raw_lowered.removeprefix("/plan ").strip()
             plan_options = [
-                CommandSuggestion("/plan", "Show the pinned plan"),
-                CommandSuggestion("/plan clear", "Clear the pinned plan"),
+                CommandSuggestion("/plan", "Show the pinned plan", "Project"),
+                CommandSuggestion("/plan clear", "Clear the pinned plan", "Project"),
             ]
             if not plan_query:
                 return plan_options
@@ -2683,10 +3207,10 @@ class NoahCodeApp(App[None]):
         if raw_lowered.startswith("/memory "):
             memory_query = raw_lowered.removeprefix("/memory ").strip()
             memory_options = [
-                CommandSuggestion("/memory", "Show project memory"),
-                CommandSuggestion("/memory save ", "Remember a convention"),
-                CommandSuggestion("/memory forget ", "Drop a convention"),
-                CommandSuggestion("/memory clear", "Clear project memory"),
+                CommandSuggestion("/memory", "Show project memory", "Project"),
+                CommandSuggestion("/memory save ", "Remember a convention", "Project"),
+                CommandSuggestion("/memory forget ", "Drop a convention", "Project"),
+                CommandSuggestion("/memory clear", "Clear project memory", "Project"),
             ]
             if not memory_query:
                 return memory_options
@@ -2694,7 +3218,7 @@ class NoahCodeApp(App[None]):
         if raw_lowered.startswith("/theme "):
             theme_query = raw_lowered.removeprefix("/theme ").strip()
             theme_options = [
-                CommandSuggestion(f"/theme {theme.name}", theme.description)
+                CommandSuggestion(f"/theme {theme.name}", theme.description, "Settings")
                 for theme in THEMES.values()
             ]
             if not theme_query:
@@ -2759,6 +3283,7 @@ class NoahCodeApp(App[None]):
                 lines.append(
                     Text.assemble(
                         ("› ", active_style),
+                        (f"{item.category.upper()[:8]:<8}  ", active_style),
                         (item.invocation, active_style),
                         (f"  {item.description}", f"{palette.canvas} on {palette.accent}"),
                     )
@@ -2766,7 +3291,8 @@ class NoahCodeApp(App[None]):
                 continue
             lines.append(
                 Text.assemble(
-                    ("  " + item.invocation, palette.text),
+                    (f"  {item.category.upper()[:8]:<8}  ", palette.accent),
+                    (item.invocation, palette.text),
                     (f"  {item.description}", palette.muted),
                 )
             )
@@ -2860,6 +3386,9 @@ class NoahCodeApp(App[None]):
         self.action_submit()
 
     async def request_approval(self, request: ApprovalRequest) -> ApprovalChoice:
+        previous = self._agent_state
+        self._set_agent_state(AgentDisplayState.WAITING_APPROVAL, "Permission required")
+        self.update_chrome(force=True)
         try:
             result = await self.push_screen_wait(ApprovalModal(request))
         except asyncio.CancelledError:
@@ -2867,17 +3396,32 @@ class NoahCodeApp(App[None]):
             # keeps input from being blocked by a stranded overlay.
             self._dismiss_stranded_modal()
             raise
+        finally:
+            if self._agent_state == AgentDisplayState.WAITING_APPROVAL:
+                self._set_agent_state(
+                    previous if previous in _ANIMATED_STATES else AgentDisplayState.THINKING
+                )
+                self.update_chrome(force=True)
         return result if result is not None else ApprovalChoice.REJECT
 
     async def request_questions(self, prompts: list[QuestionPrompt]) -> QuestionAnswer:
         selections: list[str] = []
         custom_parts: list[str] = []
         for prompt in prompts:
+            previous = self._agent_state
+            self._set_agent_state(AgentDisplayState.WAITING_INPUT, prompt.header)
+            self.update_chrome(force=True)
             try:
                 result = await self.push_screen_wait(QuestionModal(prompt))
             except asyncio.CancelledError:
                 self._dismiss_stranded_modal()
                 raise
+            finally:
+                if self._agent_state == AgentDisplayState.WAITING_INPUT:
+                    self._set_agent_state(
+                        previous if previous in _ANIMATED_STATES else AgentDisplayState.THINKING
+                    )
+                    self.update_chrome(force=True)
             if result is None:
                 continue
             selections.extend(result.selections)
@@ -2905,14 +3449,30 @@ class NoahCodeApp(App[None]):
     async def action_palette(self) -> None:
         rows = []
         seen_ids: set[str] = set()
-        for command in self._base_commands:
+        recency = {value: index for index, value in enumerate(reversed(self._recent_commands))}
+        commands = sorted(
+            self._base_commands,
+            key=lambda command: (
+                _command_insertion(command.invocation) not in recency,
+                recency.get(_command_insertion(command.invocation), 999),
+                command.category,
+                command.invocation,
+            ),
+        )
+        for command in commands:
             insertion = _command_insertion(command.invocation)
             if insertion in seen_ids:
                 # A custom command shadowing a builtin would produce a
                 # duplicate Option id and crash the palette; builtins win.
                 continue
             seen_ids.add(insertion)
-            rows.append((insertion, command.invocation, command.description))
+            rows.append(
+                (
+                    insertion,
+                    f"{command.category:<10} {command.invocation}",
+                    command.description,
+                )
+            )
         choice = await self.push_screen_wait(
             FilteredPicker("Commands", rows, "↑/↓ select · Enter insert · Esc close")
         )
@@ -3369,7 +3929,7 @@ class NoahCodeApp(App[None]):
         if self._agent_ready or self._phase not in {"startup failed", "setup required"}:
             return
         self._onboarding_required = False
-        self._phase = "starting"
+        self._set_agent_state(AgentDisplayState.STARTING)
         self.ui.set_busy(True)
         self._start_host()
 
@@ -3465,12 +4025,47 @@ class NoahCodeApp(App[None]):
     def action_work_ledger(self) -> None:
         self.push_screen(WorkLedgerScreen(self.host))
 
+    def action_queue_manager(self) -> None:
+        self.push_screen(QueueManagerScreen(self.host))
+
+    @work(exclusive=True, group="undo-confirmation")
+    async def action_confirm_undo(self) -> None:
+        preview = _undo_preview(self.host)
+        if preview.startswith("There is no reversible") or "full undo is unavailable" in preview:
+            message = (
+                "Nothing to undo"
+                if preview.startswith("There is no reversible")
+                else "Undo unavailable because the turn used shell mutations"
+            )
+            self._show_notice(message, kind="error", temporary=True, detail=preview)
+            return
+        confirmed = await self.push_screen_wait(
+            ConfirmationModal("Undo last turn?", preview, "Undo turn")
+        )
+        if not confirmed:
+            self._show_notice("Undo cancelled", temporary=True)
+            return
+        try:
+            status = await self.host.undo_last_turn_async()
+        except Exception as exc:  # noqa: BLE001
+            self._append_entry(TranscriptEntry("ERROR", f"Undo failed: {exc}"))
+            self._last_notice_title = "Undo error"
+            self._last_notice_detail = str(exc)
+        else:
+            self._append_entry(TranscriptEntry("STATUS", status))
+            self._refresh_repository_snapshot()
+
     def action_conversation_history(self) -> None:
         self.push_screen(ConversationHistoryScreen(self.host))
 
     def action_scroll_live(self) -> None:
         self.query_one("#conversation", RichLog).scroll_end(animate=False)
         self._unread_count = 0
+        with contextlib.suppress(Exception):
+            self.query_one("#activity-output", RichLog).scroll_end(animate=False)
+        self._activity_unread_lines = 0
+        self._activity_title_signature = None
+        self._update_activity_title()
         self.update_chrome(force=True)
 
     def action_quit_app(self) -> None:
@@ -3695,6 +4290,8 @@ class NoahCodeApp(App[None]):
         if self.ui.busy and self._turn_task and not self._turn_task.done():
             # The host renders the "turn cancelled" status entry itself when
             # the turn task unwinds; the app only triggers the cancellation.
+            self._set_agent_state(AgentDisplayState.CANCELLING)
+            self.update_chrome(force=True)
             self.host.cancel_active_turn()
             self.ui.set_busy(False)
             self._interrupt_count = 0
@@ -3734,6 +4331,11 @@ class NoahCodeApp(App[None]):
         slash = parse_slash(text)
         if slash:
             name = slash[0]
+            if name == "queue":
+                composer.text = ""
+                self.close_suggestions()
+                self.action_queue_manager()
+                return
             if name in SAFE_SLASH_WHILE_BUSY or name == "attach":
                 composer.text = ""
                 self.close_suggestions()
@@ -3776,6 +4378,18 @@ class NoahCodeApp(App[None]):
             return
         if isinstance(self.screen, (ApprovalModal, QuestionModal)):
             return
+        slash = parse_slash(text)
+        if slash:
+            insertion = f"/{slash[0]}"
+            for command in self._base_commands:
+                candidate = _command_insertion(command.invocation)
+                candidate_slash = parse_slash(candidate)
+                if candidate_slash and candidate_slash[0] == slash[0]:
+                    insertion = candidate
+                    break
+            with contextlib.suppress(ValueError):
+                self._recent_commands.remove(insertion)
+            self._recent_commands.append(insertion)
         if self.ui.busy and self._agent_ready:
             self._submit_while_busy(composer, text)
             return
@@ -3814,28 +4428,103 @@ class NoahCodeApp(App[None]):
             self.close_suggestions()
             self.action_reasoning_setup()
             return
+        if text == "/queue":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_queue_manager()
+            return
+        if self._agent_ready and text == "/undo":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_confirm_undo()
+            return
         composer.text = ""
         self.close_suggestions()
         self._append_entry(TranscriptEntry("YOU", text))
         self._interrupt_count = 0
         if not self._agent_ready:
             self._pending_submit = text
-            self._phase = "queued"
+            self._set_agent_state(AgentDisplayState.QUEUED)
             self.update_chrome(force=True)
             return
+        if slash is None:
+            self._set_agent_state(AgentDisplayState.THINKING)
         self._run_turn(text)
 
     @work(exclusive=True, group="turn")
     async def _run_turn(self, text: str) -> None:
         self._turn_task = asyncio.current_task()
+        is_agent_turn = parse_slash(text) is None
+        started_at = time.monotonic()
+        known_activity_ids = {record.activity_id for record in self._activity_history}
+        journal = getattr(getattr(self.host, "agent", None), "journal", None)
+        latest = getattr(journal, "latest_turn", None)
+        before_turn = latest() if callable(latest) else None
+        before_turn_id = getattr(before_turn, "turn_id", None)
+        try:
+            before_cost = float(self.host.usage_snapshot().cost_usd)
+        except (AttributeError, TypeError, ValueError):
+            before_cost = None
+        outcome = "complete"
         try:
             action = await self.host.handle_line(text)
             if action == "exit":
                 self.exit()
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
         except Exception as exc:  # noqa: BLE001
+            outcome = "failed"
+            self._set_agent_state(AgentDisplayState.ERROR, "Turn failed")
+            self._last_notice_title = "Turn error"
+            self._last_notice_detail = str(exc)
             self._append_entry(TranscriptEntry("ERROR", str(exc)))
         finally:
+            if is_agent_turn:
+                if self._agent_state == AgentDisplayState.ERROR:
+                    outcome = "failed"
+                latest_turn = latest() if callable(latest) else None
+                changed_files = 0
+                if latest_turn is not None and latest_turn.turn_id != before_turn_id:
+                    changed_files = len({mutation.path for mutation in latest_turn.mutations})
+                new_records = [
+                    record
+                    for record in self._activity_history
+                    if record.activity_id not in known_activity_ids
+                ]
+                validation_pattern = re.compile(r"\b(pytest|test|ruff|mypy|lint|build)\b", re.I)
+                validations = sum(
+                    bool(validation_pattern.search(f"{record.label} {record.detail}"))
+                    for record in new_records
+                )
+                duration = time.monotonic() - started_at
+                outcome_label = {
+                    "complete": "Turn complete",
+                    "failed": "Turn failed",
+                    "cancelled": "Turn cancelled",
+                }[outcome]
+                receipt = f"{outcome_label} · {duration:.1f}s"
+                if changed_files:
+                    receipt += f" · {changed_files} file{'s' if changed_files != 1 else ''} changed"
+                if validations:
+                    receipt += f" · {validations} validation{'s' if validations != 1 else ''}"
+                after_cost: float | None
+                try:
+                    after_cost = float(self.host.usage_snapshot().cost_usd)
+                except (AttributeError, TypeError, ValueError):
+                    after_cost = None
+                if before_cost is not None and after_cost is not None and after_cost > before_cost:
+                    receipt += f" · ${after_cost - before_cost:.4f}"
+                if changed_files:
+                    receipt += " · /diff review · /undo revert"
+                self._append_entry(TranscriptEntry("RECEIPT", receipt))
             self._turn_task = None
+            if self._agent_state not in {
+                AgentDisplayState.WAITING_INPUT,
+                AgentDisplayState.WAITING,
+                AgentDisplayState.ERROR,
+            }:
+                self._set_agent_state(AgentDisplayState.READY)
             self._rail_dirty = True
             self.update_chrome()
             self._refresh_repository_snapshot()

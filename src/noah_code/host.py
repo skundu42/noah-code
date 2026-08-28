@@ -19,6 +19,7 @@ from noah_code.commands import config_text, help_text, parse_slash
 from noah_code.config import (
     REASONING_EFFORTS,
     NoahCodeConfig,
+    save_user_animations,
     save_user_default_model,
     save_user_reasoning_effort,
     save_user_theme,
@@ -1439,6 +1440,27 @@ class AgentHost:
         paths, self._pending_attach_paths = self._pending_attach_paths, []
         return paths
 
+    def pending_attach_paths(self) -> tuple[Path, ...]:
+        """Return files waiting to be attached to the next queued prompt."""
+
+        return tuple(self._pending_attach_paths)
+
+    def remove_pending_attach(self, index: int) -> Path | None:
+        if index < 0 or index >= len(self._pending_attach_paths):
+            return None
+        return self._pending_attach_paths.pop(index)
+
+    def remove_queued_steer(self, index: int) -> bool:
+        item = self.steer_queue.remove(index)
+        if item is None:
+            return False
+        if self._runtime is not None and item.sequence is not None:
+            self._runtime.acknowledge_inbox(item.sequence, dropped=True)
+        return True
+
+    def move_queued_steer(self, index: int, delta: int) -> bool:
+        return self.steer_queue.move(index, delta)
+
     def enqueue_steer(self, text: str, attach_paths: list[Path] | None = None) -> bool:
         """Queue a follow-up for the current turn. Returns True if oldest dropped."""
 
@@ -1588,6 +1610,26 @@ class AgentHost:
                     HostEventKind.STATUS,
                     f"theme set to {selected} in {path}",
                     meta={"kind": "theme", "theme": selected},
+                )
+            )
+            return "handled"
+        if name == "animations":
+            requested = args.strip().lower()
+            if not requested:
+                state = "on" if self.config.ui.animations else "off"
+                self.ui.render(HostEvent(HostEventKind.STATUS, f"animations={state}"))
+                return "handled"
+            if requested not in {"on", "off"}:
+                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /animations [on|off]"))
+                return "handled"
+            enabled = requested == "on"
+            path = save_user_animations(enabled)
+            self.config.ui.animations = enabled
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    f"animations set to {requested} · saved in {path}",
+                    meta={"kind": "animations", "enabled": enabled},
                 )
             )
             return "handled"
@@ -1802,6 +1844,18 @@ class AgentHost:
             return "handled"
         if name == "work":
             self.ui.render(_command_output(self.work_status_text()))
+            return "handled"
+        if name == "queue":
+            queued = self.steer_queue.items()
+            attached = self.pending_attach_paths()
+            lines = [f"Queued prompts: {len(queued)}", f"Pending attachments: {len(attached)}"]
+            for index, item in enumerate(queued, start=1):
+                preview = " ".join(item.text.split())[:80]
+                suffix = f" · {len(item.attach_paths)} file(s)" if item.attach_paths else ""
+                lines.append(f"  {index}. {preview}{suffix}")
+            for index, path in enumerate(attached, start=1):
+                lines.append(f"  A{index}. {path}")
+            self.ui.render(_command_output("\n".join(lines)))
             return "handled"
         if name == "terminals":
             self.ui.render(_command_output(await agent.processes.terminal_status()))

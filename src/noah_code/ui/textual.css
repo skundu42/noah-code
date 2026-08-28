@@ -19,7 +19,8 @@ Screen {
 
 #notice-banner {
     display: none;
-    height: 1;
+    height: auto;
+    max-height: 3;
     padding: 0 2;
     background: $nc-raised;
     color: $nc-text;
@@ -142,6 +143,16 @@ Screen {
     border: round $nc-border;
 }
 
+#input-context {
+    display: none;
+    height: 1;
+    margin: 0 2;
+    padding: 0 1;
+    background: $nc-surface;
+    color: $nc-muted;
+    border-left: thick $nc-accent;
+}
+
 #context-hint {
     height: 1;
     padding: 0 3;
@@ -173,7 +184,12 @@ Screen {
 }
 
 .compact #context-hint {
-    display: none;
+    display: block;
+    padding: 0 1;
+}
+
+.compact #input-context {
+    margin: 0 1;
 }
 
 .compact #command-suggestions {
@@ -191,6 +207,9 @@ Screen {
 ApprovalModal,
 FilteredPicker,
 TextPromptModal,
+ConfirmationModal,
+NoticeDetailsScreen,
+QueueManagerScreen,
 ActivityHistoryScreen,
 ConversationHistoryScreen,
 WorkLedgerScreen {
@@ -288,6 +307,72 @@ DiffReviewScreen {
     padding: 1 2;
     background: $nc-surface;
     border: round $nc-border;
+}
+
+#confirmation-dialog,
+#notice-detail-dialog,
+#queue-dialog {
+    width: 88;
+    max-width: 94%;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    background: $nc-surface;
+    border: round $nc-border;
+}
+
+#confirmation-dialog {
+    border: round $nc-error;
+}
+
+#confirmation-title,
+#notice-detail-title,
+#queue-title {
+    height: 1;
+    margin-bottom: 1;
+    color: $nc-accent;
+    text-style: bold;
+}
+
+#confirmation-body {
+    height: auto;
+    max-height: 14;
+    margin-bottom: 1;
+}
+
+#confirmation-buttons {
+    height: auto;
+    align: center middle;
+}
+
+#confirmation-buttons Button {
+    margin: 0 1;
+}
+
+#notice-detail-dialog,
+#queue-dialog {
+    height: 28;
+}
+
+#notice-detail-body,
+#queue-list {
+    height: 1fr;
+    background: $nc-canvas;
+    border: none;
+    scrollbar-color: $nc-border;
+    scrollbar-background: $nc-canvas;
+}
+
+#queue-summary {
+    height: 2;
+    color: $nc-muted;
+}
+
+#notice-detail-hint,
+#queue-hint {
+    height: 1;
+    margin-top: 1;
+    color: $nc-muted;
 }
 
 #approval-dialog {

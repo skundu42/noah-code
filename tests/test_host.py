@@ -490,6 +490,31 @@ async def test_theme_slash_command_persists_and_emits_live_theme_event(
 
 
 @pytest.mark.asyncio
+async def test_animations_slash_persists_and_emits_live_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    monkeypatch.setattr("noah_code.host.save_user_animations", lambda enabled: config_path)
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+
+    action = await host.handle_line("/animations off")
+
+    assert action == "handled"
+    assert config.ui.animations is False
+    event = host.ui.render.call_args.args[0]
+    assert event.meta == {"kind": "animations", "enabled": False}
+    await host.close()
+
+
+@pytest.mark.asyncio
 async def test_skills_slash_command_renders_searchable_skill_metadata(tmp_path: Path) -> None:
     workspace = Workspace(root=tmp_path.resolve())
     config = load_config(

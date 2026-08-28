@@ -25,12 +25,14 @@ class CommandSpec:
 class CommandSuggestion:
     invocation: str
     description: str
+    category: str = "Other"
 
 
 BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("help", "Show available commands"),
     CommandSpec("config", "Show every resolved setting or one path", "config [PATH]"),
     CommandSpec("theme", "Show or switch the interface theme", "theme [NAME]"),
+    CommandSpec("animations", "Enable or disable interface motion", "animations [on|off]"),
     CommandSpec("mode", "Show or switch the active mode", "mode [build|plan]"),
     CommandSpec("model", "Configure a provider or switch this session's model", "model [MODEL]"),
     CommandSpec(
@@ -79,6 +81,7 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("redo", "Redo last undone turn"),
     CommandSpec("agents", "List built-in and markdown subagents"),
     CommandSpec("work", "Show live agent, terminal, and background-job work"),
+    CommandSpec("queue", "Inspect and manage queued prompts and attachments"),
     CommandSpec("terminals", "List persistent terminal sessions"),
     CommandSpec("attach", "Attach a workspace file or image to the next turn", "attach [PATH]"),
     CommandSpec("skills", "Search skills or add a compatible skill folder", "skills [add PATH]"),
@@ -86,6 +89,45 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("trace", "Show tracing destination"),
     CommandSpec("exit", "Exit Noah Code"),
 ]
+
+
+_COMMAND_CATEGORIES = {
+    "help": "General",
+    "config": "Settings",
+    "theme": "Settings",
+    "animations": "Settings",
+    "mode": "Agent",
+    "model": "Model",
+    "reasoning": "Model",
+    "providers": "Model",
+    "efficiency": "Model",
+    "session": "Session",
+    "sessions": "Session",
+    "new": "Session",
+    "continue": "Session",
+    "compact": "Session",
+    "worktree": "Git",
+    "pr": "Git",
+    "diff": "Git",
+    "undo": "Git",
+    "redo": "Git",
+    "checkpoints": "Git",
+    "plan": "Project",
+    "memory": "Project",
+    "todos": "Project",
+    "attach": "Project",
+    "status": "Runtime",
+    "health": "Runtime",
+    "tokens": "Runtime",
+    "trace": "Runtime",
+    "agents": "Work",
+    "work": "Work",
+    "queue": "Work",
+    "terminals": "Work",
+    "skills": "Extensions",
+    "mcp": "Extensions",
+    "exit": "General",
+}
 
 
 _SECRET_CONFIG_KEYS = frozenset(
@@ -218,20 +260,28 @@ def all_command_suggestions(
     custom: dict[str, CustomCommand] | None = None,
 ) -> list[CommandSuggestion]:
     suggestions = [
-        CommandSuggestion(command.invocation, command.description) for command in BUILTIN_COMMANDS
+        CommandSuggestion(
+            command.invocation,
+            command.description,
+            _COMMAND_CATEGORIES.get(command.name, "Other"),
+        )
+        for command in BUILTIN_COMMANDS
     ]
     suggestions.append(
-        CommandSuggestion("/model --global MODEL", "Set the default model for every repository")
+        CommandSuggestion(
+            "/model --global MODEL", "Set the default model for every repository", "Model"
+        )
     )
     suggestions.append(
         CommandSuggestion(
             "/reasoning --global EFFORT",
             "Set the reasoning effort default for every repository",
+            "Model",
         )
     )
     if custom:
         suggestions.extend(
-            CommandSuggestion(f"/{name} [ARGS]", command.description)
+            CommandSuggestion(f"/{name} [ARGS]", command.description, "Custom")
             for name, command in sorted(custom.items())
         )
     return suggestions
@@ -241,14 +291,23 @@ def config_command_suggestions(config: Any) -> list[CommandSuggestion]:
     suggestions = []
     for path, value in config_entries(config):
         display_value = value if len(value) <= 80 else f"{value[:77]}…"
-        suggestions.append(CommandSuggestion(f"/config {path}", f"current: {display_value}"))
+        suggestions.append(
+            CommandSuggestion(f"/config {path}", f"current: {display_value}", "Settings")
+        )
     return suggestions
 
 
 def help_text(custom: dict[str, CustomCommand] | None = None) -> str:
     lines = ["Noah Code commands:", ""]
-    for cmd in BUILTIN_COMMANDS:
-        lines.append(f"  {cmd.invocation:<28} {cmd.description}")
+    categories = list(
+        dict.fromkeys(_COMMAND_CATEGORIES.get(cmd.name, "Other") for cmd in BUILTIN_COMMANDS)
+    )
+    for category in categories:
+        lines.append(f"{category}:")
+        for cmd in BUILTIN_COMMANDS:
+            if _COMMAND_CATEGORIES.get(cmd.name, "Other") == category:
+                lines.append(f"  {cmd.invocation:<28} {cmd.description}")
+        lines.append("")
     lines.append(f"  {'/model --global MODEL':<28} Set the default model for every repository")
     lines.append(f"  {'/reasoning --global EFFORT':<28} Set the global reasoning effort default")
     if custom:

@@ -30,12 +30,16 @@ from noah_code.ui.textual_app import (
     MAX_TRANSCRIPT_LINES,
     WORKING_COMET_FRAMES,
     ActivityHistoryScreen,
+    AgentDisplayState,
     ApprovalModal,
+    ConfirmationModal,
     ConversationHistoryScreen,
     DiffReviewScreen,
     FilteredPicker,
     NoahCodeApp,
+    NoticeDetailsScreen,
     QuestionModal,
+    QueueManagerScreen,
     RepositorySnapshot,
     TextPromptModal,
     TextualUI,
@@ -92,6 +96,14 @@ def _fake_host(tmp_path: Path):
         return host.steer_queue.push(text, attach_paths=paths or None)
 
     host.take_pending_attaches = take_pending_attaches
+    host.pending_attach_paths = lambda: tuple(host._pending_attach_paths)
+    host.remove_pending_attach = lambda index: (
+        host._pending_attach_paths.pop(index)
+        if 0 <= index < len(host._pending_attach_paths)
+        else None
+    )
+    host.remove_queued_steer = lambda index: host.steer_queue.remove(index) is not None
+    host.move_queued_steer = lambda index, delta: host.steer_queue.move(index, delta)
     host.enqueue_steer = enqueue_steer
     return host
 
@@ -941,6 +953,216 @@ async def test_busy_animation_tick_repaints_only_loader(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_semantic_state_distinguishes_thinking_and_input_needed(tmp_path: Path) -> None:
+    ui = TextualUI()
+    app = NoahCodeApp(_fake_host(tmp_path), ui)
+    async with app.run_test(size=(120, 30)) as pilot:
+        ui.set_busy(True)
+        ui.render(HostEvent(HostEventKind.STATUS, "model started", meta={"kind": "llm_start"}))
+        await pilot.pause()
+        assert app._agent_state == AgentDisplayState.THINKING
+
+        ui.render(
+            HostEvent(
+                HostEventKind.STOP,
+                "Choose the target package",
+                meta={"reason": "NEED_INPUT"},
+            )
+        )
+        ui.set_busy(False)
+        await pilot.pause()
+
+        assert app._agent_state == AgentDisplayState.WAITING_INPUT
+        assert "input needed" in _rendered_text(app.query_one("#header").content)
+        assert app.query_one("#working-banner").styles.display == "block"
+        assert "Choose the target package" in _working_banner_text(app)
+
+
+@pytest.mark.asyncio
+async def test_elapsed_clock_refreshes_status_without_repainting_loader(tmp_path: Path) -> None:
+    ui = TextualUI()
+    app = NoahCodeApp(_fake_host(tmp_path), ui)
+    async with app.run_test(size=(120, 30)) as pilot:
+        ui.set_busy(True)
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                "Running tests",
+                meta={"activity_id": "test-1", "tool": "shell"},
+            )
+        )
+        await pilot.pause()
+        app._activities["test-1"].started_at = time.monotonic() - 3
+        loader = app.query_one("#working-loader")
+        status = app.query_one("#working-status")
+        loader.update = MagicMock(wraps=loader.update)
+        status.update = MagicMock(wraps=status.update)
+
+        app._refresh_working_status()
+
+        status.update.assert_called_once()
+        loader.update.assert_not_called()
+        assert "3s" in _rendered_text(status.content)
+
+
+@pytest.mark.asyncio
+async def test_reduced_motion_uses_static_loader(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host.config.ui.animations = False
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test(size=(120, 30)) as pilot:
+        ui.set_busy(True)
+        await pilot.pause()
+        loader = app.query_one("#working-loader")
+        assert "*" in _rendered_text(loader.content)
+        loader.update = MagicMock(wraps=loader.update)
+
+        app._advance_working_loader()
+
+        loader.update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_live_output_pauses_following_and_reports_new_lines(tmp_path: Path) -> None:
+    ui = TextualUI()
+    app = NoahCodeApp(_fake_host(tmp_path), ui)
+    async with app.run_test(size=(100, 24)) as pilot:
+        ui.set_busy(True)
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                "Running command",
+                meta={"activity_id": "shell-1", "tool": "shell"},
+            )
+        )
+        ui.render(
+            HostEvent(
+                HostEventKind.SHELL_CHUNK,
+                "\n".join(f"line {index}" for index in range(80)) + "\n",
+                meta={"activity_id": "shell-1", "stream": "stdout"},
+            )
+        )
+        await pilot.pause()
+        app._flush_stream()
+        log = app.query_one("#activity-output")
+        log.scroll_home(animate=False)
+        await pilot.pause()
+
+        ui.render(
+            HostEvent(
+                HostEventKind.SHELL_CHUNK,
+                "new one\nnew two\n",
+                meta={"activity_id": "shell-1", "stream": "stdout"},
+            )
+        )
+        await pilot.pause()
+        app._flush_stream()
+
+        assert app._activity_unread_lines == 2
+        assert "2 new" in _rendered_text(app.query_one("#activity-title").content)
+        app.action_scroll_live()
+        assert app._activity_unread_lines == 0
+
+
+@pytest.mark.asyncio
+async def test_long_error_has_expandable_details(tmp_path: Path) -> None:
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    detail = "Build failed\n" + "compiler diagnostic " * 20
+    async with app.run_test(size=(80, 24)) as pilot:
+        app._show_notice(detail, kind="error")
+        banner = _rendered_text(app.query_one("#notice-banner").content)
+        assert "F6 details" in banner
+
+        app.action_notice_details()
+        await pilot.pause()
+
+        assert isinstance(app.screen, NoticeDetailsScreen)
+        assert "compiler diagnostic" in _log_text(app.screen.query_one("#notice-detail-body"))
+
+
+@pytest.mark.asyncio
+async def test_compact_layout_keeps_contextual_hint_visible(tmp_path: Path) -> None:
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    async with app.run_test(size=(80, 20)):
+        hint = app.query_one("#context-hint")
+        assert app.screen.has_class("compact")
+        assert hint.styles.display == "block"
+        assert "Enter send" in _rendered_text(hint.content)
+
+
+@pytest.mark.asyncio
+async def test_input_context_and_queue_manager_remove_pending_items(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host._pending_attach_paths.append(tmp_path / "screen.png")
+    host.steer_queue.push("also update the docs")
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.update_chrome(force=True)
+        context = _rendered_text(app.query_one("#input-context").content)
+        assert "screen.png" in context
+        assert "also update the docs" in context
+
+        app.action_queue_manager()
+        await pilot.pause()
+        assert isinstance(app.screen, QueueManagerScreen)
+        await pilot.press("d")
+
+        assert host._pending_attach_paths == []
+
+
+@pytest.mark.asyncio
+async def test_undo_requires_confirmation_and_previews_scope(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    mutation = SimpleNamespace(path=str(tmp_path / "app.py"))
+    host.agent.journal.latest_turn.return_value = SimpleNamespace(
+        turn_id="12345678-abcd",
+        mutations=[mutation],
+        shell_may_bypass=False,
+    )
+    host.undo_last_turn_async = AsyncMock(return_value="undid turn 12345678 (1 files)")
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "/undo"
+        app.action_submit()
+        await pilot.pause()
+
+        assert isinstance(app.screen, ConfirmationModal)
+        assert "app.py" in _rendered_text(app.screen.query_one("#confirmation-body").content)
+        host.undo_last_turn_async.assert_not_awaited()
+
+        await pilot.press("y")
+        await pilot.pause()
+        host.undo_last_turn_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_ends_with_compact_receipt(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    mutation = SimpleNamespace(path=str(tmp_path / "app.py"))
+    host.agent.journal.latest_turn.side_effect = [
+        None,
+        SimpleNamespace(turn_id="new-turn", mutations=[mutation], shell_may_bypass=False),
+    ]
+    host.usage_snapshot.return_value = SimpleNamespace(cost_usd=0.02)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "Fix the parser"
+        app.action_submit()
+        for _ in range(20):
+            await pilot.pause()
+            if any(entry.role == "RECEIPT" for entry in app._transcript_entries):
+                break
+
+        receipt = next(entry.text for entry in app._transcript_entries if entry.role == "RECEIPT")
+        assert "Turn complete" in receipt
+        assert "1 file changed" in receipt
+        assert "/diff review" in receipt
+
+
+@pytest.mark.asyncio
 async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
     tmp_path: Path,
 ) -> None:
@@ -1362,14 +1584,14 @@ async def test_slash_suggestion_selection_remains_visible_after_first_page(
         await pilot.pause()
 
         rendered = _rendered_text(suggestions.content)
-        assert "1–5 of 35" in rendered
-        assert "› /help" in rendered
+        assert "1–5 of 37" in rendered
+        assert "› GENERAL   /help" in rendered
 
         await pilot.press("down", "down", "down", "down", "down")
         rendered = _rendered_text(suggestions.content)
 
-        assert "2–6 of 35" in rendered
-        assert "› /reasoning" in rendered
+        assert "2–6 of 37" in rendered
+        assert "› MODEL     /model" in rendered
         assert "/help" not in rendered
 
 

@@ -12,6 +12,7 @@ from noah_code.config import (
     ConfigError,
     NoahCodeConfig,
     load_config,
+    save_user_animations,
     save_user_default_model,
     save_user_reasoning_effort,
     save_user_theme,
@@ -200,6 +201,21 @@ def test_save_user_theme_preserves_ui_settings(tmp_path: Path, monkeypatch) -> N
     assert loaded.ui.theme == "noah-ocean"
     assert loaded.ui.markdown is False
     assert loaded.model == "openai/example"
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_save_user_animations_preserves_ui_settings(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[ui]\ntheme = 'graphite'\nmarkdown = false\n")
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    saved_path = save_user_animations(False)
+
+    assert saved_path == config_path
+    loaded = load_config(tmp_path)
+    assert loaded.ui.animations is False
+    assert loaded.ui.theme == "graphite"
+    assert loaded.ui.markdown is False
     assert config_path.stat().st_mode & 0o777 == 0o600
 
 

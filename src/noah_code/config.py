@@ -134,6 +134,7 @@ class UIConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     theme: ThemeName = "atom-one-dark"
+    animations: bool = True
     show_reasoning: bool = False
     markdown: bool = True
     frontend: Literal["tui", "console"] = "tui"
@@ -549,6 +550,62 @@ def save_user_theme(theme: str) -> Path:
             lines.insert(table_end, replacement)
         else:
             lines[theme_line] = replacement
+
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".config-", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write("".join(lines))
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return path
+
+
+def save_user_animations(enabled: bool) -> Path:
+    """Persist the reduced-motion preference inside the user ``[ui]`` table."""
+
+    path = _user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    existing = path.read_text() if path.is_file() else ""
+    lines = existing.splitlines(keepends=True)
+    replacement = f"animations = {'true' if enabled else 'false'}\n"
+
+    table_start = next(
+        (index for index, line in enumerate(lines) if line.strip() == "[ui]"),
+        None,
+    )
+    if table_start is None:
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += "\n"
+        if lines and lines[-1].strip():
+            lines.append("\n")
+        lines.extend(["[ui]\n", replacement])
+    else:
+        table_end = next(
+            (
+                index
+                for index, line in enumerate(lines[table_start + 1 :], start=table_start + 1)
+                if line.lstrip().startswith("[")
+            ),
+            len(lines),
+        )
+        animation_line = next(
+            (
+                index
+                for index, line in enumerate(
+                    lines[table_start + 1 : table_end], start=table_start + 1
+                )
+                if re.match(r"^\s*animations\s*=", line)
+            ),
+            None,
+        )
+        if animation_line is None:
+            lines.insert(table_end, replacement)
+        else:
+            lines[animation_line] = replacement
 
     descriptor, temporary_name = tempfile.mkstemp(prefix=".config-", dir=path.parent)
     temporary_path = Path(temporary_name)
