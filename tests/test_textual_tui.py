@@ -905,6 +905,20 @@ async def test_busy_loader_does_not_rebuild_context_rail(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_busy_loader_tolerates_widget_teardown(tmp_path: Path) -> None:
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.ui.set_busy(True)
+        await pilot.pause()
+        await app.query_one("#working-loader").remove()
+
+        app._advance_working_loader()
+
+    assert app._loader_timer is None
+    assert app._status_timer is None
+
+
+@pytest.mark.asyncio
 async def test_busy_refresh_is_throttled_and_stays_out_of_full_chrome(tmp_path: Path) -> None:
     app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
     async with app.run_test(size=(120, 30)) as pilot:

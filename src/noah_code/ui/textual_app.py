@@ -2396,6 +2396,16 @@ class NoahCodeApp(App[None]):
             self.ui.set_busy(True)
             self._start_host()
 
+    def on_unmount(self) -> None:
+        """Stop UI timers before the widget tree is dismantled."""
+
+        self._app_mounted = False
+        for timer in (self._loader_timer, self._status_timer):
+            if timer is not None:
+                timer.stop()
+        self._loader_timer = None
+        self._status_timer = None
+
     def apply_theme(self, name: str) -> None:
         """Apply a Noah palette immediately without restarting the session."""
 
@@ -2797,7 +2807,10 @@ class NoahCodeApp(App[None]):
             "x": "bold #ed8796",
             " ": "#777781",
         }
-        self.query_one("#working-loader", Static).update(
+        loader = self.query_one_optional("#working-loader", Static)
+        if loader is None:
+            return
+        loader.update(
             Text.assemble(
                 ("NOAH  ", "bold #8bd5ca"),
                 *((character, loader_styles[character]) for character in frame),
