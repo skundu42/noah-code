@@ -1069,6 +1069,11 @@ async def test_live_output_pauses_following_and_reports_new_lines(tmp_path: Path
             if len(log.lines) >= 80:
                 break
         assert len(log.lines) >= 80
+        for _ in range(20):
+            await pilot.pause()
+            if log.max_scroll_y > 0:
+                break
+        assert log.max_scroll_y > 0
         log.scroll_home(animate=False, force=True, immediate=True)
         for _ in range(10):
             await pilot.pause()
