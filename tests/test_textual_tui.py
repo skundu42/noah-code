@@ -1062,9 +1062,13 @@ async def test_live_output_pauses_following_and_reports_new_lines(tmp_path: Path
                 meta={"activity_id": "shell-1", "stream": "stdout"},
             )
         )
-        await pilot.pause()
-        app._flush_stream()
         log = app.query_one("#activity-output")
+        for _ in range(20):
+            await pilot.pause()
+            app._flush_stream()
+            if len(log.lines) >= 80:
+                break
+        assert len(log.lines) >= 80
         log.scroll_home(animate=False)
         for _ in range(10):
             await pilot.pause()
@@ -1079,8 +1083,11 @@ async def test_live_output_pauses_following_and_reports_new_lines(tmp_path: Path
                 meta={"activity_id": "shell-1", "stream": "stdout"},
             )
         )
-        await pilot.pause()
-        app._flush_stream()
+        for _ in range(20):
+            await pilot.pause()
+            app._flush_stream()
+            if app._activity_unread_lines == 2:
+                break
 
         assert app._activity_unread_lines == 2
         assert "2 new" in _rendered_text(app.query_one("#activity-title").content)
