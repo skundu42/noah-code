@@ -2412,6 +2412,8 @@ class NoahCodeApp(App[None]):
             kind = event.meta.get("kind")
             if kind == "theme":
                 self.apply_theme(str(event.meta.get("theme", self._theme_name)))
+            elif kind == "checkpoint":
+                self._append_entry(TranscriptEntry("ACTIVITY", text or "◆"))
             elif kind == "subagent":
                 state = str(event.meta.get("state", "running"))
                 if state == "running":
@@ -2439,7 +2441,11 @@ class NoahCodeApp(App[None]):
         elif event.kind == HostEventKind.STOP:
             self._finish_orphan_activity()
             self._phase = "ready"
-            self._append_entry(TranscriptEntry("STATUS", text))
+            reason = str(event.meta.get("reason", "")).upper()
+            # DONE explanations are internal protocol summaries, not user
+            # messages. Keep actionable wait/input states in the transcript.
+            if reason != "DONE" and not text.casefold().startswith("completed"):
+                self._append_entry(TranscriptEntry("STATUS", text))
         elif event.kind == HostEventKind.DIFF_REVIEW:
             review = event.meta.get("review")
             if review is not None:

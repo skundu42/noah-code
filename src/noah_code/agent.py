@@ -14,13 +14,13 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from nooa import Context, hidden, strategy
+from nooa import Agent, Context, hidden, strategy
 from nooa.config import CodeActConfig, PredictConfig
 from nooa.interactive import InteractiveAgent, RespondReason, RespondResult
 from nooa.runtime.restrictions import RESTRICTED_MODULES, RestrictionsConfig
 from nooa.runtime.sandbox.config import FileRule, SandboxConfig, resolve_spec
 from nooa.runtime.sandbox.executor import SandboxedExecutor
-from nooa.strategies import CodeActStrategy, PredictStrategy
+from nooa.strategies import CodeActStrategy
 from nooa.strategies.codeact_lite import PlainCodeActBlockFormatter
 from nooa.tools import TodoManager
 from nooa.tools.shell_tools import ShellTools
@@ -30,6 +30,7 @@ from noah_code.approvals import ApprovalBroker
 from noah_code.config import NoahCodeConfig
 from noah_code.macos_sandbox import build_macos_profile, macos_worker_main
 from noah_code.permissions import PermissionEngine
+from noah_code.predict import ISOLATED_PREDICT_CONTEXT, LeanPredictStrategy
 from noah_code.secure_files import read_text_bounded
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tools.git_tools import GitTools
@@ -360,7 +361,185 @@ def _cache_first_block_order(base: list[str] | None) -> list[str]:
     ]
 
 
+def _summarization_token_limit(config: NoahCodeConfig, llm: Any) -> int:
+    """Resolve a practical history budget without overriding an explicit limit."""
+
+    if config.summarization.max_tokens is not None:
+        return config.summarization.max_tokens
+    context_window = getattr(llm, "context_window", None)
+    ratio_limit = (
+        int(context_window * config.summarization.trigger_ratio)
+        if context_window
+        else config.efficiency.context_token_budget
+    )
+    return min(ratio_limit, config.efficiency.context_token_budget)
+
+
+_NOAH_CODEACT_INSTRUCTIONS = """## Noah CodeAct
+
+Work through tool calls; plain assistant prose cannot run code or end a turn.
+Use `execute_python(code)` for work and `return_result(...)` to finish. Python
+cell state persists. Parameters and `self` are preloaded; call async `self.*`
+tools with `await`. `self.message(text)` is synchronous—never await it.
+
+### Tools
+
+- Explore with focused `self.ws.list/search/read` and `self.lsp` queries. Edit a
+  Match with `self.ws.replace`. `self.ws.edit(path, old, new)` takes exactly
+  three arguments; two-argument calls are invalid. Prefer one atomic
+  `self.ws.apply_patch(changes)` for a
+  coherent batch; `self.ws.apply_unified_diff` accepts git-style hunks.
+- Run commands with `await self.ws.run(command)` and inspect
+  returncode/stdout/stderr. `read_only=True` skips approval only for commands
+  the engine recognizes as read-only (Git inspection, search, listing, text
+  filters). It is rejected for pytest, uv, Python, builds, and mutations.
+- Use `self.processes.start/logs/status/input/stop` for long jobs and consume
+  logs by cursor. Persistent shells use `open_terminal`, `terminal_run`,
+  `terminal_status`, and `close_terminal`; raw terminal input is blocked.
+- `self.web.fetch/search` are read-only. Use `self.github` for PR operations,
+  not shell commands. Ask choices through `self.ask.question`.
+- Manage plans through `self.plan.write/enter/exit_to_build`; never call
+  `set_mode`. Save standing conventions with `self.memory.save`.
+- Delegate bounded units with `self.task.run`, independent units with
+  `run_many`, and lead synthesis with `collaborate`.
+- If `self.media` has pending images, `show()` each consumed image first.
+
+### Workflow and safety
+
+Understand the requested end state before acting. For a conversational answer,
+call `self.message(...)` and finish without editing. Otherwise inspect repository
+instructions and nearby code, use todos only for multi-step work, preserve
+unrelated changes, make the smallest coherent edit, and validate proportional
+to risk. Never claim a command passed unless its successful result was observed.
+In plan mode do not mutate; follow an active plan without expanding scope.
+Do not commit, push, publish, or create external resources unless explicitly
+asked. Do not read secrets or expose sensitive values. `--yolo` applies only
+when the host was explicitly launched for a throwaway workspace.
+
+Sandboxed cells forbid host/system imports (including os, sys, subprocess,
+shutil, nooa, and noah_code), dynamic execution, input, and attaching callables
+to `self`. Use dedicated tools instead; use `doc(obj)` for focused API help.
+
+End with exactly one RespondResult: DONE, NEED_INPUT, or WAIT (WAIT requires a
+registered running job). In code call
+`return_result(RespondReason.DONE, explanation="...")`; never pass a bare string,
+which has the wrong type.
+Show user-facing text first with synchronous `self.message("...")`.
+"""
+
+_NOAH_EXECUTION_CONTEXT = """## Execution Context
+
+Inside `execute_python`, method parameters and `self` are already in scope and
+state persists across cells. Always available: `print`, `pprint`, `doc`,
+`return_result`, `RespondReason`, `asyncio`, and `typing`. Inspect only the API
+you need with `doc(self.ws)` or `doc(self.<tool>.<method>)`; Noah's internal
+module imports are intentionally not part of the agent-facing contract.
+"""
+
+_OBSERVABILITY_EVENT_TYPES = (
+    "LLMCallStart",
+    "LLMCallEnd",
+    "LLMComplete",
+    "Reasoning",
+    "Error",
+)
+
+
+def _forward_observability_events(source: Any, target: Any) -> list[Any]:
+    """Forward runtime evidence without copying model-visible history."""
+
+    if source is target:
+        return []
+
+    def forward(event: Any) -> None:
+        target.add(event, record=False)
+
+    return [source.on(event_type, forward) for event_type in _OBSERVABILITY_EVENT_TYPES]
+
+
+class _AuxiliaryPredictor(Agent):
+    """Stateless one-shot helpers for non-coding model work."""
+
+    def __init__(self, llm: Any, *, cache_namespace: str) -> None:
+        super().__init__(llm=llm)
+        self._agent_id = cache_namespace
+
+    @strategy(
+        LeanPredictStrategy(PredictConfig(output_serialization="tool_call")),
+        context=ISOLATED_PREDICT_CONTEXT,
+    )
+    async def name_session(self, user_message: str) -> str:
+        """Create a specific 2-5 word coding-session title. Return only the title.
+
+        Do not include quotes, punctuation, generic words like "task", or claims
+        beyond the user's request. Keep useful identifiers when present.
+        """
+
+        ...
+
+    @strategy(
+        LeanPredictStrategy(PredictConfig(output_serialization="tool_call")),
+        context=ISOLATED_PREDICT_CONTEXT,
+    )
+    async def distill_result(self, transcript: str) -> str:
+        """Compress one subagent transcript into an evidence-preserving parent report.
+
+        Return only useful sections as short plain lines without markdown headers:
+        Findings - concrete answers with exact paths and symbols.
+        Changes - files edited and what changed.
+        Validation - commands and exact observed outcomes.
+        Open - unresolved problems or user questions.
+
+        Omit empty sections, chatter, raw output, and superseded attempts. Never
+        invent success. Preserve identifiers, commands, and numbers. Maximum 1200
+        characters.
+        """
+
+        ...
+
+    @strategy(
+        LeanPredictStrategy(PredictConfig(output_serialization="tool_call")),
+        context=ISOLATED_PREDICT_CONTEXT,
+    )
+    async def distill_memories(self, turn: str) -> str:
+        """Extract only standing project conventions that should persist across sessions.
+
+        Return EMPTY when there is none; otherwise return at most eight `MEMORY:`
+        lines. Include conventions such as package managers, forbidden paths, or
+        PR-title style. Never include secrets, task status, or one-off bugs.
+        """
+
+        ...
+
+
 class _PermissionCodeActStrategy(CodeActStrategy):
+    async def strategy_instructions(self, runtime: Any) -> str:
+        """Use one stable Noah-specific contract instead of generic duplicate guidance."""
+
+        _ = runtime
+        return _NOAH_CODEACT_INSTRUCTIONS
+
+    async def execution_context(self, runtime: Any) -> str:
+        """Expose the supported cell surface, not Noah's implementation imports."""
+
+        _ = runtime
+        return _NOAH_EXECUTION_CONTEXT
+
+    async def sandbox_context(self, runtime: Any) -> str:
+        """Describe actionable sandbox limits without volatile interpreter paths."""
+
+        _ = runtime
+        sandbox = self.config.sandbox
+        return (
+            "Code cells run in an isolated worker: "
+            f"{self.config.cell_timeout:g}s wall-clock, "
+            f"{sandbox.max_cpu_seconds:g}s CPU, {sandbox.max_memory_mb} MB memory. "
+            "Direct workspace filesystem access and network sockets are unavailable; "
+            "use `self.*` tools. Returned values must be picklable. "
+            "Treat `self.<attr>` values as copies: persist changes through methods or reassignment. "
+            "Keep live objects in cell state and return compact summaries."
+        )
+
     def _build_builtins(self, runtime: Any, call: Any) -> dict[str, Any]:
         builtins = super()._build_builtins(runtime, call)
         # InteractiveAgent documents this exact inline return pattern. Keep the
@@ -452,6 +631,8 @@ class CodingAgent(InteractiveAgent):
         coordinator: WorkspaceMutationCoordinator | None = None,
         budget_guard: Any = None,
         usage_tracker: Any = None,
+        cache_namespace: str | None = None,
+        observability_event_manager: Any = None,
         nested: bool = False,
         nested_prompt: str | None = None,
         **kwargs: Any,
@@ -460,6 +641,10 @@ class CodingAgent(InteractiveAgent):
 
         llm = wrap_conversational_replies(llm)
         super().__init__(llm=llm, storage=storage, **kwargs)
+        if cache_namespace:
+            # NOOA derives prompt_cache_key from this id. A durable Noah
+            # session therefore keeps provider cache affinity across restart.
+            self._agent_id = cache_namespace
         self._lightweight_llm = lightweight_llm or self._llm
         self.workspace_root = str(workspace.root)
         self.mode = config.mode
@@ -487,6 +672,15 @@ class CodingAgent(InteractiveAgent):
         self._coordinator = coordinator or WorkspaceMutationCoordinator()
         self._budget_guard = budget_guard
         self._usage_tracker = usage_tracker
+        self._observability_event_manager = (
+            observability_event_manager
+            if observability_event_manager is not None
+            else self.event_manager
+        )
+        self._observability_unsubs = _forward_observability_events(
+            self.event_manager,
+            self._observability_event_manager,
+        )
 
         self.lsp = LSPTools(
             workspace,
@@ -583,18 +777,21 @@ class CodingAgent(InteractiveAgent):
 
             from noah_code.summarization import CodingSessionSummarizer
 
-            max_tokens = config.summarization.max_tokens
-            context_window = getattr(self._llm, "context_window", None)
-            if max_tokens is None and context_window:
-                max_tokens = int(context_window * config.summarization.trigger_ratio)
-            CodingSessionSummarizer.install(
+            summarizer = CodingSessionSummarizer.install(
                 self,
                 llm=self._lightweight_llm,
                 config=TokenBudgetConfig(
-                    max_tokens=max_tokens or 100_000,
+                    max_tokens=_summarization_token_limit(config, self._llm),
                     preserve_recent=config.summarization.preserve_recent,
                     target_chars=config.summarization.target_chars,
                 ),
+            )
+            summarizer._agent_id = f"{self.agent_id}:summarize"
+            self._observability_unsubs.extend(
+                _forward_observability_events(
+                    summarizer.event_manager,
+                    self._observability_event_manager,
+                )
             )
 
         # Discover AGENTS.md / README hints without dumping trees.
@@ -665,12 +862,7 @@ class CodingAgent(InteractiveAgent):
 
         from nooa.config.summarizer_config import TokenBudgetConfig
 
-        context_window = getattr(self._llm, "context_window", None)
-        maximum = self._config.summarization.max_tokens or (
-            int(context_window * self._config.summarization.trigger_ratio)
-            if context_window
-            else 100_000
-        )
+        maximum = _summarization_token_limit(self._config, self._llm)
         for summarizer in nooa_compat.summarizers(self):
             current = summarizer.config
             summarizer.config = TokenBudgetConfig(
@@ -708,41 +900,35 @@ class CodingAgent(InteractiveAgent):
         return await nooa_compat.compact_summarizers(self)
 
     @hidden
-    @strategy(
-        PredictStrategy(PredictConfig(output_serialization="tool_call")),
-        llm=lambda agent: agent._lightweight_llm,
-    )
-    async def name_session(self, user_message: str) -> str:
-        """Generate an ultra-short 2-5 word coding-session title.
+    async def _run_auxiliary_predict(self, route: str, value: str) -> str:
+        """Run one helper against fresh history and a stable session-local cache route."""
 
-        Conversation starts with: {user_message}
-        """
-
-        ...
+        predictor = _AuxiliaryPredictor(
+            self._lightweight_llm,
+            cache_namespace=f"{self.agent_id}:aux:{route}",
+        )
+        unsubs = _forward_observability_events(
+            predictor.event_manager,
+            self._observability_event_manager,
+        )
+        try:
+            method = getattr(predictor, route)
+            return str(await method(value))
+        finally:
+            for unsubscribe in unsubs:
+                unsubscribe()
 
     @hidden
-    @strategy(
-        PredictStrategy(PredictConfig(output_serialization="tool_call")),
-        llm=lambda agent: agent._lightweight_llm,
-    )
+    async def name_session(self, user_message: str) -> str:
+        """Generate a compact title without adding helper events to coding history."""
+
+        return await self._run_auxiliary_predict("name_session", user_message)
+
+    @hidden
     async def distill_result(self, transcript: str) -> str:
-        """Compress one subagent work transcript into a compact report for its parent.
+        """Condense a large child result without inheriting the child's work history."""
 
-        Transcript begins: {transcript}
-
-        Return only these sections when they contain real information, as short
-        plain lines without markdown headers:
-        Findings - concrete answers with file paths and symbol names.
-        Changes - files edited and what changed in each.
-        Validation - commands run and their exact observed outcomes.
-        Open - unresolved problems or questions that need the user.
-
-        Preserve exact paths, identifiers, commands, and numbers. Omit chatter,
-        raw tool output, and superseded attempts. Never claim success that the
-        transcript does not show. Stay under 1200 characters.
-        """
-
-        ...
+        return await self._run_auxiliary_predict("distill_result", transcript)
 
     @hidden
     def _git_summary(self) -> str:
@@ -810,22 +996,10 @@ class CodingAgent(InteractiveAgent):
         return MemoryStore(Path(self.workspace_root)).merge(parse_distilled_memories(raw))
 
     @hidden
-    @strategy(
-        PredictStrategy(PredictConfig(output_serialization="tool_call")),
-        llm=lambda agent: agent._lightweight_llm,
-    )
     async def distill_memories(self, turn: str) -> str:
-        """Extract standing project conventions from this turn.
+        """Extract durable conventions without polluting the coding conversation."""
 
-        Turn begins: {turn}
-
-        Return EMPTY if nothing should persist across sessions.
-        Otherwise return one MEMORY: line per standing convention such as
-        package manager, forbidden paths, or PR title style.
-        Never include secrets, task status, or one-off bugs. At most 8 lines.
-        """
-
-        ...
+        return await self._run_auxiliary_predict("distill_memories", turn)
 
     @hidden
     @property
@@ -857,121 +1031,9 @@ class CodingAgent(InteractiveAgent):
     async def handle(self, notification: dict[str, list]) -> RespondResult:
         """Handle one conversational turn for a coding task.
 
-        Read all user messages, slash-command results, and system messages
-        in the notification. Understand the requested end state before acting.
-        Conversational questions are first-class: answer them with
-        ``self.message(...)`` then return DONE. Do not emit bare assistant prose.
-        IMPORTANT: ``self.message(...)`` is SYNCHRONOUS — call it WITHOUT
-        ``await`` (``self.message("...")``). Prefixing ``await`` raises
-        ``TypeError: object NoneType can't be used in 'await' expression``
-        because it returns ``None``. All ``self.ws.*``, ``self.web.*``,
-        ``self.lsp.*``, ``self.processes.*`` calls ARE async and need ``await``.
-
-        Minimal tool cookbook:
-        - ``await self.ws.list("**/*.py")`` lists files.
-        - ``await self.ws.search("symbol")`` returns locations as text.
-        - ``match = await self.ws.read("path.py", lines=(10, 30))`` returns an
-          editable Match; ``await self.ws.replace(match, "replacement")`` edits it.
-        - ``await self.ws.edit("path.py", "unique old text", "new text")`` is the
-          simple string-edit form and takes exactly three arguments (path, old,
-          new); two-argument calls are invalid. For a Match from read(), edit
-          with ``await self.ws.replace(match, "replacement")`` instead.
-          ``await self.ws.write("new.py", content)`` creates files.
-        - Prefer ``await self.ws.apply_patch(changes)`` for coherent edits. Each change is
-          ``{"path": ..., "old": exact_text_or_None, "new": replacement_or_None}``;
-          one call validates and atomically commits the full batch.
-        - ``await self.ws.apply_unified_diff(diff_text)`` applies a unified diff
-          (git-style ---/+++/@@ hunks) with the same atomic verification.
-        - Use ``self.lsp`` for definitions, implementations, references, symbols, hover,
-          diagnostics, rename previews, and compact repository maps before broad searches.
-        - Use ``self.processes.start/logs/status/input/stop`` for servers, watchers, and
-          long-running commands. Consume logs by cursor; do not poll without new work.
-        - Use ``await self.processes.open_terminal(name)``,
-          ``await self.processes.terminal_run(name, command)``,
-          ``await self.processes.terminal_status()``, and
-          ``await self.processes.close_terminal(name)`` for
-          multiple named persistent shells. Every terminal command is permission-checked;
-          raw ``input`` is intentionally blocked for managed terminals.
-        - ``result = await self.ws.run("pytest -q")`` runs validation; inspect
-          ``result.returncode``, ``result.stdout``, and ``result.stderr``.
-          ``read_only=True`` skips approval ONLY for commands the engine
-          recognizes as read-only (``git status/log/diff/show``, ``rg``,
-          ``grep``, ``ls``, ``find`` (no -delete/-exec), ``head``, ``tail``,
-          ``wc``, ``sed``, ``awk``, ``sort``, ``uniq``, ``cut``, ``tr``,
-          ``tac``, ``column``, ``pwd``, ``file``, ``stat``, ``test``). It is
-          REJECTED for anything else — including ``pytest``, ``uv``, ``python``,
-          and build commands — so do NOT pass ``read_only=True`` for those; run
-          them with plain ``await self.ws.run(cmd)`` (YOLO auto-approves;
-          ``--auto`` prompts).
-        - If the host was launched with ``--yolo``, every approval is granted
-          automatically without prompting. That mode exists for throwaway or
-          sandboxed environments only; do not assume it is active — write code
-          that works under normal permission gating.
-        - ``await self.web.fetch(url)`` reads a page; ``await self.web.search(query)``
-          searches the public web. Both are read-only and allowed by default.
-        - ``await self.github.list()`` / ``view(number)`` inspect pull requests.
-        - ``await self.github.create(title, body)`` pushes HEAD and opens a PR.
-        - ``await self.github.push()`` updates the remote branch.
-        - ``await self.github.checkout(number)`` checks out ``pr/<number>``.
-        - ``await self.github.comment(number, text)`` comments on a PR.
-        - ``await self.ask.question(header, prompt, options)`` pauses for a user choice.
-        - ``await self.plan.write(markdown)`` pins ``.noah-code/plan.md`` (allowed in plan mode).
-        - ``await self.plan.exit_to_build()`` asks to switch to build after a plan exists.
-        - ``await self.plan.enter()`` asks to switch to plan mode. Do not call ``set_mode``.
-        - ``await self.memory.save(fact)`` remembers a standing project convention.
-        - ``await self.task.run("explore", "...")`` or ``"general"`` runs a nested
-          NOOA subagent with isolated history; results arrive condensed. Use
-          ``await self.task.run_many([("explore", "..."), ...])`` to fan out
-          bounded independent units concurrently.
-          ``await self.task.collaborate(objective, assignments, lead="general")`` fans
-          out research and hands the bounded reports to one lead for synthesis.
-        - ``self.task.list()`` shows markdown agents.
-        - If ``self.media.pending()`` is non-empty, ``show()`` each ``self.media.consume()``
-          image before reasoning. ``show`` is a CodeAct builtin; do not import ``nooa``.
-
-        Workflow:
-        - If the user attached images, show them first.
-        - If the user asked a question, explain a concept, or asked what you can do,
-          answer with ``self.message`` and return DONE. Skip file edits unless asked.
-        - Inspect relevant repository instructions and nearby code first.
-        - Prefer ``self.ws.search`` / focused ``self.ws.read`` over dumping large files.
-        - Delegate bounded research or parallel units with ``self.task.run``.
-        - Use ``self.todos`` for genuinely multi-step tasks; keep todos current.
-        - Make the smallest coherent change, preferring one atomic ``self.ws.apply_patch``.
-        - Preserve unrelated user modifications.
-        - Run validation proportional to risk (focused tests, not entire suites).
-        - Never claim a command or test passed unless its successful result was observed.
-        - Report blockers concretely via ``self.message(...)``.
-        - In plan mode (see ``self.mode``), do not modify files or run mutating commands.
-          Write the checklist with ``self.plan.write`` then ``self.plan.exit_to_build``.
-        - If an active plan is loaded, implement that plan; do not expand scope.
-        - Do not commit, push, publish, or create external resources unless explicitly asked.
-          When asked to open or update a pull request, use ``self.github`` — never ``git push``
-          or mutating ``gh pr`` through the shell.
-        - Do not read secrets or expose sensitive environment values.
-
-        Forbidden inside sandboxed code cells (do NOT attempt - they always fail
-        and burn turns): ``import os``, ``import sys``, ``import subprocess``,
-        ``import shutil``, ``import nooa``, ``import noah_code``, and any of
-        ``eval()``, ``exec()``, ``compile()``, ``__import__()``. If you need to
-        run shell logic or a host feature, do it with ``self.ws.run(...)``
-        (read-only shell is auto-approved), ``self.web``, ``self.lsp``, or the
-        dedicated tools - never by importing a blocked module. Use
-        ``self.ws.inspect(...)`` on Python data; do not try to reach host
-        objects from a cell.
-
-        Return exactly one valid RespondResult:
-        - DONE - request complete
-        - NEED_INPUT - user input genuinely required
-        - WAIT - a registered background job is still running
-
-        To end the turn, call ``return_result(RespondReason.DONE,
-        explanation="...")`` — ``return_result`` takes a ``RespondReason``
-        and an ``explanation`` string, NEVER a bare string as ``result=``
-        (that raises ``return_result validation error: 'result' has wrong
-        type``). To show the user text, call the synchronous
-        ``self.message("...")`` first (no ``await``), then
-        ``return_result(RespondReason.DONE, explanation="summary")``.
+        Process every notification item as one turn. Follow the Noah CodeAct
+        contract and repository context, fulfill the requested end state, and
+        return a valid RespondResult with a concise, evidence-based explanation.
         """
         ...
 
@@ -979,6 +1041,9 @@ class CodingAgent(InteractiveAgent):
     async def close_tools(self) -> None:
         """Close every owned shell, LSP server, and background process."""
 
+        for unsubscribe in self._observability_unsubs:
+            unsubscribe()
+        self._observability_unsubs.clear()
         await asyncio.gather(
             self.processes.close(),
             self.lsp.close(),

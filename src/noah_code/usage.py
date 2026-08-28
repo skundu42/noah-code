@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from threading import Lock
@@ -21,6 +22,8 @@ class UsageSnapshot:
     tool_output_chars: int
     prefix_calls: int = 0
     prefix_append_only: int = 0
+    prefix_reused_chars: int = 0
+    prefix_total_chars: int = 0
 
     @property
     def uncached_tokens(self) -> int:
@@ -35,6 +38,12 @@ class UsageSnapshot:
         """Share of consecutive LLM calls whose request prefix was append-only."""
 
         return self.prefix_append_only / self.prefix_calls if self.prefix_calls else 0.0
+
+    @property
+    def prefix_reuse_ratio(self) -> float:
+        """Estimated share of serialized request text shared with prior calls."""
+
+        return self.prefix_reused_chars / self.prefix_total_chars if self.prefix_total_chars else 0.0
 
     @property
     def average_llm_seconds(self) -> float:
@@ -54,6 +63,8 @@ class UsageSnapshot:
                 f"  tool output       {self.tool_output_chars:,} chars",
                 f"  prefix stability  {self.prefix_append_only}/{self.prefix_calls}"
                 f" ({self.prefix_stability_ratio:.0%})",
+                f"  prefix reuse est. {self.prefix_reused_chars:,}/{self.prefix_total_chars:,} chars"
+                f" ({self.prefix_reuse_ratio:.0%})",
                 f"  estimated cost    ${self.cost_usd:.6f}",
             ]
         )
@@ -71,6 +82,8 @@ class UsageSnapshot:
             "tool_output_chars": self.tool_output_chars,
             "prefix_calls": self.prefix_calls,
             "prefix_append_only": self.prefix_append_only,
+            "prefix_reused_chars": self.prefix_reused_chars,
+            "prefix_total_chars": self.prefix_total_chars,
         }
 
 
@@ -89,7 +102,9 @@ class UsageTracker:
         self._tool_chars = 0
         self._prefix_calls = 0
         self._prefix_append_only = 0
-        self._last_serialization: str | None = None
+        self._prefix_reused_chars = 0
+        self._prefix_total_chars = 0
+        self._last_serializations: dict[str, str] = {}
 
     def llm_start(self, event: Any) -> None:
         key = (str(getattr(event, "generation_id", "")), int(getattr(event, "turn_number", 0)))
@@ -120,25 +135,57 @@ class UsageTracker:
         with self._lock:
             self._tool_chars += size
 
-    def observe_prefix(self, messages: Any) -> None:
+    def observe_prefix(self, messages: Any, *, route: str | None = None) -> None:
         """Record whether this request's serialization extends the previous one.
 
         Append-only growth is what provider prompt caches reward: the unchanged
-        head is a cache hit and only the tail is processed fresh.
+        head is a cache hit and only the tail is processed fresh. Requests are
+        compared only within their provider cache route so main-agent, Predict,
+        and subagent calls cannot corrupt one another's diagnostics.
         """
 
         try:
+            normalized = (
+                message
+                if isinstance(message, dict)
+                else {
+                    key: getattr(message, key)
+                    for key in ("role", "content", "name", "tool_calls", "tool_call_id")
+                    if getattr(message, key, None) is not None
+                }
+                for message in messages
+            )
             serialized = "\n\x1e\n".join(
-                str(getattr(message, "content", None) or message) for message in messages
+                json.dumps(
+                    message,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                )
+                for message in normalized
             )
         except TypeError:
             return
+        route_key = str(route) if route else "default"
         with self._lock:
             self._prefix_calls += 1
-            previous = self._last_serialization
-            self._last_serialization = serialized
+            self._prefix_total_chars += len(serialized)
+            previous = self._last_serializations.get(route_key)
+            # Provider cache keys are bounded by the runtime, but custom clients
+            # may produce unbounded routes. Keep telemetry memory bounded.
+            if route_key not in self._last_serializations and len(self._last_serializations) >= 32:
+                self._last_serializations.pop(next(iter(self._last_serializations)))
+            self._last_serializations[route_key] = serialized
             if previous is not None and serialized.startswith(previous):
                 self._prefix_append_only += 1
+            if previous is not None:
+                shared = 0
+                for left, right in zip(previous, serialized, strict=False):
+                    if left != right:
+                        break
+                    shared += 1
+                self._prefix_reused_chars += shared
 
     def snapshot(self) -> UsageSnapshot:
         with self._lock:
@@ -154,6 +201,8 @@ class UsageTracker:
                 tool_output_chars=self._tool_chars,
                 prefix_calls=self._prefix_calls,
                 prefix_append_only=self._prefix_append_only,
+                prefix_reused_chars=self._prefix_reused_chars,
+                prefix_total_chars=self._prefix_total_chars,
             )
 
     def load_dict(self, data: dict[str, Any] | None) -> None:
@@ -174,3 +223,6 @@ class UsageTracker:
             self._tool_chars = max(int(data.get("tool_output_chars", 0)), 0)
             self._prefix_calls = max(int(data.get("prefix_calls", 0)), 0)
             self._prefix_append_only = max(int(data.get("prefix_append_only", 0)), 0)
+            self._prefix_reused_chars = max(int(data.get("prefix_reused_chars", 0)), 0)
+            self._prefix_total_chars = max(int(data.get("prefix_total_chars", 0)), 0)
+            self._last_serializations.clear()

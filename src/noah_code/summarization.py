@@ -17,7 +17,8 @@ import re
 from nooa import strategy
 from nooa.agents.summarization import TokenBudgetSummarizer
 from nooa.config import PredictConfig
-from nooa.strategies import PredictStrategy
+
+from noah_code.predict import ISOLATED_PREDICT_CONTEXT, LeanPredictStrategy
 
 _SPILL_ID = re.compile(r"id=([0-9a-f]{20})")
 
@@ -97,7 +98,10 @@ class CodingSessionSummarizer(TokenBudgetSummarizer):
             )
         super()._schedule_summarization(start_tag, end_tag)
 
-    @strategy(PredictStrategy(PredictConfig(max_param_chars=None)))
+    @strategy(
+        LeanPredictStrategy(PredictConfig(max_param_chars=None)),
+        context=ISOLATED_PREDICT_CONTEXT,
+    )
     async def summarize(self, history_markdown: str, target_chars: int) -> str:
         """Compress `history_markdown` into a coding checkpoint of about {target_chars} chars.
 

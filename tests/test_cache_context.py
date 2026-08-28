@@ -10,13 +10,16 @@ from nooa.unifiedllm import FakeLLMClient
 
 from noah_code import secure_files
 from noah_code.agent import (
+    _NOAH_CODEACT_INSTRUCTIONS,
+    _NOAH_EXECUTION_CONTEXT,
     CodingAgent,
     _AdaptivePermissionCodeActStrategy,
     _LeanPermissionCodeActStrategy,
     _PermissionCodeActStrategy,
+    _summarization_token_limit,
 )
 from noah_code.budget import wrap_with_budget
-from noah_code.config import BudgetConfig, load_config
+from noah_code.config import BudgetConfig, NoahCodeConfig, load_config
 from noah_code.usage import UsageTracker
 from noah_code.workspace import Workspace
 
@@ -237,6 +240,39 @@ def test_usage_tracker_detects_append_only_growth() -> None:
     assert snapshot.prefix_calls == 3
     assert snapshot.prefix_append_only == 1
     assert abs(snapshot.prefix_stability_ratio - 1 / 3) < 1e-9
+    assert snapshot.prefix_reused_chars > 0
+    assert 0 < snapshot.prefix_reuse_ratio < 1
+
+
+def test_prefix_diagnostics_isolate_provider_cache_routes() -> None:
+    tracker = UsageTracker()
+    first = [{"role": "system", "content": "shared"}, {"role": "user", "content": "a"}]
+    tracker.observe_prefix(first, route="main")
+    tracker.observe_prefix(
+        [{"role": "system", "content": "other"}, {"role": "user", "content": "b"}],
+        route="predict",
+    )
+    tracker.observe_prefix([*first, {"role": "assistant", "content": "done"}], route="main")
+
+    snapshot = tracker.snapshot()
+    assert snapshot.prefix_calls == 3
+    assert snapshot.prefix_append_only == 1
+
+
+def test_cache_namespace_is_stable_and_explicit(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(workspace.root)
+    agent = CodingAgent(workspace, config, llm=FakeLLMClient(), cache_namespace="noah:session-1")
+    assert agent.agent_id == "noah:session-1"
+
+
+def test_context_budget_caps_ratio_derived_limit() -> None:
+    config = NoahCodeConfig(efficiency={"context_token_budget": 64_000})
+    llm = type("LLM", (), {"context_window": 1_000_000})()
+    assert _summarization_token_limit(config, llm) == 64_000
+
+    config.summarization.max_tokens = 150_000
+    assert _summarization_token_limit(config, llm) == 150_000
 
 
 def test_wrap_without_budget_still_observes_prefixes() -> None:
@@ -268,8 +304,10 @@ def test_wrap_without_budget_still_observes_prefixes() -> None:
 
 
 def _handle_prompt() -> str:
+    """Combined static contract plus the small per-call method description."""
+
     doc = CodingAgent.handle.__doc__ or ""
-    return " ".join(doc.split())
+    return " ".join(f"{_NOAH_CODEACT_INSTRUCTIONS}\n{doc}".split())
 
 
 def test_prompt_directs_verification_commands_through_read_only_run() -> None:
@@ -277,7 +315,7 @@ def test_prompt_directs_verification_commands_through_read_only_run() -> None:
 
     assert "read_only=True" in prompt
     assert "recognizes as read-only" in prompt
-    assert "REJECTED" in prompt
+    assert "rejected" in prompt.lower()
     assert "pytest" in prompt and "uv" in prompt
 
 
@@ -298,9 +336,8 @@ def test_prompt_pins_edit_to_three_arguments() -> None:
 def test_prompt_marks_message_as_synchronous() -> None:
     prompt = _handle_prompt()
 
-    assert "SYNCHRONOUS" in prompt
-    assert "WITHOUT" in prompt and "await" in prompt
-    assert "NoneType can't be used in 'await'" in prompt
+    assert "synchronous" in prompt
+    assert "never await" in prompt
 
 
 def test_prompt_documents_return_result_signature() -> None:
@@ -308,5 +345,18 @@ def test_prompt_documents_return_result_signature() -> None:
 
     assert "return_result(RespondReason.DONE" in prompt
     assert "explanation" in prompt
-    assert "NEVER a bare string" in prompt
+    assert "never pass a bare string" in prompt.lower()
     assert "wrong type" in prompt
+
+
+def test_handle_prompt_stays_compact_without_losing_contracts() -> None:
+    prompt = CodingAgent.handle.__doc__ or ""
+    assert len(prompt) <= 500
+    assert len(_NOAH_CODEACT_INSTRUCTIONS) <= 4000
+
+
+def test_execution_context_exposes_only_supported_agent_surface() -> None:
+    assert "RespondReason" in _NOAH_EXECUTION_CONTEXT
+    assert "doc(self.ws)" in _NOAH_EXECUTION_CONTEXT
+    assert "import noah_code" not in _NOAH_EXECUTION_CONTEXT
+    assert "import subprocess" not in _NOAH_EXECUTION_CONTEXT

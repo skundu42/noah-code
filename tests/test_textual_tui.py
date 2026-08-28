@@ -713,12 +713,45 @@ async def test_active_context_rail_shows_semantic_tool_state_not_code(tmp_path: 
                 meta={"activity_id": "tool-1", "result_status": "success"},
             )
         )
-        ui.render(HostEvent(HostEventKind.STOP, "Completed · tests passed"))
+        ui.render(
+            HostEvent(
+                HostEventKind.STOP,
+                "Completed · tests passed",
+                meta={"kind": "agent_stop", "reason": "DONE"},
+            )
+        )
         await pilot.pause()
         assert "ready" in _rendered_text(app.query_one("#header").content)
         transcript = _log_text(app.query_one("#conversation"))
-        assert "Completed · tests passed" in transcript
+        assert "Completed · tests passed" not in transcript
         assert "\n  ·\n" not in transcript
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_status_renders_as_icon_only(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.render(HostEvent(HostEventKind.MESSAGE, "work complete"))
+        ui.render(
+            HostEvent(
+                HostEventKind.STATUS,
+                "◆",
+                meta={
+                    "kind": "checkpoint",
+                    "label": "Checkpoint saved",
+                    "checkpoint": {"ref": "turn-0001", "commit": "abc123"},
+                },
+            )
+        )
+        await pilot.pause()
+
+        transcript = _log_text(app.query_one("#conversation"))
+        assert "◆" in transcript
+        assert "checkpoint saved" not in transcript.lower()
+        assert "turn-0001" not in transcript
+        assert "abc123" not in transcript
 
 
 @pytest.mark.asyncio

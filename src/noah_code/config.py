@@ -92,7 +92,9 @@ class EfficiencyConfig(BaseModel):
     profile: Literal["fast", "balanced", "deep"] = "fast"
     strategy: Literal["lean", "standard"] = "lean"
     deterministic_titles: bool = True
+    memory_distillation: Literal["off", "heuristic", "always"] = "heuristic"
     lazy_mcp: bool = False
+    context_token_budget: int = Field(default=64_000, ge=4000, le=1_000_000)
     max_output_lines: int = Field(default=250, ge=20, le=5000)
     max_search_results: int = Field(default=100, ge=10, le=1000)
     max_file_results: int = Field(default=500, ge=50, le=5000)

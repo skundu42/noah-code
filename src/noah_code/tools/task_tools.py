@@ -361,6 +361,12 @@ async def run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> str:
         coordinator=getattr(parent, "_coordinator", None),
         budget_guard=getattr(parent, "_budget_guard", None),
         usage_tracker=getattr(parent, "_usage_tracker", None),
+        cache_namespace=f"{parent.agent_id}:task:{spec.name}",
+        observability_event_manager=getattr(
+            parent,
+            "_observability_event_manager",
+            parent.event_manager,
+        ),
         nested=True,
         nested_prompt=spec.prompt,
     )

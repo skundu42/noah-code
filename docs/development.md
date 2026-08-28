@@ -35,6 +35,18 @@ uvx pre-commit install
 Use `/tokens` during a real session to inspect provider-reported token use, cache hits, model wait,
 tool output, and estimated cost.
 
+The hermetic prompt scorecard prevents efficiency work from silently dropping agent contracts or
+growing the first request. Run it with:
+
+```bash
+uv run --all-extras pytest -q tests/test_prompt_scorecard.py tests/test_cache_context.py
+```
+
+It gates the initial token estimate, per-session cache-key and system-prefix stability, compact
+dynamic task instructions, and the required editing, validation, delegation, and safety guidance.
+It also caps isolated helper routes at 250 estimated input tokens and proves they do not mutate the
+main coding history. Live `/tokens` results remain authoritative for provider cache billing.
+
 ## CI
 
 GitHub Actions runs the complete test suite on Python 3.12 and 3.13, plus platform smoke tests on

@@ -43,6 +43,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MEMORY_CUE = re.compile(
+    r"(?:\bremember\b|\bfrom now on\b|\bgoing forward\b|\bfor this (?:project|repo)\b|"
+    r"\bour (?:team|project) (?:uses?|prefers?|requires?)\b|\bwe (?:always|never|use|prefer)\b|"
+    r"\b(?:always|never|prefer|must) (?:use|run|keep|avoid)\b|\bconvention\b|"
+    r"\bstyle guide\b|\bpackage manager\b|^\s*MEMORY:)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def _friendly_agent_error(exc: Exception) -> str:
     """Turn framework/provider failures into bounded, actionable UI copy."""
@@ -447,6 +455,7 @@ class AgentHost:
             runtime=self._runtime,
             budget_guard=self._budget_guard,
             usage_tracker=self._usage,
+            cache_namespace=f"noah:{self.meta.session_id}",
         )
         # Restore snapshot if present.
         restored = self._storage.restore_latest_snapshot(agent)
@@ -654,8 +663,12 @@ class AgentHost:
             self.ui.render(
                 HostEvent(
                     HostEventKind.STATUS,
-                    f"checkpoint saved · {snapshot['ref']} · commit {snapshot['commit'][:10]}",
-                    meta={"kind": "checkpoint", "checkpoint": snapshot},
+                    "◆",
+                    meta={
+                        "kind": "checkpoint",
+                        "label": "Checkpoint saved",
+                        "checkpoint": snapshot,
+                    },
                 )
             )
 
@@ -2225,7 +2238,14 @@ class AgentHost:
                     explanation = getattr(result, "explanation", "") or ""
                     kind = getattr(result, "kind", None)
                     self._sync_budget_cost()
-                    self.ui.render(HostEvent(HostEventKind.STOP, _stop_text(kind, explanation)))
+                    stop_kind = str(getattr(kind, "value", kind) or "").upper()
+                    self.ui.render(
+                        HostEvent(
+                            HostEventKind.STOP,
+                            _stop_text(kind, explanation),
+                            meta={"kind": "agent_stop", "reason": stop_kind},
+                        )
+                    )
                     if kind in {RespondReason.NEED_INPUT, RespondReason.GET_USER_INPUT}:
                         exit_code = 0
                         run_state = "waiting_user"
@@ -2461,8 +2481,12 @@ class AgentHost:
         return type(llm).__name__ != "FakeLLMClient"
 
     async def _maybe_remember(self, text: str, origin: _BackgroundTaskOrigin) -> None:
+        efficiency = getattr(getattr(self, "config", None), "efficiency", None)
+        memory_mode = getattr(efficiency, "memory_distillation", "heuristic")
         if (
             len(text.strip()) < 40
+            or memory_mode == "off"
+            or (memory_mode == "heuristic" and _MEMORY_CUE.search(text) is None)
             or not self._origin_is_current(origin)
             or not self._can_distill_memories(origin.agent)
         ):

@@ -85,6 +85,18 @@ def test_shell_chunk_stderr_is_styled_not_dropped() -> None:
     assert "traceback here" in buffer.getvalue()
 
 
+def test_completed_stop_protocol_summary_is_hidden() -> None:
+    ui, buffer = _make_ui()
+    ui.render(
+        HostEvent(
+            HostEventKind.STOP,
+            "Completed · greeted the user",
+            meta={"kind": "agent_stop", "reason": "DONE"},
+        )
+    )
+    assert buffer.getvalue() == ""
+
+
 @pytest.mark.asyncio
 async def test_ask_approval_parses_once_session_reject_and_invalid(monkeypatch) -> None:
     ui, buffer = _make_ui()

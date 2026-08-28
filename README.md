@@ -56,8 +56,9 @@ configuration or session history.
 - **Persistent sessions.** Resume repository-scoped conversations, steering, todos, model choices,
   budgets, background-job logs, and compacted context without losing full tool results.
 - **Token-efficient by construction.** Lean tool-output bounds with disk-backed recall, condensed
-  subagent results, cache-stable request prefixes (volatile status arrives as appended events),
-  and pointer-eviction compaction — measured live with `/tokens`.
+  subagent results, isolated low-token helper calls, cache-stable request prefixes (volatile status
+  arrives as appended events), route-aware cache telemetry, selective memory distillation, and
+  pointer-eviction compaction with a practical context ceiling — measured live with `/tokens`.
 - **Explicit control.** Switch between implementation-focused **build** mode and read-only
   **plan** mode, with ordered `allow`, `ask`, and `deny` permission rules.
 - **Extensible workflows.** Add slash commands, opt-in skills, MCP servers, or markdown subagents;

@@ -25,6 +25,8 @@ def test_defaults_and_cli_override(tmp_path: Path, monkeypatch) -> None:
     assert cfg.model == "claude-opus-4-8"
     assert cfg.auto_approve is True
     assert NoahCodeConfig().efficiency.lazy_mcp is False
+    assert NoahCodeConfig().efficiency.memory_distillation == "heuristic"
+    assert NoahCodeConfig().efficiency.context_token_budget == 64_000
 
 
 def test_project_config_layer(tmp_path: Path, monkeypatch) -> None:

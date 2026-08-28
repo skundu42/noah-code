@@ -107,7 +107,9 @@ max_output_chars = 16000
 profile = "fast"          # "fast", "balanced", or "deep"
 strategy = "lean"         # "standard" is the comparison fallback
 deterministic_titles = true
-lazy_mcp = false         # true catalogs servers without attaching them at start
+memory_distillation = "heuristic" # "off", "heuristic", or "always"
+lazy_mcp = false          # true catalogs servers without attaching them at start
+context_token_budget = 64000 # automatic compaction ceiling unless max_tokens is explicit
 max_output_lines = 250
 max_search_results = 100
 max_file_results = 500
@@ -289,8 +291,25 @@ fallback cache used when workspace tools are embedded without a durable session 
 
 Set `lightweight_model` to route compaction to a faster or cheaper model. If it is omitted, that
 route follows live `/model` switches. Compaction starts at 35% of the active main model's context
-window by default, preserves the six newest events, and writes a coding checkpoint covering the
-objective, decisions, files, validation, blockers, and next steps.
+window, capped at `efficiency.context_token_budget` (64k by default), preserves the six newest
+events, and writes a coding checkpoint covering the objective, decisions, files, validation,
+blockers, and next steps. An explicit `summarization.max_tokens` overrides the ceiling.
+
+`memory_distillation = "heuristic"` avoids an auxiliary model call on ordinary coding prompts and
+runs only when the user states a likely standing convention (for example “remember”, “we always”,
+or “for this project”). Use `"always"` for the earlier every-turn behavior or `"off"` to disable
+automatic memory extraction; explicit `self.memory.save(...)` remains available to the agent.
+
+Noah keeps provider `prompt_cache_key` affinity stable for a durable session, including after a
+process restart. Cache namespaces, histories, summaries, memory state, and telemetry remain
+independent between sessions. `/tokens` reports provider cache hits plus route-aware prefix
+stability and an estimated common-prefix reuse ratio; provider-reported cached tokens remain the
+authoritative billing measure.
+
+Auxiliary model work (optional title generation, memory extraction, subagent-result condensation,
+and history compaction) uses isolated histories and distinct session-local cache routes. These
+calls do not inherit repository/tool context or add their internal Tasks and results to the coding
+conversation; only their usage and runtime observability events feed the parent session.
 
 ### Budgets, checkpoints, and reliability
 

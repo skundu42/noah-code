@@ -8,6 +8,7 @@ import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -17,6 +18,7 @@ from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.budget import BudgetExceeded, BudgetGuard, SharedBudgetLLM
 from noah_code.commands import help_text
 from noah_code.config import BudgetConfig, NoahCodeConfig, PermissionRule, load_config
+from noah_code.events import HostEventKind
 from noah_code.host import (
     AgentHost,
     _friendly_agent_error,
@@ -283,12 +285,17 @@ async def test_session_approval_rules_do_not_leak(tmp_path: Path) -> None:
     )
     host1._persist()
     sid1 = host1.meta.session_id
+    cache_namespace1 = host1.agent.agent_id
     await host1.close()
 
     host2 = AgentHost(workspace, config, llm=FakeLLMClient(), store=store)
     await host2.start()
+    sid2 = host2.meta.session_id
     # Fresh session should not have session-1 rules.
     assert host2.agent.engine.snapshot_session_rules() == []
+    assert sid2 != sid1
+    assert host2.agent.agent_id != cache_namespace1
+    assert host2.agent.agent_id == f"noah:{sid2}"
     d = host2.agent.engine.decide("edit", "x.py")
     assert d.action == "allow"
     await host2.close()
@@ -421,6 +428,7 @@ async def test_resume_uses_persisted_model(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("nooa.unifiedllm.get_llm_client", _client)
     host = AgentHost(workspace, config, session_meta=meta, store=store)
     await host.start()
+    assert host.agent.agent_id == f"noah:{meta.session_id}"
     await host.close()
 
     assert requested == ["resumed-model"]
@@ -723,11 +731,20 @@ async def test_completed_turn_captures_checkpoint_when_enabled(
 
     host.agent.queue_manager.race = instant_race
     monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", instant_handle)
+    rendered: list[Any] = []
+    host.ui.render = rendered.append
     result = await host._run_user_turn("do the work")
 
     assert result.exit_code == 0
     assert host.last_checkpoint is not None
     assert host.last_checkpoint["ref"].endswith("0001")
+    checkpoint_event = next(
+        event for event in rendered if event.meta.get("kind") == "checkpoint"
+    )
+    assert checkpoint_event.text == "◆"
+    assert checkpoint_event.meta["label"] == "Checkpoint saved"
+    stop_event = next(event for event in rendered if event.kind == HostEventKind.STOP)
+    assert stop_event.meta["reason"] == "DONE"
     await host.close()
 
 
@@ -1483,11 +1500,11 @@ async def test_new_workspace_session_cancels_and_awaits_overlapping_memory_tasks
     host._can_distill_memories = lambda _agent: True
     tasks = [
         host._track_background_task(
-            host._maybe_remember("first completed turn " * 4, origin),
+            host._maybe_remember("Remember for this project: first convention " * 3, origin),
             name="test-memory-one",
         ),
         host._track_background_task(
-            host._maybe_remember("second completed turn " * 4, origin),
+            host._maybe_remember("Remember for this project: second convention " * 3, origin),
             name="test-memory-two",
         ),
     ]
@@ -1509,6 +1526,48 @@ async def test_new_workspace_session_cancels_and_awaits_overlapping_memory_tasks
     assert host.agent is not origin_agent
     origin_agent.absorb_memories.assert_not_called()
     assert not (new_root / ".noah-code" / "memory.md").exists()
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_distillation_only_calls_model_for_likely_conventions(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = NoahCodeConfig(session_dir=tmp_path / "sessions")
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    origin = host._background_task_origin(host.agent)
+    distill = AsyncMock(return_value="MEMORY: Use uv for Python commands")
+    absorb = MagicMock(return_value=["Use uv for Python commands"])
+    object.__setattr__(host.agent, "distill_memories", distill)
+    object.__setattr__(host.agent, "absorb_memories", absorb)
+    host._can_distill_memories = lambda _agent: True
+
+    await host._maybe_remember(
+        "Please fix the parser failure and run the focused regression tests afterwards.",
+        origin,
+    )
+    distill.assert_not_awaited()
+
+    await host._maybe_remember(
+        "For this project, always use uv for Python commands and dependency changes.",
+        origin,
+    )
+    distill.assert_awaited_once()
+    absorb.assert_called_once()
+
+    config.efficiency.memory_distillation = "off"
+    await host._maybe_remember(
+        "Remember for this project that all release tags must be signed.",
+        origin,
+    )
+    assert distill.await_count == 1
+
+    config.efficiency.memory_distillation = "always"
+    await host._maybe_remember(
+        "Please fix the renderer and run the focused regression tests afterwards.",
+        origin,
+    )
+    assert distill.await_count == 2
     await host.close()
 
 
@@ -1558,7 +1617,9 @@ async def test_stale_title_and_memory_results_cannot_mutate_new_identity(tmp_pat
     host._set_session_title = MagicMock()
     origin = host._background_task_origin(old_agent)
     title_task = asyncio.create_task(host._maybe_title("old turn", origin))
-    memory_task = asyncio.create_task(host._maybe_remember("old completed turn " * 4, origin))
+    memory_task = asyncio.create_task(
+        host._maybe_remember("Remember for this project: use the old convention " * 3, origin)
+    )
     await asyncio.wait_for(both_started.wait(), timeout=2)
 
     host._agent = new_agent

@@ -253,16 +253,16 @@ class BudgetedLLM:
     def context_window(self) -> Any:
         return getattr(self._inner, "context_window", None)
 
-    def _observe_prefix(self, messages: list[dict]) -> None:
+    def _observe_prefix(self, messages: list[dict], *, route: str | None = None) -> None:
         if self._prefix_observer is not None:
-            self._prefix_observer.observe_prefix(messages)
+            self._prefix_observer.observe_prefix(messages, route=route)
 
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
         # Active caps serialize reservations across parent and subagent routes;
         # without this lane, concurrent calls can all pass the same preflight.
         async with self._guard._async_provider_lock:
             self._guard.enforce()
-            self._observe_prefix(messages)
+            self._observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
             response = await self._inner.acall(
                 messages, tools=tools, output_model=output_model, **kwargs
             )
@@ -278,7 +278,7 @@ class BudgetedLLM:
     def call(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
         with self._guard._provider_lock:
             self._guard.enforce()
-            self._observe_prefix(messages)
+            self._observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
             response = self._inner.call(
                 messages, tools=tools, output_model=output_model, **kwargs
             )
@@ -333,13 +333,13 @@ class _PrefixObserverOnly:
         self._observer = observer
 
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
-        self._observer.observe_prefix(messages)
+        self._observer.observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
         response = await self._inner.acall(messages, tools=tools, output_model=output_model, **kwargs)
         _usage_from_response(response)  # stamp cost_usd for NOOA's LLMComplete telemetry
         return response
 
     def call(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
-        self._observer.observe_prefix(messages)
+        self._observer.observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
         response = self._inner.call(messages, tools=tools, output_model=output_model, **kwargs)
         _usage_from_response(response)  # stamp cost_usd for NOOA's LLMComplete telemetry
         return response
