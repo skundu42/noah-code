@@ -376,6 +376,44 @@ async def test_search_redacts_secret_file_matches(tmp_path: Path) -> None:
         await ws.close()
 
 
+@pytest.mark.asyncio
+async def test_search_accepts_common_paths_and_regex_arguments(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    docs = tmp_path / "docs"
+    src.mkdir()
+    docs.mkdir()
+    (src / "app.py").write_text("literal a.b\nregex axb\n")
+    (docs / "guide.md").write_text("literal a.b\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        fixed = await ws.search("a.b", paths=["src", "docs"], regex=False)
+        regex = await ws.search("a.b", paths="src", regex=True)
+
+        assert "src/app.py" in fixed.stdout
+        assert "docs/guide.md" in fixed.stdout
+        assert "regex axb" not in fixed.stdout
+        assert "regex axb" in regex.stdout
+        assert len(fixed) == 2
+        assert all(match.file.endswith(("app.py", "guide.md")) for match in fixed)
+        assert fixed[:1][0].content == "literal a.b\n"
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_read_match_supports_familiar_content_helpers(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("first\nsecond\n")
+    ws = _make_ws(tmp_path, auto=True)
+    try:
+        match = await ws.read("app.py")
+        assert isinstance(match, Match)
+        assert match.content == match.text == "first\nsecond\n"
+        assert match.file == match.path
+        assert match.splitlines() == ["first", "second"]
+    finally:
+        await ws.close()
+
+
 def test_matches_glob_is_python_312_compatible() -> None:
     assert _matches_glob("ok.py", "**/*")
     assert _matches_glob("src/app.py", "**/*")
@@ -409,6 +447,9 @@ async def test_list_files_skips_ignored_dirs_and_secrets(tmp_path: Path) -> None
     git = tmp_path / ".git"
     git.mkdir()
     (git / "HEAD").write_text("ref: refs/heads/main\n")
+    derived = tmp_path / ".build" / "DerivedData"
+    derived.mkdir(parents=True)
+    (derived / "generated.swift").write_text("ignored\n")
     ws = _make_ws(tmp_path, auto=True)
     try:
         listed = await ws.list_files("**/*")

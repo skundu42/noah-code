@@ -119,6 +119,7 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("ws", "edit"),
             ("ws", "inspect"),
             ("ws", "apply_patch"),
+            ("ws", "apply_unified_diff"),
             ("ws", "list"),
             ("ws", "list_files"),
             ("ws", "read"),
@@ -146,7 +147,13 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("web", "search"),
             ("task", "list"),
             ("task", "run"),
+            ("task", "run_many"),
+            ("task", "collaborate"),
             ("processes", "input"),
+            ("processes", "open_terminal"),
+            ("processes", "terminal_run"),
+            ("processes", "terminal_status"),
+            ("processes", "close_terminal"),
             ("processes", "logs"),
             ("processes", "start"),
             ("processes", "status"),
@@ -389,6 +396,9 @@ tools with `await`. `self.message(text)` is synchronous—never await it.
   three arguments; two-argument calls are invalid. Prefer one atomic
   `self.ws.apply_patch(changes)` for a
   coherent batch; `self.ws.apply_unified_diff` accepts git-style hunks.
+- Common shapes: `ws.search(pattern, path=".", paths=None, regex=True)` returns
+  iterable Matches plus `.stdout`; `ws.read(path, lines=None)` returns a Match
+  with `.text`/`.content`; `ws.list(pattern="**/*", path=".")` returns paths.
 - Run commands with `await self.ws.run(command)` and inspect
   returncode/stdout/stderr. `read_only=True` skips approval only for commands
   the engine recognizes as read-only (Git inspection, search, listing, text
@@ -418,7 +428,7 @@ when the host was explicitly launched for a throwaway workspace.
 
 Sandboxed cells forbid host/system imports (including os, sys, subprocess,
 shutil, nooa, and noah_code), dynamic execution, input, and attaching callables
-to `self`. Use dedicated tools instead; use `doc(obj)` for focused API help.
+to `self`. Use dedicated tools instead; use `doc(self)` for API help.
 
 End with exactly one RespondResult: DONE, NEED_INPUT, or WAIT (WAIT requires a
 registered running job). In code call
@@ -432,8 +442,8 @@ _NOAH_EXECUTION_CONTEXT = """## Execution Context
 Inside `execute_python`, method parameters and `self` are already in scope and
 state persists across cells. Always available: `print`, `pprint`, `doc`,
 `return_result`, `RespondReason`, `asyncio`, and `typing`. Inspect only the API
-you need with `doc(self.ws)` or `doc(self.<tool>.<method>)`; Noah's internal
-module imports are intentionally not part of the agent-facing contract.
+you need with `doc(self)`; nested sandbox proxies are not introspectable. Noah's
+internal module imports are intentionally not part of the agent-facing contract.
 """
 
 _OBSERVABILITY_EVENT_TYPES = (

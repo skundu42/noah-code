@@ -91,6 +91,16 @@ Screen {
     color: $nc-text;
 }
 
+#working-loader {
+    width: 18;
+    height: 1;
+}
+
+#working-status {
+    width: 1fr;
+    height: 1;
+}
+
 .wide #context-rail {
     display: block;
 }

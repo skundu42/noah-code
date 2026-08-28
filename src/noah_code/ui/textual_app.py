@@ -76,6 +76,7 @@ MAX_ACTIVITY_HISTORY = 100
 HISTORY_PAGE_SIZE = 50
 RECENT_HISTORY_SIZE = 24
 STREAM_FLUSH_SECONDS = 0.05
+BUSY_REFRESH_SECONDS = 0.08
 WIDE_MIN_COLUMNS = 110
 COMPACT_MAX_ROWS = 25
 UPDATE_BANNER_SECONDS = 12.0
@@ -85,8 +86,20 @@ UPDATE_BANNER_SECONDS = 12.0
 # only emit the escape sequence for payloads that fit comfortably.
 OSC_52_MAX_BYTES = 32_768
 
-# A single traveling glyph. Multi-mark frames read as two loaders at once.
-WORKING_PATH_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧")
+# A compact orbiting pulse. The fading wake wraps across the fixed-width field,
+# so the right-to-left reset reads as continuous forward motion instead of a jump.
+WORKING_COMET_FRAMES = (
+    "◆      ·•◈",
+    "◈◆      ·•",
+    "•◈◆      ·",
+    "·•◈◆      ",
+    " ·•◈◆     ",
+    "  ·•◈◆    ",
+    "   ·•◈◆   ",
+    "    ·•◈◆  ",
+    "     ·•◈◆ ",
+    "      ·•◈◆",
+)
 
 NOAH_WORDMARK = (
     "███╗   ██╗ ██████╗  █████╗ ██╗  ██╗",
@@ -1754,8 +1767,12 @@ class NoahCodeApp(App[None]):
         self._repository_snapshot: RepositorySnapshot | None = None
         self._repository_status_loaded = False
         self._phase = "ready"
-        self._spinner_index = 0
-        self._spinner_timer: Timer | None = None
+        self._loader_index = 0
+        self._loader_timer: Timer | None = None
+        self._working_loader_signature: str | None = None
+        self._working_status_signature: tuple[str, ...] | None = None
+        self._working_banner_visible = False
+        self._activity_title_signature: tuple[str, ...] | None = None
         self._stream_timer: Timer | None = None
         self._notice_timer: Timer | None = None
         self._native_clipboard_task: asyncio.Task[None] | None = None
@@ -1813,7 +1830,9 @@ class NoahCodeApp(App[None]):
                     min_width=0,
                     max_lines=MAX_TRANSCRIPT_LINES,
                 )
-                yield Static("", id="working-banner")
+                with Horizontal(id="working-banner"):
+                    yield Static("", id="working-loader")
+                    yield Static("", id="working-status")
                 with Vertical(id="live-activity"):
                     yield Static("", id="activity-title")
                     yield SelectableRichLog(
@@ -1844,9 +1863,9 @@ class NoahCodeApp(App[None]):
             composer.register_theme(theme)
         composer.theme = self._theme_name
         composer.focus()
-        self._spinner_timer = self.set_interval(
-            0.20,
-            self._tick_busy,
+        self._loader_timer = self.set_interval(
+            BUSY_REFRESH_SECONDS,
+            self._advance_working_loader,
             pause=not self.ui.busy and self._agent_ready,
         )
         self.update_chrome(force=True)
@@ -1966,13 +1985,12 @@ class NoahCodeApp(App[None]):
             self.query_one("#composer", ComposerTextArea).text if self._app_mounted else ""
         )
 
-    def _tick_busy(self) -> None:
+    def _advance_working_loader(self) -> None:
         if not self.ui.busy:
             return
-        self._spinner_index = (self._spinner_index + 1) % len(WORKING_PATH_FRAMES)
-        # The spinner only changes the header and working banner. Rebuilding the
-        # context rail here would repeatedly read plan/todo state from disk.
-        self.update_chrome()
+        self._loader_index = (self._loader_index + 1) % len(WORKING_COMET_FRAMES)
+        # The 80 ms animation tick invalidates only this fixed-width widget.
+        self._update_working_loader()
 
     @work(exclusive=True, group="repository-status")
     async def _refresh_repository_snapshot(self) -> None:
@@ -1991,9 +2009,13 @@ class NoahCodeApp(App[None]):
         """Keep an obvious animated turn indicator visible between tool calls."""
 
         with contextlib.suppress(Exception):
-            banner = self.query_one("#working-banner", Static)
+            banner = self.query_one("#working-banner", Horizontal)
             if not self.ui.busy:
-                banner.styles.display = "none"
+                if self._working_banner_visible:
+                    banner.styles.display = "none"
+                    self._working_banner_visible = False
+                self._working_loader_signature = None
+                self._working_status_signature = None
                 return
             label = "Thinking"
             elapsed = ""
@@ -2005,10 +2027,7 @@ class NoahCodeApp(App[None]):
                     elapsed = f"  {seconds}s"
             elif self._phase not in {"ready", "thinking"}:
                 label = self._phase.replace("_", " ").strip().capitalize()
-            frame = WORKING_PATH_FRAMES[self._spinner_index]
             parts: list[tuple[str, str]] = [
-                ("NOAH  ", "bold #8bd5ca"),
-                (f"{frame}  ", "bold #e6b673"),
                 (label, "#d1d1d6"),
                 (elapsed, "#777781"),
             ]
@@ -2017,18 +2036,54 @@ class NoahCodeApp(App[None]):
                 if len(thought) > 60:
                     thought = thought[:57] + "…"
                 parts.append((f"  ↳  {thought}", "#777781"))
-            banner.update(Text.assemble(*parts), layout=False)
-            banner.styles.display = "block"
+            signature = (label, elapsed, thought)
+            if signature != self._working_status_signature:
+                self.query_one("#working-status", Static).update(
+                    Text.assemble(*parts), layout=False
+                )
+                self._working_status_signature = signature
+            self._update_working_loader()
+            if not self._working_banner_visible:
+                banner.styles.display = "block"
+                self._working_banner_visible = True
             with contextlib.suppress(Exception):
                 if (
                     self._active_activity_id
                     and self._active_activity_id in self._activities
                     and self._activities[self._active_activity_id].label not in _HIDDEN_ACTIVITY
                 ):
-                    self.query_one("#activity-title", Static).update(
-                        Text.assemble((label, "#d1d1d6"), (elapsed, "#777781")),
-                        layout=False,
-                    )
+                    title_signature = (self._active_activity_id, label, elapsed)
+                    if title_signature != self._activity_title_signature:
+                        self.query_one("#activity-title", Static).update(
+                            Text.assemble((label, "#d1d1d6"), (elapsed, "#777781")),
+                            layout=False,
+                        )
+                        self._activity_title_signature = title_signature
+
+    def _update_working_loader(self) -> None:
+        """Render one loader frame without invalidating status or surrounding chrome."""
+
+        if not self.ui.busy:
+            return
+        frame = WORKING_COMET_FRAMES[self._loader_index]
+        if frame == self._working_loader_signature:
+            return
+        loader_styles = {
+            "◆": "bold #ffd08a",
+            "◈": "#e6b673",
+            "•": "#8bd5ca",
+            "·": "#777781",
+            " ": "#777781",
+        }
+        self.query_one("#working-loader", Static).update(
+            Text.assemble(
+                ("NOAH  ", "bold #8bd5ca"),
+                *((character, loader_styles[character]) for character in frame),
+                ("  ", "#777781"),
+            ),
+            layout=False,
+        )
+        self._working_loader_signature = frame
 
     def update_chrome(self, *, force: bool = False) -> None:
         meta = self.host.meta
@@ -2364,11 +2419,11 @@ class NoahCodeApp(App[None]):
 
     @on(UIStateChanged)
     def _ui_state_changed(self) -> None:
-        if self._spinner_timer is not None:
+        if self._loader_timer is not None:
             if self.ui.busy:
-                self._spinner_timer.resume()
+                self._loader_timer.resume()
             else:
-                self._spinner_timer.pause()
+                self._loader_timer.pause()
         self._rail_dirty = True
         self.update_chrome()
 
@@ -2490,6 +2545,7 @@ class NoahCodeApp(App[None]):
                 Text(record.label, style="#d1d1d6"),
                 layout=False,
             )
+            self._activity_title_signature = (activity_id, record.label, "")
             live.styles.display = "block"
             live.styles.height = 3
         self._update_working_banner()
@@ -2501,11 +2557,18 @@ class NoahCodeApp(App[None]):
             record = ActivityRecord(activity_id=activity_id, label="shell output", tool="shell")
             self._activities[activity_id] = record
             self._active_activity_id = activity_id
-        self.query_one("#activity-title", Static).update(
-            Text(record.label, style="#d1d1d6"),
-            layout=False,
-        )
-        self.query_one("#live-activity", Vertical).styles.display = "block"
+        seconds = int(record.duration)
+        elapsed = f"  {seconds}s" if seconds >= 1 else ""
+        title_signature = (activity_id, record.label, elapsed)
+        if title_signature != self._activity_title_signature:
+            self.query_one("#activity-title", Static).update(
+                Text.assemble((record.label, "#d1d1d6"), (elapsed, "#777781")),
+                layout=False,
+            )
+            self._activity_title_signature = title_signature
+        live = self.query_one("#live-activity", Vertical)
+        if live.styles.display != "block":
+            live.styles.display = "block"
         stream = str(event.meta.get("stream", "stdout"))
         record.append(event.text, self.host.config.max_output_chars)
         self._stream_fragments.append((stream, event.text))
@@ -2547,6 +2610,7 @@ class NoahCodeApp(App[None]):
         self._activity_history.append(record)
         if self._active_activity_id == activity_id:
             self._active_activity_id = None
+        self._activity_title_signature = None
         completion = _completed_activity_label(
             record.label,
             failed=record.state == "error",

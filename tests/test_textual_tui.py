@@ -26,8 +26,9 @@ from noah_code.themes import THEMES
 from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt
 from noah_code.ui import textual_app as textual_app_module
 from noah_code.ui.textual_app import (
+    BUSY_REFRESH_SECONDS,
     MAX_TRANSCRIPT_LINES,
-    WORKING_PATH_FRAMES,
+    WORKING_COMET_FRAMES,
     ActivityHistoryScreen,
     ApprovalModal,
     ConversationHistoryScreen,
@@ -108,6 +109,12 @@ def _rendered_text(renderable) -> str:
     console = Console(file=output, width=160, color_system=None)
     console.print(renderable)
     return output.getvalue()
+
+
+def _working_banner_text(app: NoahCodeApp) -> str:
+    loader = _rendered_text(app.query_one("#working-loader").content).rstrip("\n")
+    status = _rendered_text(app.query_one("#working-status").content).rstrip("\n")
+    return loader + status
 
 
 def _log_text(log) -> str:
@@ -850,8 +857,19 @@ async def test_context_rail_finishes_non_git_status_probe(tmp_path: Path) -> Non
         assert "Reading Git status" not in rail
 
 
+def test_working_comet_moves_continuously_left_to_right() -> None:
+    assert len({len(frame) for frame in WORKING_COMET_FRAMES}) == 1
+    assert [frame.index("◆") for frame in WORKING_COMET_FRAMES] == sorted(
+        frame.index("◆") for frame in WORKING_COMET_FRAMES
+    )
+    assert WORKING_COMET_FRAMES[0] == "◆      ·•◈"
+    assert WORKING_COMET_FRAMES[-1] == "      ·•◈◆"
+    assert all("─" not in frame for frame in WORKING_COMET_FRAMES)
+    assert all(frame.strip() for frame in WORKING_COMET_FRAMES)
+
+
 @pytest.mark.asyncio
-async def test_busy_spinner_does_not_rebuild_context_rail(tmp_path: Path) -> None:
+async def test_busy_loader_does_not_rebuild_context_rail(tmp_path: Path) -> None:
     app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
     async with app.run_test(size=(120, 30)) as pilot:
         await pilot.pause()
@@ -862,11 +880,64 @@ async def test_busy_spinner_does_not_rebuild_context_rail(tmp_path: Path) -> Non
         app.ui.set_busy(True)
         await pilot.pause()
         app._build_rail_text.reset_mock()
-        app._tick_busy()
-        app._tick_busy()
-        app._tick_busy()
+        app._advance_working_loader()
+        app._advance_working_loader()
+        app._advance_working_loader()
 
         app._build_rail_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_busy_refresh_is_throttled_and_stays_out_of_full_chrome(tmp_path: Path) -> None:
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        assert app._loader_timer is not None
+        assert BUSY_REFRESH_SECONDS == 0.08
+        app.ui.set_busy(True)
+        await pilot.pause()
+
+        app.update_chrome = MagicMock()
+        original = app._update_working_loader
+        app._update_working_loader = MagicMock(wraps=original)
+        app._advance_working_loader()
+
+        app._update_working_loader.assert_called_once_with()
+        app.update_chrome.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unchanged_busy_banner_does_not_repaint(tmp_path: Path) -> None:
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.ui.set_busy(True)
+        await pilot.pause()
+        loader = app.query_one("#working-loader")
+        status = app.query_one("#working-status")
+        loader.update = MagicMock(wraps=loader.update)
+        status.update = MagicMock(wraps=status.update)
+
+        app._update_working_banner()
+        app._update_working_banner()
+
+        loader.update.assert_not_called()
+        status.update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_busy_animation_tick_repaints_only_loader(tmp_path: Path) -> None:
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.ui.set_busy(True)
+        await pilot.pause()
+        loader = app.query_one("#working-loader")
+        status = app.query_one("#working-status")
+        loader.update = MagicMock(wraps=loader.update)
+        status.update = MagicMock(wraps=status.update)
+
+        app._advance_working_loader()
+
+        loader.update.assert_called_once()
+        status.update.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -890,17 +961,17 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
         banner = app.query_one("#working-banner")
         assert banner.styles.display == "block"
         assert "queue follow-up" in _rendered_text(app.query_one("#context-hint").content)
-        banner_text = _rendered_text(banner.content)
+        banner_text = _working_banner_text(app)
         assert "WORKING" not in banner_text
         assert "Inspecting repository" in banner_text
-        assert any(frame in banner_text for frame in WORKING_PATH_FRAMES)
+        assert any(frame in banner_text for frame in WORKING_COMET_FRAMES)
         assert "NOAH" in banner_text
         assert banner.styles.height.value == 1
         live = app.query_one("#live-activity")
         assert live.styles.display == "block"
         title = _rendered_text(app.query_one("#activity-title").content)
         assert "Inspecting repository" in title
-        assert not any(frame in title for frame in WORKING_PATH_FRAMES)
+        assert not any(frame in title for frame in WORKING_COMET_FRAMES)
 
         ui.render(
             HostEvent(
@@ -926,7 +997,7 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
 
 
 @pytest.mark.asyncio
-async def test_internal_working_label_does_not_open_second_spinner(tmp_path: Path) -> None:
+async def test_internal_working_label_does_not_open_second_loader(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
     ui = TextualUI()
     app = NoahCodeApp(host, ui)
@@ -943,8 +1014,9 @@ async def test_internal_working_label_does_not_open_second_spinner(tmp_path: Pat
 
         banner = app.query_one("#working-banner")
         assert banner.styles.display == "block"
-        assert "Working" in _rendered_text(banner.content)
-        assert any(frame in _rendered_text(banner.content) for frame in WORKING_PATH_FRAMES)
+        banner_text = _working_banner_text(app)
+        assert "Working" in banner_text
+        assert any(frame in banner_text for frame in WORKING_COMET_FRAMES)
         assert app.query_one("#live-activity").styles.display == "none"
 
 
@@ -1949,7 +2021,7 @@ async def test_reasoning_attaches_to_activity_and_banner_shows_thought(tmp_path:
         record = app._activities["read-1"]
         assert "export path" in record.thought
         assert app._last_thought == "Check the export path first"
-        banner_text = _rendered_text(app.query_one("#working-banner").content)
+        banner_text = _working_banner_text(app)
         assert "↳" in banner_text
         # Reasoning stays out of the transcript when show_reasoning is off.
         transcript = _log_text(app.query_one("#conversation"))

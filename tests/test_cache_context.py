@@ -357,6 +357,7 @@ def test_handle_prompt_stays_compact_without_losing_contracts() -> None:
 
 def test_execution_context_exposes_only_supported_agent_surface() -> None:
     assert "RespondReason" in _NOAH_EXECUTION_CONTEXT
-    assert "doc(self.ws)" in _NOAH_EXECUTION_CONTEXT
+    assert "doc(self)" in _NOAH_EXECUTION_CONTEXT
+    assert "nested sandbox proxies are not introspectable" in _NOAH_EXECUTION_CONTEXT
     assert "import noah_code" not in _NOAH_EXECUTION_CONTEXT
     assert "import subprocess" not in _NOAH_EXECUTION_CONTEXT

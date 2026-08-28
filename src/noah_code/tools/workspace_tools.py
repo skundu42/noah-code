@@ -47,9 +47,45 @@ if TYPE_CHECKING:
 InspectTargets = list[str]
 PatchChanges = list[dict[str, str | None]]
 
+
+class WorkspaceMatch(Match):
+    """A NOOA edit anchor with familiar read/search compatibility aliases."""
+
+    @property
+    def content(self) -> str:
+        """Alias used by common file-reading APIs."""
+
+        return self.text
+
+    @property
+    def file(self) -> str:
+        """Alias used by common search-result APIs."""
+
+        return self.path
+
+    def splitlines(self, keepends: bool = False) -> list[str]:
+        """Delegate ordinary string inspection to the anchor text."""
+
+        return self.text.splitlines(keepends=keepends)
+
+
+class SearchResult(ShellResult):
+    """Search output with string helpers that also behaves like a match sequence."""
+
+    def __len__(self) -> int:
+        return len(self.matches or [])
+
+    def __iter__(self):  # noqa: ANN204 - mirrors the underlying match iterator
+        return iter(self.matches or [])
+
+    def __getitem__(self, key: int | slice) -> WorkspaceMatch | list[WorkspaceMatch]:
+        return (self.matches or [])[key]
+
+
 _IGNORED_LIST_DIRS = frozenset(
     {
         ".git",
+        ".build",
         ".hg",
         ".svn",
         ".venv",
@@ -263,7 +299,7 @@ class WorkspaceTools(Skill):
         with resolved.open(encoding="utf-8") as stream:
             content = stream.read()
         total = len(content.splitlines(keepends=True))
-        return Match(str(resolved), 1, total, content)
+        return WorkspaceMatch(str(resolved), 1, total, content)
 
     @staticmethod
     def _read_line_range(resolved: Path, lines: tuple[int, int]) -> Match:
@@ -282,22 +318,60 @@ class WorkspaceTools(Skill):
             else:
                 # The file ended before the range did; clamp like a full read.
                 end = min(end, last)
-        return Match(str(resolved), start, end, "".join(collected))
+        return WorkspaceMatch(str(resolved), start, end, "".join(collected))
 
     async def search(
         self,
         pattern: Annotated[str, spec(description="Regex or fixed pattern for ripgrep")],
         path: Annotated[str, spec(description="Subdirectory or file to search")] = ".",
+        *,
+        paths: Annotated[
+            str | InspectTargets | None,
+            spec(description="Compatibility alias for one or more search paths"),
+        ] = None,
+        regex: Annotated[
+            bool,
+            spec(description="Use regex matching; false performs a fixed-string search"),
+        ] = True,
     ) -> ShellResult:
-        """Return bounded ripgrep text; call read() on a result to get an edit anchor."""
-        resolved = await self._authorize_path(path, PermissionCategory.READ, tool="ws_search")
-        target = str(resolved) if resolved != self._workspace.root.resolve() else "."
-        cmd = " ".join(
-            shlex.quote(a) for a in ["rg", "-n", "--no-heading", "-S", "--", pattern, target]
-        )
+        """Return bounded ripgrep text plus ``.matches`` edit anchors.
+
+        ``paths`` and ``regex`` accept common search-call conventions. A string
+        ``paths`` value is treated as one path; a sequence searches every path.
+        """
+        requested = [path] if paths is None else ([paths] if isinstance(paths, str) else paths)
+        requested = list(dict.fromkeys(requested))
+        if not requested:
+            requested = ["."]
+        if len(requested) > 8:
+            raise ValueError("search accepts at most 8 paths")
+        workspace_root = self._workspace.root.resolve()
+        resolved_paths = [
+            await self._authorize_path(item, PermissionCategory.READ, tool="ws_search")
+            for item in requested
+        ]
+        targets = [str(item) if item != workspace_root else "." for item in resolved_paths]
+        # Keep the command within NOOA's conservative pure-search grammar so it
+        # can independently harvest and verify editable Match anchors. ``-i``
+        # reproduces ripgrep smart-case for patterns without uppercase letters.
+        args = ["rg", "-n"]
+        if not any(character.isupper() for character in pattern):
+            args.append("-i")
+        if not regex:
+            args.append("-F")
+        args.extend(["--", pattern, *targets])
+        cmd = " ".join(shlex.quote(arg) for arg in args)
         async with self._pinned_shell_cwd():
             result = await self._shell.run(cmd, timeout=self._default_timeout)
-        return self._cap_shell_result(self._redact_secret_search(result))
+            self._absolutize_harvested_matches(result)
+        bounded = self._cap_shell_result(self._redact_secret_search(result))
+        return SearchResult(
+            stdout=bounded.stdout,
+            stderr=bounded.stderr,
+            returncode=bounded.returncode,
+            matches=bounded.matches,
+            timed_out=bounded.timed_out,
+        )
 
     async def list_files(
         self,
@@ -1221,7 +1295,9 @@ class WorkspaceTools(Skill):
             candidate = Path(match.path)
             if not candidate.is_absolute():
                 candidate = (base / candidate).resolve()
-            rewritten.append(Match(str(candidate), match.start, match.end, match.text))
+            rewritten.append(
+                WorkspaceMatch(str(candidate), match.start, match.end, match.text)
+            )
         result.matches = rewritten
 
     def _cap_shell_result(self, result: ShellResult) -> ShellResult:
