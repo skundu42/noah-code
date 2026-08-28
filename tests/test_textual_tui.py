@@ -33,11 +33,14 @@ from noah_code.ui.textual_app import (
     AgentDisplayState,
     ApprovalModal,
     ConfirmationModal,
+    ContextVisibilityScreen,
     ConversationHistoryScreen,
     DiffReviewScreen,
     FilteredPicker,
+    KeyboardHelpScreen,
     NoahCodeApp,
     NoticeDetailsScreen,
+    OnboardingScreen,
     QuestionModal,
     QueueManagerScreen,
     RepositorySnapshot,
@@ -77,6 +80,7 @@ def _fake_host(tmp_path: Path):
     host.cancel_active_turn = MagicMock()
     host.load_history_page = AsyncMock(return_value=[])
     host.list_session_metas.return_value = []
+    host.switch_session = AsyncMock()
     host.list_skill_infos.return_value = []
     host.list_mcp_infos.return_value = []
     host.list_provider_infos.return_value = []
@@ -86,6 +90,7 @@ def _fake_host(tmp_path: Path):
     host.steer_queue = SteerQueue()
     host._pending_attach_paths = []
     host.work_snapshot.return_value = {"agents": [], "jobs": []}
+    host.context_snapshot.return_value = []
 
     def take_pending_attaches():
         paths, host._pending_attach_paths = host._pending_attach_paths, []
@@ -1359,10 +1364,19 @@ async def test_first_run_opens_model_setup_before_starting_agent(tmp_path: Path)
 
     async with app.run_test(size=(120, 30)) as pilot:
         for _ in range(20):
-            if isinstance(app.screen, FilteredPicker):
+            if isinstance(app.screen, OnboardingScreen):
                 break
             await pilot.pause()
 
+        assert isinstance(app.screen, OnboardingScreen)
+        assert "Connect one model provider" in _rendered_text(
+            app.screen.query_one("#onboarding-lead").content
+        )
+        await pilot.press("enter")
+        for _ in range(20):
+            if isinstance(app.screen, FilteredPicker):
+                break
+            await pilot.pause()
         assert isinstance(app.screen, FilteredPicker)
         assert "MODEL SETUP" in app.screen.query_one("#picker-title").render().plain
         host.start.assert_not_awaited()
@@ -1566,7 +1580,7 @@ async def test_slash_suggestions_filter_navigate_and_complete(tmp_path: Path) ->
         await pilot.pause()
         await pilot.press("up")
         rendered = _rendered_text(suggestions.content)
-        assert "/model --global MODEL" in rendered
+        assert "/exit" in rendered
         assert app._suggestion_index == len(app._suggestion_matches) - 1
 
 
@@ -1585,13 +1599,15 @@ async def test_slash_suggestion_selection_remains_visible_after_first_page(
 
         rendered = _rendered_text(suggestions.content)
         assert "1–5 of 37" in rendered
-        assert "› GENERAL   /help" in rendered
+        assert "› /help" in rendered
+        assert "GENERAL" not in rendered
 
         await pilot.press("down", "down", "down", "down", "down")
         rendered = _rendered_text(suggestions.content)
 
         assert "2–6 of 37" in rendered
-        assert "› MODEL     /model" in rendered
+        assert "› /model" in rendered
+        assert "MODEL     /model" not in rendered
         assert "/help" not in rendered
 
 
@@ -1973,6 +1989,7 @@ async def test_activity_streams_live_then_compacts(tmp_path: Path) -> None:
         assert app.query_one("#live-activity").styles.display == "none"
         assert len(app._activity_history) == 1
         assert app._activity_history[0].output == "one\ntwo\n"
+        assert app._timeline_history[0].tool == "validation"
         transcript = _log_text(app.query_one("#conversation"))
         assert "✓ Bash pytest -q" in transcript
         assert "execute_python" not in transcript
@@ -2480,3 +2497,128 @@ async def test_undo_slash_is_blocked_while_busy(tmp_path: Path) -> None:
         host.handle_line.assert_not_awaited()
         assert "blocked" in _log_text(app.query_one("#conversation"))
         assert len(host.steer_queue) == 0
+
+
+@pytest.mark.asyncio
+async def test_keyboard_help_is_searchable_and_contextual(tmp_path: Path) -> None:
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    async with app.run_test() as pilot:
+        app.action_show_help()
+        await pilot.pause()
+        assert isinstance(app.screen, KeyboardHelpScreen)
+        assert "COMPOSER" in app.screen.query_one("#picker-title").render().plain
+        filter_input = app.screen.query_one("#picker-filter", Input)
+        filter_input.value = "timeline"
+        await pilot.pause()
+        option_list = app.screen.query_one("#picker-list")
+        assert "F2" in _rendered_text(option_list.get_option_at_index(0).prompt)
+
+
+@pytest.mark.asyncio
+async def test_tool_progress_shows_tool_aware_result_count(tmp_path: Path) -> None:
+    ui = TextualUI()
+    app = NoahCodeApp(_fake_host(tmp_path), ui)
+    async with app.run_test() as pilot:
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                "Searching Python files",
+                meta={"activity_id": "search-1", "tool": "grep"},
+            )
+        )
+        ui.render(
+            HostEvent(
+                HostEventKind.SHELL_CHUNK,
+                "a.py\nb.py\nc.py\n",
+                meta={"activity_id": "search-1", "stream": "stdout"},
+            )
+        )
+        await pilot.pause(0.08)
+        assert "3 results" in _rendered_text(app.query_one("#activity-title").content)
+        assert "3 results" in _working_banner_text(app)
+
+
+@pytest.mark.asyncio
+async def test_timeline_records_retries_without_transcript_clutter(tmp_path: Path) -> None:
+    ui = TextualUI()
+    app = NoahCodeApp(_fake_host(tmp_path), ui)
+    async with app.run_test() as pilot:
+        ui.render(HostEvent(HostEventKind.STATUS, "provider retry 2 of 5"))
+        await pilot.pause()
+        assert "provider retry" not in _log_text(app.query_one("#conversation"))
+        await pilot.press("f2")
+        await pilot.pause()
+        assert isinstance(app.screen, ActivityHistoryScreen)
+        option_list = app.screen.query_one("#activity-list")
+        assert "provider retry 2 of 5" in _rendered_text(
+            option_list.get_option_at_index(0).prompt
+        )
+
+
+@pytest.mark.asyncio
+async def test_context_visibility_lists_influencing_sources(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host.context_snapshot.return_value = [
+        {
+            "kind": "instruction",
+            "label": "AGENTS.md",
+            "detail": f"Repository instructions · {tmp_path / 'AGENTS.md'}",
+        },
+        {
+            "kind": "attachment",
+            "label": "trace.log",
+            "detail": f"Attached in this session · {tmp_path / 'trace.log'}",
+        },
+    ]
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.action_context_visibility()
+        await pilot.pause()
+        assert isinstance(app.screen, ContextVisibilityScreen)
+        option_list = app.screen.query_one("#context-list")
+        listing = "\n".join(
+            _rendered_text(option_list.get_option_at_index(index).prompt)
+            for index in range(len(option_list.options))
+        )
+        assert "AGENTS.md" in listing
+        assert "trace.log" in listing
+        assert "Repository instructions" in _log_text(
+            app.screen.query_one("#context-detail")
+        )
+
+
+@pytest.mark.asyncio
+async def test_continue_opens_latest_ten_workspace_sessions(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    now = time.time()
+    host.list_session_metas.return_value = [
+        SimpleNamespace(
+            session_id=f"{index:012x}",
+            title=f"Session {index}",
+            mode="build",
+            model="openai/test",
+            worktree_name="",
+            updated_at=now - index * 60,
+        )
+        for index in range(12)
+    ]
+    host.meta.session_id = host.list_session_metas.return_value[0].session_id
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "/continue"
+        await pilot.press("enter")
+        for _ in range(20):
+            if isinstance(app.screen, FilteredPicker):
+                break
+            await pilot.pause()
+        assert isinstance(app.screen, FilteredPicker)
+        assert len(app.screen.query_one("#picker-list").options) == 10
+        await pilot.press("down", "enter")
+        for _ in range(20):
+            if host.switch_session.await_count:
+                break
+            await pilot.pause()
+        host.switch_session.assert_awaited_once_with(
+            host.list_session_metas.return_value[1].session_id
+        )

@@ -249,6 +249,7 @@ class AgentHost:
         self._current_run_id: str | None = None
         self._interrupted_run: RunRecord | None = None
         self._pending_attach_paths: list[Path] = []
+        self._active_context_paths: set[Path] = set()
         self._pending_worktree_name = ""
         self.on_session_changed: Any = None  # optional UI callback
 
@@ -957,6 +958,7 @@ class AgentHost:
         """Persist current session and open a fresh one in-process."""
         self._require_idle_turn()
         self._clear_steer_state()
+        self._active_context_paths.clear()
         await self._cancel_background_tasks()
         await self._persist_async()
         if workspace is not None:
@@ -985,6 +987,7 @@ class AgentHost:
         meta = self.store.load_meta(session_id)
         rebound = self.store.workspace_for_resume(meta, self.workspace)
         self._clear_steer_state()
+        self._active_context_paths.clear()
         await self._cancel_background_tasks()
         await self._persist_async()
         self._teardown_event_bridge()
@@ -1445,6 +1448,89 @@ class AgentHost:
 
         return tuple(self._pending_attach_paths)
 
+    def active_context_paths(self) -> tuple[Path, ...]:
+        """Return attachment paths already delivered in the active session."""
+
+        return tuple(sorted(self._active_context_paths))
+
+    def context_snapshot(self) -> list[dict[str, str]]:
+        """Return a display-safe inventory of context sources for the UI."""
+
+        from noah_code.project_notes import MEMORY_RELATIVE, PLAN_RELATIVE, MemoryStore, PlanStore
+
+        rows: list[dict[str, str]] = []
+        root = self.workspace.root
+        for relative in ("AGENTS.md", "CLAUDE.md", ".noah-code/instructions.md"):
+            path = root / relative
+            if path.is_file():
+                rows.append(
+                    {
+                        "kind": "instruction",
+                        "label": relative,
+                        "detail": f"Repository instructions · {path}",
+                    }
+                )
+        if PlanStore(root).exists():
+            rows.append(
+                {
+                    "kind": "plan",
+                    "label": PLAN_RELATIVE,
+                    "detail": "Pinned project plan included at each turn boundary",
+                }
+            )
+        if MemoryStore(root).exists():
+            rows.append(
+                {
+                    "kind": "memory",
+                    "label": MEMORY_RELATIVE,
+                    "detail": "Durable project conventions included in model context",
+                }
+            )
+        for path in self.active_context_paths():
+            rows.append(
+                {
+                    "kind": "attachment",
+                    "label": path.name,
+                    "detail": f"Attached in this session · {path}",
+                }
+            )
+        for path in self.pending_attach_paths():
+            rows.append(
+                {
+                    "kind": "pending",
+                    "label": path.name,
+                    "detail": f"Waiting for the next prompt · {path}",
+                }
+            )
+        if self._agent is not None:
+            with contextlib.suppress(Exception):
+                for info in self.list_skill_infos():
+                    if info.active:
+                        rows.append(
+                            {
+                                "kind": "skill",
+                                "label": info.name,
+                                "detail": f"Active skill · {info.source}",
+                            }
+                        )
+        for name in sorted(self._mcp_attached):
+            rows.append(
+                {
+                    "kind": "mcp",
+                    "label": name,
+                    "detail": "Connected MCP server tools available to Noah",
+                }
+            )
+        return rows
+
+    def context_status_text(self) -> str:
+        rows = self.context_snapshot()
+        if not rows:
+            return "Context sources\n  Workspace defaults only"
+        lines = ["Context sources"]
+        lines.extend(f"  {row['kind']:<11} {row['label']}\n    {row['detail']}" for row in rows)
+        return "\n".join(lines)
+
     def remove_pending_attach(self, index: int) -> Path | None:
         if index < 0 or index >= len(self._pending_attach_paths):
             return None
@@ -1896,6 +1982,17 @@ class AgentHost:
                 )
             )
             return "handled"
+        if name == "context":
+            self.ui.render(_command_output(self.context_status_text()))
+            return "handled"
+        if name == "timeline":
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    "Open the task timeline with F2 in the TUI",
+                )
+            )
+            return "handled"
         if name == "health":
             health = self._runtime.health() if self._runtime is not None else {}
             rows = ["Durable runtime health"]
@@ -1998,7 +2095,7 @@ class AgentHost:
             status = "history compacted" if compacted else "nothing eligible to compact"
             self.ui.render(HostEvent(HostEventKind.STATUS, status))
             return "handled"
-        if name in {"continue"}:
+        if name == "continue":
             latest = self.store.latest_for_workspace(self.workspace)
             if latest is None:
                 self.ui.render(
@@ -2155,6 +2252,7 @@ class AgentHost:
         return expand_turn(text, self.workspace.root, attach_paths=attach_paths)
 
     def _deliver_expanded(self, agent: Any, expanded: Any) -> None:
+        self._active_context_paths.update(Path(path).resolve() for path in expanded.paths)
         if expanded.images:
             agent.media.queue(expanded.images)
             self.ui.render(

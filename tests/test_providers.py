@@ -7,9 +7,22 @@ import yaml
 
 from noah_code.providers import (
     list_providers,
+    model_setup_required,
     resolve_provider_model,
     save_custom_openai_provider,
 )
+
+
+def test_model_setup_required_only_for_recognized_unconfigured_routes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert model_setup_required("openai/gpt-test") is True
+    monkeypatch.setenv("OPENAI_API_KEY", "configured")
+    assert model_setup_required("openai/gpt-test") is False
+    assert model_setup_required("custom-company-alias") is False
+    assert model_setup_required("ollama/qwen") is False
 
 
 def test_popular_provider_status_checks_presence_without_exposing_values(

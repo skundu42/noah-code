@@ -948,13 +948,18 @@ async def _interactive(
             return code
         workspace, config, store, meta = prepared
     if use_tui:
+        from noah_code.providers import model_setup_required
+
         host = AgentHost(workspace, config, session_meta=meta, store=store)
         onboarding_required = (
-            first_run
-            and model is None
-            and meta is None
-            and not os.environ.get("NOAH_CODE_MODEL")
-            and config.model == NoahCodeConfig().model
+            (
+                first_run
+                and model is None
+                and meta is None
+                and not os.environ.get("NOAH_CODE_MODEL")
+                and config.model == NoahCodeConfig().model
+            )
+            or model_setup_required(meta.model if meta is not None else config.model)
         )
         try:
             try:

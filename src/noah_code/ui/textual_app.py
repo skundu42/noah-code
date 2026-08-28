@@ -43,7 +43,6 @@ from noah_code.commands import (
     CommandSuggestion,
     all_command_suggestions,
     config_command_suggestions,
-    help_text,
     parse_slash,
 )
 from noah_code.composer import mention_suggestions
@@ -74,6 +73,7 @@ TEXT_AREA_THEMES = tuple(_text_area_theme(theme) for theme in THEMES.values())
 
 MAX_TRANSCRIPT_LINES = 10_000
 MAX_ACTIVITY_HISTORY = 100
+MAX_TIMELINE_HISTORY = 200
 HISTORY_PAGE_SIZE = 50
 RECENT_HISTORY_SIZE = 24
 STREAM_FLUSH_SECONDS = 0.05
@@ -726,6 +726,19 @@ def _truncate_middle(value: str, limit: int) -> str:
     return f"{value[:left]}…{value[-right:]}"
 
 
+def _relative_age(timestamp: float) -> str:
+    seconds = max(0, int(time.time() - timestamp))
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86_400:
+        return f"{seconds // 3600}h ago"
+    if seconds < 604_800:
+        return f"{seconds // 86_400}d ago"
+    return time.strftime("%Y-%m-%d", time.localtime(timestamp))
+
+
 def _diff_renderable(patch: str) -> Group:
     """Render a readable unified diff without interpreting arbitrary markup."""
 
@@ -974,6 +987,65 @@ class QuestionModal(ModalScreen[QuestionAnswer | None]):
         self.action_accept()
 
 
+class OnboardingScreen(ModalScreen[bool]):
+    """Calm first-run handoff into Noah's existing provider setup flow."""
+
+    BINDINGS = [
+        Binding("enter", "start", "Set up model", show=True),
+        Binding("escape", "later", "Later", show=True),
+    ]
+
+    def __init__(self, model: str, reason: str = "") -> None:
+        super().__init__()
+        self.model = model
+        self.reason = reason
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="onboarding-dialog"):
+            yield Label("WELCOME TO NOAH CODE", id="onboarding-title")
+            yield Static(
+                "Connect one model provider before starting your first coding task.",
+                id="onboarding-lead",
+            )
+            yield Static(
+                Text.assemble(
+                    ("1  PROVIDER\n", "bold #b8a9ff"),
+                    ("   Choose OpenAI, Anthropic, OpenRouter, a local model, or another provider.\n\n", "#d1d1d6"),
+                    ("2  CREDENTIALS\n", "bold #7dc4e4"),
+                    ("   Keys are masked and stored in Noah's private auth file, never in this repository.\n\n", "#d1d1d6"),
+                    ("3  MODEL + REASONING\n", "bold #e6b673"),
+                    ("   Pick the exact model ID and reasoning level. You can change both later with /model.", "#d1d1d6"),
+                ),
+                id="onboarding-steps",
+            )
+            yield Static(
+                f"Current model: {self.model}"
+                + (f"\nSetup needed: {self.reason}" if self.reason else ""),
+                id="onboarding-current",
+            )
+            with Horizontal(id="onboarding-buttons"):
+                yield Button("Set up model", id="onboarding-start", variant="primary")
+                yield Button("Later", id="onboarding-later")
+            yield Static("Enter set up · Esc stay in setup mode", id="onboarding-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#onboarding-start", Button).focus()
+
+    def action_start(self) -> None:
+        self.dismiss(True)
+
+    def action_later(self) -> None:
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#onboarding-start")
+    def _start(self) -> None:
+        self.action_start()
+
+    @on(Button.Pressed, "#onboarding-later")
+    def _later(self) -> None:
+        self.action_later()
+
+
 class FilteredPicker(ModalScreen[str | None]):
     """Reusable keyboard-first searchable option picker."""
 
@@ -1066,6 +1138,10 @@ class FilteredPicker(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class KeyboardHelpScreen(FilteredPicker):
+    """Searchable shortcut reference ordered for the currently focused panel."""
 
 
 class TextPromptModal(ModalScreen[str | None]):
@@ -1327,6 +1403,118 @@ class QueueManagerScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class ContextVisibilityScreen(ModalScreen[None]):
+    """Explain exactly which durable and turn-local sources Noah can see."""
+
+    BINDINGS = [
+        Binding("escape,f7", "close", "Close", show=True),
+        Binding("r", "refresh", "Refresh", show=True),
+    ]
+
+    def __init__(self, host: AgentHost) -> None:
+        super().__init__()
+        self.host = host
+        self._rows: dict[str, dict[str, str]] = {}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="context-dialog"):
+            yield Label("ACTIVE CONTEXT", id="context-title")
+            yield Static(
+                "Sources listed here can influence Noah's next response. Secrets are never shown.",
+                id="context-summary",
+            )
+            with Horizontal(id="context-body"):
+                yield OptionList(id="context-list", compact=True)
+                yield SelectableRichLog(
+                    id="context-detail",
+                    markup=False,
+                    highlight=False,
+                    wrap=True,
+                    min_width=0,
+                    max_lines=500,
+                )
+            yield Static("R refresh · ↑/↓ inspect · F7 or Esc close", id="context-detail-hint")
+
+    def on_mount(self) -> None:
+        self._refresh()
+
+    def _snapshot(self) -> list[dict[str, str]]:
+        getter = getattr(self.host, "context_snapshot", None)
+        return list(getter()) if callable(getter) else []
+
+    def _refresh(self) -> None:
+        rows = self._snapshot()
+        options: list[Option] = []
+        self._rows = {}
+        palette = {
+            "instruction": "#b8a9ff",
+            "plan": "#e6b673",
+            "memory": "#8bd5ca",
+            "attachment": "#7dc4e4",
+            "pending": "#e6b673",
+            "skill": "#c6a0f6",
+            "mcp": "#7dc4e4",
+        }
+        for index, row in enumerate(rows):
+            row_id = f"context:{index}"
+            self._rows[row_id] = row
+            kind = row.get("kind", "context")
+            options.append(
+                Option(
+                    Text.assemble(
+                        (f"{kind.upper():<11}", f"bold {palette.get(kind, '#777781')}"),
+                        (row.get("label", "Context source"), "#d1d1d6"),
+                    ),
+                    id=row_id,
+                )
+            )
+        option_list = self.query_one("#context-list", OptionList)
+        option_list.clear_options()
+        if not options:
+            option_list.add_option(
+                Option(
+                    Text("Workspace defaults only · no extra context sources", style="#777781"),
+                    disabled=True,
+                )
+            )
+            detail = self.query_one("#context-detail", RichLog)
+            detail.clear()
+            detail.write(
+                Text(
+                    "Add AGENTS.md for repository instructions, /memory save for durable "
+                    "conventions, or @mention a file in the composer.",
+                    style="#d1d1d6",
+                )
+            )
+            return
+        option_list.add_options(options)
+        option_list.highlighted = 0
+        option_list.focus()
+        self._show(rows[0])
+
+    def _show(self, row: dict[str, str]) -> None:
+        detail = self.query_one("#context-detail", RichLog)
+        detail.clear()
+        detail.write(
+            Text.assemble(
+                (f"{row.get('label', 'Context source')}\n", "bold #b8a9ff"),
+                (f"{row.get('kind', 'context').upper()}\n\n", "#777781"),
+                (row.get("detail", "Active context source"), "#d1d1d6"),
+            )
+        )
+
+    @on(OptionList.OptionHighlighted, "#context-list")
+    def _highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option.id and event.option.id in self._rows:
+            self._show(self._rows[event.option.id])
+
+    def action_refresh(self) -> None:
+        self._refresh()
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class WorkLedgerScreen(ModalScreen[None]):
     """Live operator view of delegated agents, terminals, and background jobs."""
 
@@ -1484,7 +1672,7 @@ class WorkLedgerScreen(ModalScreen[None]):
 
 
 class ActivityHistoryScreen(ModalScreen[None]):
-    """Expandable inspector for agent thoughts, actions, and full output."""
+    """Collapsible long-task timeline for thoughts, tools, retries, and waits."""
 
     BINDINGS = [
         Binding("escape", "close", "Close", show=True),
@@ -1503,7 +1691,7 @@ class ActivityHistoryScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="detail-dialog"):
-            yield Label("ACTIVITY INSPECTOR", id="detail-title")
+            yield Label("LONG-TASK TIMELINE", id="detail-title")
             with Horizontal(id="detail-body"):
                 yield OptionList(id="activity-list", compact=True)
                 yield SelectableRichLog(
@@ -1522,7 +1710,15 @@ class ActivityHistoryScreen(ModalScreen[None]):
     def on_mount(self) -> None:
         options = []
         for record in self.records:
-            icon = "✓" if record.state == "complete" else "×" if record.state == "error" else "◆"
+            icon = (
+                "✓"
+                if record.state == "complete"
+                else "×"
+                if record.state == "error"
+                else "!"
+                if record.state == "waiting"
+                else "◆"
+            )
             extras = []
             if record.thought:
                 extras.append("✎")
@@ -1541,7 +1737,9 @@ class ActivityHistoryScreen(ModalScreen[None]):
             self._show_record(self.records[0])
             option_list.focus()
         else:
-            option_list.add_option(Option(Text("No activity yet", style="#777781"), disabled=True))
+            option_list.add_option(
+                Option(Text("No task events yet", style="#777781"), disabled=True)
+            )
 
     def _sections_for(self, record: ActivityRecord) -> set[str]:
         expanded = self._expanded.setdefault(record.activity_id, {"output"})
@@ -2029,11 +2227,12 @@ class NoahCodeApp(App[None]):
         Binding("ctrl+n", "new_session", "New", show=True),
         Binding("tab", "toggle_mode", "Build/Plan", show=True),
         Binding("f1", "show_help", "Help", show=True),
-        Binding("f2", "activity_history", "Activity", show=True),
+        Binding("f2", "activity_history", "Timeline", show=True),
         Binding("f3", "conversation_history", "History", show=True),
         Binding("f4", "work_ledger", "Work", show=True),
         Binding("f5", "queue_manager", "Queue", show=True),
         Binding("f6", "notice_details", "Details", show=True),
+        Binding("f7", "context_visibility", "Context", show=True),
         Binding("ctrl+]", "scroll_live", "Latest", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
     ]
@@ -2085,6 +2284,8 @@ class NoahCodeApp(App[None]):
         self._stream_fragments: list[tuple[str, str]] = []
         self._activities: dict[str, ActivityRecord] = {}
         self._activity_history: deque[ActivityRecord] = deque(maxlen=MAX_ACTIVITY_HISTORY)
+        self._timeline_history: deque[ActivityRecord] = deque(maxlen=MAX_TIMELINE_HISTORY)
+        self._thinking_timeline: ActivityRecord | None = None
         self._active_activity_id: str | None = None
         self._last_thought: str = ""
         self._transcript_entries: list[TranscriptEntry] = []
@@ -2186,7 +2387,7 @@ class NoahCodeApp(App[None]):
         self._check_update_notice()
         if self._onboarding_required:
             self._set_agent_state(AgentDisplayState.SETUP_REQUIRED)
-            self.call_after_refresh(self.action_model_setup)
+            self.call_after_refresh(self.action_onboarding)
         elif self._agent_ready:
             self._load_recent_history()
         else:
@@ -2222,9 +2423,15 @@ class NoahCodeApp(App[None]):
             return
         self._available_update = status
         self._show_notice(
-            f"Update available  {status.current} → {status.latest}  ·  run noah update when ready",
+            f"Update available  {status.current} → {status.latest}  ·  run noah update, then restart",
             kind="update",
             temporary=True,
+            detail=(
+                f"Noah Code {status.latest} is available (current: {status.current}).\n\n"
+                "Recommended: run `noah update`, then restart Noah Code.\n"
+                "If this copy was installed with another package manager, upgrade the "
+                "`noah-code` package with that manager instead."
+            ),
         )
         self.update_chrome(force=True)
 
@@ -2241,7 +2448,12 @@ class NoahCodeApp(App[None]):
         self._last_notice_detail = detail or message
         compact = " ".join(message.split())
         available = max(min(self.size.width - 18, 140), 40)
-        expandable = kind == "error" or "\n" in message or len(compact) > available
+        expandable = (
+            kind == "error"
+            or "\n" in message
+            or len(compact) > available
+            or (detail is not None and detail != message)
+        )
         suffix = "  · F6 details" if expandable else ""
         if len(compact) + len(suffix) > available:
             tail = compact.rsplit(" · ", 1)[-1] if " · " in compact else ""
@@ -2286,6 +2498,16 @@ class NoahCodeApp(App[None]):
                 f"Agent could not start: {exc} · open /model to configure a provider and retry",
                 kind="error",
             )
+            if any(
+                marker in str(exc).casefold()
+                for marker in ("api key", "credential", "model", "provider")
+            ):
+                self._onboarding_required = True
+                self.call_after_refresh(
+                    lambda: self.action_onboarding(
+                        "Provider or model configuration is missing"
+                    )
+                )
         else:
             resume = getattr(self.host, "resume_interrupted_run", None)
             if callable(resume):
@@ -2406,6 +2628,9 @@ class NoahCodeApp(App[None]):
         if self._active_activity_id and self._active_activity_id in self._activities:
             record = self._activities[self._active_activity_id]
             label = record.label
+            progress = self._activity_progress(record)
+            if progress:
+                label = f"{label} · {progress}"
             seconds = int(record.duration)
             if seconds >= 1:
                 elapsed = f"  {seconds}s"
@@ -2415,6 +2640,72 @@ class NoahCodeApp(App[None]):
             if len(thought) > 60:
                 thought = thought[:57] + "…"
         return label, elapsed, thought
+
+    @staticmethod
+    def _activity_progress(record: ActivityRecord) -> str:
+        """Turn streamed line counts into concise, tool-aware progress."""
+
+        if record.line_count <= 0:
+            return ""
+        subject = f"{record.label} {record.tool}".casefold()
+        if any(word in subject for word in ("search", "grep", "find", "glob", "rg ")):
+            noun = "result" if record.line_count == 1 else "results"
+        elif any(word in subject for word in ("list", "files", "directory", "tree")):
+            noun = "item" if record.line_count == 1 else "items"
+        else:
+            noun = "line" if record.line_count == 1 else "lines"
+        return f"{record.line_count} {noun}"
+
+    def _timeline_begin(
+        self,
+        label: str,
+        kind: str,
+        *,
+        detail: str = "",
+        thought: str = "",
+    ) -> ActivityRecord:
+        record = ActivityRecord(
+            activity_id=f"timeline-{time.monotonic_ns()}",
+            label=label,
+            tool=kind,
+            detail=detail,
+            thought=thought,
+        )
+        self._timeline_history.append(record)
+        return record
+
+    @staticmethod
+    def _timeline_finish(
+        record: ActivityRecord | None,
+        *,
+        state: str = "complete",
+        result: str = "",
+    ) -> None:
+        if record is None or record.finished_at is not None:
+            return
+        record.state = state
+        record.result = result
+        record.finished_at = time.monotonic()
+
+    def _timeline_milestone(
+        self,
+        label: str,
+        kind: str,
+        *,
+        state: str = "complete",
+        detail: str = "",
+    ) -> ActivityRecord:
+        record = self._timeline_begin(label, kind, detail=detail)
+        self._timeline_finish(record, state=state)
+        return record
+
+    def _begin_thinking_timeline(self) -> None:
+        if self._thinking_timeline is None or self._thinking_timeline.finished_at is not None:
+            self._thinking_timeline = self._timeline_begin("Thinking", "model")
+
+    def _finish_thinking_timeline(self, *, state: str = "complete") -> None:
+        self._timeline_finish(self._thinking_timeline, state=state)
+        self._thinking_timeline = None
 
     def _update_working_status(self) -> None:
         label, elapsed, thought = self._working_status_content()
@@ -2439,18 +2730,21 @@ class NoahCodeApp(App[None]):
             return
         seconds = int(record.duration)
         elapsed = f"  {seconds}s" if seconds >= 1 else ""
+        progress = self._activity_progress(record)
+        progress_text = f"  · {progress}" if progress else ""
         unread = (
             f"  · {self._activity_unread_lines} new · Ctrl+] latest"
             if self._activity_unread_lines
             else ""
         )
-        signature = (activity_id, record.label, elapsed, unread)
+        signature = (activity_id, record.label, elapsed, progress_text, unread)
         if signature == self._activity_title_signature:
             return
         self.query_one("#activity-title", Static).update(
             Text.assemble(
                 (record.label, "#d1d1d6"),
                 (elapsed, "#777781"),
+                (progress_text, "#7dc4e4"),
                 (unread, "#e6b673"),
             ),
             layout=False,
@@ -2567,17 +2861,17 @@ class NoahCodeApp(App[None]):
             compact = self.screen.has_class("compact")
         if self.ui.busy and self._agent_ready:
             hint = (
-                "Enter queue · Ctrl+C cancel · Ctrl+] latest · F5 queue"
+                "Enter queue · Ctrl+C cancel · Ctrl+] latest · ? help"
                 if compact
                 else "Enter queue follow-up · Ctrl+C cancel · drag select · "
-                f"{_copy_shortcut_label()} copy · Ctrl+] latest · F5 queue"
+                f"{_copy_shortcut_label()} copy · Ctrl+] latest · ? help"
             )
         else:
             hint = (
-                "Enter send · / commands · F4 work · F5 queue"
+                "Enter send · / commands · F2 timeline · ? help"
                 if compact
                 else "Enter send · Shift+Enter newline · drag select · "
-                f"{_copy_shortcut_label()} copy · / commands · F4 work"
+                f"{_copy_shortcut_label()} copy · / commands · F2 timeline · ? help"
             )
         if force or hint != self._hint_text:
             self._hint_text = hint
@@ -2713,6 +3007,27 @@ class NoahCodeApp(App[None]):
                     change_counts.append(f"{snapshot.untracked} new")
                 text.append(" · ".join(change_counts), style=palette.warning)
 
+        text.append("\n\nCONTEXT\n", style=f"bold {palette.accent}")
+        context_rows: list[dict[str, str]] = []
+        with contextlib.suppress(Exception):
+            context_rows = list(self.host.context_snapshot())
+        if not context_rows:
+            text.append("Workspace defaults · F7 details", style=palette.muted)
+        else:
+            counts: dict[str, int] = {}
+            for row in context_rows:
+                kind = row.get("kind", "source")
+                counts[kind] = counts.get(kind, 0) + 1
+            visible = [
+                f"{count} {kind}"
+                for kind, count in counts.items()
+                if kind not in {"pending"}
+            ]
+            text.append(" · ".join(visible[:4]) + "\n", style=palette.text)
+            pending = counts.get("pending", 0)
+            suffix = f" · {pending} pending" if pending else ""
+            text.append(f"F7 inspect sources{suffix}", style=palette.muted)
+
         text.append("\n\nSESSION\n", style=f"bold {palette.accent}")
         text.append(
             f"{meta.title if meta and meta.title != 'untitled' else 'Untitled session'}\n",
@@ -2736,7 +3051,7 @@ class NoahCodeApp(App[None]):
                 f"{self._available_update.current} → {self._available_update.latest}\n",
                 style=palette.text,
             )
-            text.append("run: noah update", style=palette.muted)
+            text.append("run: noah update · restart", style=palette.muted)
 
         with contextlib.suppress(Exception):
             usage = self.host.usage_snapshot()
@@ -2925,11 +3240,20 @@ class NoahCodeApp(App[None]):
                 )
             )
         elif event.kind == HostEventKind.REASONING:
+            if self._active_activity_id is None:
+                self._begin_thinking_timeline()
+            if self._thinking_timeline is not None:
+                self._thinking_timeline.thought = (
+                    text
+                    if not self._thinking_timeline.thought
+                    else f"{self._thinking_timeline.thought}\n{text}"
+                )
             self._set_agent_state(AgentDisplayState.THINKING)
             self._attach_thought(text)
             if self.host.config.ui.show_reasoning:
                 self._append_entry(TranscriptEntry("STATUS", f"Thinking: {text}"))
         elif event.kind == HostEventKind.TOOL_START:
+            self._finish_thinking_timeline()
             self._start_activity(event)
         elif event.kind == HostEventKind.SHELL_CHUNK:
             self._queue_activity_output(event)
@@ -2937,6 +3261,8 @@ class NoahCodeApp(App[None]):
             self._flush_stream()
             self._finish_activity(event)
         elif event.kind == HostEventKind.ERROR:
+            self._finish_thinking_timeline(state="error")
+            self._timeline_milestone(text or "Action failed", "error", state="error")
             self._finish_orphan_activity(state="error")
             self._set_agent_state(AgentDisplayState.ERROR, "Action failed")
             self._last_notice_title = "Error details"
@@ -2970,15 +3296,21 @@ class NoahCodeApp(App[None]):
             elif kind == "background_job":
                 self._append_entry(TranscriptEntry("ACTIVITY", text))
             elif kind == "llm_start":
+                self._begin_thinking_timeline()
                 self._set_agent_state(AgentDisplayState.THINKING)
             elif kind == "llm_end":
+                self._finish_thinking_timeline(
+                    state="error" if "failed" in text.casefold() else "complete"
+                )
                 self._finish_orphan_activity()
                 self._set_agent_state(AgentDisplayState.RUNNING, "Finishing response")
             elif text.startswith("mode set to "):
                 self._set_agent_state(AgentDisplayState.READY)
             elif "retry" in text.casefold():
+                self._timeline_milestone(text, "retry")
                 self._set_agent_state(AgentDisplayState.RETRYING, text)
             elif "compact" in text.casefold():
+                self._timeline_milestone(text, "compaction")
                 self._set_agent_state(AgentDisplayState.COMPACTING, text)
             elif not self._session_has_prompt:
                 if text.startswith("session="):
@@ -2990,6 +3322,7 @@ class NoahCodeApp(App[None]):
             else:
                 self._append_entry(TranscriptEntry("STATUS", text))
         elif event.kind == HostEventKind.STOP:
+            self._finish_thinking_timeline()
             self._finish_orphan_activity()
             reason = str(event.meta.get("reason", "")).upper()
             if reason in {"NEED_INPUT", "GET_USER_INPUT"}:
@@ -2998,6 +3331,16 @@ class NoahCodeApp(App[None]):
                 self._set_agent_state(AgentDisplayState.WAITING, text or "Waiting")
             else:
                 self._set_agent_state(AgentDisplayState.READY)
+            timeline_state = (
+                "waiting"
+                if reason in {"NEED_INPUT", "GET_USER_INPUT", "WAIT"}
+                else "complete"
+            )
+            self._timeline_milestone(
+                text or ("Waiting for input" if timeline_state == "waiting" else "Completed"),
+                "stop",
+                state=timeline_state,
+            )
             # DONE explanations are internal protocol summaries, not user
             # messages. Keep actionable wait/input states in the transcript.
             if reason != "DONE" and not text.casefold().startswith("completed"):
@@ -3026,13 +3369,22 @@ class NoahCodeApp(App[None]):
 
     def _start_activity(self, event: HostEvent) -> None:
         activity_id = self._activity_id(event)
+        detail = str(event.meta.get("detail", "") or "")
+        tool = str(event.meta.get("tool", "tool"))
+        if re.search(
+            r"\b(pytest|test|tests|ruff|mypy|lint|typecheck|build|cargo check)\b",
+            f"{event.text} {detail}",
+            re.I,
+        ):
+            tool = "validation"
         record = ActivityRecord(
             activity_id=activity_id,
-            label=event.text or str(event.meta.get("tool", "tool")),
-            tool=str(event.meta.get("tool", "tool")),
-            detail=str(event.meta.get("detail", "") or ""),
+            label=event.text or tool,
+            tool=tool,
+            detail=detail,
         )
         self._activities[activity_id] = record
+        self._timeline_history.append(record)
         self._active_activity_id = activity_id
         self._last_thought = ""
         self._activity_unread_lines = 0
@@ -3060,12 +3412,15 @@ class NoahCodeApp(App[None]):
             self._activities[activity_id] = record
             self._active_activity_id = activity_id
             self._set_agent_state(AgentDisplayState.RUNNING, record.label)
-        self._update_activity_title()
         live = self.query_one("#live-activity", Vertical)
         if live.styles.display != "block":
             live.styles.display = "block"
         stream = str(event.meta.get("stream", "stdout"))
         record.append(event.text, self.host.config.max_output_chars)
+        self._activity_title_signature = None
+        self._working_status_signature = None
+        self._update_activity_title()
+        self._update_working_status()
         self._stream_fragments.append((stream, event.text))
         if self._stream_timer is None:
             self._stream_timer = self.set_timer(STREAM_FLUSH_SECONDS, self._flush_stream)
@@ -3105,6 +3460,7 @@ class NoahCodeApp(App[None]):
                 label=event.text or "activity",
                 tool=str(event.meta.get("tool", "tool")),
             )
+            self._timeline_history.append(record)
         result_status = str(event.meta.get("result_status", "complete")).lower().strip()
         record.state = "error" if result_status in {"error", "failed", "fail"} else "complete"
         record.result = event.text
@@ -3283,7 +3639,6 @@ class NoahCodeApp(App[None]):
                 lines.append(
                     Text.assemble(
                         ("› ", active_style),
-                        (f"{item.category.upper()[:8]:<8}  ", active_style),
                         (item.invocation, active_style),
                         (f"  {item.description}", f"{palette.canvas} on {palette.accent}"),
                     )
@@ -3291,7 +3646,7 @@ class NoahCodeApp(App[None]):
                 continue
             lines.append(
                 Text.assemble(
-                    (f"  {item.category.upper()[:8]:<8}  ", palette.accent),
+                    ("  ", palette.accent),
                     (item.invocation, palette.text),
                     (f"  {item.description}", palette.muted),
                 )
@@ -3387,6 +3742,12 @@ class NoahCodeApp(App[None]):
 
     async def request_approval(self, request: ApprovalRequest) -> ApprovalChoice:
         previous = self._agent_state
+        result: ApprovalChoice | None = None
+        timeline = self._timeline_begin(
+            f"Approval · {request.decision.category}",
+            "approval",
+            detail=f"{request.decision.target}\n{request.decision.reason}",
+        )
         self._set_agent_state(AgentDisplayState.WAITING_APPROVAL, "Permission required")
         self.update_chrome(force=True)
         try:
@@ -3397,6 +3758,11 @@ class NoahCodeApp(App[None]):
             self._dismiss_stranded_modal()
             raise
         finally:
+            self._timeline_finish(
+                timeline,
+                state="complete" if result is not None else "error",
+                result=getattr(result, "value", "cancelled"),
+            )
             if self._agent_state == AgentDisplayState.WAITING_APPROVAL:
                 self._set_agent_state(
                     previous if previous in _ANIMATED_STATES else AgentDisplayState.THINKING
@@ -3409,6 +3775,12 @@ class NoahCodeApp(App[None]):
         custom_parts: list[str] = []
         for prompt in prompts:
             previous = self._agent_state
+            result: QuestionAnswer | None = None
+            timeline = self._timeline_begin(
+                f"Input requested · {prompt.header}",
+                "input",
+                detail=prompt.prompt,
+            )
             self._set_agent_state(AgentDisplayState.WAITING_INPUT, prompt.header)
             self.update_chrome(force=True)
             try:
@@ -3417,6 +3789,10 @@ class NoahCodeApp(App[None]):
                 self._dismiss_stranded_modal()
                 raise
             finally:
+                self._timeline_finish(
+                    timeline,
+                    state="complete" if result is not None else "waiting",
+                )
                 if self._agent_state == AgentDisplayState.WAITING_INPUT:
                     self._set_agent_state(
                         previous if previous in _ANIMATED_STATES else AgentDisplayState.THINKING
@@ -3440,9 +3816,60 @@ class NoahCodeApp(App[None]):
             while isinstance(self.screen, (ApprovalModal, QuestionModal, TextPromptModal)):
                 self.screen.dismiss(None)
 
-    def action_show_help(self) -> None:
-        self._append_entry(
-            TranscriptEntry("NOAH", f"```text\n{help_text(self.host._custom_commands)}\n```", True)
+    @work(exclusive=True, group="keyboard-help")
+    async def action_show_help(self) -> None:
+        focused = self.focused
+        if isinstance(focused, ComposerTextArea):
+            focus_name = "Composer"
+        elif isinstance(focused, SelectableRichLog):
+            focus_name = "Transcript"
+        elif focused is None:
+            focus_name = "Global"
+        else:
+            focus_name = str(focused.id or type(focused).__name__).replace("-", " ").title()
+        shortcuts = [
+            ("Enter", "Send prompt or selected command", "Composer"),
+            ("Shift+Enter", "Insert a new line", "Composer"),
+            ("/", "Search commands", "Composer"),
+            ("@path", "Attach a workspace file", "Composer"),
+            ("↑ / ↓", "Move through suggestions", "Composer"),
+            ("Tab", "Toggle Build and Plan when suggestions are closed", "Composer"),
+            ("Ctrl+C", "Cancel the active turn; press twice while idle to quit", "Global"),
+            ("Ctrl+P", "Open the command palette", "Global"),
+            ("Ctrl+O", "Browse all workspace sessions", "Global"),
+            ("Ctrl+N", "Start a new session", "Global"),
+            ("F2", "Open the collapsible long-task timeline", "Global"),
+            ("F3", "Open persisted conversation history", "Global"),
+            ("F4", "Inspect agents, jobs, and terminals", "Global"),
+            ("F5", "Manage queued prompts and attachments", "Global"),
+            ("F6", "Expand the latest notice or error", "Global"),
+            ("F7", "Inspect active context sources", "Global"),
+            ("? / F1", "Search this keyboard reference", "Global"),
+            ("Ctrl+]", "Jump to the latest transcript and tool output", "Transcript"),
+            (_copy_shortcut_label(), "Copy the selected transcript text", "Transcript"),
+            ("Page Up / Down", "Read older or newer output", "Transcript"),
+            ("Home", "Load older persisted history", "History"),
+            ("U / J", "Reorder queued follow-up prompts", "Queue"),
+            ("D", "Remove a queued prompt or attachment", "Queue"),
+        ]
+        ordered = sorted(
+            enumerate(shortcuts),
+            key=lambda item: (
+                item[1][2] != focus_name,
+                item[1][2] != "Global",
+                item[0],
+            ),
+        )
+        rows = [
+            (f"shortcut:{index}", f"{keys:<16} {action}", context)
+            for index, (keys, action, context) in ordered
+        ]
+        await self.push_screen_wait(
+            KeyboardHelpScreen(
+                f"Keyboard help · {focus_name}",
+                rows,
+                "Type to search keys or actions · Esc close",
+            )
         )
 
     @work(exclusive=True, group="palette")
@@ -3455,7 +3882,6 @@ class NoahCodeApp(App[None]):
             key=lambda command: (
                 _command_insertion(command.invocation) not in recency,
                 recency.get(_command_insertion(command.invocation), 999),
-                command.category,
                 command.invocation,
             ),
         )
@@ -3469,7 +3895,7 @@ class NoahCodeApp(App[None]):
             rows.append(
                 (
                     insertion,
-                    f"{command.category:<10} {command.invocation}",
+                    command.invocation,
                     command.description,
                 )
             )
@@ -3817,6 +4243,19 @@ class NoahCodeApp(App[None]):
         except Exception as exc:  # noqa: BLE001
             self._show_notice(f"Theme setup failed: {exc}", kind="error")
 
+    @work(exclusive=True, group="onboarding")
+    async def action_onboarding(self, reason: str = "") -> None:
+        """Explain setup before entering the credential/model picker."""
+
+        model = self.host.meta.model if self.host.meta else self.host.config.model
+        proceed = await self.push_screen_wait(OnboardingScreen(str(model), reason))
+        if proceed:
+            self.action_model_setup()
+            return
+        self._set_agent_state(AgentDisplayState.SETUP_REQUIRED)
+        self._pre_prompt_status = "Setup needed · press ? for help or open /model"
+        self.update_chrome(force=True)
+
     @work(exclusive=True, group="model-setup")
     async def action_model_setup(self) -> None:
         """Configure a provider credential and model from the TUI."""
@@ -3971,6 +4410,57 @@ class NoahCodeApp(App[None]):
             self._append_entry(TranscriptEntry("ERROR", str(exc)))
 
     @work(exclusive=True, group="sessions")
+    async def action_continue_session(self) -> None:
+        """Choose any of the ten most recently updated workspace sessions."""
+
+        if not self._agent_ready:
+            return
+        if self.ui.busy:
+            self._show_notice(
+                "Cancel the running turn before continuing another session",
+                temporary=True,
+            )
+            return
+        try:
+            sessions = list(await asyncio.to_thread(self.host.list_session_metas))[:10]
+            if not sessions:
+                self._show_notice("No previous sessions for this workspace", temporary=True)
+                return
+            rows = []
+            current = self.host.meta.session_id if self.host.meta else ""
+            for session in sessions:
+                title = (
+                    session.title
+                    if session.title and session.title != "untitled"
+                    else session.session_id[:8]
+                )
+                state = "current" if session.session_id == current else _relative_age(session.updated_at)
+                workspace = f" · {session.worktree_name}" if session.worktree_name else ""
+                rows.append(
+                    (
+                        session.session_id,
+                        title,
+                        f"{state} · {session.mode} · {session.model}{workspace} · {session.session_id[:8]}",
+                    )
+                )
+            session_id = await self.push_screen_wait(
+                FilteredPicker(
+                    "Continue session · latest 10",
+                    rows,
+                    "Type to search · ↑/↓ choose · Enter resume · Esc close",
+                )
+            )
+            if not session_id:
+                return
+            if session_id == current:
+                self._show_notice("Already using that session", temporary=True)
+                return
+            await self.host.switch_session(session_id)
+            self._show_notice(f"Continued session {session_id[:8]}", temporary=True)
+        except Exception as exc:  # noqa: BLE001
+            self._append_entry(TranscriptEntry("ERROR", f"Could not continue session: {exc}"))
+
+    @work(exclusive=True, group="sessions")
     async def action_new_session(self) -> None:
         if not self._agent_ready:
             return
@@ -3993,6 +4483,8 @@ class NoahCodeApp(App[None]):
         self._pre_prompt_status = "Ready for your first prompt"
         self._config_commands = None
         self._base_commands = all_command_suggestions(self.host._custom_commands)
+        self._timeline_history.clear()
+        self._thinking_timeline = None
         self._rail_dirty = True
         self._refresh_repository_snapshot()
         if not changed_session:
@@ -4012,15 +4504,22 @@ class NoahCodeApp(App[None]):
         if self._available_update is not None:
             self._show_notice(
                 f"Update available  {self._available_update.current} → "
-                f"{self._available_update.latest}  ·  run noah update when ready",
+                f"{self._available_update.latest}  ·  run noah update, then restart",
                 kind="update",
                 temporary=True,
+                detail=(
+                    "Run `noah update`, then restart Noah Code. If installed with another "
+                    "package manager, upgrade the `noah-code` package with that manager."
+                ),
             )
         self._load_recent_history()
         self.update_chrome(force=True)
 
     def action_activity_history(self) -> None:
-        self.push_screen(ActivityHistoryScreen(list(self._activity_history)))
+        self.push_screen(ActivityHistoryScreen(list(self._timeline_history)))
+
+    def action_context_visibility(self) -> None:
+        self.push_screen(ContextVisibilityScreen(self.host))
 
     def action_work_ledger(self) -> None:
         self.push_screen(WorkLedgerScreen(self.host))
@@ -4336,6 +4835,16 @@ class NoahCodeApp(App[None]):
                 self.close_suggestions()
                 self.action_queue_manager()
                 return
+            if name == "timeline":
+                composer.text = ""
+                self.close_suggestions()
+                self.action_activity_history()
+                return
+            if name == "context":
+                composer.text = ""
+                self.close_suggestions()
+                self.action_context_visibility()
+                return
             if name in SAFE_SLASH_WHILE_BUSY or name == "attach":
                 composer.text = ""
                 self.close_suggestions()
@@ -4433,6 +4942,21 @@ class NoahCodeApp(App[None]):
             self.close_suggestions()
             self.action_queue_manager()
             return
+        if text == "/timeline":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_activity_history()
+            return
+        if text == "/context":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_context_visibility()
+            return
+        if text == "/continue":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_continue_session()
+            return
         if self._agent_ready and text == "/undo":
             composer.text = ""
             self.close_suggestions()
@@ -4456,6 +4980,11 @@ class NoahCodeApp(App[None]):
         self._turn_task = asyncio.current_task()
         is_agent_turn = parse_slash(text) is None
         started_at = time.monotonic()
+        turn_timeline = self._timeline_begin(
+            "Turn started",
+            "turn",
+            detail=" ".join(text.split())[:500],
+        )
         known_activity_ids = {record.activity_id for record in self._activity_history}
         journal = getattr(getattr(self.host, "agent", None), "journal", None)
         latest = getattr(journal, "latest_turn", None)
@@ -4480,6 +5009,12 @@ class NoahCodeApp(App[None]):
             self._last_notice_detail = str(exc)
             self._append_entry(TranscriptEntry("ERROR", str(exc)))
         finally:
+            self._finish_thinking_timeline(state="error" if outcome == "failed" else "complete")
+            self._timeline_finish(
+                turn_timeline,
+                state="error" if outcome == "failed" else "complete",
+                result=outcome,
+            )
             if is_agent_turn:
                 if self._agent_state == AgentDisplayState.ERROR:
                     outcome = "failed"

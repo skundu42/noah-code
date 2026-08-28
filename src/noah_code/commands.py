@@ -34,11 +34,15 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("theme", "Show or switch the interface theme", "theme [NAME]"),
     CommandSpec("animations", "Enable or disable interface motion", "animations [on|off]"),
     CommandSpec("mode", "Show or switch the active mode", "mode [build|plan]"),
-    CommandSpec("model", "Configure a provider or switch this session's model", "model [MODEL]"),
+    CommandSpec(
+        "model",
+        "Configure a provider or switch this session's model",
+        "model [MODEL | --global MODEL]",
+    ),
     CommandSpec(
         "reasoning",
         "Show or set reasoning effort for compatible models",
-        "reasoning [default|none|minimal|low|medium|high|xhigh]",
+        "reasoning [EFFORT | --global EFFORT]",
     ),
     CommandSpec(
         "providers",
@@ -64,10 +68,11 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
         "Show, save, forget, or clear project conventions",
         "memory [save|forget|clear]",
     ),
-    CommandSpec("continue", "Resume most recent session"),
+    CommandSpec("continue", "Choose from the latest ten workspace sessions"),
     CommandSpec("compact", "Trigger history summarization"),
     CommandSpec("todos", "Show todo list"),
     CommandSpec("status", "Show mode/model/session/context"),
+    CommandSpec("context", "Inspect files, instructions, memory, and attachments in context"),
     CommandSpec("health", "Show durable runtime health"),
     CommandSpec("checkpoints", "List rolling Git worktree checkpoints"),
     CommandSpec("tokens", "Show token, cache, cost, and latency usage"),
@@ -81,6 +86,7 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("redo", "Redo last undone turn"),
     CommandSpec("agents", "List built-in and markdown subagents"),
     CommandSpec("work", "Show live agent, terminal, and background-job work"),
+    CommandSpec("timeline", "Inspect the current task timeline"),
     CommandSpec("queue", "Inspect and manage queued prompts and attachments"),
     CommandSpec("terminals", "List persistent terminal sessions"),
     CommandSpec("attach", "Attach a workspace file or image to the next turn", "attach [PATH]"),
@@ -117,11 +123,13 @@ _COMMAND_CATEGORIES = {
     "todos": "Project",
     "attach": "Project",
     "status": "Runtime",
+    "context": "Runtime",
     "health": "Runtime",
     "tokens": "Runtime",
     "trace": "Runtime",
     "agents": "Work",
     "work": "Work",
+    "timeline": "Work",
     "queue": "Work",
     "terminals": "Work",
     "skills": "Extensions",
@@ -267,22 +275,12 @@ def all_command_suggestions(
         )
         for command in BUILTIN_COMMANDS
     ]
-    suggestions.append(
-        CommandSuggestion(
-            "/model --global MODEL", "Set the default model for every repository", "Model"
-        )
-    )
-    suggestions.append(
-        CommandSuggestion(
-            "/reasoning --global EFFORT",
-            "Set the reasoning effort default for every repository",
-            "Model",
-        )
-    )
     if custom:
+        reserved = {command.name for command in BUILTIN_COMMANDS}
         suggestions.extend(
             CommandSuggestion(f"/{name} [ARGS]", command.description, "Custom")
             for name, command in sorted(custom.items())
+            if name not in reserved
         )
     return suggestions
 
@@ -299,22 +297,19 @@ def config_command_suggestions(config: Any) -> list[CommandSuggestion]:
 
 def help_text(custom: dict[str, CustomCommand] | None = None) -> str:
     lines = ["Noah Code commands:", ""]
-    categories = list(
-        dict.fromkeys(_COMMAND_CATEGORIES.get(cmd.name, "Other") for cmd in BUILTIN_COMMANDS)
-    )
-    for category in categories:
-        lines.append(f"{category}:")
-        for cmd in BUILTIN_COMMANDS:
-            if _COMMAND_CATEGORIES.get(cmd.name, "Other") == category:
-                lines.append(f"  {cmd.invocation:<28} {cmd.description}")
-        lines.append("")
-    lines.append(f"  {'/model --global MODEL':<28} Set the default model for every repository")
-    lines.append(f"  {'/reasoning --global EFFORT':<28} Set the global reasoning effort default")
+    lines.extend(f"  {cmd.invocation:<38} {cmd.description}" for cmd in BUILTIN_COMMANDS)
     if custom:
-        lines.append("")
-        lines.append("Custom commands:")
-        for name, c in sorted(custom.items()):
-            lines.append(f"  /{name:<12} {c.description} ({c.source})")
+        reserved = {command.name for command in BUILTIN_COMMANDS}
+        visible_custom = [
+            (name, command)
+            for name, command in sorted(custom.items())
+            if name not in reserved
+        ]
+    else:
+        visible_custom = []
+    if visible_custom:
+        for name, c in visible_custom:
+            lines.append(f"  /{name + ' [ARGS]':<37} {c.description}")
     lines.append("")
     lines.append(
         "File-journal undo only covers WorkspaceTools edits, not arbitrary shell mutations."

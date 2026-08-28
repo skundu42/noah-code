@@ -686,7 +686,7 @@ async def test_model_name_with_global_prefix_is_not_parsed_as_flag(
 
 
 def test_help_includes_global_model_command() -> None:
-    assert "/model --global MODEL" in help_text()
+    assert "/model [MODEL | --global MODEL]" in help_text()
 
 
 @pytest.mark.asyncio
@@ -1960,3 +1960,28 @@ async def test_plan_slash_blocked_while_turn_running(tmp_path: Path, monkeypatch
     assert action == "handled"
     assert "blocked" in host.ui.render.call_args.args[0].text
     await host.close()
+
+
+def test_context_snapshot_reports_instructions_notes_and_attachments(tmp_path: Path) -> None:
+    (tmp_path / "AGENTS.md").write_text("Use focused tests.\n")
+    notes = tmp_path / ".noah-code"
+    notes.mkdir()
+    (notes / "plan.md").write_text("# Ship context visibility\n")
+    (notes / "memory.md").write_text("- Prefer small diffs\n")
+    attachment = tmp_path / "trace.log"
+    attachment.write_text("trace\n")
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(
+        workspace.root,
+        cli_overrides={"session_dir": str(tmp_path / "sessions")},
+    )
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    host._active_context_paths.add(attachment.resolve())
+
+    rows = host.context_snapshot()
+    labels = {(row["kind"], row["label"]) for row in rows}
+
+    assert ("instruction", "AGENTS.md") in labels
+    assert ("plan", ".noah-code/plan.md") in labels
+    assert ("memory", ".noah-code/memory.md") in labels
+    assert ("attachment", "trace.log") in labels

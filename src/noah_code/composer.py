@@ -38,6 +38,7 @@ class ExpandedTurn:
 
     text: str
     images: list[Any] = field(default_factory=list)
+    paths: list[Path] = field(default_factory=list)
 
 
 def _workspace_files(root: Path) -> list[Path]:
@@ -100,6 +101,7 @@ def expand_turn(
     extras = [Path(path) for path in attach_paths or []]
     sections: list[str] = []
     images: list[Any] = []
+    paths: list[Path] = []
     seen: set[str] = set()
 
     for raw in [*mentioned, *[str(path) for path in extras]]:
@@ -110,6 +112,7 @@ def expand_turn(
         if key in seen:
             continue
         seen.add(key)
+        paths.append(resolved)
         relative = _display(root, resolved)
         suffix = resolved.suffix.lower()
         if suffix in IMAGE_TYPES:
@@ -128,7 +131,7 @@ def expand_turn(
     if not sections:
         return ExpandedTurn(text=text)
     notice = "Attached files from @mentions:\n\n" + "\n\n".join(sections)
-    return ExpandedTurn(text=f"{text.rstrip()}\n\n{notice}", images=images)
+    return ExpandedTurn(text=f"{text.rstrip()}\n\n{notice}", images=images, paths=paths)
 
 
 def _resolve(root: Path, raw: str) -> Path | None:

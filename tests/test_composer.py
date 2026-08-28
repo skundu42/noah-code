@@ -25,6 +25,7 @@ def test_expand_turn_inlines_mentioned_text_files(tmp_path: Path) -> None:
     assert "### src/auth.py" in turn.text
     assert "def login():" in turn.text
     assert turn.images == []
+    assert turn.paths == [(tmp_path / "src" / "auth.py").resolve()]
 
 
 def test_expand_turn_attaches_png_via_nooa_image(tmp_path: Path) -> None:
@@ -62,6 +63,7 @@ def test_expand_turn_explicit_attach_paths(tmp_path: Path) -> None:
     assert "hello" in turn.text
     assert len(turn.images) == 1
     assert turn.images[0].media_type in IMAGE_TYPES.values()
+    assert turn.paths == [shot.resolve(), note.resolve()]
 
 
 def test_mention_suggestions_match_workspace_files(tmp_path: Path) -> None:

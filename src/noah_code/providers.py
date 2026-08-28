@@ -218,6 +218,13 @@ def list_providers(active_model: str = "") -> list[ProviderInfo]:
     ]
 
 
+def model_setup_required(model: str) -> bool:
+    """Return whether a recognized model route is missing its credentials."""
+
+    active = [info for info in list_providers(model) if info.active]
+    return bool(active and not active[0].configured)
+
+
 def format_providers(active_model: str = "") -> str:
     lines = [
         "Model providers",
