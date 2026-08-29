@@ -84,6 +84,10 @@ class SteerQueue:
                 return None
             return self._items.popleft()
 
+    def pop_last(self) -> SteerItem | None:
+        with self._lock:
+            return self._items.pop() if self._items else None
+
     def clear(self) -> None:
         with self._lock:
             self._items.clear()

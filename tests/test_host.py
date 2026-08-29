@@ -50,6 +50,23 @@ def _find_resilient(layers: list[str]) -> object:
     return None
 
 
+def test_recall_queued_steer_restores_attachments(tmp_path: Path) -> None:
+    host = AgentHost(
+        Workspace(root=tmp_path.resolve()),
+        NoahCodeConfig(session_dir=tmp_path / "sessions"),
+        llm=FakeLLMClient(),
+    )
+    attachment = tmp_path / "screen.png"
+    host.steer_queue.push("first")
+    host.steer_queue.push("edit this", attach_paths=[attachment])
+
+    recalled = host.recall_queued_steer()
+
+    assert recalled is not None and recalled.text == "edit this"
+    assert [item.text for item in host.steer_queue.items()] == ["first"]
+    assert host.pending_attach_paths() == (attachment,)
+
+
 @pytest.mark.asyncio
 async def test_tui_keeps_mouse_enabled_for_copy_on_select(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

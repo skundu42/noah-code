@@ -30,7 +30,7 @@ from noah_code.event_bridge import install_event_bridge
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.redaction import safe_error_message
 from noah_code.sessions import SessionEventRecord, SessionMeta, SessionStore
-from noah_code.steer import SAFE_SLASH_WHILE_BUSY, SteerQueue, expansion_failed
+from noah_code.steer import SAFE_SLASH_WHILE_BUSY, SteerItem, SteerQueue, expansion_failed
 from noah_code.telemetry import AgentTelemetry, setup_agent_telemetry
 from noah_code.themes import THEME_NAMES, get_theme
 from noah_code.ui.console import ConsoleUI
@@ -1543,6 +1543,19 @@ class AgentHost:
         if self._runtime is not None and item.sequence is not None:
             self._runtime.acknowledge_inbox(item.sequence, dropped=True)
         return True
+
+    def recall_queued_steer(self) -> SteerItem | None:
+        """Move the newest queued prompt and its attachments back to the composer."""
+
+        item = self.steer_queue.pop_last()
+        if item is None:
+            return None
+        if self._runtime is not None and item.sequence is not None:
+            self._runtime.acknowledge_inbox(item.sequence, dropped=True)
+        for path in item.attach_paths:
+            if path not in self._pending_attach_paths:
+                self._pending_attach_paths.append(path)
+        return item
 
     def move_queued_steer(self, index: int, delta: int) -> bool:
         return self.steer_queue.move(index, delta)

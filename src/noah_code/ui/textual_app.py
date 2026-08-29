@@ -2224,6 +2224,7 @@ class NoahCodeApp(App[None]):
         Binding("ctrl+o", "sessions", "Sessions", show=True),
         Binding("ctrl+n", "new_session", "New", show=True),
         Binding("ctrl+t", "toggle_activity_output", "Tool output", show=False),
+        Binding("alt+up", "recall_queued_prompt", "Recall queued", show=False),
         Binding("tab", "toggle_mode", "Build/Plan", show=True),
         Binding("f1", "show_help", "Help", show=True),
         Binding("f2", "activity_history", "Timeline", show=True),
@@ -3853,6 +3854,7 @@ class NoahCodeApp(App[None]):
             ("Ctrl+P", "Open the command palette", "Global"),
             ("Ctrl+O", "Browse all workspace sessions", "Global"),
             ("Ctrl+T", "Expand or collapse live tool output", "Global"),
+            ("Alt+↑", "Recall the newest queued prompt", "Composer"),
             ("Ctrl+N", "Start a new session", "Global"),
             ("F2", "Open the collapsible long-task timeline", "Global"),
             ("F3", "Open persisted conversation history", "Global"),
@@ -4848,6 +4850,20 @@ class NoahCodeApp(App[None]):
         )
         self._activity_title_signature = None
         self._update_activity_title()
+
+    def action_recall_queued_prompt(self) -> None:
+        composer = self.query_one("#composer", ComposerTextArea)
+        if composer.text.strip():
+            self._show_notice("Clear the composer before recalling a queued prompt", temporary=True)
+            return
+        recall = getattr(self.host, "recall_queued_steer", None)
+        item = recall() if callable(recall) else None
+        if item is None:
+            return
+        composer.text = str(item.text)
+        composer.cursor_location = composer.document.end
+        composer.focus()
+        self.update_chrome(force=True)
 
     @work(exclusive=True, group="mode-switch")
     async def _toggle_mode(self, target: str) -> None:

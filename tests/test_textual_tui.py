@@ -110,6 +110,14 @@ def _fake_host(tmp_path: Path):
     )
     host.remove_queued_steer = lambda index: host.steer_queue.remove(index) is not None
     host.move_queued_steer = lambda index, delta: host.steer_queue.move(index, delta)
+
+    def recall_queued_steer():
+        item = host.steer_queue.pop_last()
+        if item is not None:
+            host._pending_attach_paths.extend(item.attach_paths)
+        return item
+
+    host.recall_queued_steer = recall_queued_steer
     host.enqueue_steer = enqueue_steer
     return host
 
@@ -2526,6 +2534,34 @@ async def test_busy_enter_queues_follow_up_without_starting_a_turn(tmp_path: Pat
         item = host.steer_queue.pop()
         assert item is not None and item.text == "also run pytest"
         assert "also run pytest" in _log_text(app.query_one("#conversation"))
+
+
+@pytest.mark.asyncio
+async def test_alt_up_recalls_newest_queued_prompt_with_attachments(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host.steer_queue.push("keep queued")
+    host.steer_queue.push("edit this prompt", attach_paths=[tmp_path / "screen.png"])
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        await pilot.press("alt+up")
+        await pilot.pause()
+
+        composer = app.query_one("#composer")
+        assert composer.text == "edit this prompt"
+        assert composer.cursor_location == composer.document.end
+        assert [item.text for item in host.steer_queue.items()] == ["keep queued"]
+        assert host.pending_attach_paths() == (tmp_path / "screen.png",)
+        context = _rendered_text(app.query_one("#input-context").content)
+        assert "screen.png" in context
+        assert "keep queued" in context
+
+        await pilot.press("alt+up")
+        await pilot.pause()
+
+        assert composer.text == "edit this prompt"
+        assert [item.text for item in host.steer_queue.items()] == ["keep queued"]
+        notice = _rendered_text(app.query_one("#notice-banner").content)
+        assert "Clear the composer" in notice
 
 
 @pytest.mark.asyncio

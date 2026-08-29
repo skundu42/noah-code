@@ -11,6 +11,7 @@
 | `Ctrl+G` | Open the searchable skills picker |
 | `Ctrl+O` | Open the session picker |
 | `Ctrl+T` | Expand or collapse live tool output |
+| `Alt+Up` | Recall the newest queued prompt into the composer |
 | `Ctrl+N` | Start a new session |
 | `Ctrl+C` | Cancel the active turn and clear queued follow-ups; press twice while idle to quit |
 | `Ctrl+Q` | Quit |
@@ -64,6 +65,8 @@ While Noah is working, the composer stays open. `Enter` queues the current text 
 a second turn. Chrome shows `queued · n`. When the in-flight `handle()` returns (`DONE`,
 `NEED_INPUT`, or `WAIT`), the host injects the next item in the same journaled turn — one persist
 and one checkpoint for the whole steered run. `/undo` therefore reverts every follow-up together.
+Press `Alt+Up` with an empty composer to pull the newest queued prompt and its attachments back for
+editing.
 
 The queue holds at most 100 items. A 101st `Enter` drops the oldest and status-prints
 `steer dropped oldest`. `@path` mentions and `/attach` paths expand when the item is injected, not

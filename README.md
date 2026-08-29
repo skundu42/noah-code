@@ -126,6 +126,7 @@ Type `/` to search the full command and configuration reference. The most common
 | `Ctrl+Shift+C` with no selection | Copy the latest Noah reply |
 | `Ctrl+G` | Open the searchable skills picker |
 | `Ctrl+T` | Expand or collapse live tool output |
+| `Alt+Up` | Recall the newest queued prompt for editing |
 | `Ctrl+]` | Return to live transcript output |
 | `Tab` | Switch between build and plan mode |
 | `F2` | Open execution activity |
