@@ -51,6 +51,26 @@ def _find_resilient(layers: list[str]) -> object:
 
 
 @pytest.mark.asyncio
+async def test_tui_keeps_mouse_enabled_for_copy_on_select(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = AgentHost(
+        Workspace(root=tmp_path.resolve()),
+        NoahCodeConfig(session_dir=tmp_path / "sessions"),
+        llm=FakeLLMClient(),
+    )
+    options: dict[str, object] = {}
+
+    async def run_async(_app: object, **kwargs: object) -> None:
+        options.update(kwargs)
+
+    monkeypatch.setattr("noah_code.ui.textual_app.NoahCodeApp.run_async", run_async)
+
+    assert await host.run_tui() == 0
+    assert options["mouse"] is True
+
+
+@pytest.mark.asyncio
 async def test_model_switch_restores_retry_and_fallback_wrapping(
     tmp_path: Path, monkeypatch
 ) -> None:

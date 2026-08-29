@@ -298,6 +298,8 @@ async def test_oversized_read_is_not_an_editable_match(tmp_path: Path) -> None:
     result = await ws.read("large.txt")
 
     assert isinstance(result, str)
+    assert result.text == str(result)
+    assert result.content == str(result)
     assert "full output id=" in result
     assert "self.ws.read_output" in result
     await ws.close()
@@ -314,6 +316,21 @@ async def test_batched_inspect_returns_search_and_file_sections(tmp_path: Path) 
     assert "## file: parser.py" in result
     assert "## symbols: definitions" in result
     assert ws.raw_shell.session._start_count == 1
+    await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_read_accepts_first_n_lines_and_search_matches_have_common_aliases(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "parser.py").write_text("first\nneedle\nthird\n")
+    ws = _make_ws(tmp_path)
+
+    read = await ws.read("parser.py", lines=2)
+    match = (await ws.search("needle", "parser.py"))[0]
+
+    assert read.text == "first\nneedle\n"
+    assert (match.lineno, match.line_number, match.line) == (2, 2, "needle")
     await ws.close()
 
 

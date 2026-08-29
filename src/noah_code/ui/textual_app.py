@@ -311,10 +311,6 @@ def read_os_clipboard() -> str | None:
     return None
 
 
-def _copy_shortcut_label() -> str:
-    return "Cmd+C" if sys.platform == "darwin" else "Ctrl+Shift+C"
-
-
 def _overlay_style(existing: Style | None, overlay: Style) -> Style:
     """Layer *overlay* colors onto *existing* without losing selection meta."""
 
@@ -615,7 +611,8 @@ _PROGRESSIVE_ACTIVITY = (
 def _completed_activity_label(label: str, *, failed: bool) -> str | None:
     """Collapse internal activity into one OpenCode-style transcript line."""
 
-    if label in _HIDDEN_ACTIVITY:
+    # Failed attempts remain available in the timeline; final errors render separately.
+    if failed or label in _HIDDEN_ACTIVITY:
         return None
     completed = label
     for prefix, replacement in _PROGRESSIVE_ACTIVITY:
@@ -624,7 +621,7 @@ def _completed_activity_label(label: str, *, failed: bool) -> str | None:
             continue
         completed = completed.replace(prefix, replacement)
     completed = completed.strip()
-    return f"× {completed} failed" if failed else f"✓ {completed}"
+    return f"✓ {completed}"
 
 
 _DONE_FILE_ACTIVITY = re.compile(
@@ -2219,6 +2216,7 @@ class NoahCodeApp(App[None]):
     BINDINGS = [
         Binding("ctrl+q", "quit_app", "Quit", show=True),
         Binding("ctrl+c", "cancel_or_quit", "Cancel", show=True),
+        Binding("super+a", "select_focused_text", "Select all", show=False, priority=True),
         Binding("super+c,ctrl+shift+c", "copy_selection", "Copy", show=True, priority=True),
         Binding("ctrl+v,super+v", "paste_clipboard", "Paste", show=False, priority=True),
         Binding("ctrl+p", "palette", "Commands", show=True),
@@ -2876,15 +2874,15 @@ class NoahCodeApp(App[None]):
             hint = (
                 "Enter queue · Ctrl+C cancel · Ctrl+] latest · ? help"
                 if compact
-                else "Enter queue follow-up · Ctrl+C cancel · drag select · "
-                f"{_copy_shortcut_label()} copy · Ctrl+] latest · ? help"
+                else "Enter queue follow-up · Ctrl+C cancel · drag to copy · "
+                "Ctrl+] latest · ? help"
             )
         else:
             hint = (
                 "Enter send · / commands · F2 timeline · ? help"
                 if compact
-                else "Enter send · Shift+Enter newline · drag select · "
-                f"{_copy_shortcut_label()} copy · / commands · F2 timeline · ? help"
+                else "Enter send · Shift+Enter newline · drag to copy · "
+                "/ commands · F2 timeline · ? help"
             )
         if force or hint != self._hint_text:
             self._hint_text = hint
@@ -3847,6 +3845,7 @@ class NoahCodeApp(App[None]):
             ("@path", "Attach a workspace file", "Composer"),
             ("↑ / ↓", "Move through suggestions", "Composer"),
             ("Tab", "Toggle Build and Plan when suggestions are closed", "Composer"),
+            ("Cmd+A / C / V", "Select all, copy, or paste", "Composer"),
             ("Ctrl+C", "Cancel the active turn; press twice while idle to quit", "Global"),
             ("Ctrl+P", "Open the command palette", "Global"),
             ("Ctrl+O", "Browse all workspace sessions", "Global"),
@@ -3859,7 +3858,7 @@ class NoahCodeApp(App[None]):
             ("F7", "Inspect active context sources", "Global"),
             ("? / F1", "Search this keyboard reference", "Global"),
             ("Ctrl+]", "Jump to the latest transcript and tool output", "Transcript"),
-            (_copy_shortcut_label(), "Copy the selected transcript text", "Transcript"),
+            ("Mouse drag", "Select and copy transcript text", "Transcript"),
             ("Page Up / Down", "Read older or newer output", "Transcript"),
             ("Home", "Load older persisted history", "History"),
             ("U / J", "Reorder queued follow-up prompts", "Queue"),
@@ -4735,6 +4734,14 @@ class NoahCodeApp(App[None]):
             return None
         return "\n".join(parts)
 
+    def on_text_selected(self, _event: events.TextSelected) -> None:
+        """Copy completed Textual selections and clear them without a notice redraw."""
+
+        selected = self.screen.get_selected_text() or ""
+        if selected.strip():
+            self.copy_to_clipboard(selected)
+        self.screen.clear_selection()
+
     @staticmethod
     def _copied_notice(text: str) -> str:
         lines = len(text.splitlines()) or 1
@@ -4750,7 +4757,6 @@ class NoahCodeApp(App[None]):
             field_selection = focused.selected_text
             if field_selection:
                 self.copy_to_clipboard(field_selection)
-                self._show_notice(self._copied_notice(field_selection), temporary=True)
                 return
         selected = self._mouse_selection_text()
         if not selected:
@@ -4768,6 +4774,11 @@ class NoahCodeApp(App[None]):
             self._show_notice("Copied latest Noah reply", temporary=True)
             return
         self._show_notice("Select text or wait for a Noah reply to copy", temporary=True)
+
+    def action_select_focused_text(self) -> None:
+        focused = self.focused
+        if isinstance(focused, (Input, TextArea)):
+            focused.action_select_all()
 
     def action_paste_clipboard(self) -> None:
         """Paste the native clipboard into the currently focused editable field."""

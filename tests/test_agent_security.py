@@ -5,6 +5,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import platform
 import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -160,6 +161,46 @@ def test_unique_spawn_passfds_drops_duplicate_and_invalid_fds(
 
         util.spawnv_passfds("/bin/true", [], [2, 0, 2, -1, 1, 0, 1_000_000])
     assert seen["fds"] == (0, 1, 2)
+
+
+def test_spawn_passfds_patch_is_serialized_between_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    second_entered = threading.Event()
+    seen: list[tuple[int, ...]] = []
+
+    def fake_spawnv(_path: object, _args: object, passfds: object) -> int:
+        seen.append(tuple(passfds))
+        return 0
+
+    monkeypatch.setattr("multiprocessing.util.spawnv_passfds", fake_spawnv)
+
+    def first() -> None:
+        with _unique_spawn_passfds():
+            entered.set()
+            release.wait()
+
+    def second() -> None:
+        entered.wait()
+        with _unique_spawn_passfds():
+            second_entered.set()
+            import multiprocessing.util as util
+
+            util.spawnv_passfds("/bin/true", [], [2, 0, 2, -1, 1])
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for thread in threads:
+        thread.start()
+    assert entered.wait(1)
+    assert not second_entered.wait(0.05)
+    release.set()
+    for thread in threads:
+        thread.join()
+
+    assert second_entered.is_set()
+    assert seen == [(0, 1, 2)]
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="requires native macOS sandbox")

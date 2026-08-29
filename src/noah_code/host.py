@@ -2756,7 +2756,7 @@ class AgentHost:
         self.ui = ui
         app = NoahCodeApp(self, ui, onboarding_required=onboarding_required)
         try:
-            await app.run_async()
+            await app.run_async(mouse=True)
             return 0
         finally:
             await self.close()

@@ -8,6 +8,7 @@ import platform
 import site
 import sys
 import sysconfig
+import threading
 import types
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -196,6 +197,8 @@ def _spawn_safe_local_agent(agent: Any) -> Any:
 
 
 _OMIT = object()
+# ``spawnv_passfds`` is process-global; patch and restore it as one critical section.
+_SPAWN_PASSFDS_LOCK = threading.RLock()
 
 
 def _pipe_picklable(value: Any) -> bool:
@@ -246,28 +249,29 @@ def _unique_spawn_passfds() -> Iterator[None]:
     import multiprocessing.util as util
     import os
 
-    original = util.spawnv_passfds
+    with _SPAWN_PASSFDS_LOCK:
+        original = util.spawnv_passfds
 
-    def _inherit_fds(passfds: Any) -> tuple[int, ...]:
-        kept: list[int] = []
-        for fd in sorted({int(fd) for fd in passfds}):
-            if fd < 0:
-                continue
-            try:
-                os.fstat(fd)
-            except OSError:
-                continue
-            kept.append(fd)
-        return tuple(kept)
+        def _inherit_fds(passfds: Any) -> tuple[int, ...]:
+            kept: list[int] = []
+            for fd in sorted({int(fd) for fd in passfds}):
+                if fd < 0:
+                    continue
+                try:
+                    os.fstat(fd)
+                except OSError:
+                    continue
+                kept.append(fd)
+            return tuple(kept)
 
-    def _spawnv(path: Any, args: Any, passfds: Any) -> Any:
-        return original(path, args, _inherit_fds(passfds))
+        def _spawnv(path: Any, args: Any, passfds: Any) -> Any:
+            return original(path, args, _inherit_fds(passfds))
 
-    util.spawnv_passfds = _spawnv
-    try:
-        yield
-    finally:
-        util.spawnv_passfds = original
+        util.spawnv_passfds = _spawnv
+        try:
+            yield
+        finally:
+            util.spawnv_passfds = original
 
 
 class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
@@ -386,8 +390,9 @@ _NOAH_CODEACT_INSTRUCTIONS = """## Noah CodeAct
 
 Work through tool calls; plain assistant prose cannot run code or end a turn.
 Use `execute_python(code)` for work and `return_result(...)` to finish. Python
-cell state persists. Parameters and `self` are preloaded; call async `self.*`
-tools with `await`. `self.message(text)` is synchronous—never await it.
+cell state persists. Parameters and `self` are preloaded. Every `self.ws.*`
+call is async: always `await` it before iterating or accessing the result.
+`self.message(text)` is synchronous—never await it.
 
 ### Tools
 
@@ -396,9 +401,10 @@ tools with `await`. `self.message(text)` is synchronous—never await it.
   three arguments; two-argument calls are invalid. Prefer one atomic
   `self.ws.apply_patch(changes)` for a
   coherent batch; `self.ws.apply_unified_diff` accepts git-style hunks.
-- Common shapes: `ws.search(pattern, path=".", paths=None, regex=True)` returns
-  iterable Matches plus `.stdout`; `ws.read(path, lines=None)` returns a Match
-  with `.text`/`.content`; `ws.list(pattern="**/*", path=".")` returns paths.
+- Common shapes: `await ws.search(pattern, path=".", paths=None, regex=True)`
+  returns iterable Matches plus `.stdout`; `await ws.read(path, lines=None)`
+  returns text with `.text`/`.content`; `lines=60` reads the first 60 lines;
+  `await ws.list(pattern="**/*", path=".")` returns paths.
 - Run commands with `await self.ws.run(command)` and inspect
   returncode/stdout/stderr. `read_only=True` skips approval only for commands
   the engine recognizes as read-only (Git inspection, search, listing, text

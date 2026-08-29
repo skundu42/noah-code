@@ -63,10 +63,34 @@ class WorkspaceMatch(Match):
 
         return self.path
 
+    @property
+    def lineno(self) -> int:
+        return self.start
+
+    @property
+    def line_number(self) -> int:
+        return self.start
+
+    @property
+    def line(self) -> str:
+        return self.text.splitlines()[0] if self.text else ""
+
     def splitlines(self, keepends: bool = False) -> list[str]:
         """Delegate ordinary string inspection to the anchor text."""
 
         return self.text.splitlines(keepends=keepends)
+
+
+class WorkspaceText(str):
+    """Bounded text with the same familiar aliases as an edit anchor."""
+
+    @property
+    def text(self) -> str:
+        return str(self)
+
+    @property
+    def content(self) -> str:
+        return str(self)
 
 
 class SearchResult(ShellResult):
@@ -260,10 +284,10 @@ class WorkspaceTools(Skill):
         self,
         path: Annotated[str, spec(description="File path relative to workspace")],
         lines: Annotated[
-            tuple[int, int] | None,
-            spec(description="Optional (start, end) 1-indexed inclusive range"),
+            tuple[int, int] | int | None,
+            spec(description="Optional first-N count or (start, end) inclusive range"),
         ] = None,
-    ) -> Match | str:
+    ) -> WorkspaceMatch | WorkspaceText:
         """Read a file range; oversized reads return a managed preview, not an edit anchor."""
         resolved = await self._authorize_path(path, PermissionCategory.READ, tool="ws_read")
         stat = resolved.stat()
@@ -273,6 +297,10 @@ class WorkspaceTools(Skill):
                 f"{display} is {stat.st_size} bytes, above the {self._max_file_bytes}-byte "
                 "whole-file read limit; re-read a range with lines=(start, end)"
             )
+        if isinstance(lines, int):
+            if lines < 1:
+                raise ValueError("lines must be a positive count")
+            lines = (1, lines)
         # Reads run natively on the authorized absolute path: no shell pinning,
         # no whole-file load for ranged reads, and a clean binary-file error.
         try:
@@ -292,17 +320,17 @@ class WorkspaceTools(Skill):
         if bounded != match.text:
             # A head/tail preview is not contiguous file content and therefore
             # must never masquerade as an editable Match anchor.
-            return f"{match.path}:{match.start}-{match.end}\n{bounded}"
+            return WorkspaceText(f"{match.path}:{match.start}-{match.end}\n{bounded}")
         return match
 
-    def _read_whole_file(self, resolved: Path) -> Match:
+    def _read_whole_file(self, resolved: Path) -> WorkspaceMatch:
         with resolved.open(encoding="utf-8") as stream:
             content = stream.read()
         total = len(content.splitlines(keepends=True))
         return WorkspaceMatch(str(resolved), 1, total, content)
 
     @staticmethod
-    def _read_line_range(resolved: Path, lines: tuple[int, int]) -> Match:
+    def _read_line_range(resolved: Path, lines: tuple[int, int]) -> WorkspaceMatch:
         """Stream only the requested 1-indexed inclusive range from disk."""
         start = max(1, lines[0])
         end = lines[1]
@@ -439,11 +467,11 @@ class WorkspaceTools(Skill):
             tuple[int, int],
             spec(description="1-indexed inclusive line range to retrieve"),
         ],
-    ) -> str:
+    ) -> WorkspaceText:
         """Read a focused slice of a previously truncated full tool result."""
 
         text = self._output_store.read(output_id, lines)
-        return self._bound(text)
+        return WorkspaceText(self._bound(text))
 
     async def inspect(
         self,
@@ -459,7 +487,7 @@ class WorkspaceTools(Skill):
             bool,
             spec(description="Also return class/function/type declarations"),
         ] = False,
-    ) -> str:
+    ) -> WorkspaceText:
         """Batch focused repository searches and reads into one compact result."""
 
         queries: list[str] = list(dict.fromkeys(searches or []))
@@ -497,7 +525,7 @@ class WorkspaceTools(Skill):
                 sections.append(f"{result.path}:{result.start}-{result.end}\n{result.text}")
             else:
                 sections.append(str(result))
-        return self._bound("\n\n".join(sections))
+        return WorkspaceText(self._bound("\n\n".join(sections)))
 
     async def replace(
         self,

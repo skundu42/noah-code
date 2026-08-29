@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from rich.console import Console
+from textual import events
 from textual.geometry import Offset
 from textual.selection import SELECT_ALL, Selection
 from textual.widgets import Input
@@ -262,6 +263,26 @@ async def test_transcript_selection_and_copy_shortcuts_are_useful(tmp_path: Path
         await pilot.pause()
         await pilot.press("ctrl+shift+c")
         assert app.clipboard == "latest answer"
+
+
+@pytest.mark.asyncio
+async def test_completed_mouse_selection_copies_and_clears_without_notice(
+    tmp_path: Path,
+) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.render(HostEvent(HostEventKind.MESSAGE, "copy on select"))
+        await pilot.pause()
+
+        transcript = app.query_one("#conversation")
+        app.screen.selections = {transcript: SELECT_ALL}
+        app.screen.post_message(events.TextSelected())
+        await pilot.pause()
+
+        assert "copy on select" in app.clipboard
+        assert app.screen.selections == {}
 
 
 @pytest.mark.asyncio
@@ -534,6 +555,29 @@ async def test_ctrl_copy_and_paste_work_in_single_line_fields(
         await pilot.press("ctrl+v")
         await pilot.pause()
         assert field.value == "native value"
+
+
+@pytest.mark.asyncio
+async def test_cmd_edit_shortcuts_work_in_composer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(textual_app_module, "read_os_clipboard", lambda: "pasted text")
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "copy me"
+        composer.focus()
+
+        await pilot.press("super+a")
+        assert composer.selected_text == "copy me"
+
+        await pilot.press("super+c")
+        assert app.clipboard == "copy me"
+
+        composer.text = ""
+        await pilot.press("super+v")
+        await pilot.pause()
+        assert composer.text == "pasted text"
 
 
 @pytest.mark.asyncio
@@ -1970,6 +2014,7 @@ def test_completed_activity_label_keeps_file_paths() -> None:
     assert _completed_activity_label("Bash pytest -q", failed=False) == "✓ Bash pytest -q"
     assert _completed_activity_label("Think", failed=False) is None
     assert _completed_activity_label("Preparing", failed=False) is None
+    assert _completed_activity_label("Read src/parser.py", failed=True) is None
 
 
 def test_consecutive_file_activity_compacts_into_one_line() -> None:
