@@ -10,6 +10,7 @@
 | `Ctrl+P` | Open the command palette |
 | `Ctrl+G` | Open the searchable skills picker |
 | `Ctrl+O` | Open the session picker |
+| `Ctrl+T` | Expand or collapse live tool output |
 | `Ctrl+N` | Start a new session |
 | `Ctrl+C` | Cancel the active turn and clear queued follow-ups; press twice while idle to quit |
 | `Ctrl+Q` | Quit |
@@ -28,6 +29,10 @@ terminal size. At 110 columns or wider, a change-ledger rail prioritizes the cur
 branch and staged/modified/new counts, session, model usage, and up to six open or blocked todos.
 Narrow terminals retain the transcript, live activity, suggestions, and composer without the rail.
 Terminals 25 rows high or shorter use compact spacing.
+
+Live tool output stays in a compact two-line drawer so long commands do not push the conversation
+away. Press `Ctrl+T` to expand the drawer in place; `F2` retains the complete output after the tool
+finishes.
 
 Type `/` in the composer to open the inline command list; the list remains visible and filters
 continuously. Use `Up`/`Down` to highlight a command, `Enter` or `Tab` to complete it, and `Esc` to

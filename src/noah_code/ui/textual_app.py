@@ -2223,6 +2223,7 @@ class NoahCodeApp(App[None]):
         Binding("ctrl+g", "skills", "Skills", show=True),
         Binding("ctrl+o", "sessions", "Sessions", show=True),
         Binding("ctrl+n", "new_session", "New", show=True),
+        Binding("ctrl+t", "toggle_activity_output", "Tool output", show=False),
         Binding("tab", "toggle_mode", "Build/Plan", show=True),
         Binding("f1", "show_help", "Help", show=True),
         Binding("f2", "activity_history", "Timeline", show=True),
@@ -2293,6 +2294,7 @@ class NoahCodeApp(App[None]):
         self._transcript_line_counts: list[int] = []
         self._unread_count = 0
         self._activity_unread_lines = 0
+        self._activity_expanded = False
         self._follow_batch: bool | None = None
         self._suggestion_matches: list[CommandSuggestion] = []
         self._suggestion_index = 0
@@ -2745,7 +2747,8 @@ class NoahCodeApp(App[None]):
             if self._activity_unread_lines
             else ""
         )
-        signature = (activity_id, record.label, elapsed, progress_text, unread)
+        toggle = "  · Ctrl+T collapse" if self._activity_expanded else "  · Ctrl+T expand"
+        signature = (activity_id, record.label, elapsed, progress_text, unread, toggle)
         if signature == self._activity_title_signature:
             return
         self.query_one("#activity-title", Static).update(
@@ -2754,6 +2757,7 @@ class NoahCodeApp(App[None]):
                 (elapsed, "#777781"),
                 (progress_text, "#7dc4e4"),
                 (unread, "#e6b673"),
+                (toggle, "#777781"),
             ),
             layout=False,
         )
@@ -3406,11 +3410,8 @@ class NoahCodeApp(App[None]):
         if record.label in _HIDDEN_ACTIVITY:
             live.styles.display = "none"
         else:
-            self.query_one("#activity-title", Static).update(
-                Text(record.label, style="#d1d1d6"),
-                layout=False,
-            )
-            self._activity_title_signature = (activity_id, record.label, "")
+            self._activity_title_signature = None
+            self._update_activity_title()
             live.styles.display = "block"
             live.styles.height = 3
         self._update_working_banner()
@@ -3460,7 +3461,9 @@ class NoahCodeApp(App[None]):
             self._update_activity_title()
         if self._active_activity_id and self._active_activity_id in self._activities:
             lines = self._activities[self._active_activity_id].line_count
-            self.query_one("#live-activity", Vertical).styles.height = min(max(lines + 2, 4), 7)
+            self.query_one("#live-activity", Vertical).styles.height = (
+                min(max(lines + 3, 5), 12) if self._activity_expanded else 5
+            )
 
     def _finish_activity(self, event: HostEvent) -> None:
         activity_id = self._activity_id(event)
@@ -3849,6 +3852,7 @@ class NoahCodeApp(App[None]):
             ("Ctrl+C", "Cancel the active turn; press twice while idle to quit", "Global"),
             ("Ctrl+P", "Open the command palette", "Global"),
             ("Ctrl+O", "Browse all workspace sessions", "Global"),
+            ("Ctrl+T", "Expand or collapse live tool output", "Global"),
             ("Ctrl+N", "Start a new session", "Global"),
             ("F2", "Open the collapsible long-task timeline", "Global"),
             ("F3", "Open persisted conversation history", "Global"),
@@ -4830,6 +4834,20 @@ class NoahCodeApp(App[None]):
             return
         target = "plan" if self.host.agent.mode == "build" else "build"
         self._toggle_mode(target)
+
+    def action_toggle_activity_output(self) -> None:
+        """Expand or collapse the current tool's captured output."""
+
+        activity_id = self._active_activity_id
+        if not activity_id or activity_id not in self._activities:
+            return
+        self._activity_expanded = not self._activity_expanded
+        record = self._activities[activity_id]
+        self.query_one("#live-activity", Vertical).styles.height = (
+            min(max(record.line_count + 3, 5), 12) if self._activity_expanded else 5
+        )
+        self._activity_title_signature = None
+        self._update_activity_title()
 
     @work(exclusive=True, group="mode-switch")
     async def _toggle_mode(self, target: str) -> None:

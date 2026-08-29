@@ -2124,6 +2124,41 @@ async def test_file_activity_is_visible_live_then_compacts_together(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_live_tool_output_stays_compact_until_expanded(tmp_path: Path) -> None:
+    ui = TextualUI()
+    app = NoahCodeApp(_fake_host(tmp_path), ui)
+    async with app.run_test(size=(120, 30)) as pilot:
+        ui.render(
+            HostEvent(
+                HostEventKind.TOOL_START,
+                "Bash pytest -q",
+                meta={"activity_id": "tool-1", "tool": "execute_python"},
+            )
+        )
+        ui.render(
+            HostEvent(
+                HostEventKind.SHELL_CHUNK,
+                "one\ntwo\nthree\nfour\nfive\n",
+                meta={"activity_id": "tool-1", "stream": "stdout"},
+            )
+        )
+        await pilot.pause(0.08)
+
+        live = app.query_one("#live-activity")
+        assert live.styles.height.value == 5
+        assert "Ctrl+T expand" in _rendered_text(app.query_one("#activity-title").content)
+
+        await pilot.press("ctrl+t")
+        await pilot.pause()
+
+        assert live.styles.height.value == 8
+        assert "Ctrl+T collapse" in _rendered_text(app.query_one("#activity-title").content)
+
+        await pilot.press("ctrl+t")
+        assert live.styles.height.value == 5
+
+
+@pytest.mark.asyncio
 async def test_event_burst_uses_one_drain_and_bounded_writes(tmp_path: Path, monkeypatch) -> None:
     host = _fake_host(tmp_path)
     ui = TextualUI()
