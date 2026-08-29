@@ -815,7 +815,7 @@ async def test_active_context_rail_shows_semantic_tool_state_not_code(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_status_renders_as_icon_only(tmp_path: Path) -> None:
+async def test_checkpoint_status_waits_for_turn_receipt(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
     ui = TextualUI()
     app = NoahCodeApp(host, ui)
@@ -835,10 +835,11 @@ async def test_checkpoint_status_renders_as_icon_only(tmp_path: Path) -> None:
         await pilot.pause()
 
         transcript = _log_text(app.query_one("#conversation"))
-        assert "◆" in transcript
+        assert "◆" not in transcript
         assert "checkpoint saved" not in transcript.lower()
         assert "turn-0001" not in transcript
         assert "abc123" not in transcript
+        assert app._checkpoint_pending is True
 
 
 @pytest.mark.asyncio
@@ -1267,26 +1268,39 @@ async def test_undo_requires_confirmation_and_previews_scope(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_agent_turn_ends_with_compact_receipt(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
+    ui = TextualUI()
+
+    async def handle_line(_text: str) -> str:
+        ui.render(HostEvent(HostEventKind.STATUS, "◆", meta={"kind": "checkpoint"}))
+        return "continue"
+
+    host.handle_line.side_effect = handle_line
     mutation = SimpleNamespace(path=str(tmp_path / "app.py"))
     host.agent.journal.latest_turn.side_effect = [
         None,
         SimpleNamespace(turn_id="new-turn", mutations=[mutation], shell_may_bypass=False),
     ]
     host.usage_snapshot.return_value = SimpleNamespace(cost_usd=0.02)
-    app = NoahCodeApp(host, TextualUI())
+    app = NoahCodeApp(host, ui)
     async with app.run_test(size=(120, 30)) as pilot:
         composer = app.query_one("#composer")
         composer.text = "Fix the parser"
         app.action_submit()
         for _ in range(20):
             await pilot.pause()
-            if any(entry.role == "RECEIPT" for entry in app._transcript_entries):
+            if any(
+                entry.role == "RECEIPT" and entry.text.startswith("◆ ")
+                for entry in app._transcript_entries
+            ):
                 break
 
         receipt = next(entry.text for entry in app._transcript_entries if entry.role == "RECEIPT")
-        assert "Turn complete" in receipt
+        assert receipt.startswith("◆ Turn complete")
         assert "1 file changed" in receipt
         assert "/diff review" in receipt
+        assert not any(
+            entry.role == "ACTIVITY" and entry.text == "◆" for entry in app._transcript_entries
+        )
 
 
 @pytest.mark.asyncio

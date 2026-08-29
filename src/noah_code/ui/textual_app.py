@@ -2299,6 +2299,7 @@ class NoahCodeApp(App[None]):
         self._unread_count = 0
         self._activity_unread_lines = 0
         self._activity_expanded = False
+        self._checkpoint_pending = False
         self._follow_batch: bool | None = None
         self._suggestion_matches: list[CommandSuggestion] = []
         self._suggestion_index = 0
@@ -3339,7 +3340,18 @@ class NoahCodeApp(App[None]):
                 self._working_loader_signature = None
                 self._sync_status_timers()
             elif kind == "checkpoint":
-                self._append_entry(TranscriptEntry("ACTIVITY", text or "◆"))
+                if self._transcript_entries and self._transcript_entries[-1].role == "RECEIPT":
+                    receipt = self._transcript_entries[-1]
+                    if not receipt.text.startswith("◆ "):
+                        self._transcript_entries[-1] = TranscriptEntry(
+                            "RECEIPT",
+                            f"◆ {receipt.text}",
+                            receipt.markdown,
+                            receipt.event_id,
+                        )
+                        self._rerender_transcript()
+                else:
+                    self._checkpoint_pending = True
             elif kind == "subagent":
                 state = str(event.meta.get("state", "running"))
                 if state == "running":
@@ -5214,6 +5226,9 @@ class NoahCodeApp(App[None]):
                     receipt += f" · ${after_cost - before_cost:.4f}"
                 if changed_files:
                     receipt += " · /diff review · /undo revert"
+                if self._checkpoint_pending:
+                    receipt = f"◆ {receipt}"
+                    self._checkpoint_pending = False
                 self._append_entry(TranscriptEntry("RECEIPT", receipt))
             self._turn_task = None
             if self._agent_state not in {
