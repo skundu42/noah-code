@@ -132,6 +132,7 @@ Type `/` to search the full command and configuration reference. The most common
 | `F2` | Open execution activity |
 | `F3` | Open paginated conversation history |
 | `F4` | Open the live agent, terminal, and job ledger |
+| `Shift+F7` | Focus or leave the scrollable context rail |
 | `/model` | Configure a provider or switch the session model |
 | `/theme` | Choose Atom One Dark, Noah Ocean, Graphite, or High Contrast |
 | `/diff` | Review staged and unstaged changes |

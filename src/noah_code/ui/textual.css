@@ -79,6 +79,20 @@ Screen {
     background: $nc-surface;
     color: $nc-text;
     border-left: solid $nc-border;
+    scrollbar-color: $nc-border;
+    scrollbar-color-hover: $nc-muted;
+    scrollbar-color-active: $nc-accent;
+    scrollbar-background: $nc-surface;
+    scrollbar-size-vertical: 1;
+}
+
+#context-rail:focus {
+    border-left: solid $nc-accent;
+}
+
+#context-rail-content {
+    width: 1fr;
+    height: auto;
 }
 
 #working-banner {

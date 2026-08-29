@@ -789,7 +789,7 @@ async def test_active_context_rail_shows_semantic_tool_state_not_code(tmp_path: 
         )
         await pilot.pause()
 
-        rail = _rendered_text(app.query_one("#context-rail").content)
+        rail = _rendered_text(app.query_one("#context-rail-content").content)
         assert "Running\nBash pytest -q" in rail
         assert "result = await" not in rail
 
@@ -913,7 +913,7 @@ async def test_context_rail_prioritizes_changes_session_and_usage(
                 break
             await pilot.pause()
 
-        rail = _rendered_text(app.query_one("#context-rail").content)
+        rail = _rendered_text(app.query_one("#context-rail-content").content)
         assert "NOW" in rail
         assert "CHANGES\nfeature/tui\n1 staged · 2 modified · 3 new" in rail
         assert "SESSION" in rail
@@ -932,7 +932,7 @@ async def test_context_rail_finishes_non_git_status_probe(tmp_path: Path) -> Non
                 break
             await pilot.pause()
 
-        rail = _rendered_text(app.query_one("#context-rail").content)
+        rail = _rendered_text(app.query_one("#context-rail-content").content)
         assert "CHANGES\nNot a Git worktree" in rail
         assert "Reading Git status" not in rail
 
@@ -1432,7 +1432,7 @@ async def test_tui_paints_before_host_start_and_queues_first_prompt(tmp_path: Pa
         assert "agent at work" in welcome
         assert len(welcome.splitlines()) >= 8
         assert "Starting agent" not in welcome
-        assert "Starting" in _rendered_text(app.query_one("#context-rail").content)
+        assert "Starting" in _rendered_text(app.query_one("#context-rail-content").content)
         host.start.assert_awaited_once()
 
         composer = app.query_one("#composer")
@@ -1499,7 +1499,7 @@ async def test_first_run_opens_model_setup_before_starting_agent(tmp_path: Path)
         assert "MODEL SETUP" in app.screen.query_one("#picker-title").render().plain
         host.start.assert_not_awaited()
         assert app.query_one("#welcome").styles.display == "block"
-        rail = _rendered_text(app.query_one("#context-rail").content)
+        rail = _rendered_text(app.query_one("#context-rail-content").content)
         assert "Choose a model" in rail
 
         await pilot.press("enter")
@@ -1545,7 +1545,7 @@ async def test_available_update_uses_temporary_banner_and_persistent_rail(
         assert banner.styles.display == "block"
         assert "0.2.1 → 0.3.0" in _rendered_text(banner.content)
         assert "noah update" in _rendered_text(banner.content)
-        rail = _rendered_text(app.query_one("#context-rail").content)
+        rail = _rendered_text(app.query_one("#context-rail-content").content)
         assert "UPDATE" in rail
         assert "0.2.1 → 0.3.0" in rail
 
@@ -2042,6 +2042,27 @@ async def test_adaptive_layout_breakpoints(
         assert app.screen.has_class("compact") is compact
         expected = "block" if wide else "none"
         assert app.query_one("#context-rail").styles.display == expected
+
+
+@pytest.mark.asyncio
+async def test_context_rail_is_keyboard_scrollable(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host.agent.todos.list_todos.return_value = [
+        SimpleNamespace(status="open", title=f"Task {index}") for index in range(8)
+    ]
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=(120, 24)) as pilot:
+        rail = app.query_one("#context-rail")
+        assert rail.max_scroll_y > 0
+
+        await pilot.press("shift+f7")
+        assert app.focused is rail
+        await pilot.press("end")
+        await pilot.pause()
+        assert rail.is_vertical_scroll_end
+
+        await pilot.press("shift+f7")
+        assert app.focused is app.query_one("#composer")
 
 
 def test_completed_activity_label_keeps_file_paths() -> None:
@@ -2614,7 +2635,7 @@ async def test_chrome_shows_queued_count(tmp_path: Path) -> None:
         app.update_chrome(force=True)
         await pilot.pause()
         header = _rendered_text(app.query_one("#header").content)
-        rail = _rendered_text(app.query_one("#context-rail").content)
+        rail = _rendered_text(app.query_one("#context-rail-content").content)
         assert "queued · 2" in header
         assert "queued · 2" in rail
 

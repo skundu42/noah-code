@@ -27,7 +27,7 @@ from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.geometry import Offset
 from textual.message import Message
 from textual.screen import ModalScreen
@@ -2233,6 +2233,7 @@ class NoahCodeApp(App[None]):
         Binding("f5", "queue_manager", "Queue", show=True),
         Binding("f6", "notice_details", "Details", show=True),
         Binding("f7", "context_visibility", "Context", show=True),
+        Binding("shift+f7", "focus_context_rail", "Context rail", show=False),
         Binding("ctrl+]", "scroll_live", "Latest", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
     ]
@@ -2352,7 +2353,8 @@ class NoahCodeApp(App[None]):
                         min_width=0,
                         max_lines=500,
                     )
-            yield Static("", id="context-rail")
+            with VerticalScroll(id="context-rail"):
+                yield Static("", id="context-rail-content")
         yield Static("", id="command-suggestions")
         yield Static("", id="input-context")
         yield ComposerTextArea(
@@ -2910,7 +2912,7 @@ class NoahCodeApp(App[None]):
             if force or rail != self._rail_text:
                 self._rail_text = rail
                 with contextlib.suppress(Exception):
-                    self.query_one("#context-rail", Static).update(rail, layout=False)
+                    self.query_one("#context-rail-content", Static).update(rail, layout=False)
             self._rail_dirty = False
         self._update_input_context()
         self._update_working_banner()
@@ -3895,6 +3897,7 @@ class NoahCodeApp(App[None]):
             ("F5", "Manage queued prompts and attachments", "Global"),
             ("F6", "Expand the latest notice or error", "Global"),
             ("F7", "Inspect active context sources", "Global"),
+            ("Shift+F7", "Focus or leave the scrollable context rail", "Global"),
             ("? / F1", "Search this keyboard reference", "Global"),
             ("Ctrl+]", "Jump to the latest transcript and tool output", "Transcript"),
             ("Mouse drag", "Select and copy transcript text", "Transcript"),
@@ -4571,6 +4574,16 @@ class NoahCodeApp(App[None]):
 
     def action_context_visibility(self) -> None:
         self.push_screen(ContextVisibilityScreen(self.host))
+
+    def action_focus_context_rail(self) -> None:
+        if not self.screen.has_class("wide"):
+            self.action_context_visibility()
+            return
+        rail = self.query_one("#context-rail", VerticalScroll)
+        if self.focused is rail:
+            self.query_one("#composer", ComposerTextArea).focus()
+        else:
+            rail.focus()
 
     def action_work_ledger(self) -> None:
         self.push_screen(WorkLedgerScreen(self.host))

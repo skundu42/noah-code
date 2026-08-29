@@ -19,6 +19,7 @@
 | `F2` | Open recent activity and full captured output |
 | `F3` | Open paginated persisted conversation history |
 | `F4` | Open the live work ledger for agents, terminals, and background jobs |
+| `Shift+F7` | Focus or leave the context rail on wide terminals |
 | `Ctrl+]` | Return to live transcript output and clear the new-output counter |
 
 At an approval prompt, press `1` to approve once, `2` to remember the approval for the current
@@ -47,9 +48,10 @@ to every resolved configuration path and its current redacted value.
 
 Until a session has its first user prompt, the main pane keeps the large Noah wordmark centered. Startup,
 repository changes, model, mode, usage, and update state live in the context rail on wide
-terminals. Git status is collected in a background worker at startup and turn boundaries; the
-animated Noah path updates only the working banner and live activity. Existing sessions with user history restore
-their transcript normally.
+terminals. The rail scrolls when its sections exceed the available rows; press `Shift+F7`, then use
+arrows, Page Up/Down, Home, or End without leaving the keyboard. Git status is collected in a
+background worker at startup and turn boundaries; the animated Noah path updates only the working
+banner and live activity. Existing sessions with user history restore their transcript normally.
 
 Drag across transcript, activity, diff, or history text to select it. `Cmd+C` on macOS or
 `Ctrl+Shift+C` in other terminals copies the selection; when there is no selection, the same
