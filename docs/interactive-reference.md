@@ -9,9 +9,11 @@
 | `Tab` | Toggle `build`/`plan` mode; accept the highlighted slash option while suggestions are open |
 | `Ctrl+P` | Open the command palette |
 | `Ctrl+G` | Open the searchable skills picker |
+| `Ctrl+L` | Open the model picker |
 | `Ctrl+O` | Open the session picker |
 | `Ctrl+T` | Expand or collapse live tool output |
 | `Alt+Up` | Recall the newest queued prompt into the composer |
+| `Shift+Tab` | Open the reasoning-effort picker |
 | `Ctrl+N` | Start a new session |
 | `Ctrl+C` | Cancel the active turn and clear queued follow-ups; press twice while idle to quit |
 | `Ctrl+Q` | Quit |

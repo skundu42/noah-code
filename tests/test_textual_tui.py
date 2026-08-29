@@ -1954,6 +1954,58 @@ async def test_exact_reasoning_command_opens_picker_and_switches_effort(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_model_and_reasoning_shortcuts_preserve_composer_draft(tmp_path: Path) -> None:
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "Keep this draft"
+
+        await pilot.press("ctrl+l")
+        await pilot.pause()
+        assert isinstance(app.screen, FilteredPicker)
+        assert "MODEL SETUP" in app.screen.query_one("#picker-title").render().plain
+        model_picker = app.screen
+        await pilot.press("ctrl+l")
+        assert app.screen is model_picker
+        await pilot.press("escape")
+        await pilot.pause()
+        assert composer.text == "Keep this draft"
+
+        await pilot.press("shift+tab")
+        await pilot.pause()
+        assert isinstance(app.screen, FilteredPicker)
+        assert "REASONING EFFORT" in app.screen.query_one("#picker-title").render().plain
+        await pilot.press("escape")
+        await pilot.pause()
+        assert composer.text == "Keep this draft"
+
+
+@pytest.mark.asyncio
+async def test_setup_shortcuts_explain_unavailable_states(tmp_path: Path) -> None:
+    ui = TextualUI()
+    app = NoahCodeApp(_fake_host(tmp_path), ui)
+    async with app.run_test() as pilot:
+        ui.set_busy(True)
+        await pilot.press("ctrl+l")
+        await pilot.pause()
+
+        assert not isinstance(app.screen, FilteredPicker)
+        notice = _rendered_text(app.query_one("#notice-banner").content)
+        assert "Finish or cancel the active turn" in notice
+
+        await pilot.press("shift+tab")
+        await pilot.pause()
+        assert "before changing reasoning effort" in app._last_notice_detail
+
+        ui.set_busy(False)
+        app._agent_ready = False
+        await pilot.press("shift+tab")
+        await pilot.pause()
+        notice = _rendered_text(app.query_one("#notice-banner").content)
+        assert "Choose a model" in notice
+
+
+@pytest.mark.asyncio
 async def test_model_setup_recovers_a_missing_credential_startup_failure(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
     host._agent = None

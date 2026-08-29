@@ -2221,10 +2221,12 @@ class NoahCodeApp(App[None]):
         Binding("ctrl+v,super+v", "paste_clipboard", "Paste", show=False, priority=True),
         Binding("ctrl+p", "palette", "Commands", show=True),
         Binding("ctrl+g", "skills", "Skills", show=True),
+        Binding("ctrl+l", "model_setup", "Model", show=True),
         Binding("ctrl+o", "sessions", "Sessions", show=True),
         Binding("ctrl+n", "new_session", "New", show=True),
         Binding("ctrl+t", "toggle_activity_output", "Tool output", show=False),
         Binding("alt+up", "recall_queued_prompt", "Recall queued", show=False),
+        Binding("shift+tab", "reasoning_setup", "Reasoning", show=False, priority=True),
         Binding("tab", "toggle_mode", "Build/Plan", show=True),
         Binding("f1", "show_help", "Help", show=True),
         Binding("f2", "activity_history", "Timeline", show=True),
@@ -3887,9 +3889,11 @@ class NoahCodeApp(App[None]):
             ("Cmd+A / C / V", "Select all, copy, or paste", "Composer"),
             ("Ctrl+C", "Cancel the active turn; press twice while idle to quit", "Global"),
             ("Ctrl+P", "Open the command palette", "Global"),
+            ("Ctrl+L", "Choose the session model", "Global"),
             ("Ctrl+O", "Browse all workspace sessions", "Global"),
             ("Ctrl+T", "Expand or collapse live tool output", "Global"),
             ("Alt+↑", "Recall the newest queued prompt", "Composer"),
+            ("Shift+Tab", "Choose the reasoning effort", "Composer"),
             ("Ctrl+N", "Start a new session", "Global"),
             ("F2", "Open the collapsible long-task timeline", "Global"),
             ("F3", "Open persisted conversation history", "Global"),
@@ -4242,6 +4246,17 @@ class NoahCodeApp(App[None]):
     async def action_reasoning_setup(self) -> None:
         """Switch reasoning effort without repeating provider or credential setup."""
 
+        if isinstance(self.screen, ModalScreen):
+            return
+        if not self._agent_ready:
+            self._show_notice("Choose a model before setting reasoning effort", temporary=True)
+            return
+        if self.ui.busy:
+            self._show_notice(
+                "Finish or cancel the active turn before changing reasoning effort",
+                temporary=True,
+            )
+            return
         try:
             effort = await self._pick_reasoning_effort("Reasoning effort")
             if effort is None:
@@ -4314,6 +4329,14 @@ class NoahCodeApp(App[None]):
     async def action_model_setup(self) -> None:
         """Configure a provider credential and model from the TUI."""
 
+        if isinstance(self.screen, ModalScreen):
+            return
+        if self.ui.busy and self._agent_ready:
+            self._show_notice(
+                "Finish or cancel the active turn before changing models",
+                temporary=True,
+            )
+            return
         try:
             from noah_code.providers import provider_preset
 

@@ -125,7 +125,9 @@ Type `/` to search the full command and configuration reference. The most common
 | Drag, then `Cmd+C` / `Ctrl+Shift+C` | Select and copy TUI text |
 | `Ctrl+Shift+C` with no selection | Copy the latest Noah reply |
 | `Ctrl+G` | Open the searchable skills picker |
+| `Ctrl+L` | Open the model picker |
 | `Ctrl+T` | Expand or collapse live tool output |
+| `Shift+Tab` | Open the reasoning-effort picker |
 | `Alt+Up` | Recall the newest queued prompt for editing |
 | `Ctrl+]` | Return to live transcript output |
 | `Tab` | Switch between build and plan mode |
