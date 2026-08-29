@@ -31,6 +31,10 @@ branch and staged/modified/new counts, session, model usage, and up to six open 
 Narrow terminals retain the transcript, live activity, suggestions, and composer without the rail.
 Terminals 25 rows high or shorter use compact spacing.
 
+The line below the composer keeps the active keyboard guidance on the left and, when space permits,
+session input/output tokens, cache hit rate, and estimated cost on the right. This telemetry remains
+available even when the wide context rail is hidden.
+
 Live tool output stays in a compact two-line drawer so long commands do not push the conversation
 away. Press `Ctrl+T` to expand the drawer in place; `F2` retains the complete output after the tool
 finishes.

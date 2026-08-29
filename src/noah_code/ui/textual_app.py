@@ -2257,7 +2257,6 @@ class NoahCodeApp(App[None]):
         self._session_id = host.meta.session_id if host.meta else None
         self._interrupt_count = 0
         self._header_text = ""
-        self._hint_text = ""
         self._rail_text: Text | str = ""
         self._rail_dirty = True
         self._repository_snapshot: RepositorySnapshot | None = None
@@ -2356,13 +2355,13 @@ class NoahCodeApp(App[None]):
             yield Static("", id="context-rail")
         yield Static("", id="command-suggestions")
         yield Static("", id="input-context")
-        yield Static("Enter send · Shift+Enter newline · / commands · F4 work", id="context-hint")
         yield ComposerTextArea(
             id="composer",
             language=None,
             soft_wrap=True,
             placeholder="Describe the outcome you want, or type / for commands",
         )
+        yield Static("Enter send · Shift+Enter newline · / commands · F4 work", id="context-hint")
 
     def on_mount(self) -> None:
         self._app_mounted = True
@@ -2889,10 +2888,7 @@ class NoahCodeApp(App[None]):
                 else "Enter send · Shift+Enter newline · drag to copy · "
                 "/ commands · F2 timeline · ? help"
             )
-        if force or hint != self._hint_text:
-            self._hint_text = hint
-            with contextlib.suppress(Exception):
-                self.query_one("#context-hint", Static).update(hint, layout=False)
+        self._update_context_hint(hint)
 
         if force or self._rail_dirty:
             rail = self._build_rail_text()
@@ -2903,6 +2899,30 @@ class NoahCodeApp(App[None]):
             self._rail_dirty = False
         self._update_input_context()
         self._update_working_banner()
+
+    def _update_context_hint(self, hint: str) -> None:
+        """Render contextual keys with pi-style session telemetry when it fits."""
+
+        telemetry = ""
+        with contextlib.suppress(AttributeError, TypeError, ValueError):
+            usage = self.host.usage_snapshot()
+            prompt_tokens = int(usage.prompt_tokens)
+            completion_tokens = int(usage.completion_tokens)
+            cost = float(usage.cost_usd)
+            if prompt_tokens or completion_tokens or cost:
+                telemetry = f"↑{prompt_tokens:,}  ↓{completion_tokens:,}"
+                if prompt_tokens:
+                    telemetry += f"  {float(usage.cache_hit_ratio):.0%} cache"
+                telemetry += f"  ${cost:.4f}"
+        available = max(self.size.width - 6, 0)
+        gap = available - len(hint) - len(telemetry)
+        palette = self.theme_palette
+        content = Text(hint, style=palette.muted)
+        if telemetry and gap >= 3:
+            content.append(" " * gap)
+            content.append(telemetry, style=palette.muted)
+        with contextlib.suppress(Exception):
+            self.query_one("#context-hint", Static).update(content, layout=False)
 
     def _update_input_context(self) -> None:
         """Show pending files and queued prompts immediately above the composer."""
@@ -3623,9 +3643,8 @@ class NoahCodeApp(App[None]):
         if not self._suggestion_matches:
             widget.update("")
             widget.styles.display = "none"
-            self.query_one("#context-hint", Static).update(
-                "Enter send · Shift+Enter newline · Tab build/plan · / commands · F4 work",
-                layout=False,
+            self._update_context_hint(
+                "Enter send · Shift+Enter newline · Tab build/plan · / commands · F4 work"
             )
             return
         total = len(self._suggestion_matches)
@@ -3668,9 +3687,8 @@ class NoahCodeApp(App[None]):
             )
         widget.update(Group(*lines))
         widget.styles.display = "block"
-        self.query_one("#context-hint", Static).update(
-            "↑/↓ choose · Tab complete · Enter select/send · Esc close",
-            layout=False,
+        self._update_context_hint(
+            "↑/↓ choose · Tab complete · Enter select/send · Esc close"
         )
 
     def move_suggestion(self, delta: int) -> None:

@@ -164,7 +164,7 @@ Screen {
     height: 4;
     min-height: 3;
     max-height: 8;
-    margin: 0 2 1 2;
+    margin: 0 2;
     padding: 0 1;
     background: $nc-surface;
     color: $nc-text;
@@ -181,11 +181,6 @@ Screen {
 
 .compact #welcome {
     padding: 1 2;
-}
-
-.compact #context-hint {
-    display: block;
-    padding: 0 1;
 }
 
 .compact #input-context {

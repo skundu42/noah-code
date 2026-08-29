@@ -92,6 +92,17 @@ def _fake_host(tmp_path: Path):
     host._pending_attach_paths = []
     host.work_snapshot.return_value = {"agents": [], "jobs": []}
     host.context_snapshot.return_value = []
+    host.usage_snapshot.return_value = UsageSnapshot(
+        calls=0,
+        failed_calls=0,
+        prompt_tokens=0,
+        cached_tokens=0,
+        completion_tokens=0,
+        reasoning_tokens=0,
+        cost_usd=0,
+        llm_seconds=0,
+        tool_output_chars=0,
+    )
 
     def take_pending_attaches():
         paths, host._pending_attach_paths = host._pending_attach_paths, []
@@ -1176,6 +1187,35 @@ async def test_compact_layout_keeps_contextual_hint_visible(tmp_path: Path) -> N
         assert app.screen.has_class("compact")
         assert hint.styles.display == "block"
         assert "Enter send" in _rendered_text(hint.content)
+
+
+@pytest.mark.asyncio
+async def test_composer_footer_shows_session_usage_when_space_allows(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host.usage_snapshot.return_value = UsageSnapshot(
+        calls=3,
+        failed_calls=0,
+        prompt_tokens=12_000,
+        cached_tokens=9_000,
+        completion_tokens=800,
+        reasoning_tokens=200,
+        cost_usd=0.1234,
+        llm_seconds=4.2,
+        tool_output_chars=1_024,
+    )
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=(100, 20)):
+        children = list(app.screen.children)
+        composer = app.query_one("#composer")
+        footer = app.query_one("#context-hint")
+        assert children.index(composer) < children.index(footer)
+
+        text = _rendered_text(footer.content)
+        assert "Enter send" in text
+        assert "↑12,000" in text
+        assert "↓800" in text
+        assert "75% cache" in text
+        assert "$0.1234" in text
 
 
 @pytest.mark.asyncio

@@ -145,6 +145,8 @@ On wide terminals, the side rail prioritizes the active operation, delegated age
 terminals, Git branch and change counts, session, model usage, update state, and plan. Git status is refreshed in the background at turn
 boundaries, so the animated working state stays responsive. The main pane remains centered on the
 large Noah wordmark until the first prompt, then becomes the conversation and execution timeline.
+The composer footer keeps contextual keys and compact token, cache, and cost telemetry visible at
+every terminal width where they fit.
 
 ## Sessions and crash recovery
 
