@@ -126,6 +126,7 @@ Type `/` to search the full command and configuration reference. The most common
 | `Ctrl+Shift+C` with no selection | Copy the latest Noah reply |
 | `Ctrl+G` | Open the searchable skills picker |
 | `Ctrl+L` | Open the model picker |
+| `Ctrl+R` | Search and recall a prior prompt |
 | `Ctrl+T` | Expand or collapse live tool output |
 | `Shift+Tab` | Open the reasoning-effort picker |
 | `Alt+Up` | Recall the newest queued prompt for editing |

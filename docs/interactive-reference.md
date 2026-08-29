@@ -11,6 +11,7 @@
 | `Ctrl+G` | Open the searchable skills picker |
 | `Ctrl+L` | Open the model picker |
 | `Ctrl+O` | Open the session picker |
+| `Ctrl+R` | Search prior prompts and recall one into the composer |
 | `Ctrl+T` | Expand or collapse live tool output |
 | `Alt+Up` | Recall the newest queued prompt into the composer |
 | `Shift+Tab` | Open the reasoning-effort picker |
@@ -47,6 +48,9 @@ Type `/` in the composer to open the inline command list; the list remains visib
 continuously. Use `Up`/`Down` to highlight a command, `Enter` or `Tab` to complete it, and `Esc` to
 close the list. Press `Enter` again to run the completed command. Typing `/config` expands the list
 to every resolved configuration path and its current redacted value.
+
+Press `Ctrl+R` to search prompts already shown in the current session. Choosing one loads it into
+the composer without sending it; pressing `Esc` keeps the current draft unchanged.
 
 Until a session has its first user prompt, the main pane keeps the large Noah wordmark centered. Startup,
 repository changes, model, mode, usage, and update state live in the context rail on wide

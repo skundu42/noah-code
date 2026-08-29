@@ -2361,6 +2361,45 @@ async def test_conversation_history_loads_persisted_events(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_prompt_history_search_recalls_text_without_losing_draft_on_cancel(
+    tmp_path: Path,
+) -> None:
+    host = _fake_host(tmp_path)
+    prompt = (
+        "Plan the database migration with compatibility checks, staged rollout, "
+        "monitoring, and a searchable needle\nInclude rollback steps"
+    )
+    host.load_history_page.return_value = [
+        SessionEventRecord(1, "event-1", "Task", {"prompt": "Older prompt"}),
+        SessionEventRecord(2, "event-2", "Task", {"prompt": prompt}),
+    ]
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        composer = app.query_one("#composer")
+        composer.text = "Current unfinished draft"
+
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        assert isinstance(app.screen, FilteredPicker)
+        assert "PROMPT HISTORY" in app.screen.query_one("#picker-title").render().plain
+        await pilot.press("escape")
+        await pilot.pause()
+        assert composer.text == "Current unfinished draft"
+
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        app.screen.query_one("#picker-filter", Input).value = "searchable needle"
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert composer.text == prompt
+        assert composer.cursor_location == composer.document.end
+        host.handle_line.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_approval_modal_reject_is_safe_default(tmp_path: Path) -> None:
     decision = PermissionDecision(
         category="edit",

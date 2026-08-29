@@ -1090,7 +1090,7 @@ class FilteredPicker(ModalScreen[str | None]):
             contains = [
                 row
                 for row in self._rows
-                if row not in starts and query in f"{row[1]} {row[2]}".lower()
+                if row not in starts and query in f"{row[0]} {row[1]} {row[2]}".lower()
             ]
             self._filtered = starts + contains
         else:
@@ -2223,6 +2223,7 @@ class NoahCodeApp(App[None]):
         Binding("ctrl+g", "skills", "Skills", show=True),
         Binding("ctrl+l", "model_setup", "Model", show=True),
         Binding("ctrl+o", "sessions", "Sessions", show=True),
+        Binding("ctrl+r", "prompt_history", "Recall", show=True),
         Binding("ctrl+n", "new_session", "New", show=True),
         Binding("ctrl+t", "toggle_activity_output", "Tool output", show=False),
         Binding("alt+up", "recall_queued_prompt", "Recall queued", show=False),
@@ -2902,10 +2903,10 @@ class NoahCodeApp(App[None]):
             )
         else:
             hint = (
-                "Enter send · / commands · F2 timeline · ? help"
+                "Enter send · / commands · Ctrl+R recall · ? help"
                 if compact
-                else "Enter send · Shift+Enter newline · drag to copy · "
-                "/ commands · F2 timeline · ? help"
+                else "Enter send · Shift+Enter newline · Ctrl+R recall · "
+                "/ commands · ? help"
             )
         self._update_context_hint(hint)
 
@@ -3891,6 +3892,7 @@ class NoahCodeApp(App[None]):
             ("Ctrl+P", "Open the command palette", "Global"),
             ("Ctrl+L", "Choose the session model", "Global"),
             ("Ctrl+O", "Browse all workspace sessions", "Global"),
+            ("Ctrl+R", "Search and recall a prior prompt", "Composer"),
             ("Ctrl+T", "Expand or collapse live tool output", "Global"),
             ("Alt+↑", "Recall the newest queued prompt", "Composer"),
             ("Shift+Tab", "Choose the reasoning effort", "Composer"),
@@ -3964,6 +3966,39 @@ class NoahCodeApp(App[None]):
             composer = self.query_one("#composer", ComposerTextArea)
             composer.text = choice
             composer.cursor_location = (0, len(choice))
+            composer.focus()
+
+    @work(exclusive=True, group="prompt-history")
+    async def action_prompt_history(self) -> None:
+        """Recall a prior prompt into the composer without sending it."""
+
+        if isinstance(self.screen, ModalScreen):
+            return
+        seen: set[str] = set()
+        prompts: list[str] = []
+        for entry in reversed(self._transcript_entries):
+            prompt = entry.text.strip()
+            if entry.role == "YOU" and prompt and prompt not in seen:
+                seen.add(prompt)
+                prompts.append(prompt)
+        if not prompts:
+            self._show_notice("No prior prompts to recall", temporary=True)
+            return
+        rows = [
+            (
+                prompt,
+                _truncate_middle(" ".join(prompt.split()), 76),
+                f"{len(prompt.splitlines())} lines" if "\n" in prompt else "",
+            )
+            for prompt in prompts
+        ]
+        choice = await self.push_screen_wait(
+            FilteredPicker("Prompt history", rows, "Type to search · Enter recall · Esc keep draft")
+        )
+        if choice is not None:
+            composer = self.query_one("#composer", ComposerTextArea)
+            composer.text = choice
+            composer.cursor_location = composer.document.end
             composer.focus()
 
     @work(exclusive=True, group="skills")
