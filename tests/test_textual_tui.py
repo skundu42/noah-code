@@ -1290,7 +1290,7 @@ async def test_agent_turn_ends_with_compact_receipt(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
+async def test_activity_drawer_replaces_busy_banner_without_cluttering_chat(
     tmp_path: Path,
 ) -> None:
     host = _fake_host(tmp_path)
@@ -1308,14 +1308,8 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
         await pilot.pause()
 
         banner = app.query_one("#working-banner")
-        assert banner.styles.display == "block"
+        assert banner.styles.display == "none"
         assert "queue follow-up" in _rendered_text(app.query_one("#context-hint").content)
-        banner_text = _working_banner_text(app)
-        assert "WORKING" not in banner_text
-        assert "Inspecting repository" in banner_text
-        assert any(frame in banner_text for frame in WORKING_COMET_FRAMES)
-        assert "NOAH" in banner_text
-        assert banner.styles.height.value == 1
         live = app.query_one("#live-activity")
         assert live.styles.display == "block"
         title = _rendered_text(app.query_one("#activity-title").content)
@@ -1338,6 +1332,8 @@ async def test_busy_banner_is_obvious_and_internal_cells_do_not_clutter_chat(
         assert "✓ Inspect" in transcript
         assert "execute_python" not in transcript
         assert "Activity" not in transcript
+        assert banner.styles.display == "block"
+        assert "Thinking" in _working_banner_text(app)
 
         ui.set_busy(False)
         await pilot.pause()
@@ -2193,7 +2189,7 @@ async def test_live_tool_output_stays_compact_until_expanded(tmp_path: Path) -> 
         await pilot.pause(0.08)
 
         live = app.query_one("#live-activity")
-        assert live.styles.height.value == 5
+        assert live.styles.height.value == 6
         assert "Ctrl+T expand" in _rendered_text(app.query_one("#activity-title").content)
 
         await pilot.press("ctrl+t")
@@ -2203,7 +2199,7 @@ async def test_live_tool_output_stays_compact_until_expanded(tmp_path: Path) -> 
         assert "Ctrl+T collapse" in _rendered_text(app.query_one("#activity-title").content)
 
         await pilot.press("ctrl+t")
-        assert live.styles.height.value == 5
+        assert live.styles.height.value == 6
 
 
 @pytest.mark.asyncio
@@ -2397,7 +2393,9 @@ async def test_question_modal_other_escape_returns_to_choices(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_reasoning_attaches_to_activity_and_banner_shows_thought(tmp_path: Path) -> None:
+async def test_reasoning_attaches_to_activity_title_without_duplicate_banner(
+    tmp_path: Path,
+) -> None:
     host = _fake_host(tmp_path)
     host.config.ui.show_reasoning = False
     ui = TextualUI()
@@ -2418,8 +2416,9 @@ async def test_reasoning_attaches_to_activity_and_banner_shows_thought(tmp_path:
         record = app._activities["read-1"]
         assert "export path" in record.thought
         assert app._last_thought == "Check the export path first"
-        banner_text = _working_banner_text(app)
-        assert "↳" in banner_text
+        title = _rendered_text(app.query_one("#activity-title").content)
+        assert "↳ Check the export path first" in title
+        assert app.query_one("#working-banner").styles.display == "none"
         # Reasoning stays out of the transcript when show_reasoning is off.
         transcript = _log_text(app.query_one("#conversation"))
         assert "Thinking:" not in transcript

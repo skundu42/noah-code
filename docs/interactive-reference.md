@@ -37,7 +37,8 @@ available even when the wide context rail is hidden.
 
 Live tool output stays in a compact two-line drawer so long commands do not push the conversation
 away. Press `Ctrl+T` to expand the drawer in place; `F2` retains the complete output after the tool
-finishes.
+finishes. The drawer replaces the animated working banner while a visible tool is active, avoiding
+duplicate status lines; the banner returns between tools.
 
 Type `/` in the composer to open the inline command list; the list remains visible and filters
 continuously. Use `Up`/`Down` to highlight a command, `Enter` or `Tab` to complete it, and `Esc` to

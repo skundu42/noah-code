@@ -2618,7 +2618,11 @@ class NoahCodeApp(App[None]):
 
         with contextlib.suppress(Exception):
             banner = self.query_one("#working-banner", Horizontal)
-            if not self._working_state_visible():
+            activity = self._activities.get(self._active_activity_id or "")
+            activity_visible = activity is not None and activity.label not in _HIDDEN_ACTIVITY
+            if not self._working_state_visible() or activity_visible:
+                if activity_visible:
+                    self._update_activity_title()
                 if self._working_banner_visible:
                     banner.styles.display = "none"
                     self._working_banner_visible = False
@@ -2747,8 +2751,18 @@ class NoahCodeApp(App[None]):
             if self._activity_unread_lines
             else ""
         )
+        thought = " ".join(record.thought.splitlines()[-1].split()) if record.thought else ""
+        thought_text = f"  ↳ {_truncate_middle(thought, 40)}" if thought else ""
         toggle = "  · Ctrl+T collapse" if self._activity_expanded else "  · Ctrl+T expand"
-        signature = (activity_id, record.label, elapsed, progress_text, unread, toggle)
+        signature = (
+            activity_id,
+            record.label,
+            elapsed,
+            progress_text,
+            thought_text,
+            unread,
+            toggle,
+        )
         if signature == self._activity_title_signature:
             return
         self.query_one("#activity-title", Static).update(
@@ -2756,6 +2770,7 @@ class NoahCodeApp(App[None]):
                 (record.label, "#d1d1d6"),
                 (elapsed, "#777781"),
                 (progress_text, "#7dc4e4"),
+                (thought_text, "#777781"),
                 (unread, "#e6b673"),
                 (toggle, "#777781"),
             ),
@@ -3483,7 +3498,7 @@ class NoahCodeApp(App[None]):
         if self._active_activity_id and self._active_activity_id in self._activities:
             lines = self._activities[self._active_activity_id].line_count
             self.query_one("#live-activity", Vertical).styles.height = (
-                min(max(lines + 3, 5), 12) if self._activity_expanded else 5
+                min(max(lines + 3, 6), 12) if self._activity_expanded else 6
             )
 
     def _finish_activity(self, event: HostEvent) -> None:
@@ -4864,7 +4879,7 @@ class NoahCodeApp(App[None]):
         self._activity_expanded = not self._activity_expanded
         record = self._activities[activity_id]
         self.query_one("#live-activity", Vertical).styles.height = (
-            min(max(record.line_count + 3, 5), 12) if self._activity_expanded else 5
+            min(max(record.line_count + 3, 6), 12) if self._activity_expanded else 6
         )
         self._activity_title_signature = None
         self._update_activity_title()
