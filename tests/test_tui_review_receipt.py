@@ -18,6 +18,9 @@ from noah_code.tools.git_tools import DiffFile, DiffReview
 from noah_code.ui.textual_app import DiffReviewScreen, NoahCodeApp, TextualUI, _recorded_checks_text
 from noah_code.workspace import Workspace
 from test_git_tools import _git_workspace
+from test_textual_tui import (
+    _disable_live_update_checks as _disable_live_update_checks,
+)
 from test_textual_tui import _fake_host, _log_text
 from test_workspace_tools import _make_ws
 
@@ -121,7 +124,9 @@ async def test_review_opens_before_patch_and_supports_filter_refresh_hunks(tmp_p
         await screen.action_revert().wait()
         host.revert_diff_file.assert_not_called()
         assert "Read-only review" in str(screen.query_one("#diff-status").content)
+        patch_worker = next(worker for worker in screen.workers if worker.group == "diff-details")
         loaded.set()
+        await asyncio.wait_for(patch_worker.wait(), 5)
         await pilot.pause()
         assert "+new" in _log_text(screen.query_one("#diff-patch"))
         screen.action_next_hunk()

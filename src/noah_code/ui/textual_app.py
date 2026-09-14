@@ -3169,6 +3169,8 @@ class NoahCodeApp(App[None]):
         self._working_loader_signature = frame
 
     def update_chrome(self, *, force: bool = False) -> None:
+        if not self.screen_stack:
+            return
         meta = self.host.meta
         palette = self.theme_palette
         mode = self.host.agent.mode if self.host._agent else self.host.config.mode

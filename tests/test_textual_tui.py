@@ -952,6 +952,16 @@ async def test_context_rail_prioritizes_changes_and_keeps_metadata_in_header(
 
 
 @pytest.mark.asyncio
+async def test_chrome_refresh_is_safe_without_a_screen(tmp_path: Path) -> None:
+    app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
+    app.update_chrome(force=True)
+    async with app.run_test():
+        assert app.screen_stack
+    assert not app.screen_stack
+    app.update_chrome(force=True)
+
+
+@pytest.mark.asyncio
 async def test_context_rail_finishes_non_git_status_probe(tmp_path: Path) -> None:
     app = NoahCodeApp(_fake_host(tmp_path), TextualUI())
     async with app.run_test(size=(120, 30)) as pilot:
