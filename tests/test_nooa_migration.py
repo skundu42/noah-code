@@ -7,19 +7,20 @@ from nooa.tools.shell_tools import ShellTools
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command,expected_code", [("printf 'unterminated", 1), ("cat", 0)])
+@pytest.mark.parametrize("command,expected_codes", [("printf 'unterminated", (1, 2)), ("cat", (0,))])
 async def test_shell_commands_cannot_consume_the_control_protocol(
-    tmp_path: Path, command: str, expected_code: int
+    tmp_path: Path, command: str, expected_codes: tuple[int, ...]
 ) -> None:
     shell = ShellTools(cwd=str(tmp_path))
     try:
         await shell.run("printf ready", timeout=2)
         result = await shell.run(command, timeout=0.5)
-        assert result.returncode == expected_code
+        # Bash 3 (macOS) and Bash 5 (Linux) use different syntax-error codes.
+        assert result.returncode in expected_codes
         assert not result.timed_out
         assert result.stdout == ""
-        if expected_code:
-            assert "syntax error" in result.stderr
+        if result.returncode:
+            assert "unexpected EOF" in result.stderr
         recovered = await shell.run("printf recovered", timeout=2)
         assert recovered.returncode == 0
         assert recovered.stdout == "recovered"
