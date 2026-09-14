@@ -449,6 +449,11 @@ async def test_approval_deny_stable_ids() -> None:
 
 @pytest.mark.asyncio
 async def test_resume_uses_persisted_model(tmp_path: Path, monkeypatch) -> None:
+    from noah_code.host import _load_agent_runtime
+
+    # NOOA initializes its default client on first import; measure the host's
+    # session selection after that framework initialization has completed.
+    _load_agent_runtime()
     workspace = Workspace(root=tmp_path.resolve())
     config = load_config(
         workspace.root,
@@ -1207,6 +1212,86 @@ async def test_handle_crash_preserves_queue_for_recovery(tmp_path: Path, monkeyp
     assert races["n"] == 1
     assert len(host.steer_queue) == 1
     await host.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_close_does_not_overwrite_persisted_journal(tmp_path: Path) -> None:
+    host = AgentHost(
+        Workspace(root=tmp_path.resolve()),
+        NoahCodeConfig(session_dir=tmp_path / "sessions"),
+        llm=FakeLLMClient(),
+    )
+    meta = await host.start()
+    await host.close()
+    journal_path = host.store._journal_path(meta.session_id)
+    journal_path.write_text('{"turns": [{"id": "preserve-me"}], "redo": []}')
+    original = journal_path.read_bytes()
+
+    await host.close()
+
+    assert journal_path.read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_resume_honors_newer_preferences_over_checkpoint_and_snapshot(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = NoahCodeConfig(session_dir=tmp_path / "sessions")
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    meta = await host.start()
+    await host.close()
+
+    meta = host.store.load_meta(meta.session_id)
+    meta.mode = "plan"
+    meta.model = "selected-model"
+    meta.reasoning_effort = "high"
+    host.store.save_meta(meta)
+    resumed = AgentHost(workspace, config, llm=FakeLLMClient(), session_meta=meta)
+    try:
+        await resumed.start()
+        assert resumed.meta.mode == resumed.agent.mode == resumed.agent.engine.mode == "plan"
+        assert resumed.meta.model == resumed.agent.v.model == "selected-model"
+        assert resumed.meta.reasoning_effort == "high"
+    finally:
+        await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_metadata_migration_does_not_override_newer_checkpoint(tmp_path: Path) -> None:
+    import json
+
+    workspace = Workspace(root=_init_repo(tmp_path / "repo"))
+    config = NoahCodeConfig(session_dir=tmp_path / "sessions")
+    store = SessionStore(config.session_dir)
+    meta = store.create(workspace, model="stale-model", mode="build")
+    checkpoint_meta = json.loads(meta.to_json())
+    checkpoint_meta.update(mode="plan", model="checkpoint-model", reasoning_effort="high")
+    runtime = store.open_runtime(meta.session_id)
+    runtime.save_checkpoint({"meta": checkpoint_meta})
+    # A legacy sidecar needs repo metadata backfilled at startup. That write
+    # must not turn its stale model preferences into newer user overrides.
+    meta.repo_id = ""
+    host = AgentHost(workspace, config, llm=FakeLLMClient(), session_meta=meta, store=store)
+    try:
+        await host.start()
+        assert host.meta.model == host.agent.v.model == "checkpoint-model"
+        assert host.meta.mode == host.agent.mode == host.agent.engine.mode == "plan"
+        assert host.meta.reasoning_effort == "high"
+    finally:
+        await host.close()
+
+
+@pytest.mark.asyncio
+async def test_background_wait_obeys_session_deadline(tmp_path: Path) -> None:
+    host = AgentHost(
+        Workspace(root=tmp_path.resolve()),
+        NoahCodeConfig(session_dir=tmp_path / "sessions"),
+        llm=FakeLLMClient(),
+    )
+    host._budget_guard = BudgetGuard(BudgetConfig(max_seconds=0.05))
+    agent = SimpleNamespace(processes=SimpleNamespace(has_running=lambda: True))
+    async with asyncio.timeout(1):
+        with pytest.raises(BudgetExceeded, match="time limit exceeded"):
+            await host._wait_for_wake(agent)
 
 
 @pytest.mark.asyncio

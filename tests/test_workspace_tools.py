@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shlex
 import sqlite3
@@ -439,6 +440,48 @@ def test_matches_glob_is_python_312_compatible() -> None:
     assert not _matches_glob("src/a.py", "*.py")
     assert _matches_glob(".venv/lib/site.py", ".venv/**")
     assert _matches_glob("src/app.py", "./**/*.py")
+    assert _matches_glob("src/app.py", "**/[a-z]*.[pt][xy]")
+    assert _matches_glob("test_b.py", "test_[!a].py")
+    assert not _matches_glob("test_a.py", "test_[!a].py")
+    assert not _matches_glob("dir/app.py", "dir[!x]app.py")
+    assert _matches_glob("[literal.py", "[literal.py")
+
+
+def test_glob_translation_is_cached() -> None:
+    from noah_code.tools.workspace_tools import _glob_to_regex
+
+    _glob_to_regex.cache_clear()
+    for filename in ("app.py", "test.py", "readme.md"):
+        _matches_glob(filename, "*.py")
+    assert _glob_to_regex.cache_info().misses == 1
+
+
+@pytest.mark.asyncio
+async def test_rereading_file_does_not_make_an_old_anchor_safe(tmp_path: Path) -> None:
+    path = tmp_path / "app.py"
+    path.write_text("original\n")
+    ws = _make_ws(tmp_path)
+    try:
+        stale = await ws.read("app.py")
+        path.write_text("someone else's change\n")
+        await ws.read("app.py")
+        with pytest.raises(ValueError, match="stale edit anchor"):
+            await ws.replace(stale, "would overwrite their change\n")
+        assert path.read_text() == "someone else's change\n"
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_read_rejects_invalid_line_ranges(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("first\nsecond\n")
+    ws = _make_ws(tmp_path)
+    try:
+        for lines in ((0, 2), (2, 1), (-1, 2)):
+            with pytest.raises(ValueError, match="1-indexed inclusive"):
+                await ws.read("app.py", lines=lines)
+    finally:
+        await ws.close()
 
 
 @pytest.mark.asyncio
@@ -587,23 +630,33 @@ async def test_streamed_cd_is_synchronized_before_pin_and_restore(tmp_path: Path
 async def test_run_read_only_delegates_to_trusted_readonly(tmp_path: Path, monkeypatch) -> None:
     ws = _make_ws(tmp_path, auto=True)
     try:
-        delegated: list[str] = []
+        delegated: list[tuple[str, str | None, float | None]] = []
         original = ws.run_trusted_readonly
 
-        async def spy(command: str):
-            delegated.append(command)
-            return await original(command)
+        async def spy(command: str, *, stdin=None, timeout=None):
+            delegated.append((command, stdin, timeout))
+            return await original(command, stdin=stdin, timeout=timeout)
 
         monkeypatch.setattr(ws, "run_trusted_readonly", spy)
 
-        result = await ws.run("pwd", read_only=True)
+        result = await ws.run("pwd", read_only=True, timeout=7)
 
-        assert delegated == ["pwd"]
+        assert delegated == [("pwd", None, 7)]
         assert Path(result.stdout.strip()).resolve() == tmp_path.resolve()
 
         with pytest.raises(PermissionError, match="not read-only"):
             await ws.run(f"touch {shlex.quote(str(tmp_path / 'nope.txt'))}", read_only=True)
         assert not (tmp_path / "nope.txt").exists()
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_readonly_alias_respects_plan_workspace_boundary(tmp_path: Path) -> None:
+    ws = _make_ws(tmp_path, mode="plan")
+    try:
+        with pytest.raises(PermissionError, match="outside the workspace"):
+            await ws.run("ls /tmp", read_only=True)
     finally:
         await ws.close()
 
@@ -863,7 +916,7 @@ async def test_read_skips_fingerprint_for_oversized_files(tmp_path: Path) -> Non
 
 
 def _file_operation_rows(runtime: RuntimeStateStore) -> list[tuple]:
-    with sqlite3.connect(runtime.path) as connection:
+    with contextlib.closing(sqlite3.connect(runtime.path)) as connection:
         return connection.execute(
             "SELECT state, pre_bytes FROM file_operations"
         ).fetchall()

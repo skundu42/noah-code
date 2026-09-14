@@ -324,7 +324,5 @@ def parse_slash(text: str) -> tuple[str, str] | None:
     body = stripped[1:]
     if not body:
         return None
-    if " " in body:
-        name, rest = body.split(" ", 1)
-        return name.lower(), rest.strip()
-    return body.lower(), ""
+    parts = body.split(maxsplit=1)
+    return parts[0].lower(), parts[1].strip() if len(parts) > 1 else ""

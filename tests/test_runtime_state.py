@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from pathlib import Path
 
@@ -114,7 +115,7 @@ def test_runtime_event_log_is_bounded(tmp_path: Path) -> None:
     for index in range(8):
         store.event("test", {"index": index})
 
-    with sqlite3.connect(store.path) as connection:
+    with contextlib.closing(sqlite3.connect(store.path)) as connection:
         rows = connection.execute(
             "SELECT payload FROM runtime_events ORDER BY sequence"
         ).fetchall()
@@ -122,6 +123,30 @@ def test_runtime_event_log_is_bounded(tmp_path: Path) -> None:
     assert len(rows) == 3
     assert '"index":5' in rows[0][0]
     assert '"index":7' in rows[-1][0]
+
+
+def test_runtime_connections_close_after_commit_and_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def track_connection(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", track_connection)
+    store = RuntimeStateStore(tmp_path / "session")
+    store.set_state("committed", "kept")
+    with pytest.raises(RuntimeError, match="abort transaction"), store._connect() as connection:
+        connection.execute("UPDATE state SET value='\"discarded\"'")
+        raise RuntimeError("abort transaction")
+    assert store.get_state("committed") == "kept"
+    assert len(opened) == 4
+    for connection in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
 
 
 def test_workspace_lease_prevents_concurrent_checkout_owners(tmp_path: Path) -> None:

@@ -86,6 +86,7 @@ class ProcessTools(Skill):
         self._jobs: dict[str, BackgroundJob] = {}
         self._on_lifecycle: Any = None
         self._runtime = runtime
+        self._launch_lock = asyncio.Lock()
 
     async def start(
         self,
@@ -105,8 +106,8 @@ class ProcessTools(Skill):
         if not self._ws._engine.is_readonly_command(command):
             await self._ws.checkpoint_before_shell(command)
             self._ws._journal.mark_shell_bypass()
-        runtime = min(timeout or self._max_runtime, self._max_runtime)
-        if runtime <= 0:
+        runtime = min(self._max_runtime if timeout is None else timeout, self._max_runtime)
+        if not runtime > 0:
             raise ValueError("timeout must be positive")
         if os.name == "nt":
             argv: tuple[str, ...] = ("cmd.exe", "/d", "/s", "/c", command)
@@ -157,8 +158,8 @@ class ProcessTools(Skill):
         await self._ws._approvals.require(
             self._ws._engine.decide("task", f"terminal:{label}", tool="terminal_open")
         )
-        runtime = min(timeout or self._max_runtime, self._max_runtime)
-        if runtime <= 0:
+        runtime = min(self._max_runtime if timeout is None else timeout, self._max_runtime)
+        if not runtime > 0:
             raise ValueError("timeout must be positive")
         argv = (executable,) if os.name == "nt" else (executable, "-l")
         job = await self._launch(
@@ -185,7 +186,7 @@ class ProcessTools(Skill):
         command = command.strip()
         if not command:
             raise ValueError("command is required")
-        if timeout <= 0:
+        if not timeout > 0:
             raise ValueError("timeout must be positive")
         wait_timeout = min(timeout, self._max_runtime)
         decision = self._ws._shell_decision(command, tool="terminal_run")
@@ -244,31 +245,38 @@ class ProcessTools(Skill):
         runtime: float,
         kind: str = "process",
     ) -> BackgroundJob:
-        self._ensure_capacity()
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=self._ws._workspace.root,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=(
-                asyncio.subprocess.STDOUT if kind == "terminal" else asyncio.subprocess.PIPE
-            ),
-            start_new_session=os.name != "nt",
-        )
-        job_id = uuid.uuid4().hex[:8]
-        log_path = self._runtime.process_log_dir / f"{job_id}.jsonl" if self._runtime else None
-        job = BackgroundJob(
-            id=job_id,
-            name=name,
-            command=command,
-            process=process,
-            log_path=log_path,
-            kind=kind,
-        )
+        async with self._launch_lock:
+            self._ensure_capacity()
+            if kind == "terminal" and any(
+                job.kind == "terminal" and job.name == name
+                and job.state in {"running", "stopping"}
+                for job in self._jobs.values()
+            ):
+                raise ValueError(f"terminal name already exists: {name}")
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=self._ws._workspace.root,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=(
+                    asyncio.subprocess.STDOUT if kind == "terminal" else asyncio.subprocess.PIPE
+                ),
+                start_new_session=os.name != "nt",
+            )
+            job_id = uuid.uuid4().hex[:8]
+            log_path = self._runtime.process_log_dir / f"{job_id}.jsonl" if self._runtime else None
+            job = BackgroundJob(
+                id=job_id,
+                name=name,
+                command=command,
+                process=process,
+                log_path=log_path,
+                kind=kind,
+            )
+            self._jobs[job_id] = job
         try:
             if log_path is not None:
                 log_path.touch(mode=0o600, exist_ok=False)
-            self._jobs[job_id] = job
             if self._runtime is not None:
                 self._runtime.register_job(
                     job_id=job_id,
@@ -326,7 +334,10 @@ class ProcessTools(Skill):
             prefix = "! " if event.stream == "stderr" else ""
             value = prefix + event.text
             if used + len(value) > limit:
-                break
+                if rows:
+                    break
+                notice = "\n… event truncated; increase max_chars to read it in full …"
+                value = value[: limit - len(notice)] + notice
             rows.append(value.rstrip("\n"))
             used += len(value)
             next_cursor = event.sequence
@@ -399,7 +410,8 @@ class ProcessTools(Skill):
             return self._status_line(job)
         job.state = "stopping"
         if self._runtime is not None:
-            self._runtime.update_job(job.id, "stopping")
+            with contextlib.suppress(Exception):
+                self._runtime.update_job(job.id, "stopping")
         await self._terminate(job)
         await asyncio.gather(
             *(task for task in job.tasks if task.get_name().endswith("-wait")),
@@ -487,18 +499,27 @@ class ProcessTools(Skill):
     ) -> tuple[str, int]:
         deadline = asyncio.get_running_loop().time() + timeout
         collected = ""
+        truncated = False
+        # ponytail: retain a bounded terminal tail; use durable logs for older output.
+        output_limit = max(self._max_buffer, 32_000) + len(marker) + 32
         next_cursor = cursor
         while True:
             events = [event for event in job.events if event.sequence > next_cursor]
             if events:
                 collected += "".join(event.text for event in events)
+                if len(collected) > output_limit:
+                    collected = collected[-output_limit:]
+                    truncated = True
                 next_cursor = events[-1].sequence
                 marker_at = collected.find(marker + ":")
-                if marker_at >= 0:
+                if marker_at >= 0 and "\n" in collected[marker_at:]:
                     suffix = collected[marker_at + len(marker) + 1 :]
                     code_text = suffix.splitlines()[0].strip() if suffix else ""
                     try:
-                        return collected[:marker_at], int(code_text)
+                        output = collected[:marker_at]
+                        if truncated:
+                            output = "… earlier terminal output truncated …\n" + output
+                        return output, int(code_text)
                     except ValueError as exc:
                         raise RuntimeError(
                             f"terminal {job.name} returned an invalid exit marker"
@@ -541,10 +562,15 @@ class ProcessTools(Skill):
                 self._append(job, stream_name, text)
 
     def _append(self, job: BackgroundJob, stream: str, text: str) -> None:
-        event = ProcessEvent(job.next_sequence, stream, text, time.monotonic())
+        retained = text
+        if len(retained) > self._max_buffer:
+            notice = "… earlier output truncated …\n"
+            retained = notice + retained[-max(self._max_buffer - len(notice), 1):]
+            retained = retained[-self._max_buffer:]
+        event = ProcessEvent(job.next_sequence, stream, retained, time.monotonic())
         job.next_sequence += 1
         job.events.append(event)
-        job.event_chars += len(text)
+        job.event_chars += len(retained)
         job.output_event.set()
         while job.events and job.event_chars > self._max_buffer:
             removed = job.events.popleft()
@@ -560,10 +586,18 @@ class ProcessTools(Skill):
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-            with job.log_path.open("a", encoding="utf-8") as output:
-                output.write(payload + "\n")
-                output.flush()
-            self._cap_durable_log(job)
+            try:
+                with job.log_path.open("a", encoding="utf-8") as output:
+                    output.write(payload + "\n")
+                    output.flush()
+                self._cap_durable_log(job)
+            except OSError as exc:
+                # Keep draining the pipe when durable storage fails; otherwise
+                # a full stdout pipe can deadlock the owned child process.
+                job.log_path = None
+                message = f"[noah] durable process logging disabled: {exc}"
+                self._append(job, "stderr", message)
+                self._emit(job, message)
 
     def _cap_durable_log(self, job: BackgroundJob) -> None:
         """Rotate an oversized JSONL log, keeping whole recent lines.
@@ -638,6 +672,7 @@ class ProcessTools(Skill):
             job.state = "stopped"
         job.returncode = returncode
         job.finished_at = time.monotonic()
+        job.output_event.set()
         if self._runtime is not None:
             try:
                 self._runtime.update_job(job.id, job.state, returncode=returncode)
@@ -763,7 +798,10 @@ class ProcessTools(Skill):
                 except (json.JSONDecodeError, TypeError, ValueError):
                     continue
                 if used + len(text) > limit:
-                    break
+                    if rows:
+                        break
+                    notice = "\n… event truncated; increase max_chars to read it in full …"
+                    text = text[: limit - len(notice)] + notice
                 rows.append(text.rstrip("\n"))
                 used += len(text)
                 next_cursor = sequence
@@ -803,7 +841,8 @@ class ProcessTools(Skill):
             if job.state == "running":
                 job.state = "stopping"
                 if self._runtime is not None:
-                    self._runtime.update_job(job.id, "stopping")
+                    with contextlib.suppress(Exception):
+                        self._runtime.update_job(job.id, "stopping")
         await asyncio.gather(*(self._terminate(job) for job in running), return_exceptions=True)
         current = asyncio.current_task()
         for job in self._jobs.values():

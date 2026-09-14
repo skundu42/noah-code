@@ -125,9 +125,27 @@ async def test_bound_result_falls_back_to_truncation_when_distill_fails() -> Non
     child = _DistillingChild(fail=True)
     body = "".join(f"line{i}\n" for i in range(2000))
     result = await bound_result(child, "general", body, max_chars=800)
-    assert len(result) < 1200
+    assert len(result) <= 800
     assert "chars omitted" in result
     assert "line0" in result and "line1999" in result
+
+
+@pytest.mark.asyncio
+async def test_bound_result_keeps_final_evidence_and_enforces_distilled_limit() -> None:
+    from noah_code.tools.task_tools import bound_result
+
+    class VerboseChild:
+        async def distill_result(self, transcript: str) -> str:
+            assert len(transcript) <= 24_000
+            assert transcript.startswith("Initial request")
+            assert transcript.endswith("FINAL: tests passed")
+            return "Details " * 1000 + "FINAL: tests passed"
+
+    body = "Initial request" + "x" * 30_000 + "FINAL: tests passed"
+    result = await bound_result(VerboseChild(), "explore", body, max_chars=500)
+    assert len(result) <= 500
+    assert result.endswith("FINAL: tests passed")
+    assert "condensed from" in result
 
 
 # ---------------------------------------------------------------------------
@@ -374,3 +392,77 @@ def test_child_engine_clones_rules_and_sets_mode_without_touching_parent() -> No
     # mutating the clone must not leak into the parent
     clone.add_session_rule(PermissionRule(category="bash", pattern="ls*", action="allow"))
     assert len(parent.snapshot_session_rules()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "job_state", ["running", "completed", "missing", "needs_input", "condensed_input"]
+)
+async def test_subagent_handles_wait_and_input_outcomes(
+    tmp_path: Path, job_state: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import json
+
+    from nooa.unifiedllm import FakeLLMClient, LLMResponse, ToolCall
+
+    from noah_code.agent import CodingAgent
+    from noah_code.agents import builtin_agents
+    from noah_code.config import NoahCodeConfig
+    from noah_code.tools.task_tools import run_subagent
+
+    codes = [
+        (
+            'await self.processes.start("sleep 0.05", name="verify")\n'
+            if job_state in {"running", "completed"} else ''
+        )
+        + ('await asyncio.sleep(0.15)\n' if job_state == "completed" else '')
+        + 'return_result(RespondReason.WAIT, explanation="awaiting verification")',
+        'self.message(await self.processes.status())\n'
+        'return_result(RespondReason.DONE, explanation="verified completion")',
+    ]
+    if job_state in {"needs_input", "condensed_input"}:
+        codes[0] = 'return_result(RespondReason.NEED_INPUT, explanation="choose a target")'
+    if job_state == "condensed_input":
+        async def condense_without_control_markers(*_args, **_kwargs):
+            return "choose a target"
+
+        monkeypatch.setattr(
+            "noah_code.tools.task_tools.bound_result", condense_without_control_markers
+        )
+    llm = FakeLLMClient(
+        scripted_responses=[
+            LLMResponse(
+                raw_response=None,
+                content="",
+                tool_calls=[ToolCall(id=str(index), name="execute_python", arguments=json.dumps({"code": code}))],
+                finish_reason="tool_calls",
+                assistant_message={"role": "assistant", "content": "", "tool_calls": []},
+            )
+            for index, code in enumerate(codes)
+        ]
+    )
+    parent = CodingAgent(
+        Workspace(root=tmp_path.resolve()),
+        NoahCodeConfig(auto_approve=True, unsafe_inprocess_code_execution=True),
+        llm=llm,
+        nested=True,
+    )
+    general = next(spec for spec in builtin_agents() if spec.name == "general")
+    try:
+        if job_state == "missing":
+            with pytest.raises(RuntimeError, match="WAIT without a running"):
+                await asyncio.wait_for(run_subagent(parent, general, "verify"), timeout=5)
+            assert llm.call_count == 1
+            return
+        result = await asyncio.wait_for(run_subagent(parent, general, "verify"), timeout=5)
+    finally:
+        await parent.close_tools()
+
+    if job_state in {"needs_input", "condensed_input"}:
+        assert "[NEED_INPUT] choose a target" in result
+        assert llm.call_count == 1
+        return
+    assert llm.call_count == 2
+    assert "verified completion" in result
+    assert "[completed]" in result and "exit=0" in result

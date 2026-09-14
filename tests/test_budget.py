@@ -282,3 +282,69 @@ def test_response_cost_nan_is_stamped_as_zero() -> None:
     assert response.usage is not None
     assert response.usage["cost_usd"] == 0.0
     assert guard.status()["cost_usd"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_deadline_cancels_inflight_and_queued_provider_calls() -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class HangingLLM:
+        async def acall(self, *_args, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    first, guard = wrap_with_budget(HangingLLM(), BudgetConfig(max_seconds=0.05))
+    queued_inner = FakeLLM(responses=[FakeResponse()])
+    second = SharedBudgetLLM(queued_inner, guard)
+    pending = asyncio.create_task(first.acall([]))
+    await started.wait()
+    results = await asyncio.wait_for(
+        asyncio.gather(pending, second.acall([]), return_exceptions=True), timeout=1
+    )
+
+    assert all(isinstance(result, BudgetExceeded) for result in results)
+    assert cancelled.is_set()
+    assert queued_inner.calls == 0
+    assert guard.remaining_seconds() == 0
+    with pytest.raises(BudgetExceeded, match="time limit"):
+        await first.acall([])
+
+
+@pytest.mark.asyncio
+async def test_provider_timeout_before_deadline_keeps_original_error() -> None:
+    class TimeoutLLM:
+        async def acall(self, *_args, **_kwargs):
+            raise TimeoutError("provider timeout")
+
+    client, guard = wrap_with_budget(TimeoutLLM(), BudgetConfig(max_seconds=10))
+    with pytest.raises(TimeoutError, match="provider timeout"):
+        await client.acall([])
+    assert guard.exceeded is None
+
+
+def test_sync_provider_receives_remaining_session_deadline() -> None:
+    class SyncLLM:
+        def call(self, *_args, **kwargs):
+            assert 0 < kwargs["timeout"] <= 1
+            return FakeResponse()
+
+    client, _guard = wrap_with_budget(SyncLLM(), BudgetConfig(max_seconds=1))
+    client.call([], timeout=180)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured_timeout", [0.01, 180])
+async def test_async_provider_receives_remaining_session_deadline(
+    configured_timeout: float,
+) -> None:
+    class AsyncLLM:
+        async def acall(self, *_args, **kwargs):
+            assert 0 < kwargs["timeout"] <= min(configured_timeout, 1)
+            return FakeResponse()
+
+    client, _guard = wrap_with_budget(AsyncLLM(), BudgetConfig(max_seconds=1))
+    await client.acall([], timeout=configured_timeout)

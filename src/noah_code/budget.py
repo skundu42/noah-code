@@ -83,6 +83,11 @@ class BudgetGuard:
         wall_elapsed = max(time.time() - self._started_wall, 0.0)
         return max(monotonic_elapsed, wall_elapsed)
 
+    def remaining_seconds(self) -> float | None:
+        if self._config.max_seconds is None:
+            return None
+        return max(self._config.max_seconds - self.elapsed_seconds(), 0.0)
+
     def add_usage(
         self,
         *,
@@ -257,28 +262,50 @@ class BudgetedLLM:
         if self._prefix_observer is not None:
             self._prefix_observer.observe_prefix(messages, route=route)
 
+    def _limit_timeout(self, kwargs: dict[str, Any]) -> None:
+        remaining = self._guard.remaining_seconds()
+        if remaining is not None:
+            configured_timeout = kwargs.get("timeout")
+            kwargs["timeout"] = (
+                min(configured_timeout, remaining)
+                if isinstance(configured_timeout, int | float)
+                else remaining
+            )
+
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
         # Active caps serialize reservations across parent and subagent routes;
         # without this lane, concurrent calls can all pass the same preflight.
-        async with self._guard._async_provider_lock:
+        self._guard.enforce()
+        try:
+            async with asyncio.timeout(self._guard.remaining_seconds()):
+                async with self._guard._async_provider_lock:
+                    self._guard.enforce()
+                    self._observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
+                    # NOOA shields LiteLLM's provider task from cancellation.
+                    # Bound its own request timeout as well as our outer wait.
+                    self._limit_timeout(kwargs)
+                    response = await self._inner.acall(
+                        messages, tools=tools, output_model=output_model, **kwargs
+                    )
+                    prompt, completion, cost = _usage_from_response(response)
+                    self._guard.add_usage(
+                        prompt_tokens=prompt,
+                        completion_tokens=completion,
+                        cost_usd=cost,
+                    )
+                    self._guard.enforce()
+                    return response
+        except TimeoutError:
+            # Preserve a provider's own timeout unless the session deadline
+            # expired. A session timeout must surface as a sticky budget stop.
             self._guard.enforce()
-            self._observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
-            response = await self._inner.acall(
-                messages, tools=tools, output_model=output_model, **kwargs
-            )
-            prompt, completion, cost = _usage_from_response(response)
-            self._guard.add_usage(
-                prompt_tokens=prompt,
-                completion_tokens=completion,
-                cost_usd=cost,
-            )
-            self._guard.enforce()
-            return response
+            raise
 
     def call(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
         with self._guard._provider_lock:
             self._guard.enforce()
             self._observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
+            self._limit_timeout(kwargs)
             response = self._inner.call(
                 messages, tools=tools, output_model=output_model, **kwargs
             )

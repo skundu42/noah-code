@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import sqlite3
@@ -288,7 +289,7 @@ def test_load_event_page_skips_malformed_json(tmp_path: Path) -> None:
     storage = store.open_storage(meta.session_id)
     storage.close()
     db_path = store.session_dir / meta.session_id / "session.db"
-    with sqlite3.connect(db_path) as connection:
+    with contextlib.closing(sqlite3.connect(db_path)) as connection, connection:
         connection.execute(
             "INSERT INTO events(tag, event_id, event_type, data, insertion_order) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -296,3 +297,24 @@ def test_load_event_page_skips_malformed_json(tmp_path: Path) -> None:
         )
 
     assert store.load_event_page(meta.session_id) == []
+
+
+def test_open_storage_permission_failure_releases_database_and_session_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    meta = store.create(Workspace(root=tmp_path.resolve()), model="m")
+    real_chmod = Path.chmod
+
+    def fail_database_chmod(path: Path, *args, **kwargs):
+        if path.name == "session.db":
+            raise PermissionError("cannot secure database")
+        return real_chmod(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "chmod", fail_database_chmod)
+    with pytest.raises(SessionError, match="cannot secure database"):
+        store.open_storage(meta.session_id)
+    monkeypatch.setattr(Path, "chmod", real_chmod)
+    # A leaked NOOA storage manager retains the exclusive session lock.
+    with store.open_storage(meta.session_id) as storage:
+        assert storage is not None

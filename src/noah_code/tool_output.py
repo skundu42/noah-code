@@ -7,6 +7,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 
 _OUTPUT_ID = re.compile(r"[0-9a-f]{20}")
@@ -83,14 +84,13 @@ class ToolOutputStore:
         path = self._path(output_id)
         if not path.is_file():
             raise FileNotFoundError(f"managed tool output not found or expired: {output_id}")
-        text = path.read_text(errors="replace")
         if lines is None:
-            return text
+            return path.read_text(encoding="utf-8", errors="replace")
         start, end = lines
         if start < 1 or end < start:
             raise ValueError("lines must be a 1-indexed inclusive (start, end) range")
-        selected = text.splitlines(keepends=True)[start - 1 : end]
-        return "".join(selected)
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            return "".join(islice(stream, start - 1, end))
 
     def bound(self, text: str, *, max_chars: int, max_lines: int) -> BoundedOutput:
         lines = text.splitlines(keepends=True)

@@ -146,7 +146,7 @@ def _configure_first_run_model(model_override: str | None) -> str | None:
         return selected
 
 
-@click.command("noah-code")
+@click.command("noah-code", context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, prog_name="noah-code")
 @click.argument("path", required=False, type=click.Path())
 @click.option("--continue", "continue_session", is_flag=True, help="Resume latest session")
@@ -856,6 +856,7 @@ async def _prepare(
     store = SessionStore(config.session_dir)
 
     meta = None
+    launch_root = workspace.root
     try:
         if session_id:
             meta = store.load_meta(session_id)
@@ -866,11 +867,18 @@ async def _prepare(
                 click.echo("error: no prior session for this workspace", err=True)
                 return None, EXIT_CONFIG
             workspace = store.workspace_for_resume(meta, workspace)
-        if meta is not None and (model is not None or reasoning_effort is not None):
+        if workspace.root != launch_root:
+            config = load_config(
+                workspace.root,
+                cli_overrides={**overrides, "session_dir": store.session_dir},
+            )
+        if meta is not None and any(value is not None for value in (model, reasoning_effort, mode)):
             if model is not None:
                 meta.model = config.model
             if reasoning_effort is not None:
                 meta.reasoning_effort = config.reasoning_effort
+            if mode is not None:
+                meta.mode = config.mode
             store.save_meta(meta)
     except SessionError as exc:
         click.echo(f"error: {exc}", err=True)
@@ -894,7 +902,7 @@ async def _interactive(
     unsafe_inprocess_code_execution: bool,
 ) -> int:
     first_run = user_default_model() is None
-    if first_run and (model is not None or use_console):
+    if first_run and (model is not None or (use_console and not (continue_session or session_id))):
         try:
             model = _configure_first_run_model(model)
         except (OSError, ValueError) as exc:
@@ -922,7 +930,7 @@ async def _interactive(
         return code
     workspace, config, store, meta = prepared
     use_tui = config.ui.frontend == "tui" and not use_console
-    if first_run and model is None and not use_tui:
+    if first_run and model is None and not use_tui and meta is None:
         try:
             model = _configure_first_run_model(model)
         except (OSError, ValueError) as exc:
@@ -1038,6 +1046,9 @@ async def _run_session(
 
         click.echo(f"error: {safe_error_message(exc)}", err=True)
         return EXIT_AGENT
+    finally:
+        # Startup can fail before run_once reaches its own cleanup block.
+        await host.close()
 
 
 def main(argv: list[str] | None = None) -> None:

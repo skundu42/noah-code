@@ -134,6 +134,27 @@ def test_read_reports_missing_output_and_validates_ranges(tmp_path: Path) -> Non
         store.read(output_id, (3, 2))
 
 
+def test_ranged_output_read_stops_at_requested_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    store = ToolOutputStore(tmp_path / "outputs")
+    output_id = store.store("first\nsecond\nthird\n")
+
+    class FocusedStream(io.StringIO):
+        def read(self, *_args: object, **_kwargs: object) -> str:
+            raise AssertionError("ranged read must not load the full output")
+
+        def __next__(self) -> str:
+            if self.tell() >= len("first\nsecond\n"):
+                raise AssertionError("ranged read must stop at its end line")
+            return super().__next__()
+
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: FocusedStream("first\nsecond\nthird\n"))
+    assert store.read(output_id, (2, 2)) == "second\n"
+
+
 def test_cleanup_skips_junk_files_and_survives_undeletable_entries(tmp_path: Path) -> None:
     root = tmp_path / "outputs"
     root.mkdir()

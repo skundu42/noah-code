@@ -25,6 +25,21 @@ TaskRunner = Callable[[AgentSpec, str], Awaitable[str]]
 _DISTILL_INPUT_LIMIT = 24_000
 
 
+def _truncate_result(text: str, max_chars: int) -> str:
+    """Retain the assignment's opening context and final findings within budget."""
+
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+    if len(text) <= max_chars:
+        return text
+    marker = "\n\n...[chars omitted]...\n\n"
+    if max_chars <= len(marker):
+        return text[:max_chars]
+    available = max_chars - len(marker)
+    head = available * 2 // 3
+    return text[:head] + marker + text[-(available - head):]
+
+
 @dataclass
 class TaskActivity:
     """Presentation-safe lifecycle record for one delegated assignment."""
@@ -143,8 +158,7 @@ class TaskTools(Skill):
             "from recommendations.\n\n"
             f"Objective:\n{goal}\n\nTeammate reports:\n{reports}"
         )
-        if len(synthesis) > _DISTILL_INPUT_LIMIT:
-            synthesis = synthesis[: _DISTILL_INPUT_LIMIT - 20].rstrip() + "\n… reports bounded"
+        synthesis = _truncate_result(synthesis, _DISTILL_INPUT_LIMIT)
         runner = self._runner or _default_runner(self._parent)
         if runner is None:
             raise RuntimeError("subagent runner is not configured")
@@ -310,6 +324,7 @@ def _child_engine(parent_engine: PermissionEngine, mode: str) -> PermissionEngin
 async def run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> str:
     """Start a nested CodingAgent with isolated storage and a per-run permission engine."""
 
+    from nooa.interactive import RespondReason
     from nooa.storage.in_memory import InMemoryStorageManager
 
     from noah_code.agent import CodingAgent
@@ -374,17 +389,46 @@ async def run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> str:
         child.todos.add("Complete the assigned task", notes=prompt[:500])
     child.inject_status_snapshot(force=True)
     child._render_message = lambda text, **_kwargs: messages.append(str(text))  # noqa: SLF001, ARG005
+    wake = asyncio.Event()
+    child.processes.set_lifecycle_handler(
+        lambda _id, _name, _message, terminal=False: wake.set() if terminal else None
+    )
     try:
         nooa_compat.queue_user_message(child, prompt)
-        wins = await child.queue_manager.race()
-        notification: dict[str, list] = {}
-        for name, item in wins:
-            notification.setdefault(name, []).append(item)
-        result = await child.handle(notification)
+        while True:
+            wins = await child.queue_manager.race()
+            notification: dict[str, list] = {}
+            for name, item in wins:
+                notification.setdefault(name, []).append(item)
+            result = await child.handle(notification)
+            if getattr(result, "kind", None) != RespondReason.WAIT:
+                break
+            if not child.processes.has_running() and not wake.is_set():
+                raise RuntimeError("subagent returned WAIT without a running background job")
+            guard = getattr(parent, "_budget_guard", None)
+            try:
+                async with asyncio.timeout(guard.remaining_seconds() if guard else None):
+                    await wake.wait()
+            except TimeoutError:
+                if guard is not None:
+                    guard.enforce()
+                raise
+            wake.clear()
+            child.inject_status_snapshot(force=True)
+            nooa_compat.queue_system_message(
+                child,
+                "A background process changed state. Inspect its status and logs, "
+                "then continue the assigned task.",
+            )
         explanation = str(getattr(result, "explanation", "") or "").strip()
+        prefix = "[NEED_INPUT] " if getattr(result, "kind", None) in {
+            RespondReason.NEED_INPUT, RespondReason.GET_USER_INPUT
+        } else ""
         body = "\n\n".join(part for part in [*messages, explanation] if part)
         raw = body or f"{spec.name} finished with no message."
-        return await bound_result(child, spec.name, raw, max_chars=_result_budget(parent))
+        return prefix + await bound_result(
+            child, spec.name, raw, max_chars=_result_budget(parent) - len(prefix)
+        )
     finally:
         await child.close_tools()
 
@@ -401,16 +445,12 @@ async def bound_result(child: Any, agent_name: str, body: str, *, max_chars: int
     if len(body) <= max_chars:
         return body
     try:
-        distilled = str(await child.distill_result(body[:_DISTILL_INPUT_LIMIT])).strip()
+        distilled = str(
+            await child.distill_result(_truncate_result(body, _DISTILL_INPUT_LIMIT))
+        ).strip()
     except Exception:  # noqa: BLE001 - summarizer failures fall back to truncation
         distilled = ""
     if distilled:
         header = f"[{agent_name} condensed from {len(body)} chars]"
-        return f"{header}\n{distilled}"
-    keep = max(max_chars - 120, 200)
-    head_keep = keep * 2 // 3
-    tail_keep = max(keep - head_keep, 1)
-    head = body[:head_keep].rstrip()
-    tail = body[-tail_keep:].lstrip()
-    omitted = len(body) - len(head) - len(tail)
-    return f"{head}\n\n...[{omitted} chars omitted]...\n\n{tail}"
+        return _truncate_result(f"{header}\n{distilled}", max_chars)
+    return _truncate_result(body, max_chars)

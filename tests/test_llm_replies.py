@@ -54,6 +54,13 @@ def test_coerce_leaves_real_tool_calls_alone() -> None:
     assert coerce_text_only_response(original) is original
 
 
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter", None])
+def test_coerce_does_not_finish_incomplete_responses(finish_reason: str | None) -> None:
+    original = _text_only("The first part of the answer is")
+    original.finish_reason = finish_reason
+    assert coerce_text_only_response(original) is original
+
+
 def test_protocol_text_only_errors_stay_off_the_transcript() -> None:
     manager = SimpleNamespace(handlers={})
 
@@ -77,7 +84,10 @@ def test_protocol_text_only_errors_stay_off_the_transcript() -> None:
 
 
 @pytest.mark.asyncio
-async def test_plain_text_reply_answers_conversational_query(tmp_path: Path) -> None:
+@pytest.mark.parametrize("truncated_replies", [0, 1, 3])
+async def test_plain_text_reply_answers_conversational_query(
+    tmp_path: Path, truncated_replies: int
+) -> None:
     workspace = Workspace(root=tmp_path.resolve())
     config = load_config(
         workspace.root,
@@ -87,7 +97,12 @@ async def test_plain_text_reply_answers_conversational_query(tmp_path: Path) -> 
             "unsafe_inprocess_code_execution": True,
         },
     )
-    llm = FakeLLMClient(scripted_responses=[_text_only("I can inspect repos, edit code, and answer questions.")])
+    responses = [_text_only("I can inspect repos, edit code, and answer questions.")]
+    for _ in range(truncated_replies):
+        partial = _text_only("The first part of the answer is")
+        partial.finish_reason = "length"
+        responses.insert(0, partial)
+    llm = FakeLLMClient(scripted_responses=responses)
     events: list[HostEvent] = []
 
     class Capture:
@@ -122,7 +137,12 @@ async def test_plain_text_reply_answers_conversational_query(tmp_path: Path) -> 
     )
     result = await host.run_once("what can you do?")
     texts = "\n".join(event.text for event in events)
+    if truncated_replies == 3:
+        assert result.exit_code != 0
+        assert "I can inspect repos" not in texts
+        assert llm.call_count == 3
+        return
     assert result.exit_code == 0
     assert "I can inspect repos" in texts
     assert "plain text with no tool call" not in texts
-    assert llm.call_count == 1
+    assert llm.call_count == truncated_replies + 1

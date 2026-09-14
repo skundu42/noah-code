@@ -5,7 +5,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from noah_code.composer import IMAGE_TYPES, ExpandedTurn, expand_turn, mention_suggestions
+from noah_code.composer import (
+    IMAGE_TYPES,
+    ExpandedTurn,
+    expand_turn,
+    mention_suggestions,
+    mention_text,
+)
 
 PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -139,3 +145,66 @@ def test_mention_suggestions_cache_walks_once_per_ttl_window(tmp_path: Path, mon
     monkeypatch.setattr("noah_code.composer._SUGGESTION_CACHE_TTL", 0.0)
     assert "alphabet.py" in mention_suggestions(tmp_path, "@alpha")
     assert walks == 2
+
+
+def test_attachments_resolve_absolute_symlinks_and_parent_paths(tmp_path: Path) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    secret = tmp_path / "outside.txt"
+    secret.write_text("private content")
+    link = workspace / "link.txt"
+    link.symlink_to(secret)
+    env = workspace / ".env"
+    env.write_text("TOKEN=private")
+    (workspace / "env.txt").symlink_to(env)
+
+    turn = expand_turn("review", workspace, attach_paths=[link, workspace / ".." / "outside.txt"])
+    assert turn.text == "review"
+    assert not turn.paths
+    assert mention_suggestions(workspace, "@link") == []
+    assert mention_suggestions(workspace, "@env") == []
+
+
+def test_image_attachments_share_the_file_limit(tmp_path: Path) -> None:
+    images = [tmp_path / f"image-{index}.png" for index in range(10)]
+    for path in images:
+        path.write_bytes(PNG_BYTES)
+
+    turn = expand_turn("review", tmp_path, attach_paths=images)
+    assert len(turn.images) == len(turn.paths) == 8
+    assert "image-8.png" not in turn.text
+
+
+def test_text_attachment_reads_only_inline_budget(tmp_path: Path, monkeypatch) -> None:
+    from io import StringIO
+
+    path = tmp_path / "large.txt"
+    path.touch()
+
+    class BoundedRead(StringIO):
+        def read(self, size=-1):
+            assert size == 8_001
+            return super().read(size)
+
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: BoundedRead("x" * 50_000))
+    turn = expand_turn("@large.txt", tmp_path)
+    assert "x" * 8_000 in turn.text
+    assert "x" * 8_001 not in turn.text
+    assert "truncated" in turn.text
+
+
+def test_quoted_mentions_support_spaces_and_unicode(tmp_path: Path) -> None:
+    path = tmp_path / "design notes 雪.txt"
+    path.write_text("the actual file")
+    turn = expand_turn(f"Read {mention_text(path.name)}", tmp_path)
+    assert turn.paths == [path]
+    assert "the actual file" in turn.text
+
+
+def test_suggestions_prioritize_path_matches_before_basename_matches(tmp_path: Path) -> None:
+    for directory in ("a", "b", "src"):
+        (tmp_path / directory).mkdir()
+        (tmp_path / directory / "main.py").write_text("pass")
+
+    assert mention_suggestions(tmp_path, "@src/main", limit=1) == ["src/main.py"]
+    assert mention_suggestions(tmp_path, "@src/main", limit=0) == []

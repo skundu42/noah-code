@@ -127,7 +127,6 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("ws", "read_output"),
             ("ws", "replace"),
             ("ws", "run"),
-            ("ws", "run_trusted_readonly"),
             ("ws", "search"),
             ("ws", "write"),
             ("ws", "write_file"),

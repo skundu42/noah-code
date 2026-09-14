@@ -69,6 +69,21 @@ def test_sandbox_broker_exposes_only_permission_gated_capabilities() -> None:
     assert not _PermissionSandboxedExecutor._path_allowed(("runtime", "execute_code"))
     assert not _PermissionSandboxedExecutor._path_allowed(("_shell", "run"))
     assert not _PermissionSandboxedExecutor._path_allowed(("ws", "raw_shell", "run"))
+    assert not _PermissionSandboxedExecutor._path_allowed(("ws", "run_trusted_readonly"))
+
+
+@pytest.mark.asyncio
+async def test_sandbox_cannot_call_the_host_only_readonly_runner() -> None:
+    executor = object.__new__(_PermissionSandboxedExecutor)
+    executor._agent = SimpleNamespace(
+        ws=SimpleNamespace(run_trusted_readonly=lambda _command: "private host data")
+    )
+    result = await executor._dispatch_tool_call(
+        {"kind": "call", "path": ["ws", "run_trusted_readonly"], "args": ["ls /tmp"]}
+    )
+    assert result["ok"] is False
+    assert result["error_type"] == "PermissionError"
+    assert "sandbox broker access denied" in result["error"]
 
 
 def test_macos_profile_allows_both_symlink_and_resolved_runtime_paths(tmp_path: Path) -> None:

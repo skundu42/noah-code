@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 
-from noah_code.commands import BUILTIN_COMMANDS, all_command_suggestions, help_text
+from noah_code.commands import BUILTIN_COMMANDS, all_command_suggestions, help_text, parse_slash
 from noah_code.custom_commands import CustomCommand
 
 
@@ -63,3 +63,13 @@ def test_help_is_a_flat_command_list_without_category_labels() -> None:
         "Extensions:",
     ):
         assert category not in rendered
+
+
+def test_slash_parser_accepts_pasted_whitespace_without_changing_argument_text() -> None:
+    for separator in (" ", "\t", "\n", "\r\n", "  \t"):
+        assert parse_slash(f" /MEMORY{separator}save first\nsecond ") == (
+            "memory", "save first\nsecond"
+        )
+    assert parse_slash("/help") == ("help", "")
+    assert parse_slash("/") is None
+    assert parse_slash("a prompt") is None

@@ -97,6 +97,21 @@ def test_completed_stop_protocol_summary_is_hidden() -> None:
     assert buffer.getvalue() == ""
 
 
+@pytest.mark.parametrize("kind", list(HostEventKind))
+def test_console_event_data_is_literal(kind: HostEventKind) -> None:
+    ui, buffer = _make_ui(markdown=False)
+    value = "[bold]literal[/] [/unmatched]"
+    ui.render(HostEvent(kind, value))
+    assert value in buffer.getvalue()
+
+
+def test_shell_stream_preserves_chunk_boundaries_and_blank_lines() -> None:
+    ui, buffer = _make_ui()
+    for chunk in ("comp", "ile\n\n", "done\n"):
+        ui.render(HostEvent(HostEventKind.SHELL_CHUNK, chunk))
+    assert buffer.getvalue() == "compile\n\ndone\n"
+
+
 @pytest.mark.asyncio
 async def test_ask_approval_parses_once_session_reject_and_invalid(monkeypatch) -> None:
     ui, buffer = _make_ui()

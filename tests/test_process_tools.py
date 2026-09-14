@@ -475,3 +475,175 @@ async def test_input_after_process_death_reports_clean_error(
             await manager.input(job_id, "too late")
     finally:
         await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_concurrent_launches_preserve_capacity_and_unique_names(
+    tmp_path: Path, terminal: bool
+) -> None:
+    manager = _manager(tmp_path, max_jobs=8 if terminal else 1)
+    try:
+        results = await asyncio.gather(
+            *(
+                manager.open_terminal("same", shell="/bin/sh")
+                if terminal else manager.start("sleep 30")
+                for _ in range(2)
+            ),
+            return_exceptions=True,
+        )
+        assert sum(isinstance(result, str) for result in results) == 1
+        failures = [result for result in results if isinstance(result, Exception)]
+        assert len(failures) == 1
+        assert ("already exists" if terminal else "job limit reached") in str(failures[0])
+        assert len(manager._jobs) == 1
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_exit_marker_waits_for_complete_line(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    job = BackgroundJob(id="test", name="test", command="test", process=None)  # type: ignore[arg-type]
+    waiting = asyncio.create_task(
+        manager._wait_for_terminal_marker(job, cursor=0, marker="MARKER", timeout=1)
+    )
+    manager._append(job, "stdout", "ready\nMARKER:")
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    manager._append(job, "stdout", "1")
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    manager._append(job, "stdout", "2\n")
+    assert await waiting == ("ready\n", 12)
+
+
+@pytest.mark.asyncio
+async def test_terminal_wait_bounds_noisy_output(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    job = BackgroundJob(id="test", name="test", command="test", process=None)  # type: ignore[arg-type]
+    waiting = asyncio.create_task(
+        manager._wait_for_terminal_marker(job, cursor=0, marker="MARKER", timeout=1)
+    )
+    for _ in range(40):
+        manager._append(job, "stdout", "x" * 4000)
+        await asyncio.sleep(0)
+    manager._append(job, "stdout", "tail\nMARKER:0\n")
+    output, returncode = await waiting
+    assert returncode == 0
+    assert output.startswith("… earlier terminal output truncated …")
+    assert output.endswith("tail\n")
+    assert len(output) < 65_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [0, -1, float("nan")])
+async def test_invalid_process_timeouts_are_rejected(tmp_path: Path, timeout: float) -> None:
+    manager = _manager(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            await manager.start("sleep 30", timeout=timeout)
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            await manager.open_terminal("invalid", shell="/bin/sh", timeout=timeout)
+        assert not manager._jobs
+        await manager.open_terminal("valid", shell="/bin/sh")
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            await manager.terminal_run("valid", "touch unexpected.txt", timeout=timeout)
+        assert not (tmp_path / "unexpected.txt").exists()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_log_failure_does_not_stop_draining_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+    manager = _manager(tmp_path, runtime=runtime)
+    original_open = Path.open
+    events: list[tuple] = []
+    manager.set_lifecycle_handler(lambda *args: events.append(args))
+
+    def fail_log_append(path: Path, mode="r", *args, **kwargs):
+        if path.parent == runtime.process_log_dir and mode == "a":
+            raise OSError("disk full")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_log_append)
+    command = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote(
+        "print('x' * 200000); print('finished-marker')"
+    )
+    try:
+        started = await manager.start(command)
+        job = manager._jobs[started.split()[1]]
+        async with asyncio.timeout(3):
+            while job.state == "running":
+                await asyncio.sleep(0.01)
+        assert job.state == "completed"
+        assert job.log_path is None
+        assert any("logging disabled" in event[2] for event in events)
+        assert any("finished-marker" in event.text for event in job.events)
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_large_event_log_pages_advance_live_and_after_restart(tmp_path: Path) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+    manager = _manager(tmp_path, runtime=runtime)
+    log_path = runtime.process_log_dir / "test.jsonl"
+    job = BackgroundJob(
+        id="test", name="test", command="test", process=None, log_path=log_path,  # type: ignore[arg-type]
+    )
+    runtime.register_job(
+        job_id=job.id, name=job.name, command=job.command, pid=os.getpid(),
+        timeout_seconds=5, log_path=log_path,
+    )
+    runtime.update_job(job.id, "completed", returncode=0)
+    manager._jobs[job.id] = job
+    manager._append(job, "stdout", "x" * 4000)
+    manager._append(job, "stdout", "tail\n")
+    for durable in (False, True):
+        if durable:
+            manager._jobs.clear()
+        page = await manager.logs(job.id, max_chars=1000)
+        assert "event truncated" in page
+        assert "next_cursor=1" in page
+        assert len(page.split("\n\n", 1)[0]) <= 1000
+        assert "tail" in await manager.logs(job.id, cursor=1, max_chars=1000)
+        assert "x" * 4000 in await manager.logs(job.id, max_chars=8000)
+
+
+def test_single_oversized_event_retains_its_tail(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, max_buffer_chars=300)
+    job = BackgroundJob(id="test", name="test", command="test", process=None)  # type: ignore[arg-type]
+    manager._append(job, "stdout", "x" * 4000 + "tail-marker")
+    assert job.event_chars == 300
+    assert len(job.events) == 1
+    assert job.events[0].text.endswith("tail-marker")
+    assert "output truncated" in job.events[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_all", [False, True])
+async def test_stopping_survives_runtime_storage_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, close_all: bool
+) -> None:
+    runtime = RuntimeStateStore(tmp_path / "session")
+    manager = _manager(tmp_path, runtime=runtime)
+    started = await manager.start("sleep 30")
+    job = manager._jobs[started.split()[1]]
+
+    def fail_update(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("database is unavailable")
+
+    monkeypatch.setattr(runtime, "update_job", fail_update)
+    try:
+        if close_all:
+            await manager.close()
+        else:
+            assert "[stopped]" in await manager.stop(job.id)
+        assert job.process.returncode is not None
+        assert not manager.has_running()
+    finally:
+        await manager.close()

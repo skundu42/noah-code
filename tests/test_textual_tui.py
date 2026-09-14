@@ -730,7 +730,7 @@ async def test_cancel_renders_single_host_status_entry(tmp_path: Path) -> None:
         app.action_cancel_or_quit()
 
         host.cancel_active_turn.assert_called_once()
-        assert ui.busy is False
+        assert ui.busy is True  # Host cleanup owns the transition back to idle.
         assert app._interrupt_count == 0
         assert "cancelled" not in _log_text(app.query_one("#conversation"))
 
@@ -739,6 +739,24 @@ async def test_cancel_renders_single_host_status_entry(tmp_path: Path) -> None:
         await pilot.pause()
         rendered = _log_text(app.query_one("#conversation"))
         assert rendered.count("turn cancelled") == 1
+
+
+@pytest.mark.asyncio
+async def test_image_paste_keeps_workspace_path_and_quotes_spaces(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    image = tmp_path / "assets" / "screen shot.png"
+    image.parent.mkdir()
+    image.touch()
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        await composer._on_paste(events.Paste(str(image)))
+        assert composer.text == '@"assets/screen shot.png" '
+
+        composer.text = ""
+        await composer._on_paste(events.Paste("/outside/missing.png"))
+        assert composer.text == "/outside/missing.png"
+        await pilot.pause()
 
 
 @pytest.mark.asyncio
@@ -2356,6 +2374,52 @@ async def test_scrolled_transcript_counts_new_output_until_end(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_coalesced_activity_preserves_transcript_scroll_position(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=(80, 20)) as pilot:
+        for index in range(40):
+            app.ui.render(HostEvent(HostEventKind.MESSAGE, f"message {index}"))
+        await pilot.pause()
+        app._append_entry(textual_app_module.TranscriptEntry("ACTIVITY", "✓ Read a.py"))
+        await pilot.pause()
+        log = app.query_one("#conversation")
+        log.scroll_home(animate=False)
+        await pilot.pause()
+        app._append_entry(textual_app_module.TranscriptEntry("ACTIVITY", "✓ Read b.py"))
+        await pilot.pause()
+        assert not log.is_vertical_scroll_end
+        assert log.scroll_y == 0
+        assert app._unread_count == 1
+        assert app._transcript_entries[-1].text == "✓ Read a.py, b.py"
+
+
+@pytest.mark.asyncio
+async def test_session_switch_clears_previous_activity_and_error_state(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        app._process_host_event(HostEvent(HostEventKind.TOOL_START, "Run old task"))
+        app._queue_activity_output(HostEvent(HostEventKind.SHELL_CHUNK, "old output"))
+        app._unread_count = 5
+        app._checkpoint_pending = True
+        app._set_agent_state(AgentDisplayState.ERROR, "old failure")
+        host.meta.session_id = "another-session"
+        app._session_changed()
+        await pilot.pause()
+        assert app._agent_state == AgentDisplayState.READY
+        assert not app._activities
+        assert not app._activity_history
+        assert not app._timeline_history
+        assert not app._stream_fragments
+        assert app._active_activity_id is None
+        assert app._unread_count == 0
+        assert not app._checkpoint_pending
+        assert app.query_one("#live-activity").styles.display == "none"
+        assert not _log_text(app.query_one("#activity-output"))
+
+
+@pytest.mark.asyncio
 async def test_conversation_history_loads_persisted_events(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
     host.load_history_page.return_value = [
@@ -2454,7 +2518,7 @@ async def test_question_modal_other_collects_free_text_answer(tmp_path: Path) ->
     app = NoahCodeApp(host, ui)
     prompt = QuestionPrompt(
         header="Approach",
-        prompt="Which approach should the fix take?",
+        prompt="Which approach should fix [bold]literal[/]?",
         options=("safe", "fast"),
     )
     result_box: list[QuestionAnswer] = []
@@ -2467,6 +2531,11 @@ async def test_question_modal_other_collects_free_text_answer(tmp_path: Path) ->
         app.run_worker(_ask)
         await pilot.pause()
         assert isinstance(app.screen, QuestionModal)
+        assert app.screen.styles.align_horizontal == "center"
+        assert app.screen.styles.align_vertical == "middle"
+        assert "[bold]literal[/]" in _rendered_text(
+            app.screen.query_one("#approval-body").content
+        )
 
         # "Other" chains a free-text prompt instead of submitting "other".
         await pilot.press("0")

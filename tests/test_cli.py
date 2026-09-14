@@ -23,9 +23,10 @@ from noah_code.cli import (
 from noah_code.updates import UpdateStatus
 
 
-def test_help() -> None:
+@pytest.mark.parametrize("flag", ["-h", "--help"])
+def test_help(flag: str) -> None:
     runner = CliRunner()
-    result = runner.invoke(interactive_cmd, ["--help"])
+    result = runner.invoke(interactive_cmd, [flag])
     assert result.exit_code == 0
     assert "console" in result.output.lower()
     assert "session" in result.output.lower() or "Usage" in result.output
@@ -349,6 +350,9 @@ def test_run_does_not_auto_install_update(monkeypatch, tmp_path: Path) -> None:
         async def run_once(self, prompt: str) -> SimpleNamespace:
             return SimpleNamespace(exit_code=0)
 
+        async def close(self) -> None:
+            pass
+
     monkeypatch.setattr("noah_code.cli._AUTO_UPDATE_CHECKED", False)
     monkeypatch.setattr("noah_code.cli.maybe_check_for_update", fake_check)
     monkeypatch.setattr("noah_code.cli.maybe_auto_update", fake_install)
@@ -431,3 +435,120 @@ async def test_interactive_closes_host_on_all_exit_paths(
     assert console_exit == EXIT_SIGINT
     assert tui_exit == EXIT_CONFIG
     assert sorted(_CloseTrackingHost.closed) == ["console", "tui"]
+
+
+@pytest.mark.asyncio
+async def test_console_resume_keeps_session_model_without_first_run_prompt(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from noah_code.config import NoahCodeConfig
+    from noah_code.workspace import Workspace
+
+    config = NoahCodeConfig(model="project-default")
+    meta = SimpleNamespace(model="saved-session-model", reasoning_effort="high")
+    prepare = AsyncMock(return_value=((Workspace(root=tmp_path), config, object(), meta), 0))
+    setup = Mock(side_effect=AssertionError("resume must not replace the session model"))
+    host = Mock(run_interactive=AsyncMock(return_value=0), close=AsyncMock())
+    monkeypatch.setattr("noah_code.cli.user_default_model", lambda: None)
+    monkeypatch.setattr("noah_code.cli._configure_first_run_model", setup)
+    monkeypatch.setattr("noah_code.cli._prepare", prepare)
+    monkeypatch.setattr("noah_code.cli.AgentHost", lambda *_args, **_kwargs: host)
+
+    kwargs = _interactive_kwargs(tmp_path)
+    kwargs["continue_session"] = True
+    assert await _interactive(use_console=True, **kwargs) == 0
+    setup.assert_not_called()
+    assert prepare.await_args.kwargs["model"] is None
+    assert meta.model == "saved-session-model"
+    host.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_prepare_applies_explicit_mode_when_resuming(monkeypatch, tmp_path: Path) -> None:
+    from noah_code.sessions import SessionStore
+    from noah_code.workspace import Workspace
+
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: tmp_path / "missing.toml")
+    monkeypatch.setenv("NOAH_CODE_AUTO_UPDATE", "false")
+    monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))
+    store = SessionStore(tmp_path / "sessions")
+    saved = store.create(Workspace(root=tmp_path), model="saved-model", mode="build")
+
+    prepared, code = await _prepare(
+        path=str(tmp_path), model=None, reasoning_effort=None, auto=False, yolo=False,
+        mode="plan", session_id=saved.session_id,
+    )
+
+    assert code == 0
+    assert prepared is not None
+    assert prepared[3].mode == "plan"
+    assert store.load_meta(saved.session_id).mode == "plan"
+    assert store.load_meta(saved.session_id).model == "saved-model"
+
+
+@pytest.mark.asyncio
+async def test_prepare_loads_resumed_worktree_config_and_preserves_cli_overrides(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from noah_code.sessions import SessionStore
+    from noah_code.workspace import Workspace
+    from noah_code.worktree import WorktreeManager
+
+    repo = _init_repo(tmp_path / "repo")
+    copy = WorktreeManager(repo, tmp_path / "worktrees").create("resume")
+    for root, output_limit in ((repo, 1_000), (copy.directory, 2_000)):
+        (root / ".noah-code").mkdir()
+        (root / ".noah-code" / "config.toml").write_text(
+            f'max_output_chars = {output_limit}\nmax_iterations = 10\n[ui]\nfrontend = "tui"\n'
+        )
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: tmp_path / "missing.toml")
+    monkeypatch.setenv("NOAH_CODE_AUTO_UPDATE", "false")
+    monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))
+    store = SessionStore(tmp_path / "sessions")
+    saved = store.create(Workspace(root=copy.directory), model="saved-model")
+
+    prepared, code = await _prepare(
+        path=str(repo), model="explicit-model", reasoning_effort="high", auto=True, yolo=False,
+        mode="plan", max_iterations=7, frontend="console", session_id=saved.session_id,
+    )
+
+    assert code == 0
+    assert prepared is not None
+    workspace, config, selected_store, meta = prepared
+    assert workspace.root == copy.directory.resolve()
+    assert config.max_output_chars == 2_000
+    assert config.max_iterations == 7
+    assert config.auto_approve
+    assert config.ui.frontend == "console"
+    assert config.model == meta.model == "explicit-model"
+    assert config.mode == meta.mode == "plan"
+    assert config.reasoning_effort == meta.reasoning_effort == "high"
+    assert config.session_dir == selected_store.session_dir == store.session_dir
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, RuntimeError("startup failed")])
+async def test_run_always_closes_host_even_when_startup_fails(
+    monkeypatch, tmp_path: Path, failure: Exception | None
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from noah_code.cli import _run_session
+    from noah_code.config import NoahCodeConfig
+    from noah_code.workspace import Workspace
+
+    host = Mock(
+        run_once=AsyncMock(return_value=SimpleNamespace(exit_code=0), side_effect=failure),
+        close=AsyncMock(),
+    )
+    config = NoahCodeConfig()
+    prepare = AsyncMock(return_value=((Workspace(root=tmp_path), config, object(), None), 0))
+    monkeypatch.setattr("noah_code.cli._prepare", prepare)
+    monkeypatch.setattr("noah_code.cli.AgentHost", lambda *_args, **_kwargs: host)
+    kwargs = _interactive_kwargs(tmp_path)
+    kwargs.pop("continue_session")
+
+    assert await _run_session(prompt="fix", **kwargs) == (1 if failure else 0)
+    host.close.assert_awaited_once()

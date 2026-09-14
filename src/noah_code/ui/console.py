@@ -9,6 +9,7 @@ from typing import TextIO
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.text import Text
 
 from noah_code.approvals import ApprovalChoice, ApprovalRequest
 from noah_code.events import HostEvent, HostEventKind
@@ -37,35 +38,37 @@ class ConsoleUI:
             else:
                 self.console.print(event.text, markup=False, highlight=False)
         elif event.kind == HostEventKind.REASONING:
-            self.console.print(f"[dim]thinking:[/dim] {event.text}")
+            self.console.print(Text.assemble(("thinking: ", "dim"), event.text))
         elif event.kind == HostEventKind.TOOL_START:
-            self.console.print(f"[cyan]→[/cyan] {event.text}")
+            self.console.print(Text.assemble(("→ ", "cyan"), event.text))
         elif event.kind == HostEventKind.TOOL_FINISH:
-            self.console.print(f"[green]✓[/green] {event.text}")
+            self.console.print(Text.assemble(("✓ ", "green"), event.text))
         elif event.kind == HostEventKind.SHELL_CHUNK:
             stream = event.meta.get("stream", "stdout")
             style = "red" if stream == "stderr" else "white"
-            self.console.print(event.text.rstrip("\n"), style=style, highlight=False)
+            self.console.print(event.text, style=style, markup=False, highlight=False, end="")
         elif event.kind == HostEventKind.ERROR:
-            self.console.print(f"[bold red]error:[/bold red] {event.text}")
+            self.console.print(Text.assemble(("error: ", "bold red"), event.text))
         elif event.kind == HostEventKind.SUMMARY:
-            self.console.print(Panel(event.text, title="summary", border_style="blue"))
+            self.console.print(Panel(Text(event.text), title="summary", border_style="blue"))
         elif event.kind == HostEventKind.STATUS:
-            self.console.print(f"[dim]{event.text}[/dim]")
+            self.console.print(event.text, style="dim", markup=False, highlight=False)
         elif event.kind == HostEventKind.STOP:
             if str(event.meta.get("reason", "")).upper() != "DONE":
-                self.console.print(f"[bold]stop:[/bold] {event.text}")
+                self.console.print(Text.assemble(("stop: ", "bold"), event.text))
         elif event.kind == HostEventKind.DIFF_REVIEW:
             self.console.print(event.text or "(no changes)", markup=False, highlight=False)
         else:
-            self.console.print(event.text)
+            self.console.print(event.text, markup=False, highlight=False)
 
     async def ask_approval(self, request: ApprovalRequest) -> ApprovalChoice:
         d = request.decision
         self.console.print(
             Panel(
-                f"[yellow]{d.category}[/yellow] {d.target}\n{d.reason}\n"
-                f"remember pattern: {d.remember_pattern}",
+                Text.assemble(
+                    (str(d.category), "yellow"),
+                    f" {d.target}\n{d.reason}\nremember pattern: {d.remember_pattern}",
+                ),
                 title=f"Approval {request.id[:8]}",
                 border_style="yellow",
             )
@@ -88,7 +91,7 @@ class ConsoleUI:
     async def ask_questions(self, prompts: list[QuestionPrompt]) -> QuestionAnswer:
         return await console_question_handler(
             prompts,
-            printer=lambda line: self.console.print(line, highlight=False),
+            printer=lambda line: self.console.print(line, markup=False, highlight=False),
         )
 
     async def prompt(self, status: str) -> str | None:

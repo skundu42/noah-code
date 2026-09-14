@@ -45,7 +45,7 @@ from noah_code.commands import (
     config_command_suggestions,
     parse_slash,
 )
-from noah_code.composer import mention_suggestions
+from noah_code.composer import _resolve, mention_suggestions, mention_text
 from noah_code.event_bridge import _describe_code_activity
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.sessions import SessionEventRecord
@@ -701,12 +701,12 @@ def _command_insertion(invocation: str) -> str:
 
 
 def _active_mention(text: str) -> str | None:
-    match = re.search(r"@[A-Za-z0-9_./-]*$", text.rstrip())
+    match = re.search(r'(?<![\w/])@(?:"[^"\r\n]*"?|[A-Za-z0-9_./-]*)$', text.rstrip())
     return match.group(0) if match else None
 
 
 def _replace_active_mention(text: str, insertion: str) -> str:
-    match = re.search(r"@[A-Za-z0-9_./-]*$", text.rstrip())
+    match = re.search(r'(?<![\w/])@(?:"[^"\r\n]*"?|[A-Za-z0-9_./-]*)$', text.rstrip())
     if match is None:
         return f"{text.rstrip()} {insertion}".strip()
     return text[: match.start()] + insertion
@@ -855,13 +855,17 @@ class ComposerTextArea(TextArea):
     async def _on_paste(self, event: events.Paste) -> None:
         pasted = (event.text or "").strip()
         if pasted and "\n" not in pasted:
-            path = Path(pasted).expanduser()
+            raw = pasted[1:-1] if pasted[0] in {"'", '"'} and pasted[-1] == pasted[0] else pasted
+            path = Path(raw).expanduser()
             if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
-                event.stop()
-                event.prevent_default()
-                mention = f"@{path.name}" if path.name else pasted
-                self.replace(f"{mention} ", *self.selection, maintain_selection_offset=False)
-                return
+                root = Path(self.app.host.workspace.root).resolve()  # type: ignore[attr-defined]
+                resolved = _resolve(root, raw)
+                if resolved is not None:
+                    event.stop()
+                    event.prevent_default()
+                    mention = mention_text(resolved.relative_to(root).as_posix())
+                    self.replace(f"{mention} ", *self.selection, maintain_selection_offset=False)
+                    return
         await super()._on_paste(event)
 
 
@@ -938,7 +942,7 @@ class QuestionModal(ModalScreen[QuestionAnswer | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="approval-dialog"):
             yield Label(self.prompt.header.upper(), id="approval-title")
-            yield Static(self.prompt.prompt, id="approval-body")
+            yield Static(Text(self.prompt.prompt), id="approval-body")
             yield OptionList(id="question-list", compact=True)
             yield Static("↑/↓ choose · Enter select · 0 other · Esc cancel", id="picker-hint")
 
@@ -2406,7 +2410,7 @@ class NoahCodeApp(App[None]):
         """Stop UI timers before the widget tree is dismantled."""
 
         self._app_mounted = False
-        for timer in (self._loader_timer, self._status_timer):
+        for timer in (self._loader_timer, self._status_timer, self._stream_timer, self._notice_timer):
             if timer is not None:
                 timer.stop()
         self._loader_timer = None
@@ -3181,6 +3185,8 @@ class NoahCodeApp(App[None]):
                     previous.event_id,
                 )
                 self._rerender_transcript()
+                if not at_end:
+                    self._unread_count += 1
                 return
         self._transcript_entries.append(entry)
         if len(self._transcript_entries) > 500:
@@ -3208,6 +3214,8 @@ class NoahCodeApp(App[None]):
 
     def _rerender_transcript(self) -> None:
         log = self.query_one("#conversation", SelectableRichLog)
+        at_end = self._follow_batch if self._follow_batch is not None else self._at_transcript_end()
+        scroll_y = log.scroll_y
         log.clear()
         counts: list[int] = []
         for entry in self._transcript_entries:
@@ -3215,7 +3223,10 @@ class NoahCodeApp(App[None]):
             log.write(_role_renderable(entry), scroll_end=False)
             counts.append(max(len(log.lines) - rows_before, 0))
         self._transcript_line_counts = counts
-        log.scroll_end(animate=False)
+        if at_end:
+            log.scroll_end(animate=False)
+        else:
+            log.scroll_to(y=scroll_y, animate=False, force=True)
 
     @work(exclusive=True, group="recent-history")
     async def _load_recent_history(self) -> None:
@@ -3584,7 +3595,7 @@ class NoahCodeApp(App[None]):
         if mention is not None:
             matches = mention_suggestions(Path(self.host.workspace.root), mention)
             return [
-                CommandSuggestion(f"@{path}", "Attach workspace file", "Project")
+                CommandSuggestion(mention_text(path), "Attach workspace file", "Project")
                 for path in matches
             ]
         if not query.startswith("/"):
@@ -4615,6 +4626,22 @@ class NoahCodeApp(App[None]):
             self._load_recent_history()
             self.update_chrome(force=True)
             return
+        if self._stream_timer is not None:
+            self._stream_timer.stop()
+            self._stream_timer = None
+        self._stream_fragments.clear()
+        self._activities.clear()
+        self._activity_history.clear()
+        self._active_activity_id = None
+        self._last_thought = ""
+        self._unread_count = 0
+        self._activity_unread_lines = 0
+        self._activity_expanded = False
+        self._checkpoint_pending = False
+        self._activity_title_signature = None
+        self.query_one("#activity-output", RichLog).clear()
+        self.query_one("#live-activity", Vertical).styles.display = "none"
+        self._set_agent_state(AgentDisplayState.READY)
         self._transcript_entries.clear()
         self._transcript_event_ids.clear()
         self._transcript_line_counts.clear()
@@ -4938,7 +4965,6 @@ class NoahCodeApp(App[None]):
             self._set_agent_state(AgentDisplayState.CANCELLING)
             self.update_chrome(force=True)
             self.host.cancel_active_turn()
-            self.ui.set_busy(False)
             self._interrupt_count = 0
             return
         self._interrupt_count += 1

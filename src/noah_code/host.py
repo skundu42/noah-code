@@ -282,6 +282,7 @@ class AgentHost:
     async def start(self) -> SessionMeta:
         from noah_code.worktree import infer_worktree_name, repo_id_for, worktree_storage_root
 
+        loaded_meta_updated_at = self.meta.updated_at if self.meta is not None else None
         if self.meta is None:
             self.meta = self.store.create(
                 self.workspace,
@@ -343,6 +344,15 @@ class AgentHost:
                 and persisted_meta.get("session_id") == self.meta.session_id
             ):
                 recovered_meta = SessionMeta.from_json(json.dumps(persisted_meta))
+                if (
+                    loaded_meta_updated_at is not None
+                    and loaded_meta_updated_at > recovered_meta.updated_at
+                ):
+                    # CLI overrides and idle model switches may be newer than
+                    # the last completed turn's checkpoint.
+                    recovered_meta.mode = self.meta.mode
+                    recovered_meta.model = self.meta.model
+                    recovered_meta.reasoning_effort = self.meta.reasoning_effort
                 # The runtime checkpoint is written as one generation and is the
                 # authoritative host-state view when JSON sidecars lag a crash.
                 self.meta = recovered_meta
@@ -463,7 +473,6 @@ class AgentHost:
         restored = self._storage.restore_latest_snapshot(agent)
         if restored:
             # Re-bind host-owned nosnapshot infrastructure after restore.
-            agent._engine.mode = agent.mode
             agent._engine.load_session_rules(self.meta.permission_rules)
             journal_data = checkpoint.get("journal")
             if not isinstance(journal_data, dict):
@@ -474,10 +483,9 @@ class AgentHost:
             todos = checkpoint.get("todos", self.meta.todos)
             if isinstance(todos, dict) and todos:
                 agent.todos.from_dict(todos)
-        else:
-            agent.set_mode(self.meta.mode)
-            agent.v.mode = self.meta.mode
-            agent.v.model = self.meta.model
+        agent.set_mode(self.meta.mode)
+        agent.v.mode = self.meta.mode
+        agent.v.model = self.meta.model
 
         agent._approvals.set_handler(self.ui.ask_approval)
         agent.ask.set_handler(self.ui.ask_questions)
@@ -790,6 +798,8 @@ class AgentHost:
         itself must stay on the event-loop thread.
         """
 
+        if self._agent is None or self.meta is None or self._storage is None:
+            return
         journal_data = await asyncio.to_thread(self._persist_state)
         await asyncio.to_thread(self._write_persist_files, journal_data)
         if self._agent is not None and self._storage is not None:
@@ -2308,6 +2318,12 @@ class AgentHost:
         """
 
         while True:
+            timeout = self._wake_timeout_seconds
+            if self._budget_guard is not None:
+                self._budget_guard.enforce()
+                remaining = self._budget_guard.remaining_seconds()
+                if remaining is not None:
+                    timeout = min(timeout, remaining)
             if not agent.processes.has_running():
                 if latched or self._wake_event.is_set():
                     self._wake_event.clear()
@@ -2319,7 +2335,7 @@ class AgentHost:
             try:
                 await asyncio.wait_for(
                     self._wake_event.wait(),
-                    timeout=self._wake_timeout_seconds,
+                    timeout=timeout,
                 )
                 self._wake_event.clear()
                 return True

@@ -20,7 +20,7 @@ IMAGE_TYPES = {
     ".bmp": "image/bmp",
 }
 
-_MENTION = re.compile(r"(?<![\w/])@([A-Za-z0-9_./-]+)")
+_MENTION = re.compile(r'(?<![\w/])@(?:"([^"\r\n]+)"|([A-Za-z0-9_./-]+))')
 _MAX_INLINE_CHARS = 8_000
 _MAX_FILES = 8
 
@@ -57,6 +57,8 @@ def _workspace_files(root: Path) -> list[Path]:
             path = Path(dirpath) / filename
             if not path.is_file() or is_secret_path(path):
                 continue
+            if path.is_symlink() and _resolve(root, str(path)) is None:
+                continue
             files.append(path)
     files.sort()
     _suggestion_cache[root] = (now, files)
@@ -67,25 +69,32 @@ def mention_suggestions(workspace: Path, prefix: str, *, limit: int = 8) -> list
     """Return workspace-relative paths matching a live ``@`` prefix."""
 
     raw = prefix.strip()
-    if not raw.startswith("@"):
+    if not raw.startswith("@") or limit <= 0:
         return []
-    query = raw[1:].lstrip("./")
+    query = raw[1:].removeprefix('"').removeprefix("./")
     if not query:
         return []
     root = workspace.resolve()
-    matches: list[str] = []
+    starts: list[str] = []
+    rest: list[str] = []
     for path in _workspace_files(root):
         try:
             relative = path.relative_to(root).as_posix()
         except ValueError:
             continue
-        if relative.startswith(query) or Path(relative).name.startswith(Path(query).name):
-            matches.append(relative)
-        if len(matches) >= limit:
+        if relative.startswith(query):
+            starts.append(relative)
+        elif len(rest) < limit and Path(relative).name.startswith(Path(query).name):
+            rest.append(relative)
+        if len(starts) >= limit:
             break
-    starts = [item for item in matches if item.startswith(query)]
-    rest = [item for item in matches if item not in starts]
-    return starts + rest
+    return (starts + rest)[:limit]
+
+
+def mention_text(path: str) -> str:
+    """Quote workspace paths that contain spaces or non-ASCII characters."""
+
+    return f"@{path}" if re.fullmatch(r"[A-Za-z0-9_./-]+", path) else f'@"{path}"'
 
 
 def expand_turn(
@@ -97,7 +106,7 @@ def expand_turn(
     """Inline ``@path`` text files and attach mentioned images via ``nooa.Image``."""
 
     root = workspace.resolve()
-    mentioned = [match.group(1) for match in _MENTION.finditer(text)]
+    mentioned = [match.group(1) or match.group(2) for match in _MENTION.finditer(text)]
     extras = [Path(path) for path in attach_paths or []]
     sections: list[str] = []
     images: list[Any] = []
@@ -105,6 +114,8 @@ def expand_turn(
     seen: set[str] = set()
 
     for raw in [*mentioned, *[str(path) for path in extras]]:
+        if len(paths) >= _MAX_FILES:
+            break
         resolved = _resolve(root, raw)
         if resolved is None:
             continue
@@ -121,12 +132,11 @@ def expand_turn(
             images.append(Image.from_file(resolved))
             sections.append(f"Attached image `{relative}`. Call `show(image)` on pending media.")
             continue
-        body = resolved.read_text(errors="replace")
+        with resolved.open(encoding="utf-8", errors="replace") as handle:
+            body = handle.read(_MAX_INLINE_CHARS + 1)
         if len(body) > _MAX_INLINE_CHARS:
             body = body[:_MAX_INLINE_CHARS] + "\n...(truncated)..."
         sections.append(f"### {relative}\n```\n{body}\n```")
-        if len(sections) >= _MAX_FILES:
-            break
 
     if not sections:
         return ExpandedTurn(text=text)
@@ -136,12 +146,12 @@ def expand_turn(
 
 def _resolve(root: Path, raw: str) -> Path | None:
     candidate = Path(raw).expanduser()
-    path = candidate if candidate.is_absolute() else (root / raw).resolve()
     try:
+        path = (candidate if candidate.is_absolute() else root / candidate).resolve()
         path.relative_to(root)
-    except ValueError:
+    except (OSError, RuntimeError, ValueError):
         return None
-    if not path.is_file() or is_secret_path(path):
+    if not path.is_file() or is_secret_path(candidate) or is_secret_path(path):
         return None
     return path
 

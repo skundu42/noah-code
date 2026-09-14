@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import difflib
+import fnmatch
 import gc
 import hashlib
 import os
@@ -15,6 +16,7 @@ import tempfile
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
@@ -138,6 +140,7 @@ def _pattern_keeps_dir(pattern: str, name: str) -> bool:
     return name in pattern.replace("\\", "/").split("/")
 
 
+@lru_cache(maxsize=128)
 def _glob_to_regex(pattern: str) -> re.Pattern[str]:
     """Translate a glob with ``**`` into a regex that works on Python 3.12+."""
     parts: list[str] = []
@@ -161,6 +164,19 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
             parts.append("[^/]*")
         elif char == "?":
             parts.append("[^/]")
+        elif char == "[":
+            end = index + 1
+            if end < length and pattern[end] == "!":
+                end += 1
+            if end < length and pattern[end] == "]":
+                end += 1
+            end = pattern.find("]", end)
+            if end != -1:
+                parts.append("(?!/)" + fnmatch.translate(pattern[index : end + 1]))
+                parts[-1] = parts[-1].removesuffix(r"\Z")
+                index = end + 1
+                continue
+            parts.append(r"\[")
         else:
             parts.append(re.escape(char))
         index += 1
@@ -332,8 +348,9 @@ class WorkspaceTools(Skill):
     @staticmethod
     def _read_line_range(resolved: Path, lines: tuple[int, int]) -> WorkspaceMatch:
         """Stream only the requested 1-indexed inclusive range from disk."""
-        start = max(1, lines[0])
-        end = lines[1]
+        start, end = lines
+        if start < 1 or end < start:
+            raise ValueError("lines must be a 1-indexed inclusive (start, end) range")
         collected: list[str] = []
         last = 0
         with resolved.open(encoding="utf-8") as stream:
@@ -550,10 +567,6 @@ class WorkspaceTools(Skill):
                         f"stale edit anchor: {self._workspace.relpath(resolved)} changed "
                         "since read(); call read() again to refresh the Match"
                     )
-            else:
-                # Anchors harvested via grep/run() never passed through read(),
-                # so verify the anchored region's current content instead.
-                self._verify_anchor_fresh(resolved, match)
             oversized = self._preimage_exceeds_blob_limit(resolved)
             durable = self._begin_durable_file_operation(resolved)
             mut = self._journal.record_preimage(resolved)
@@ -918,7 +931,10 @@ class WorkspaceTools(Skill):
         agents avoid the approval gate for verification commands.
         """
         if read_only:
-            return await self.run_trusted_readonly(command)
+            if not self._engine.is_readonly_command(command):
+                raise PermissionError(f"trusted command is not read-only: {command}")
+            await self._approvals.require(self._shell_decision(command))
+            return await self.run_trusted_readonly(command, stdin=stdin, timeout=timeout)
         decision = self._shell_decision(command)
         await self._approvals.require(decision)
         if not self._engine.is_readonly_command(command):
@@ -1040,7 +1056,9 @@ class WorkspaceTools(Skill):
             self._runtime.rollback_file_operation(operation_id)
 
     @hidden
-    async def run_trusted_readonly(self, command: str) -> ShellResult:
+    async def run_trusted_readonly(
+        self, command: str, *, stdin: str | None = None, timeout: float | None = None
+    ) -> ShellResult:
         """Run a host-constructed, strictly read-only command without a model approval."""
         if not self._engine.is_readonly_command(command):
             raise PermissionError(f"trusted command is not read-only: {command}")
@@ -1051,7 +1069,9 @@ class WorkspaceTools(Skill):
         if any(is_secret_path(token) or is_secret_path(Path(token).name) for token in tokens):
             raise PermissionError(f"trusted command targets a secret path: {command}")
         async with self._pinned_shell_cwd():
-            result = await self._shell.run(command, timeout=self._default_timeout)
+            result = await self._shell.run(
+                command, stdin=stdin, timeout=self._default_timeout if timeout is None else timeout
+            )
         return self._cap_shell_result(result)
 
     async def _ensure_shell_started(self) -> None:
@@ -1127,37 +1147,10 @@ class WorkspaceTools(Skill):
     @staticmethod
     def _hash_path(path: Path) -> str | None:
         try:
-            return hashlib.sha256(path.read_bytes()).hexdigest()
+            with path.open("rb") as stream:
+                return hashlib.file_digest(stream, "sha256").hexdigest()
         except OSError:
             return None
-
-    def _verify_anchor_fresh(self, resolved: Path, match: Match) -> None:
-        """Content-based staleness check for anchors that bypassed read()."""
-        rel = self._workspace.relpath(resolved)
-        try:
-            data = resolved.read_bytes()
-        except OSError as exc:
-            raise ValueError(
-                f"stale edit anchor: cannot re-read {rel}; call read() again to refresh the Match"
-            ) from exc
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            text = data.decode("latin-1")
-        all_lines = text.splitlines(keepends=True)
-        start = max(1, int(match.start))
-        end = min(len(all_lines), int(match.end))
-        region = "".join(all_lines[start - 1 : end]) if start <= len(all_lines) else ""
-        if region == match.text:
-            return
-        # Anchors harvested by grep/run() pass through universal-newline
-        # decoding, so tolerate newline-convention differences only.
-        if _normalize_newlines(region) == _normalize_newlines(match.text):
-            return
-        raise ValueError(
-            f"stale edit anchor: {rel} changed since the Match was captured; "
-            "call read() again to refresh the Match"
-        )
 
     def _native_replace_string(
         self, resolved: Path, path_display: str, old: str, new: str
@@ -1230,6 +1223,11 @@ class WorkspaceTools(Skill):
                 "call read() again to refresh the Match"
             )
         removed = all_lines[start - 1 : end]
+        if _normalize_newlines("".join(removed)) != _normalize_newlines(match.text):
+            raise ValueError(
+                f"stale edit anchor: {self._workspace.relpath(resolved)} changed; "
+                "call read() again to refresh the Match"
+            )
         replacement = new_text
         if replacement and not replacement.endswith("\n") and end < total:
             eol = "\r\n" if removed and removed[-1].endswith("\r\n") else "\n"

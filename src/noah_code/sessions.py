@@ -246,12 +246,16 @@ class SessionStore:
 
         db = self._db_path(session_id)
         db.parent.mkdir(parents=True, exist_ok=True)
+        storage = None
         try:
             storage = SQLiteStorageManager(db)
             if db.exists():
                 db.chmod(0o600)
             return storage
         except Exception as exc:  # noqa: BLE001 - surface recovery path
+            if storage is not None:
+                with contextlib.suppress(Exception):
+                    storage.close()
             raise SessionError(
                 f"cannot open session database {db}: {exc}. "
                 f"If damaged, delete with: noah-code sessions delete {session_id}"

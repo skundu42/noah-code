@@ -23,7 +23,9 @@ def _reply_text(response: Any) -> str:
 def coerce_text_only_response(response: Any) -> Any:
     """Rewrite a bare assistant message as ``self.message`` + ``return_result``."""
 
-    if getattr(response, "tool_calls", None):
+    # A token-limited reply is incomplete. Let CodeAct request continuation
+    # instead of silently reporting a partial answer as successfully finished.
+    if getattr(response, "tool_calls", None) or getattr(response, "finish_reason", None) != "stop":
         return response
     text = _reply_text(response)
     if not text:

@@ -20,6 +20,7 @@ import signal
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -155,14 +156,17 @@ class RuntimeStateStore:
         self._max_events = max_events
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=5000")
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        # SQLite's own context manager finishes the transaction but leaves the
+        # connection open. Close on success, rollback, and setup failure alike.
+        with contextlib.closing(sqlite3.connect(self.path, timeout=5.0)) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            yield connection
 
     def _initialize(self) -> None:
         schema = """
