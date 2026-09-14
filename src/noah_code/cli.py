@@ -37,20 +37,6 @@ EXIT_AGENT = 1
 EXIT_CONFIG = 2
 EXIT_SIGINT = 130
 
-SUBCOMMANDS = frozenset(
-    {
-        "run",
-        "checkpoints",
-        "sessions",
-        "worktree",
-        "pr",
-        "doctor",
-        "config",
-        "providers",
-        "update",
-    }
-)
-
 _AUTO_UPDATE_CHECKED = False
 
 
@@ -1056,7 +1042,7 @@ def main(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
     base = os.path.basename(sys.argv[0]) if sys.argv else "noah-code"
     prog = base if base in {"nc", "noah", "noah-code"} else "noah-code"
-    if args and args[0] in SUBCOMMANDS:
+    if args and args[0] in cli_group.commands:
         cli_group.main(args=args, prog_name=prog)
     else:
         interactive_cmd.main(args=args, prog_name=prog)

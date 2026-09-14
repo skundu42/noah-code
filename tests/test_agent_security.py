@@ -10,10 +10,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from nooa.interactive import AgentVars
 from nooa.runtime.restrictions import RestrictionsConfig
 from nooa.runtime.sandbox.config import SandboxConfig
 from nooa.runtime.sandbox.errors import SandboxExecutionError
 from nooa.runtime.sandbox.serialization import effective_error_limit
+from nooa.storage.snapshot_vars import SnapshotVars
+from nooa.tools import TodoManager
 
 from noah_code.agent import (
     _codeact_config,
@@ -87,6 +90,90 @@ async def test_sandbox_cannot_call_the_host_only_readonly_runner() -> None:
     assert result["ok"] is False
     assert result["error_type"] == "PermissionError"
     assert "sandbox broker access denied" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_sandbox_broker_authorizes_operations_and_full_targets() -> None:
+    async def read(path: str) -> str:
+        return f"contents of {path}"
+
+    agent = SimpleNamespace(
+        ws=SimpleNamespace(read=read),
+        todos=TodoManager(),
+        vars=SnapshotVars(),
+        mode="plan",
+        workspace_root="workspace",
+        approved=SimpleNamespace(read=read),
+        _sandbox_approved_roots={"approved"},
+    )
+    agent.v = AgentVars(agent)
+    executor = object.__new__(_PermissionSandboxedExecutor)
+    executor._agent = agent
+    executor._max_error = effective_error_limit(None)
+
+    for path in (
+        ["ws"],
+        ["ws", "read"],
+        ["ws", "_engine"],
+        ["ws", "new_method"],
+        ["todos"],
+        ["todos", "add"],
+        ["todos", "_todos"],
+        ["v"],
+        ["v", "_agent"],
+        ["v", "record", "field"],
+        ["mode"],
+        ["workspace_root"],
+        ["approved"],
+        ["approved", "read"],
+    ):
+        result = await executor._dispatch_tool_call(
+            {"kind": "setattr", "path": path, "value": None}
+        )
+        assert result["ok"] is False, path
+        assert result["error_type"] == "PermissionError", path
+    assert agent.ws.read is read
+    assert agent.mode == "plan"
+    assert not hasattr(agent.ws, "new_method")
+
+    for message in (
+        {"kind": "unknown", "path": ["ws", "read"]},
+        {"kind": "call", "path": ["ws"]},
+        {"kind": "call", "path": ["v", "record"]},
+        {"kind": "iter", "path": ["todos"]},
+        {"kind": "attr", "path": ["approved", "_private"]},
+        {"kind": "attr", "path": ["v", "_agent"]},
+        {"kind": "attr", "path": "ws.read"},
+        {"kind": "call", "path": [None]},
+        {"kind": "setattr", "path": ["v", "record"], "value": read},
+    ):
+        result = await executor._dispatch_tool_call(message)
+        assert result["error_type"] == "PermissionError", message
+
+    for path in (["ws"], ["ws", "read"], ["todos"], ["v"], ["approved", "read"]):
+        result = await executor._dispatch_tool_call({"kind": "attr", "path": path})
+        assert result == {"ok": True, "result": None, "proxy": True}
+    for path in (["ws", "read"], ["approved", "read"]):
+        result = await executor._dispatch_tool_call(
+            {"kind": "call", "path": path, "args": ["notes.txt"]}
+        )
+        assert result["result"] == "contents of notes.txt"
+        assert result["was_async"] is True
+    result = await executor._dispatch_tool_call(
+        {"kind": "call", "path": ["todos", "add"], "args": ["Review"]}
+    )
+    assert result["ok"] is True
+    assert agent.todos.get(result["result"].id).title == "Review"
+    result = await executor._dispatch_tool_call({"kind": "attr", "path": ["mode"]})
+    assert result["result"] == "plan"
+    result = await executor._dispatch_tool_call(
+        {"kind": "setattr", "path": ["v", "record"], "value": ["done"]}
+    )
+    assert result["ok"] is True
+    assert agent.vars["record"] == ["done"]
+    for kind in ("attr", "iter"):
+        result = await executor._dispatch_tool_call({"kind": kind, "path": ["v", "record"]})
+        assert result["result"] == ["done"]
 
 
 def test_macos_profile_allows_both_symlink_and_resolved_runtime_paths(tmp_path: Path) -> None:

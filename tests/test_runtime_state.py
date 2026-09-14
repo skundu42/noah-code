@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 from pathlib import Path
 
@@ -75,6 +76,57 @@ def test_started_file_operations_roll_back_after_crash(tmp_path: Path) -> None:
     assert existing.stat().st_mode & 0o777 == 0o640
     assert not created.exists()
     assert RuntimeStateStore(session).recover_file_operations() == []
+
+
+def test_recovery_preserves_post_crash_repairs_and_backup_failure_is_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from noah_code.runtime_state import _restore_file
+
+    store = RuntimeStateStore(tmp_path / "session")
+    existing, created = tmp_path / "existing.py", tmp_path / "created.py"
+    existing.write_bytes(b"original")
+    for target in (existing, created):
+        store.begin_file_operation(target)
+        target.write_bytes(b"partial write")
+        target.write_bytes(b"user repair\x00\xff")
+
+    def fail_backup(path, data, mode):
+        if path.parent == store.recovery_dir:
+            raise OSError("backup disk full")
+        _restore_file(path, data, mode)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("noah_code.runtime_state._restore_file", fail_backup)
+        with pytest.raises(OSError, match="backup disk full"):
+            store.recover_file_operations()
+    assert existing.read_bytes() == created.read_bytes() == b"user repair\x00\xff"
+
+    reopened = RuntimeStateStore(store.session_path)
+    assert set(reopened.recover_file_operations()) == {str(existing), str(created)}
+    assert existing.read_bytes() == b"original"
+    assert not created.exists()
+    backups = [json.loads(path.read_text()) for path in reopened.recovery_dir.glob("*.json")]
+    assert {backup["path"] for backup in backups} == {str(existing), str(created)}
+    for backup in backups:
+        content = reopened.recovery_dir / backup["content_file"]
+        assert content.read_bytes() == b"user repair\x00\xff"
+        assert content.stat().st_mode & 0o777 == 0o600
+
+
+def test_recovery_preserves_replacement_symlink_without_touching_its_target(tmp_path: Path) -> None:
+    store = RuntimeStateStore(tmp_path / "session")
+    path, target = tmp_path / "replaced.txt", tmp_path / "elsewhere.txt"
+    target.write_text("unrelated")
+    store.begin_file_operation(path)
+    path.symlink_to(target)
+
+    store.recover_file_operations()
+
+    assert not path.is_symlink()
+    assert target.read_text() == "unrelated"
+    backup = json.loads(next(store.recovery_dir.glob("*.json")).read_text())
+    assert backup["symlink_target"] == str(target)
 
 
 def test_committed_file_operation_is_not_rolled_back(tmp_path: Path) -> None:

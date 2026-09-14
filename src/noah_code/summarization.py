@@ -2,9 +2,9 @@
 
 Compaction runs two passes over the evicted range:
 
-1. Pointer eviction (free): old tool outputs that were already spilled to the
-   :class:`ToolOutputStore` have their bulky bodies replaced by one-line
-   ``self.ws.read_output`` stubs. No LLM tokens are spent.
+1. Pointer eviction (free): complete event fields containing spilled outputs
+   are saved before replacement by ``self.ws.read_output`` stubs. A field
+   may contain several results, so its first spill is not a complete backup.
 2. Narrative summarization (LLM): whatever remains is compressed into the
    structured coding checkpoint.
 """
@@ -19,8 +19,9 @@ from nooa.agents.summarization import TokenBudgetSummarizer
 from nooa.config import PredictConfig
 
 from noah_code.predict import ISOLATED_PREDICT_CONTEXT, LeanPredictStrategy
+from noah_code.tool_output import ToolOutputStore
 
-_SPILL_ID = re.compile(r"id=([0-9a-f]{20})")
+_SPILL_NOTICE = re.compile(r"full output id=[0-9a-f]{20}; read with self\.ws\.read_output\(")
 
 #: Bodies below this size stay for narrative summarization; eviction targets
 #: only genuinely large spilled outputs.
@@ -47,7 +48,9 @@ def _candidate_fields(event: object) -> tuple[tuple[str, str], ...]:
     return ()
 
 
-def evict_spilled_outputs(manager: object, start_tag: str, end_tag: str) -> int:
+def evict_spilled_outputs(
+    manager: object, start_tag: str, end_tag: str, output_store: ToolOutputStore
+) -> int:
     """Replace large spilled tool outputs in ``[start_tag..end_tag]`` with stubs.
 
     Returns the number of characters reclaimed from the model-visible history.
@@ -73,10 +76,10 @@ def evict_spilled_outputs(manager: object, start_tag: str, end_tag: str) -> int:
             text = getattr(event, field, None)
             if not isinstance(text, str) or len(text) <= EVICT_FLOOR_CHARS:
                 continue
-            match = _SPILL_ID.search(text)
-            if match is None:
+            if _SPILL_NOTICE.search(text) is None:
                 continue
-            stub = _stub(source, match.group(1), len(text))
+            output_id = output_store.store(text)
+            stub = _stub(source, output_id, len(text))
             if manager.update(tag, **{field: stub}):  # type: ignore[attr-defined]
                 saved += len(text) - len(stub)
     return saved
@@ -87,15 +90,17 @@ class CodingSessionSummarizer(TokenBudgetSummarizer):
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
+        self._output_store: ToolOutputStore | None = None
         self.evicted_output_chars = 0
 
     def _schedule_summarization(self, start_tag: str, end_tag: str) -> None:
         """Evict spilled tool outputs first so the LLM compresses only prose."""
 
-        with contextlib.suppress(Exception):  # eviction must never block compaction
-            self.evicted_output_chars += evict_spilled_outputs(
-                self.target_event_manager, start_tag, end_tag
-            )
+        if self._output_store is not None:
+            with contextlib.suppress(Exception):  # failed persistence leaves the field intact
+                self.evicted_output_chars += evict_spilled_outputs(
+                    self.target_event_manager, start_tag, end_tag, self._output_store
+                )
         super()._schedule_summarization(start_tag, end_tag)
 
     @strategy(

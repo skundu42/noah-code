@@ -219,12 +219,14 @@ supported by the OTLP exporters; keep authentication headers in the environment 
 secret store rather than TOML.
 
 Repository-controlled configuration cannot weaken the host trust boundary. Project config is
-ignored for `auto_approve`, `budget`, `efficiency`, `enabled_skills`, `hooks`, `lsp`, `mcp`,
+ignored for `auto_approve`, `yolo`, `budget`, `checkpoints`, `efficiency`, `enabled_skills`, `hooks`, `lsp`, `mcp`,
 `permission_rules`, `processes`, `reliability`, `session_dir`, `tracing`, `updates`, and
 `unsafe_inprocess_code_execution`. Put those settings in trusted user config, the environment, or
 an explicit CLI flag. Language-server overrides and hooks are user-only because they launch local
-executables; reliability and budget settings are user-only so repository content cannot weaken
-host limits.
+executables; reliability, budget, and checkpoint settings are user-only so repository content cannot
+weaken host limits or recovery protections. Project config may select `mode = "plan"`, but choosing
+build mode requires trusted configuration or an explicit CLI flag. Newly added settings are user-only
+unless explicitly approved for project configuration.
 
 A user-configured `permission_rules` array replaces the default rule array. Copy forward every
 default you still want before adding overrides. Hard secret, destructive-shell, and plan-mode
@@ -362,8 +364,8 @@ Permission rules are evaluated in order, and the last matching rule wins. The de
 - Keeps file tools inside the active workspace and asks before MCP access.
 - Denies plan-mode mutations regardless of broader allow rules. Plan mode may still run
   read-only subagents. Its shell allowlist accepts only literal, unqualified read-only programs;
-  test collection and interpreter execution are not treated as read-only because they can load
-  repository code.
+  arguments are checked for write-capable options. Test collection and interpreter execution,
+  including arbitrary awk programs, are not treated as read-only because they can execute code.
 
 `--auto` changes routine ask decisions to allow but never overrides an explicit deny.
 Elevated-risk commands such as file removal, downloads, and package installation still require
@@ -384,7 +386,7 @@ sh install.sh
 ```
 
 Installs created by the one-line command check PyPI at most once every 24 hours. If a release is
-available, a new TUI session shows a temporary banner and keeps the version in the context rail.
+available, a new TUI session shows a temporary banner with `F6` opening its details.
 Run `noah update` when ready. When an update is installed, Noah exits before starting the task so
 it cannot mix old and new runtime modules. Rerun the command to continue on the new version.
 

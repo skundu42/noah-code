@@ -16,8 +16,8 @@
 
 <p align="center"><sub>The real Textual interface, captured from a deterministic Noah Code session.</sub></p>
 
-Noah keeps the conversation central while the context rail tracks live work, Git changes, session,
-model usage, and the current plan. Tool execution stays visible, completed work compacts into
+Noah keeps the conversation central while the sidebar tracks the current action, changed files,
+and the active plan. Tool execution stays visible, completed work compacts into
 readable records, and every session remains scoped to its repository.
 
 Built on the [NVIDIA OO Agents (NOOA)](https://github.com/NVIDIA-NeMo/labs-OO-Agents) runtime.
@@ -121,20 +121,27 @@ Type `/` to search the full command and configuration reference. The most common
 | Control | Action |
 | --- | --- |
 | `Enter` | Send the current prompt or accept a selected suggestion |
-| `Shift+Enter` | Insert a newline |
+| `Shift+Enter` / `Ctrl+J` | Insert a newline |
+| `Alt+Enter` | Expand or collapse the composer |
+| `Alt+Z` | Restore a displaced draft |
 | Drag, then `Cmd+C` / `Ctrl+Shift+C` | Select and copy TUI text |
 | `Ctrl+Shift+C` with no selection | Copy the latest Noah reply |
 | `Ctrl+G` | Open the searchable skills picker |
 | `Ctrl+L` | Open the model picker |
 | `Ctrl+R` | Search and recall a prior prompt |
 | `Ctrl+T` | Expand or collapse live tool output |
-| `Shift+Tab` | Open the reasoning-effort picker |
+| `Alt+E` | Open the reasoning-effort picker |
 | `Alt+Up` | Recall the newest queued prompt for editing |
 | `Ctrl+]` | Return to live transcript output |
-| `Tab` | Switch between build and plan mode |
+| `Tab` / `Shift+Tab` | Navigate focus; Tab completes suggestions |
+| `Ctrl+B` | Switch between build and plan mode |
+| `Ctrl+D` | Review changes while working or idle |
+| `Ctrl+C` | Stop the current run and pause queued follow-ups |
 | `F2` | Open execution activity |
 | `F3` | Open paginated conversation history |
 | `F4` | Open the live agent, terminal, and job ledger |
+| `F5` | Edit, reorder, resume, or discard queued follow-ups |
+| `F8` | Show or hide the sidebar |
 | `Shift+F7` | Focus or leave the scrollable context rail |
 | `/model` | Configure a provider or switch the session model |
 | `/theme` | Choose Atom One Dark, Noah Ocean, Graphite, or High Contrast |
@@ -202,7 +209,7 @@ are configured under `[reliability.retries]`.
 ## Updates
 
 Noah checks PyPI for new versions at most once every 24 hours. New TUI sessions show a temporary
-banner when an update is available and keep the version visible in the context rail. Installation
+banner when an update is available, with `F6` opening its details. Installation
 remains explicit by default:
 
 ```bash

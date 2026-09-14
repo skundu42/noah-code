@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import fnmatch
 import os
+import signal
 from dataclasses import dataclass
 
 from noah_code.config import HooksConfig, HookSpec
@@ -78,23 +79,44 @@ class HookRunner:
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                start_new_session=os.name != "nt",
+                limit=8192,
             )
         except OSError as exc:
             return 127, f"hook failed to launch: {exc}"
-        try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=spec.timeout_seconds)
-        except asyncio.CancelledError:
-            if process.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    process.kill()
-                await process.wait()
-            raise
-        except TimeoutError:
-            process.kill()
+
+        async def collect_output() -> str:
+            output = bytearray()
+            assert process.stdout is not None
+            while chunk := await process.stdout.read(8192):
+                # Drain the pipe while capping retained bytes, including UTF-8 output.
+                output.extend(chunk[: max(8000 - len(output), 0)])
             await process.wait()
+            return output.decode("utf-8", errors="replace").strip()[:2000]
+
+        try:
+            output = await asyncio.wait_for(collect_output(), timeout=spec.timeout_seconds)
+        except (asyncio.CancelledError, TimeoutError) as exc:
+            # The shell may already have exited while a child still holds stdout.
+            with contextlib.suppress(ProcessLookupError):
+                if os.name != "nt":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except PermissionError:
+                        process.kill()
+                else:
+                    process.kill()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+            # Escaped descendants can retain a pipe even after our group is gone.
+            # asyncio has no public Process.close(); release its pipe transports.
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                transport.close()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             return 124, f"hook timed out after {spec.timeout_seconds:g}s"
-        output = (stdout or b"").decode("utf-8", errors="replace").strip()
-        return int(process.returncode or 0), output[:2000]
+        return int(process.returncode or 0), output
 
     async def run_pre(
         self, *, tool: str, category: str, target: str

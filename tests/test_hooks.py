@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import shlex
+import signal
+import sys
+import time
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -50,41 +57,68 @@ async def test_pre_hook_timeout_vetoes_fail_closed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_hook_terminates_its_subprocess(tmp_path: Path, monkeypatch) -> None:
-    communicate_started = asyncio.Event()
-
-    class FakeProcess:
-        returncode: int | None = None
-        killed = False
-
-        async def communicate(self):  # noqa: ANN201
-            communicate_started.set()
-            await asyncio.Event().wait()
-
-        def kill(self) -> None:
-            self.killed = True
-            self.returncode = -9
-
-        async def wait(self) -> int:
-            return self.returncode or 0
-
-    process = FakeProcess()
-
-    async def create_process(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
-        return process
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
-    runner = _runner(tmp_path, post=[HookSpec(match="*", command="ignored")])
+@pytest.mark.parametrize("stop", ["timeout", "cancel", "shell-exited"])
+async def test_stopped_hook_reaps_children_with_bounded_cleanup(
+    tmp_path: Path, monkeypatch, stop: str
+) -> None:
+    monkeypatch.setenv("SHELL", "/bin/sh")
+    command = "sleep 30 & echo $$ $! > pids"
+    if stop != "shell-exited":
+        command += "; wait"
+    runner = _runner(
+        tmp_path,
+        post=[HookSpec(match="*", command=command, timeout_seconds=30 if stop == "cancel" else 0.2)],
+    )
     task = asyncio.create_task(
         runner.run_post(tool="ws_run", category="tool", target="pytest", status="ok")
     )
-    await communicate_started.wait()
+    pids = tmp_path / "pids"
+    for _ in range(100):
+        if pids.exists() and len(pids.read_text().split()) == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert pids.exists()
+    group, child = map(int, pids.read_text().split())
+    started = time.monotonic()
+    try:
+        if stop == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            failures = await task
+            assert "timed out" in failures[0]
+        assert time.monotonic() - started < 1.5
+        for _ in range(100):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("hook child survived cleanup")
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(group, signal.SIGKILL)
 
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
 
-    assert process.killed
+@pytest.mark.asyncio
+async def test_hook_output_is_bounded_during_collection(tmp_path: Path) -> None:
+    script = "import os; [os.write(1, b'x' * 8192) for _ in range(1024)]; raise SystemExit(1)"
+    runner = _runner(
+        tmp_path,
+        pre=[HookSpec(match="*", command=f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}")],
+    )
+    tracemalloc.start()
+    try:
+        outcome = await runner.run_pre(tool="ws_run", category="bash", target="pytest")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert not outcome.allowed
+    assert outcome.reason.endswith("x" * 2000)
+    assert len(outcome.reason) < 2100
+    assert peak < 2_000_000
 
 
 @pytest.mark.asyncio

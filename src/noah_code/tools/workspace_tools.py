@@ -13,7 +13,9 @@ import re
 import shlex
 import sys
 import tempfile
+import time
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from functools import lru_cache
@@ -245,6 +247,7 @@ class WorkspaceTools(Skill):
         )
         self._default_timeout = default_timeout
         self._on_shell_chunk: Any = None
+        self._command_results: deque[tuple[float, str, int]] = deque(maxlen=512)
         self._lsp = lsp
         self._runtime = runtime
         self._coordinator = coordinator or WorkspaceMutationCoordinator()
@@ -937,6 +940,13 @@ class WorkspaceTools(Skill):
             return await self.run_trusted_readonly(command, stdin=stdin, timeout=timeout)
         decision = self._shell_decision(command)
         await self._approvals.require(decision)
+        return await self._run_authorized(command, stdin=stdin, timeout=timeout)
+
+    async def _run_authorized(
+        self, command: str, *, stdin: str | None = None,
+        timeout: float | None = None, before_run: Any = None,
+    ) -> ShellResult:
+        """Execute an approved command, optionally checking a host-owned precondition."""
         if not self._engine.is_readonly_command(command):
             await self.checkpoint_before_shell(command)
             self._journal.mark_shell_bypass()
@@ -946,11 +956,14 @@ class WorkspaceTools(Skill):
         mutating = not self._engine.is_readonly_command(command)
         async with self._mutation_guard(mutating), self._file_op_lock:
             await self._ensure_shell_started()
+            if before_run is not None:
+                await before_run()
             result = await self._shell.run(
                 command,
                 stdin=stdin,
                 timeout=timeout or self._default_timeout,
             )
+        self._command_results.append((time.monotonic(), command, result.returncode))
         self._absolutize_harvested_matches(result)
         if self._on_shell_chunk is not None:
             with contextlib.suppress(Exception):
@@ -982,6 +995,8 @@ class WorkspaceTools(Skill):
                 async for event in self._shell.run_stream(
                     command, timeout=timeout or self._default_timeout
                 ):
+                    if isinstance(event, StreamDone):
+                        self._command_results.append((time.monotonic(), command, event.returncode))
                     if self._on_shell_chunk is not None and hasattr(event, "kind"):
                         with contextlib.suppress(Exception):
                             self._on_shell_chunk(
@@ -1072,6 +1087,7 @@ class WorkspaceTools(Skill):
             result = await self._shell.run(
                 command, stdin=stdin, timeout=self._default_timeout if timeout is None else timeout
             )
+        self._command_results.append((time.monotonic(), command, result.returncode))
         return self._cap_shell_result(result)
 
     async def _ensure_shell_started(self) -> None:

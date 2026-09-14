@@ -10,6 +10,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+JOURNAL_MAX_TURNS = 20
+
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -54,6 +56,7 @@ class SnapshotJournal:
     def end_turn(self) -> None:
         if self._current and (self._current.mutations or self._current.shell_may_bypass):
             self._turns.append(self._current)
+            del self._turns[:-JOURNAL_MAX_TURNS]
             self._redo.clear()
         self._current = None
 
@@ -116,7 +119,8 @@ class SnapshotJournal:
             return False
         return not self._turns[-1].shell_may_bypass
 
-    def undo(self) -> TurnJournal:
+    def validate_undo(self) -> TurnJournal:
+        """Preflight the latest undo without modifying files or journal state."""
         if not self._turns:
             raise RuntimeError("nothing to undo")
         turn = self._turns[-1]
@@ -148,6 +152,10 @@ class SnapshotJournal:
                     raise RuntimeError(f"corrupt postimage for {mut.path}")
             simulated[mut.path] = mut.pre_hash if mut.existed_before else None
 
+        return turn
+
+    def undo(self) -> TurnJournal:
+        turn = self.validate_undo()
         applied: list[FileMutation] = []
         try:
             for mut in reversed(turn.mutations):
@@ -164,6 +172,7 @@ class SnapshotJournal:
 
         self._turns.pop()
         self._redo.append(turn)
+        del self._redo[:-JOURNAL_MAX_TURNS]
         return turn
 
     def redo(self) -> TurnJournal:
@@ -200,6 +209,7 @@ class SnapshotJournal:
 
         self._redo.pop()
         self._turns.append(turn)
+        del self._turns[:-JOURNAL_MAX_TURNS]
         return turn
 
     def capture_post_bytes_before_undo(self, turn: TurnJournal) -> None:
@@ -264,7 +274,7 @@ class SnapshotJournal:
         if not isinstance(entries, list):
             return []
         loaded: list[TurnJournal] = []
-        for entry in entries:
+        for entry in entries[-JOURNAL_MAX_TURNS:]:
             try:
                 loaded.append(self._turn_from_dict(entry))
             except (AttributeError, KeyError, TypeError, ValueError):
@@ -317,11 +327,11 @@ class SnapshotJournal:
                     existed_before=m["existed_before"],
                     pre_hash=m.get("pre_hash"),
                     post_hash=m.get("post_hash"),
-                    pre_bytes=base64.b64decode(pre) if pre else None,
+                    pre_bytes=base64.b64decode(pre) if pre is not None else None,
                     mode=m.get("mode"),
                     turn_id=m["turn_id"],
                     timestamp=m.get("timestamp", 0.0),
-                    post_bytes=base64.b64decode(post) if post else None,
+                    post_bytes=base64.b64decode(post) if post is not None else None,
                     post_mode=m.get("post_mode"),
                 )
             )

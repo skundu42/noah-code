@@ -75,7 +75,7 @@ Screen {
     display: none;
     width: 36;
     height: 1fr;
-    padding: 1 2;
+    padding: 0 2;
     background: $nc-surface;
     color: $nc-text;
     border-left: solid $nc-border;
@@ -187,6 +187,15 @@ Screen {
 
 #composer:focus {
     border: round $nc-accent;
+}
+
+#composer.composer-expanded {
+    max-height: 100%;
+}
+
+#conversation:focus,
+#activity-output:focus {
+    border-left: solid $nc-accent;
 }
 
 .compact #conversation {
@@ -305,6 +314,51 @@ DiffReviewScreen {
 #diff-hint {
     height: 1;
     color: $nc-muted;
+}
+
+#diff-filter,
+#history-filter,
+#activity-filter {
+    height: 3;
+    margin: 0;
+    border: round $nc-border;
+}
+
+#diff-filter:focus,
+#history-filter:focus,
+#activity-filter:focus {
+    border: round $nc-accent;
+}
+
+.narrow #diff-body {
+    layout: vertical;
+}
+
+.narrow #diff-files {
+    width: 1fr;
+    height: 3;
+    border-right: none;
+    border-bottom: solid $nc-border;
+}
+
+.narrow #diff-inspector {
+    padding-left: 0;
+}
+
+.narrow #diff-summary,
+.narrow #diff-file-header {
+    height: 1;
+    padding: 0;
+}
+
+.narrow #diff-validation {
+    display: none;
+    height: 3;
+    padding: 0 1;
+}
+
+.narrow #diff-hint {
+    height: 2;
 }
 
 #approval-dialog,
@@ -503,8 +557,22 @@ DiffReviewScreen {
 
 #approval-body {
     height: auto;
-    max-height: 14;
     margin-bottom: 1;
+}
+
+ApprovalModal #approval-dialog {
+    height: 80%;
+}
+
+#approval-scroll {
+    height: 1fr;
+    min-height: 3;
+    scrollbar-size-vertical: 1;
+}
+
+#question-progress {
+    height: 1;
+    color: $nc-muted;
 }
 
 #approval-buttons {

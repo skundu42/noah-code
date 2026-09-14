@@ -74,6 +74,7 @@ def test_safe_slash_allowlist_matches_spec() -> None:
             "context",
             "queue",
             "terminals",
+            "diff",
         }
     ) == SAFE_SLASH_WHILE_BUSY
 

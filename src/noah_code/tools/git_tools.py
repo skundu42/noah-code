@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import hashlib
+import shlex
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Annotated
 
-from nooa import Skill, spec
+from nooa import Skill, hidden, spec
 
 from noah_code.permissions import is_secret_path
 from noah_code.tools.workspace_tools import WorkspaceTools
@@ -24,6 +27,10 @@ class DiffFile:
     deletions: int = 0
     diagnostics: str = "pending"
     patch: str = ""
+    loaded: bool = False
+    captured_at: float = 0.0
+    truncated: bool = False
+    revision: str | None = None
 
     @property
     def key(self) -> str:
@@ -33,6 +40,7 @@ class DiffFile:
 @dataclass
 class DiffReview:
     files: list[DiffFile] = field(default_factory=list)
+    captured_at: float = field(default_factory=time.time)
 
     @property
     def additions(self) -> int:
@@ -92,9 +100,9 @@ class GitTools(Skill):
         result = await self._ws.run_trusted_readonly(f"git log -n {int(n)} --oneline")
         return result.stdout or "(no commits)"
 
-    async def review(self) -> DiffReview:
-        """Return staged and unstaged files with bounded per-file patches."""
-        status = await self._git("status", "--porcelain=v1", "-z")
+    async def review(self, *, eager: bool = True) -> DiffReview:
+        """List changes immediately; optionally load patches for noninteractive callers."""
+        status = await self._git("status", "--porcelain=v1", "-z", "--untracked-files=all")
         if status.returncode != 0:
             raise RuntimeError(status.stderr.strip() or "git status failed")
         entries = [entry for entry in status.stdout.split("\0") if entry]
@@ -114,26 +122,69 @@ class GitTools(Skill):
                 changed.append((path, "unstaged", "?" if code == "??" else y))
             index += 1
 
-        files: list[DiffFile] = []
-        for path, scope, status_code in changed:
-            patch = await self._patch(path, scope, status_code)
-            additions, deletions = await self._counts(path, scope, status_code)
-            files.append(
-                DiffFile(
-                    path=path,
-                    scope=scope,
-                    status=self._status_name(status_code),
-                    additions=additions,
-                    deletions=deletions,
-                    patch=patch,
-                )
-            )
+        files = [
+            DiffFile(path=path, scope=scope, status=self._status_name(status_code))
+            for path, scope, status_code in changed
+        ]
         files.sort(key=lambda item: (item.path, item.scope != "staged"))
-        return DiffReview(files)
+        review = DiffReview(files)
+        if eager:
+            for item in files:
+                await self.review_file(item)
+        return review
 
-    async def revert(self, path: str, scope: str) -> str:
+    @hidden
+    async def review_file(self, item: DiffFile) -> None:
+        """Capture one file's patch; keep it fixed until the next explicit refresh."""
+        before = await self._review_signature(item.path)
+        status = "?" if item.status == "untracked" else item.status
+        patch = await self._patch(item.path, item.scope, status)
+        item.additions, item.deletions = await self._counts(item.path, item.scope, status)
+        item.truncated = len(patch) > 80_000
+        item.patch = patch[:80_000]
+        if item.truncated:
+            item.patch += "\n… Patch truncated at 80,000 characters. Press O to open the file in your editor."
+        after = await self._review_signature(item.path)
+        item.revision = after if before == after else None
+        if item.revision is None:
+            item.patch += "\nFile changed while loading. Refresh before reverting."
+        item.captured_at = time.time()
+        item.loaded = True
+
+    @hidden
+    async def change_fingerprints(self) -> dict[str, tuple[object, ...]]:
+        """Observe Git-visible changes without reading or hashing file contents."""
+        review = await self.review(eager=False)
+        index = await self._git("ls-files", "--stage", "-z")
+        index_entries = {}
+        for entry in index.stdout.split("\0"):
+            metadata, separator, path = entry.partition("\t")
+            if separator:
+                index_entries[path] = metadata
+        fingerprints: dict[str, tuple[object, ...]] = {}
+        for item in review.files:
+            fingerprints[item.key] = (item.status, index_entries.get(item.path), *self._stat_signature(item.path))
+        return fingerprints
+
+    def _stat_signature(self, path: str) -> tuple[int, ...]:
+        # lstat observes links without following them.
+        try:
+            stat = (self._ws._workspace.root / path).lstat()
+            return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_mode)
+        except OSError:
+            return ()
+
+    async def _review_signature(self, path: str) -> str:
+        index = await self._git("ls-files", "--stage", "--", path)
+        head = await self._git("rev-parse", "--verify", "HEAD")
+        raw = repr((self._stat_signature(path), index.returncode, index.stdout, head.stdout))
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    async def revert(self, path: str, scope: str, *, expected_revision: str | None = None) -> str:
         """Revert one explicitly selected file after host/UI confirmation."""
         resolved = await self._ws._authorize_path(path, "edit", tool="git_revert")
+        if expected_revision is not None and await self._review_signature(path) != expected_revision:
+            raise RuntimeError("File or index changed since this review; refresh before reverting")
         if scope == "unstaged":
             current = resolved.read_text(errors="strict") if resolved.exists() else None
             index_content = await self._git("show", f":{path}")
@@ -153,10 +204,18 @@ class GitTools(Skill):
         # Staging metadata is outside the file journal. Capture the worktree
         # preimage, perform the explicit Git restore, and mark this turn as not
         # fully reversible so /undo never overpromises.
-        mutation = self._ws._journal.record_preimage(resolved)
-        result = await self._ws.run(
-            f"git restore --source=HEAD --staged --worktree -- {__import__('shlex').quote(path)}"
-        )
+        command = f"git --literal-pathspecs restore --source=HEAD --staged --worktree -- {shlex.quote(path)}"
+        await self._ws._approvals.require(self._ws._shell_decision(command))
+        mutation = None
+
+        async def preflight() -> None:
+            nonlocal mutation
+            if expected_revision is not None and await self._review_signature(path) != expected_revision:
+                raise RuntimeError("File or index changed since this review; refresh before reverting")
+            mutation = self._ws._journal.record_preimage(resolved)
+
+        result = await self._ws._run_authorized(command, before_run=preflight)
+        assert mutation is not None
         if result.returncode != 0:
             self._ws._journal.discard_mutation(mutation)
             raise RuntimeError(result.stderr or "git restore failed")
@@ -170,19 +229,22 @@ class GitTools(Skill):
         if status == "?":
             target = self._ws._workspace.resolve(path)
             try:
-                text = target.read_text(errors="replace")
+                def read_preview() -> str:
+                    with target.open(errors="replace") as stream:
+                        return stream.read(80_001)
+                text = await asyncio.to_thread(read_preview)
             except OSError as exc:
                 return f"diff unavailable: {exc}"
             lines = text.splitlines(keepends=True)
             return "".join(
                 difflib.unified_diff([], lines, fromfile="/dev/null", tofile=f"b/{path}", n=3)
-            )[:80_000]
+            )
         args = ["diff", "--no-ext-diff", "--unified=3"]
         if scope == "staged":
             args.append("--cached")
         args.extend(["--", path])
         result = await self._git(*args)
-        return (result.stdout or result.stderr or "(no textual diff)")[:80_000]
+        return result.stdout or result.stderr or "(no textual diff)"
 
     async def _counts(self, path: str, scope: str, status: str) -> tuple[int, int]:
         if self._review_path_error(path) is not None:
@@ -190,7 +252,15 @@ class GitTools(Skill):
         if status == "?":
             target = self._ws._workspace.resolve(path)
             try:
-                return len(target.read_text(errors="replace").splitlines()), 0
+                def count_lines() -> int:
+                    count = 0
+                    last = ""
+                    with target.open(errors="replace") as stream:
+                        while chunk := stream.read(1_000_000):
+                            count += chunk.count("\n")
+                            last = chunk[-1]
+                    return count + int(bool(last) and last != "\n")
+                return await asyncio.to_thread(count_lines), 0
             except (OSError, WorkspaceError):
                 return 0, 0
         args = ["diff", "--numstat"]
@@ -210,7 +280,7 @@ class GitTools(Skill):
         def run() -> subprocess.CompletedProcess[str]:
             try:
                 return subprocess.run(
-                    ["git", *args],
+                    ["git", "--literal-pathspecs", *args],
                     cwd=self._ws._workspace.root,
                     capture_output=True,
                     text=True,

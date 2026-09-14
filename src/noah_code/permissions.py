@@ -99,19 +99,22 @@ _READ_ONLY_PROGRAMS = frozenset(
         "head",
         "tail",
         "wc",
-        "file",
         "stat",
         "test",
-        "sed",
-        "awk",
-        "sort",
-        "uniq",
         "cut",
         "tr",
         "tac",
         "column",
     }
 )
+# Only the small text-filter forms below are recognized; other flags and
+# programs require approval instead of attempting to parse embedded languages.
+_READ_ONLY_FILTER_FLAGS = {
+    "sort": re.compile(r"-[bcdfghinMrRsuVz]+"),
+    "uniq": re.compile(r"-[cdui]+"),
+    "file": re.compile(r"-[biL]+"),
+}
+_SED_PRINT = re.compile(r"(?:(?:[1-9][0-9]*|\$)(?:,(?:[1-9][0-9]*|\$))?)?p")
 _READ_ONLY_GIT_SUBCOMMANDS = frozenset({"branch", "diff", "log", "rev-parse", "show", "status"})
 _GIT_READ_UNSAFE_FLAGS = frozenset({"--ext-diff", "--output", "--textconv"})
 _GIT_PATCH_SUBCOMMANDS = frozenset({"diff", "log", "show"})
@@ -541,20 +544,29 @@ class PermissionEngine:
         if session_allowed:
             return None
         try:
-            normalized_tokens = " ".join(shlex.split(command))
+            tokens = shlex.split(command)
         except ValueError:
-            normalized_tokens = ""
-        for pat in _ALWAYS_ASK_BASH:
-            if pat.search(command) or (normalized_tokens and pat.search(normalized_tokens)):
-                return PermissionDecision(
-                    category=PermissionCategory.BASH,
-                    target=command,
-                    action="ask",
-                    matching_rule=None,
-                    reason="elevated-risk shell command requires approval",
-                    remember_pattern=self._remember_pattern(PermissionCategory.BASH, command),
-                    elevated_floor=True,
-                )
+            tokens = []
+        normalized_tokens = " ".join(tokens)
+        effective = _effective_shell_tokens(tokens)
+        unsafe_filter = bool(
+            effective
+            and _program_name(effective[0]) in _READ_ONLY_FILTER_FLAGS
+            and not self.is_readonly_command(command)
+        )
+        if unsafe_filter or any(
+            pat.search(command) or (normalized_tokens and pat.search(normalized_tokens))
+            for pat in _ALWAYS_ASK_BASH
+        ):
+            return PermissionDecision(
+                category=PermissionCategory.BASH,
+                target=command,
+                action="ask",
+                matching_rule=None,
+                reason="elevated-risk shell command requires approval",
+                remember_pattern=self._remember_pattern(PermissionCategory.BASH, command),
+                elevated_floor=True,
+            )
         return None
 
     def _plan_mode_gate(self, category: str, target: str) -> PermissionDecision | None:
@@ -632,7 +644,7 @@ class PermissionEngine:
         # replace a supposedly read-only utility with arbitrary executable code.
         source_program = cmd.split(None, 1)[0]
         program = tokens[0]
-        if source_program != program or program not in _READ_ONLY_PROGRAMS | {"git", "rg"}:
+        if source_program != program:
             return False
         if program == "git":
             return _is_readonly_git(tokens[1:])
@@ -642,6 +654,8 @@ class PermissionEngine:
             return len(tokens) == 1
         if program == "find":
             return not any(_is_mutating_find_flag(token) for token in tokens[1:])
+        if program == "sed" or program in _READ_ONLY_FILTER_FLAGS:
+            return _is_readonly_filter(program, tokens[1:])
         return program in _READ_ONLY_PROGRAMS
 
     @staticmethod
@@ -664,6 +678,26 @@ class PermissionEngine:
         return program in {"sh", "bash", "zsh", "ksh", "dash"} and any(
             token in {"-c", "-lc"} for token in tokens[1:]
         )
+
+
+def _is_readonly_filter(program: str, args: list[str]) -> bool:
+    if program == "sed":
+        if len(args) < 2 or args[0] != "-n" or not _SED_PRINT.fullmatch(args[1]):
+            return False
+        args = args[2:]
+    operands = 0
+    options = True
+    for arg in args:
+        if options and arg == "--":
+            options = False
+        elif options and arg.startswith("-") and arg != "-":
+            flags = _READ_ONLY_FILTER_FLAGS.get(program)
+            if flags is None or not flags.fullmatch(arg):
+                return False
+        else:
+            operands += 1
+    # uniq's second positional argument is an output filename.
+    return program != "uniq" or operands <= 1
 
 
 def _is_compound(command: str) -> bool:
@@ -1200,6 +1234,8 @@ def _contains_executing_interpreter(tokens: list[str]) -> bool:
         return True
     if program in _AUTO_INDIRECT_EXECUTORS:
         return True
+    if program in {"sed", "awk", "gawk", "mawk", "nawk"}:
+        return not PermissionEngine.is_readonly_command(shlex.join(effective))
 
     if _AUTO_INTERPRETER_NAME.fullmatch(program) is not None:
         remaining = effective[1:]

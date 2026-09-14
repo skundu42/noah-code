@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,7 @@ def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> N
     conf.mkdir()
     (conf / "config.toml").write_text(
         "auto_approve = true\n"
+        "yolo = true\n"
         "unsafe_inprocess_code_execution = true\n"
         "session_dir = '/tmp/repository-controlled-sessions'\n"
         "[efficiency]\n"
@@ -72,9 +74,13 @@ def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> N
         "max_jobs = 32\n"
         "[updates]\n"
         "auto_install = true\n"
+        "[checkpoints]\n"
+        "enabled = false\n"
     )
-    cfg = load_config(tmp_path)
+    cfg = load_config(tmp_path, cli_overrides={"mode": "plan"})
     assert cfg.auto_approve is False
+    assert cfg.yolo is False
+    assert cfg.checkpoints.enabled is True
     assert cfg.unsafe_inprocess_code_execution is False
     assert str(cfg.session_dir) != "/tmp/repository-controlled-sessions"
     assert cfg.efficiency.lazy_mcp is False
@@ -82,6 +88,38 @@ def test_project_config_cannot_weaken_security(tmp_path: Path, monkeypatch) -> N
     assert cfg.lsp.servers == {}
     assert cfg.processes.max_jobs == 8
     assert cfg.updates.auto_install is False
+    from noah_code.permissions import PermissionEngine
+
+    engine = PermissionEngine(cfg.permission_rules, mode=cfg.mode, yolo=cfg.yolo)
+    assert engine.decide("read", ".env").action == "deny"
+    assert engine.decide("edit", "app.py").action == "deny"
+    assert engine.decide("bash", "git push origin main").action == "deny"
+
+
+def test_yolo_requires_trusted_configuration(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "user-config.toml"
+    config_path.write_text("yolo = true\n")
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    assert load_config(tmp_path).yolo is True
+    assert load_config(tmp_path, cli_overrides={"yolo": False}).yolo is False
+    config_path.unlink()
+    assert load_config(tmp_path, cli_overrides={"yolo": True}).yolo is True
+
+
+def test_repository_cannot_override_trusted_plan_mode(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "user-config.toml"
+    config_path.write_text("mode = 'plan'\n")
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+    project_path = tmp_path / ".noah-code"
+    project_path.mkdir()
+    (project_path / "config.toml").write_text("mode = 'build'\n")
+
+    assert load_config(tmp_path).mode == "plan"
+    assert load_config(tmp_path, cli_overrides={"mode": "build"}).mode == "build"
+    config_path.write_text("mode = 'build'\n")
+    (project_path / "config.toml").write_text("mode = 'plan'\n")
+    assert load_config(tmp_path).mode == "plan"
 
 
 def test_auto_update_environment_override(tmp_path: Path, monkeypatch) -> None:
@@ -257,6 +295,63 @@ def test_save_user_reasoning_effort_preserves_sections(tmp_path: Path, monkeypat
     assert config_path.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.parametrize(
+    "original",
+    [
+        '[ui] # preferences\ntheme = "graphite"\nmarkdown = false\n',
+        '"model" = "old"\n\'reasoning_effort\' = "low"\n["ui"]\n"theme" = "graphite"\n',
+        'ui = {theme = "graphite", markdown = false}',
+        'ui.theme = "graphite"\nui.markdown = false\n',
+        'model = """old\nmodel"""\n[[hooks.pre_tool]]\ncommand = \'\'\'echo hello\n[ui]\ntheme = "keep"\'\'\'\n',
+        'max_iterations = 12',
+    ],
+)
+def test_settings_edits_preserve_toml_values_and_comments(
+    tmp_path: Path, monkeypatch, original: str
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(original)
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+    expected = tomllib.loads(original)
+    expected.update(model="new-model", reasoning_effort="high")
+    expected.setdefault("ui", {}).update(theme="noah-ocean", animations=False)
+
+    save_user_default_model("new-model")
+    save_user_reasoning_effort("high")
+    save_user_theme("noah-ocean")
+    save_user_animations(False)
+
+    updated = config_path.read_text()
+    assert tomllib.loads(updated) == expected
+    if "# preferences" in original:
+        assert "# preferences" in updated
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("original", ['[ui', 'ui = "not a table"\n'])
+def test_invalid_settings_file_is_never_replaced(tmp_path: Path, monkeypatch, original: str) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(original)
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    with pytest.raises(ConfigError):
+        save_user_theme("graphite")
+    assert config_path.read_text() == original
+
+
+def test_settings_edit_preserves_unrelated_nonfinite_values(tmp_path: Path, monkeypatch) -> None:
+    import math
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("cell_timeout = nan\n")
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    save_user_theme("graphite")
+    parsed = tomllib.loads(config_path.read_text())
+    assert math.isnan(parsed["cell_timeout"])
+    assert parsed["ui"]["theme"] == "graphite"
+
+
 def test_user_hooks_load_from_flat_array_tables(tmp_path: Path, monkeypatch) -> None:
     config_path = tmp_path / "user-config.toml"
     config_path.write_text(
@@ -323,5 +418,5 @@ def test_unknown_nested_key_raises_config_error(tmp_path: Path, monkeypatch) -> 
     conf.mkdir()
     (conf / "config.toml").write_text('[ui]\ntheem = "dark"\n')
 
-    with pytest.raises(ConfigError, match="theem"):
+    with pytest.raises(ConfigError, match="ui.theem"):
         load_config(tmp_path)

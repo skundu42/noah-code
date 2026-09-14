@@ -394,6 +394,72 @@ async def test_async_undo_persists_on_sqlite_owner_thread(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_journal_retention_matches_memory_both_stores_and_resume(tmp_path: Path) -> None:
+    from noah_code.snapshots import JOURNAL_MAX_TURNS
+
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(workspace.root, cli_overrides={"session_dir": str(tmp_path / "sessions")})
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    target = tmp_path / "edited.txt"
+    target.write_text("original")
+    for index in range(JOURNAL_MAX_TURNS + 5):
+        journal = host.agent.journal
+        journal.begin_turn()
+        mutation = journal.record_preimage(target)
+        target.write_text(str(index))
+        journal.record_postimage(mutation, target)
+        journal.end_turn()
+    host._persist()
+
+    expected = host.agent.journal.to_dict()
+    assert len(expected["turns"]) == JOURNAL_MAX_TURNS
+    assert host._runtime.load_checkpoint()["journal"] == expected
+    assert host.store.load_journal(host.meta.session_id) == expected
+    host.agent.journal.undo()
+    expected = host.agent.journal.to_dict()
+    await host.close()
+
+    resumed = AgentHost(
+        workspace, config, llm=FakeLLMClient(), store=host.store,
+        session_meta=host.store.load_meta(host.meta.session_id),
+    )
+    await resumed.start()
+    try:
+        assert resumed.agent.journal.to_dict() == expected
+        assert resumed._runtime.load_checkpoint()["journal"] == expected
+        assert resumed.store.load_journal(resumed.meta.session_id) == expected
+        resumed.agent.journal.redo()
+        assert target.read_text() == str(JOURNAL_MAX_TURNS + 4)
+    finally:
+        await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_reports_preserved_recovery_contents(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(workspace.root, cli_overrides={"session_dir": str(tmp_path / "sessions")})
+    store = SessionStore(config.session_dir)
+    meta = store.create(workspace, model="test-model")
+    runtime = store.open_runtime(meta.session_id)
+    target = tmp_path / "repair.txt"
+    target.write_text("before")
+    runtime.begin_file_operation(target)
+    target.write_text("user repair")
+    host = AgentHost(workspace, config, llm=FakeLLMClient(), store=store, session_meta=meta)
+    events = []
+    host.ui.render = events.append
+
+    await host.start()
+    try:
+        assert any(str(runtime.recovery_dir) in event.text for event in events)
+        assert target.read_text() == "before"
+        assert next(runtime.recovery_dir.glob("*.bin")).read_text() == "user repair"
+    finally:
+        await host.close()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_turn_persists_finalized_undo_journal(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -609,7 +675,8 @@ async def test_dollar_skill_invocation_activates_instructions_and_runs_task(tmp_
     assert action == "continue"
     assert "cmd.host-explicit-skill" in host.agent.skills.activated()
     host._run_user_turn.assert_awaited_once_with(
-        "Use the $host-explicit-skill skill instructions for this task:\n\ncheck the parser"
+        "Use the $host-explicit-skill skill instructions for this task:\n\ncheck the parser",
+        attach_paths=[],
     )
     await host.close()
 
@@ -1117,7 +1184,7 @@ async def test_empty_need_input_stops_without_another_handle(
 
 
 @pytest.mark.asyncio
-async def test_cancel_clears_steer_queue(tmp_path: Path, monkeypatch) -> None:
+async def test_cancel_pauses_and_preserves_steer_queue(tmp_path: Path, monkeypatch) -> None:
     host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
     host.steer_queue.push("follow-up")
     started = asyncio.Event()
@@ -1134,7 +1201,9 @@ async def test_cancel_clears_steer_queue(tmp_path: Path, monkeypatch) -> None:
     with pytest.raises(asyncio.CancelledError):
         await turn
 
-    assert len(host.steer_queue) == 0
+    assert len(host.steer_queue) == 1
+    assert host.queue_paused
+    assert not host._apply_next_steer(host.agent)
     await host.close()
 
 

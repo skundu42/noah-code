@@ -137,6 +137,18 @@ def test_main_dispatches_subcommand(tmp_path: Path) -> None:
             assert exc.code in {0, None}
 
 
+def test_main_dispatches_newly_registered_command(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    dispatch = Mock()
+    monkeypatch.setitem(cli_group.commands, "registered", interactive_cmd)
+    monkeypatch.setattr(cli_group, "main", dispatch)
+
+    main(["registered", "--help"])
+
+    assert dispatch.call_args.kwargs["args"] == ["registered", "--help"]
+
+
 def test_first_run_prompts_and_saves_global_model(monkeypatch, tmp_path: Path) -> None:
     saved: list[str] = []
     config_path = tmp_path / "config.toml"

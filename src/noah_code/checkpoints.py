@@ -150,89 +150,83 @@ class CheckpointManager:
         return Path(os.fsdecode(result.stdout.strip()))
 
     def _stage_worktree(self, index_path: str, top: Path) -> None:
-        """Mirror the worktree into the temp index with filter-free plumbing.
+        """Batch raw blob hashing and index changes without invoking clean filters."""
 
-        ``git add --all`` would execute repo-defined clean filters (arbitrary
-        commands configured via .gitattributes) and stage secret files that
-        the permission engine hard-denies. Hashing blobs directly with
-        ``--no-filters`` and registering them with ``update-index
-        --cacheinfo`` avoids both.
-        """
-
-        tracked = self._git("ls-files", "-z", "--full-name", "--", ":/", env_index=index_path)
-        if tracked.returncode != 0:
-            raise CheckpointError(f"checkpoint ls-files failed: {_err(tracked)}")
-        deleted = self._git(
-            "ls-files", "-d", "-z", "--full-name", "--", ":/", env_index=index_path
+        tracked = self._git(
+            "ls-files", "--stage", "-z", "--full-name", "--", ":/", env_index=index_path
         )
-        if deleted.returncode != 0:
-            raise CheckpointError(f"checkpoint ls-files failed: {_err(deleted)}")
-
-        # Defensively drop already-tracked secret paths (committed before the
-        # permission engine denied them) alongside ordinary deletions.
-        removals = {p for p in _split_nul(tracked.stdout) if is_secret_path(p)}
-        removals.update(_split_nul(deleted.stdout))
-        for path in sorted(removals):
-            # Absolute path: update-index prefixes relative paths with the
-            # process cwd, which may differ from the worktree root here.
-            remove = self._git(
-                "update-index", "--force-remove", "--", str(top / path), env_index=index_path
-            )
-            if remove.returncode != 0:
-                raise CheckpointError(
-                    f"checkpoint index removal failed for {path!r}: {_err(remove)}"
-                )
-
-        candidates = self._git(
-            "ls-files", "-c", "-o", "--exclude-standard", "-z", "--full-name", "--", ":/",
+        untracked = self._git(
+            "ls-files", "-o", "--exclude-standard", "-z", "--full-name", "--", ":/",
             env_index=index_path,
         )
-        if candidates.returncode != 0:
-            raise CheckpointError(f"checkpoint ls-files failed: {_err(candidates)}")
-        for path in _split_nul(candidates.stdout):
+        for result in (tracked, untracked):
+            if result.returncode != 0:
+                raise CheckpointError(f"checkpoint ls-files failed: {_err(result)}")
+        previous: dict[str, tuple[str, str]] = {}
+        for entry in _split_nul(tracked.stdout):
+            metadata, path = entry.split("\t", 1)
+            mode, sha, _stage = metadata.split()
+            previous[path] = (mode, sha)
+
+        updates: list[bytes] = []
+        regular: list[tuple[str, str]] = []
+
+        def register(path: str, mode: str, sha: str) -> None:
+            if previous.get(path) != (mode, sha):
+                updates.append(f"{mode} {sha}\t".encode() + os.fsencode(path) + b"\0")
+
+        def remove(path: str) -> None:
+            if path in previous:
+                register(path, "0", "0" * len(previous[path][1]))
+
+        for path in sorted(set(previous) | set(_split_nul(untracked.stdout))):
             if is_secret_path(path):
+                remove(path)
                 continue
-            self._stage_file(index_path, top, path)
-
-    def _stage_file(self, index_path: str, top: Path, rel_path: str) -> None:
-        full_path = top / rel_path
-        try:
-            info = os.lstat(full_path)
-        except OSError:
-            return  # Vanished between listing and staging.
-        if stat.S_ISLNK(info.st_mode):
+            full_path = top / path
             try:
-                # The blob content is the link target itself; never follow it.
-                content = os.fsencode(os.readlink(full_path))
-            except OSError:
-                return
-            blob = self._git("hash-object", "-w", "--no-filters", "--stdin", input_bytes=content)
-            mode = "120000"
-        elif stat.S_ISREG(info.st_mode):
-            # --no-filters: without it hash-object applies attributes-based
-            # clean filters, which are repo-defined arbitrary commands.
-            blob = self._git("hash-object", "-w", "--no-filters", "--", str(full_path))
-            mode = "100755" if info.st_mode & 0o111 else "100644"
-        else:
-            return  # Directories, fifos, sockets, and devices are not files.
-        if blob.returncode != 0:
-            if not os.path.lexists(full_path):
-                return  # Lost a race with a concurrent edit; skip it.
-            raise CheckpointError(f"checkpoint hashing failed for {rel_path!r}: {_err(blob)}")
-        sha = blob.stdout.decode().strip()
-        # --cacheinfo takes the path verbatim (root-relative, never prefixed).
-        register = self._git(
-            "update-index",
-            "--add",
-            "--replace",
-            "--cacheinfo",
-            f"{mode},{sha},{rel_path}",
-            env_index=index_path,
-        )
-        if register.returncode != 0:
-            raise CheckpointError(
-                f"checkpoint index update failed for {rel_path!r}: {_err(register)}"
+                info = full_path.lstat()
+                if stat.S_ISLNK(info.st_mode):
+                    # A symlink's blob is its target string, never the target's bytes.
+                    content = os.fsencode(os.readlink(full_path))
+                    blob = self._git(
+                        "hash-object", "-w", "--no-filters", "--stdin", input_bytes=content
+                    )
+                    if blob.returncode != 0:
+                        raise CheckpointError(f"checkpoint hashing failed: {_err(blob)}")
+                    register(path, "120000", blob.stdout.decode().strip())
+                elif stat.S_ISREG(info.st_mode):
+                    regular.append((path, "100755" if info.st_mode & 0o111 else "100644"))
+                elif previous.get(path, ("", ""))[0] != "160000":
+                    remove(path)
+            except (FileNotFoundError, NotADirectoryError):
+                remove(path)
+
+        if regular:
+            # stdin-paths accepts Git's quoted path syntax, avoiding argv limits
+            # while preserving embedded newlines, quotes and filesystem bytes.
+            paths = b"".join(
+                b'"' + os.fsencode(top / path).replace(b"\\", b"\\\\")
+                .replace(b'"', b'\\"').replace(b"\n", b"\\n") + b'"\n'
+                for path, _mode in regular
             )
+            blobs = self._git(
+                "hash-object", "-w", "--no-filters", "--stdin-paths", input_bytes=paths
+            )
+            if blobs.returncode != 0:
+                # A concurrently removed file aborts the capture, never publishes
+                # an incomplete snapshot or changes the user's index/worktree.
+                raise CheckpointError(f"checkpoint hashing failed: {_err(blobs)}")
+            for (path, mode), sha in zip(regular, blobs.stdout.decode().splitlines(), strict=True):
+                register(path, mode, sha)
+
+        if updates:
+            result = self._git(
+                "update-index", "--add", "--replace", "-z", "--index-info",
+                env_index=index_path, input_bytes=b"".join(updates),
+            )
+            if result.returncode != 0:
+                raise CheckpointError(f"checkpoint index update failed: {_err(result)}")
 
     def _head_commit(self) -> str | None:
         result = self._git("rev-parse", "--verify", "HEAD")
@@ -264,15 +258,60 @@ class CheckpointManager:
     def restore(self, ref: str) -> str:
         """Restore tracked files from a checkpoint into index+worktree.
 
-        HEAD does not move; the operation is equivalent to
-        ``git restore --source=<ref> --staged --worktree :/``. Files created
-        after the snapshot are left in place.
+        HEAD does not move. Protected paths retain their current contents and
+        index entries. Untracked files created after the snapshot remain in place.
         """
 
         valid = [item["ref"] for item in self.list()]
         if ref not in valid:
             raise CheckpointError(f"unknown checkpoint ref: {ref}")
-        result = self._git("restore", "--source", ref, "--staged", "--worktree", ":/")
+        tracked = self._git("ls-files", "-z", "--full-name", "--", ":/")
+        snapshot = self._git("ls-tree", "-r", "--full-tree", "-z", ref)
+        for listing in (tracked, snapshot):
+            if listing.returncode != 0:
+                raise CheckpointError(f"restore file listing failed: {_err(listing)}")
+        source_modes = {}
+        for entry in _split_nul(snapshot.stdout):
+            metadata, path = entry.split("\t", 1)
+            source_modes[path] = metadata.split()[0]
+        tracked_paths = set(_split_nul(tracked.stdout))
+        protected = {path for path in tracked_paths if is_secret_path(path)}
+        protected_ancestors = {parent for path in protected for parent in Path(path).parents}
+        paths = {path for path in tracked_paths | set(source_modes) if not is_secret_path(path)}
+        if not paths:
+            return f"restored {ref}: no unprotected files (HEAD unchanged)"
+        top = self._toplevel()
+
+        def check_directory(directory: Path) -> None:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    child = Path(entry.path)
+                    if is_secret_path(child.relative_to(top)):
+                        raise CheckpointError(f"restore would displace protected path: {child}")
+                    if entry.is_dir(follow_symlinks=False):
+                        check_directory(child)
+
+        # A literal file path can still replace a whole directory, including
+        # protected children omitted from the explicit pathspecs. Preflight all
+        # such conflicts before Git touches either the index or the worktree.
+        for path in paths:
+            if Path(path) in protected_ancestors:
+                raise CheckpointError(
+                    f"restore would displace protected paths in the index beneath: {top / path}"
+                )
+            for parent in Path(path).parents:
+                if parent.as_posix() in protected or (
+                    is_secret_path(parent) and os.path.lexists(top / parent)
+                ):
+                    raise CheckpointError(f"restore would displace protected path: {top / parent}")
+            target = top / path
+            if source_modes.get(path) != "160000" and target.is_dir() and not target.is_symlink():
+                check_directory(target)
+        result = self._git(
+            "restore", "--source", ref, "--staged", "--worktree",
+            "--pathspec-from-file=-", "--pathspec-file-nul",
+            input_bytes=b"".join(b":(top,literal)" + os.fsencode(path) + b"\0" for path in sorted(paths)),
+        )
         if result.returncode != 0:
             raise CheckpointError(f"restore failed: {_err(result)}")
         return f"restored {ref} into index+worktree (HEAD unchanged)"

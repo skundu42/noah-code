@@ -808,3 +808,49 @@ def test_devnull_discard_does_not_mask_real_redirection() -> None:
     ):
         assert engine.is_readonly_command(command) is False, command
         assert engine.is_uncertain_shell(command) is True, command
+
+
+def test_text_filter_write_and_execution_forms_require_approval() -> None:
+    build = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
+    auto = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    for command in (
+        "sort -o sorted.txt input.txt",
+        "sort -usorted.txt input.txt",
+        "sort --output=sorted.txt input.txt",
+        "sort --compress-program=helper input.txt",
+        "sed -n 'w copied.txt' input.txt",
+        "sed -i 's/old/new/' input.txt",
+        "sed -n '1p' input.txt -e 'w copied.txt'",
+        "sed -n '1p' -f filters.sed input.txt",
+        "sed -n 'e echo hello' input.txt",
+        "awk 'BEGIN { print 1 }'",
+        "awk -f filters.awk input.txt",
+        "uniq input.txt output.txt",
+        "uniq -c input.txt output.txt",
+        "file -C -m patterns",
+        "file --compile patterns",
+    ):
+        assert not build.is_readonly_command(command), command
+        assert build.decide("bash", command).action == "ask", command
+        assert plan.decide("bash", command).action == "deny", command
+        assert auto.decide("bash", command).action in {"ask", "deny"}, command
+
+
+def test_narrow_text_filter_forms_remain_readonly() -> None:
+    build = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
+    for command in (
+        "sort input.txt",
+        "sort -unr input.txt",
+        "sort -- -output",
+        "sed -n '1,15p' input.txt",
+        "sed -n p -- -input",
+        "uniq -ci input.txt",
+        "uniq -- -input",
+        "file -bi input.txt",
+        "rg needle src | sort -u | uniq -c",
+    ):
+        assert build.is_readonly_command(command), command
+        assert build.decide("bash", command).action == "allow", command
+        assert plan.decide("bash", command).action == "allow", command

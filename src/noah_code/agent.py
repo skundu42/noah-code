@@ -162,26 +162,94 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("processes", "start"),
             ("processes", "status"),
             ("processes", "stop"),
+            *(
+                ("todos", name)
+                for name in (
+                    "add",
+                    "get",
+                    "done",
+                    "reopen",
+                    "remove",
+                    "clear",
+                    "update",
+                    "add_dep",
+                    "remove_dep",
+                    "set_var",
+                    "del_var",
+                    "get_var",
+                    "comment",
+                    "comments",
+                    "list_todos",
+                    "status",
+                    "to_dict",
+                    "from_dict",
+                )
+            ),
         }
     )
-    _SAFE_SUBTREES = frozenset({("todos",), ("v",)})
+    _VALUE_PATHS = frozenset({("mode",), ("workspace_root",)})
 
     @classmethod
     def _path_allowed(cls, path: tuple[str, ...]) -> bool:
-        if any(path[: len(prefix)] == prefix for prefix in cls._SAFE_SUBTREES):
+        if not path or any(not part or part.startswith("_") for part in path):
+            return False
+        if path[0] == "v" and len(path) <= 2:
             return True
         return path in cls._EXACT_PATHS or any(
             allowed[: len(path)] == path for allowed in cls._EXACT_PATHS
         )
 
-    def _walk_path(self, path: list[str]) -> Any:
-        normalized = tuple(path)
+    def _approved_path(self, path: tuple[str, ...]) -> bool:
+        if not path or any(not part or part.startswith("_") for part in path):
+            return False
         approved_roots: set[str] = getattr(self._agent, "_sandbox_approved_roots", set())
-        dynamically_allowed = bool(normalized and normalized[0] in approved_roots)
-        if not normalized or not (self._path_allowed(normalized) or dynamically_allowed):
+        return self._path_allowed(path) or path[0] in approved_roots
+
+    def _walk_path(self, path: list[str]) -> Any:
+        if not self._approved_path(tuple(path)):
             display = ".".join(path) or "<root>"
             raise PermissionError(f"sandbox broker access denied: self.{display}")
         return super()._walk_path(path)
+
+    async def _dispatch_tool_call(self, msg: dict[str, Any]) -> dict[str, Any]:
+        path = msg.get("path")
+        kind = msg.get("kind")
+        normalized = (
+            tuple(path)
+            if isinstance(path, list) and all(isinstance(part, str) for part in path)
+            else ()
+        )
+        state = len(normalized) == 2 and normalized[0] == "v"
+        allowed = self._approved_path(normalized)
+        if kind == "setattr":
+            # Only variable reassignment mutates host state. Capability objects,
+            # methods and private attributes must never be replaced by a cell.
+            allowed = allowed and state and not callable(msg.get("value"))
+        elif kind == "call":
+            allowed = allowed and (
+                normalized in self._EXACT_PATHS - self._VALUE_PATHS
+                or (
+                    len(normalized) > 1
+                    and normalized[0] not in {"todos", "v"}
+                    and normalized[0] in getattr(self._agent, "_sandbox_approved_roots", set())
+                )
+            )
+        elif kind == "iter":
+            allowed = allowed and state
+        elif kind != "attr":
+            allowed = False
+        if not allowed:
+            display = ".".join(normalized) or "<root>"
+            return {
+                "ok": False,
+                "error_type": "PermissionError",
+                "error": f"sandbox broker access denied: {kind} self.{display}",
+            }
+        if kind == "attr" and not state and normalized not in self._VALUE_PATHS:
+            # Even a picklable capability stays behind the broker. Variables and
+            # scalar metadata cross as copies; tools cross only as proxies.
+            return {"ok": True, "result": None, "proxy": True}
+        return await super()._dispatch_tool_call(msg)
 
 
 def _spawn_safe_local_agent(agent: Any) -> Any:
@@ -350,9 +418,7 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
             parent_conn.send(
                 {
                     "agent": _spawn_safe_local_agent(self._agent),
-                    "framework_builtins": _spawn_safe_framework_builtins(
-                        self._framework_builtins
-                    ),
+                    "framework_builtins": _spawn_safe_framework_builtins(self._framework_builtins),
                     "restrictions": self._restrictions,
                     "spec": self._spec,
                     "max_error": self._max_error,
@@ -665,6 +731,7 @@ class CodingAgent(InteractiveAgent):
     workspace_root: str = "."
     mode: Literal["build", "plan"] = "build"
     _system_messages_in: Annotated[Channel, hidden, nosnapshot]
+    _summarizers: Annotated[list[Any], hidden, nosnapshot]
 
     def __init__(
         self,
@@ -837,6 +904,7 @@ class CodingAgent(InteractiveAgent):
                     target_chars=config.summarization.target_chars,
                 ),
             )
+            summarizer._output_store = self.ws._output_store
             summarizer._agent_id = f"{self.agent_id}:summarize"
             self._observability_unsubs.extend(
                 _forward_observability_events(

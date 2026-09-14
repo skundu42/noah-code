@@ -6,7 +6,43 @@ from pathlib import Path
 
 import pytest
 
-from noah_code.snapshots import SnapshotJournal
+from noah_code.snapshots import JOURNAL_MAX_TURNS, SnapshotJournal
+
+
+@pytest.mark.parametrize(("before", "after"), [(b"", b"content"), (b"content", b"")])
+def test_empty_images_survive_undo_and_redo_reload(tmp_path: Path, before: bytes, after: bytes) -> None:
+    path = tmp_path / "empty.txt"
+    path.write_bytes(before)
+    journal = SnapshotJournal()
+    journal.begin_turn()
+    mutation = journal.record_preimage(path)
+    path.write_bytes(after)
+    journal.record_postimage(mutation, path)
+    journal.end_turn()
+
+    restored = SnapshotJournal()
+    restored.load_dict(journal.to_dict())
+    restored.undo()
+    assert path.read_bytes() == before
+    redone = SnapshotJournal()
+    redone.load_dict(restored.to_dict())
+    redone.redo()
+    assert path.read_bytes() == after
+
+
+def test_journal_bounds_completed_turns_and_legacy_load() -> None:
+    journal = SnapshotJournal()
+    ids = []
+    for _ in range(JOURNAL_MAX_TURNS + 5):
+        ids.append(journal.begin_turn())
+        journal.mark_shell_bypass()
+        journal.end_turn()
+    assert [turn.turn_id for turn in journal._turns] == ids[-JOURNAL_MAX_TURNS:]
+
+    legacy_turns = [{"turn_id": turn_id, "mutations": []} for turn_id in ids]
+    journal.load_dict({"turns": legacy_turns, "redo": legacy_turns})
+    for stack in (journal._turns, journal._redo):
+        assert [turn.turn_id for turn in stack] == ids[-JOURNAL_MAX_TURNS:]
 
 
 def test_undo_refuses_concurrent_change(tmp_path: Path) -> None:

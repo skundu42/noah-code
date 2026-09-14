@@ -78,7 +78,7 @@ HISTORY_PAGE_SIZE = 50
 RECENT_HISTORY_SIZE = 24
 STREAM_FLUSH_SECONDS = 0.05
 BUSY_REFRESH_SECONDS = 0.08
-WIDE_MIN_COLUMNS = 110
+WIDE_MIN_COLUMNS = 128
 COMPACT_MAX_ROWS = 25
 UPDATE_BANNER_SECONDS = 12.0
 STATUS_REFRESH_SECONDS = 1.0
@@ -426,6 +426,7 @@ class RepositorySnapshot:
     staged: int = 0
     modified: int = 0
     untracked: int = 0
+    paths: tuple[str, ...] = ()
 
     @property
     def is_clean(self) -> bool:
@@ -448,6 +449,7 @@ def _parse_git_status(output: str) -> RepositorySnapshot | None:
         branch = branch_header.split("...", 1)[0].split(" [", 1)[0].strip()
     branch = branch or "detached"
     staged = modified = untracked = 0
+    paths: list[str] = []
     skip_rename_source = False
     for record in records[1:]:
         if skip_rename_source:
@@ -456,6 +458,7 @@ def _parse_git_status(output: str) -> RepositorySnapshot | None:
         if len(record) < 3 or record[2] != " ":
             continue
         index_state, worktree_state = record[0], record[1]
+        paths.append(record[3:])
         if index_state == "?" and worktree_state == "?":
             untracked += 1
             continue
@@ -466,7 +469,7 @@ def _parse_git_status(output: str) -> RepositorySnapshot | None:
         skip_rename_source = nul_delimited and (
             "R" in {index_state, worktree_state} or "C" in {index_state, worktree_state}
         )
-    return RepositorySnapshot(branch, staged, modified, untracked)
+    return RepositorySnapshot(branch, staged, modified, untracked, tuple(dict.fromkeys(paths)))
 
 
 def _read_repository_snapshot(root: Path) -> RepositorySnapshot | None:
@@ -540,16 +543,17 @@ class ActivityRecord:
         return max(0.0, (self.finished_at or time.monotonic()) - self.started_at)
 
 
-def _role_renderable(entry: TranscriptEntry) -> Group:
+def _role_renderable(entry: TranscriptEntry, palette: ThemePalette | None = None) -> Group:
+    palette = palette or THEMES["atom-one-dark"]
     colors = {
-        "YOU": "#b8a9ff",
-        "NOAH": "#8bd5ca",
-        "COMMAND": "#a6da95",
-        "ACTIVITY": "#e6b673",
-        "ERROR": "#ed8796",
-        "SUMMARY": "#c6a0f6",
-        "STATUS": "#777781",
-        "RECEIPT": "#8bd5ca",
+        "YOU": palette.accent,
+        "NOAH": palette.success,
+        "COMMAND": palette.text,
+        "ACTIVITY": palette.error if entry.text.startswith("✗") else palette.muted,
+        "ERROR": palette.error,
+        "SUMMARY": palette.accent,
+        "STATUS": palette.muted,
+        "RECEIPT": palette.error if "failed" in entry.text.lower() else palette.text,
     }
     labels = {
         "YOU": "▌ You",
@@ -562,19 +566,25 @@ def _role_renderable(entry: TranscriptEntry) -> Group:
         "RECEIPT": "  ✓",
     }
     if entry.role in {"ACTIVITY", "STATUS", "RECEIPT"}:
-        return Group(Padding(Text(entry.text, style=colors[entry.role]), (0, 0, 1, 2)))
+        text = Text(entry.text, style=colors[entry.role])
+        if entry.role == "ACTIVITY":
+            text.stylize(Style(meta={"@click": "app.activity_history"}))
+        elif entry.role == "RECEIPT" and "/diff" in entry.text:
+            text.stylize(Style(meta={"@click": "app.review_changes"}))
+        return Group(Padding(text, (0, 0, 1, 2)))
     label = Text(
         labels.get(entry.role, entry.role),
-        style=f"bold {colors.get(entry.role, '#777781')}",
+        style=f"bold {colors.get(entry.role, palette.muted)}",
     )
     if entry.markdown:
         body: Any = Markdown(
             _normalize_markdown(entry.text),
             code_theme="monokai",
             hyperlinks=True,
+            style=palette.text,
         )
     else:
-        body = Text(entry.text, style="#d1d1d6")
+        body = Text(entry.text, style=palette.text)
     return Group(label, Padding(body, (0, 0, 1, 2)))
 
 
@@ -611,8 +621,7 @@ _PROGRESSIVE_ACTIVITY = (
 def _completed_activity_label(label: str, *, failed: bool) -> str | None:
     """Collapse internal activity into one OpenCode-style transcript line."""
 
-    # Failed attempts remain available in the timeline; final errors render separately.
-    if failed or label in _HIDDEN_ACTIVITY:
+    if label in _HIDDEN_ACTIVITY:
         return None
     completed = label
     for prefix, replacement in _PROGRESSIVE_ACTIVITY:
@@ -621,7 +630,7 @@ def _completed_activity_label(label: str, *, failed: bool) -> str | None:
             continue
         completed = completed.replace(prefix, replacement)
     completed = completed.strip()
-    return f"✓ {completed}"
+    return f"✗ {completed} · failed · F2 details" if failed else f"✓ {completed}"
 
 
 _DONE_FILE_ACTIVITY = re.compile(
@@ -736,21 +745,22 @@ def _relative_age(timestamp: float) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(timestamp))
 
 
-def _diff_renderable(patch: str) -> Group:
+def _diff_renderable(patch: str, palette: ThemePalette | None = None) -> Group:
     """Render a readable unified diff without interpreting arbitrary markup."""
 
+    palette = palette or THEMES["atom-one-dark"]
     lines: list[Text] = []
     for raw in (patch or "(no textual diff)").splitlines():
         if raw.startswith("@@"):
-            style = "bold #b8a9ff"
+            style = f"bold {palette.accent}"
         elif raw.startswith("+++") or raw.startswith("---") or raw.startswith("diff "):
-            style = "bold #7dc4e4"
+            style = f"bold {palette.text}"
         elif raw.startswith("+"):
-            style = "#8bd5ca"
+            style = palette.success
         elif raw.startswith("-"):
-            style = "#ed8796"
+            style = palette.error
         else:
-            style = "#d1d1d6"
+            style = palette.text
         lines.append(Text(raw, style=style, no_wrap=False))
     return Group(*lines)
 
@@ -835,17 +845,17 @@ class ComposerTextArea(TextArea):
             event.prevent_default()
             app.close_suggestions()  # type: ignore[attr-defined]
             return
-        if event.key == "tab":
+        if event.key in {"tab", "shift+tab"}:
             event.stop()
             event.prevent_default()
-            app.action_toggle_mode()  # type: ignore[attr-defined]
+            (app.action_focus_next if event.key == "tab" else app.action_focus_previous)()
             return
         if event.key == "enter":
             event.stop()
             event.prevent_default()
             self.post_message(self.Submitted(self))
             return
-        if event.key == "shift+enter":
+        if event.key in {"shift+enter", "ctrl+j"}:
             event.stop()
             event.prevent_default()
             self.replace("\n", *self.selection, maintain_selection_offset=False)
@@ -884,18 +894,26 @@ class ApprovalModal(ModalScreen[ApprovalChoice]):
         self.request = request
 
     def compose(self) -> ComposeResult:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         decision = self.request.decision
         with Vertical(id="approval-dialog"):
             yield Label("PERMISSION REQUIRED", id="approval-title")
-            yield Static(
-                Text.assemble(
-                    (f"{decision.category.upper()}\n", "bold #e6b673"),
-                    (f"{decision.target}\n\n", "#d1d1d6"),
-                    (f"{decision.reason}\n", "#777781"),
-                    (f"Remember as: {decision.remember_pattern}", "#777781"),
-                ),
-                id="approval-body",
-            )
+            with VerticalScroll(id="approval-scroll"):
+                yield Static(
+                    Text.assemble(
+                        (f"{decision.category.upper()}\n", f"bold {palette.warning}"),
+                        (f"{decision.target}\n\n", palette.text),
+                        (f"{decision.reason}\n\n", palette.muted),
+                        ("Allow once permits only this request.\n", palette.text),
+                        (
+                            f"This session also permits future {decision.category} requests "
+                            "whose targets match the pattern below, without asking again.\n",
+                            palette.text,
+                        ),
+                        (f"Session pattern: {decision.remember_pattern}", palette.muted),
+                    ),
+                    id="approval-body",
+                )
             with Horizontal(id="approval-buttons"):
                 yield Button("Allow once  [1]", id="once", variant="primary")
                 yield Button("This session  [2]", id="session", variant="success")
@@ -930,21 +948,25 @@ class QuestionModal(ModalScreen[QuestionAnswer | None]):
     """Keyboard-first multiple-choice card for the question tool."""
 
     BINDINGS = [
-        Binding("escape", "cancel", "Cancel", show=True),
+        Binding("escape", "cancel", "Skip question", show=True),
         Binding("enter", "accept", "Choose", show=True),
         Binding("0", "other", "Other", show=False),
+        *[Binding(str(number), f"choose({number})", "Choose", show=False) for number in range(1, 10)],
     ]
 
-    def __init__(self, prompt: QuestionPrompt) -> None:
+    def __init__(self, prompt: QuestionPrompt, *, number: int = 1, total: int = 1) -> None:
         super().__init__()
         self.prompt = prompt
+        self.number = number
+        self.total = total
 
     def compose(self) -> ComposeResult:
         with Vertical(id="approval-dialog"):
             yield Label(self.prompt.header.upper(), id="approval-title")
+            yield Static(f"Question {self.number} of {self.total}", id="question-progress")
             yield Static(Text(self.prompt.prompt), id="approval-body")
             yield OptionList(id="question-list", compact=True)
-            yield Static("↑/↓ choose · Enter select · 0 other · Esc cancel", id="picker-hint")
+            yield Static("1–9 choose · ↑/↓ then Enter · 0 other · Esc skip question", id="picker-hint")
 
     def on_mount(self) -> None:
         option_list = self.query_one("#question-list", OptionList)
@@ -955,6 +977,10 @@ class QuestionModal(ModalScreen[QuestionAnswer | None]):
         option_list.add_options(options)
         option_list.highlighted = 0
         option_list.focus()
+
+    def action_choose(self, number: int) -> None:
+        if 1 <= number <= len(self.prompt.options):
+            self.dismiss(QuestionAnswer(selections=[self.prompt.options[number - 1]], custom=""))
 
     def action_accept(self) -> None:
         option_list = self.query_one("#question-list", OptionList)
@@ -1002,6 +1028,7 @@ class OnboardingScreen(ModalScreen[bool]):
         self.reason = reason
 
     def compose(self) -> ComposeResult:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         with Vertical(id="onboarding-dialog"):
             yield Label("WELCOME TO NOAH CODE", id="onboarding-title")
             yield Static(
@@ -1010,12 +1037,12 @@ class OnboardingScreen(ModalScreen[bool]):
             )
             yield Static(
                 Text.assemble(
-                    ("1  PROVIDER\n", "bold #b8a9ff"),
-                    ("   Choose OpenAI, Anthropic, OpenRouter, a local model, or another provider.\n\n", "#d1d1d6"),
-                    ("2  CREDENTIALS\n", "bold #7dc4e4"),
-                    ("   Keys are masked and stored in Noah's private auth file, never in this repository.\n\n", "#d1d1d6"),
-                    ("3  MODEL + REASONING\n", "bold #e6b673"),
-                    ("   Pick the exact model ID and reasoning level. You can change both later with /model.", "#d1d1d6"),
+                    ("1  PROVIDER\n", f"bold {palette.accent}"),
+                    ("   Choose OpenAI, Anthropic, OpenRouter, a local model, or another provider.\n\n", palette.text),
+                    ("2  CREDENTIALS\n", f"bold {palette.accent}"),
+                    ("   Keys are masked and stored in Noah's private auth file, never in this repository.\n\n", palette.text),
+                    ("3  MODEL + REASONING\n", f"bold {palette.warning}"),
+                    ("   Pick the exact model ID and reasoning level. You can change both later with /model.", palette.text),
                 ),
                 id="onboarding-steps",
             )
@@ -1071,20 +1098,21 @@ class FilteredPicker(ModalScreen[str | None]):
         self.query_one("#picker-filter", Input).focus()
 
     def _refresh_options(self) -> None:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         option_list = self.query_one("#picker-list", OptionList)
         option_list.clear_options()
         options = []
         for value, label, description in self._filtered:
             prompt = Text.assemble(
-                (label, "bold #b8a9ff"),
-                (f"  {description}" if description else "", "#777781"),
+                (label, f"bold {palette.accent}"),
+                (f"  {description}" if description else "", palette.muted),
             )
             options.append(Option(prompt, id=value))
         if options:
             option_list.add_options(options)
             option_list.highlighted = 0
         else:
-            option_list.add_option(Option(Text("No matches", style="#777781"), disabled=True))
+            option_list.add_option(Option(Text("No matches", style=palette.muted), disabled=True))
 
     @on(Input.Changed, "#picker-filter")
     def _filter(self, event: Input.Changed) -> None:
@@ -1279,7 +1307,8 @@ class NoticeDetailsScreen(ModalScreen[None]):
             yield Static("Page Up/Down inspect · F6 or Esc close", id="notice-detail-hint")
 
     def on_mount(self) -> None:
-        self.query_one("#notice-detail-body", RichLog).write(Text(self.detail, style="#d1d1d6"))
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
+        self.query_one("#notice-detail-body", RichLog).write(Text(self.detail, style=palette.text))
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -1293,11 +1322,16 @@ class QueueManagerScreen(ModalScreen[None]):
         Binding("d,delete", "remove", "Remove", show=True),
         Binding("u,shift+up", "move_up", "Move up", show=True),
         Binding("j,shift+down", "move_down", "Move down", show=True),
+        Binding("e", "edit", "Edit prompt", show=True),
+        Binding("r", "resume", "Resume queue", show=True),
+        Binding("x", "discard", "Discard all", show=True),
     ]
 
     def __init__(self, host: AgentHost) -> None:
         super().__init__()
         self.host = host
+        self._displayed_items: list[Any] = []
+        self._displayed_paths: tuple[Path, ...] = ()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="queue-dialog"):
@@ -1305,7 +1339,7 @@ class QueueManagerScreen(ModalScreen[None]):
             yield Static("", id="queue-summary")
             yield OptionList(id="queue-list", compact=True)
             yield Static(
-                "↑/↓ select · U/J reorder prompts · D remove · Esc close",
+                "E edit · R resume · X discard all · U/J reorder · D remove · Esc close",
                 id="queue-hint",
             )
 
@@ -1326,31 +1360,35 @@ class QueueManagerScreen(ModalScreen[None]):
     def _refresh(self, *, highlighted: int | None = None) -> None:
         paths = self._pending_paths()
         queued = self._queued_items()
+        self._displayed_paths, self._displayed_items = paths, queued
+        palette = self.app.theme_palette  # type: ignore[attr-defined]
+        state = "PAUSED" if getattr(self.host, "queue_paused", False) is True else "WAITING"
         self.query_one("#queue-summary", Static).update(
-            f"{len(paths)} attachment(s) waiting · {len(queued)} queued prompt(s)",
+            f"{state} · {len(paths)} attachment(s) · {len(queued)} prompt(s)\n"
+            "Consumed prompts appear in the transcript; only waiting prompts can be edited.",
             layout=False,
         )
         option_list = self.query_one("#queue-list", OptionList)
         option_list.clear_options()
         options: list[Option] = []
         for index, path in enumerate(paths):
-            options.append(Option(Text(f"ATTACH  {path}", style="#7dc4e4"), id=f"attach:{index}"))
+            options.append(Option(Text(f"ATTACH  {path}", style=palette.accent), id=f"attach:{index}"))
         for index, item in enumerate(queued):
             preview = " ".join(str(item.text).split())[:100]
             suffix = f"  · {len(item.attach_paths)} file(s)" if item.attach_paths else ""
             options.append(
                 Option(
                     Text.assemble(
-                        (f"{index + 1:>2}. ", "bold #e6b673"),
-                        (preview, "#d1d1d6"),
-                        (suffix, "#777781"),
+                        (f"{index + 1:>2}. ", f"bold {palette.warning}"),
+                        (preview, palette.text),
+                        (suffix, palette.muted),
                     ),
                     id=f"queue:{index}",
                 )
             )
         if not options:
             option_list.add_option(
-                Option(Text("Nothing queued or attached", style="#777781"), disabled=True)
+                Option(Text("Nothing queued or attached", style=palette.muted), disabled=True)
             )
             return
         option_list.add_options(options)
@@ -1365,7 +1403,20 @@ class QueueManagerScreen(ModalScreen[None]):
         if not option.id or ":" not in option.id:
             return None
         kind, raw_index = option.id.split(":", 1)
-        return kind, int(raw_index)
+        index = int(raw_index)
+        if kind == "attach":
+            path = self._displayed_paths[index]
+            for current, candidate in enumerate(self._pending_paths()):
+                if candidate == path:
+                    return kind, current
+        else:
+            item = self._displayed_items[index]
+            for current, candidate in enumerate(self._queued_items()):
+                if candidate is item:
+                    return kind, current
+        self._refresh()
+        self.query_one("#queue-summary", Static).update("This input was already consumed or removed.")
+        return None
 
     def action_remove(self) -> None:
         selected = self._selected()
@@ -1395,6 +1446,32 @@ class QueueManagerScreen(ModalScreen[None]):
 
     def action_move_down(self) -> None:
         self._move(1)
+
+    def action_edit(self) -> None:
+        selected = self._selected()
+        if selected is None or selected[0] != "queue":
+            return
+        item = self.host.recall_queued_steer(selected[1])
+        if item is not None:
+            self.action_close()
+            self.app._replace_composer_draft(item.text)  # type: ignore[attr-defined]
+
+    def action_resume(self) -> None:
+        self.action_close()
+        app = self.app
+        if app.ui.busy:  # type: ignore[attr-defined]
+            self.host.resume_queued_input()
+        else:
+            app._run_turn("/queue resume")  # type: ignore[attr-defined]
+
+    @work(exclusive=True, group="queue-discard")
+    async def action_discard(self) -> None:
+        confirmed = await self.app.push_screen_wait(
+            ConfirmationModal("Discard waiting input?", "Remove all queued prompts and pending attachments.", "Discard all")
+        )
+        if confirmed:
+            self.host.discard_queued_input()
+            self._refresh()
 
     def action_close(self) -> None:
         with contextlib.suppress(Exception):
@@ -1444,17 +1521,18 @@ class ContextVisibilityScreen(ModalScreen[None]):
         return list(getter()) if callable(getter) else []
 
     def _refresh(self) -> None:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         rows = self._snapshot()
         options: list[Option] = []
         self._rows = {}
-        palette = {
-            "instruction": "#b8a9ff",
-            "plan": "#e6b673",
-            "memory": "#8bd5ca",
-            "attachment": "#7dc4e4",
-            "pending": "#e6b673",
-            "skill": "#c6a0f6",
-            "mcp": "#7dc4e4",
+        kind_colors = {
+            "instruction": palette.accent,
+            "plan": palette.warning,
+            "memory": palette.success,
+            "attachment": palette.accent,
+            "pending": palette.warning,
+            "skill": palette.accent,
+            "mcp": palette.accent,
         }
         for index, row in enumerate(rows):
             row_id = f"context:{index}"
@@ -1463,8 +1541,8 @@ class ContextVisibilityScreen(ModalScreen[None]):
             options.append(
                 Option(
                     Text.assemble(
-                        (f"{kind.upper():<11}", f"bold {palette.get(kind, '#777781')}"),
-                        (row.get("label", "Context source"), "#d1d1d6"),
+                        (f"{kind.upper():<11}", f"bold {kind_colors.get(kind, palette.muted)}"),
+                        (row.get("label", "Context source"), palette.text),
                     ),
                     id=row_id,
                 )
@@ -1474,7 +1552,7 @@ class ContextVisibilityScreen(ModalScreen[None]):
         if not options:
             option_list.add_option(
                 Option(
-                    Text("Workspace defaults only · no extra context sources", style="#777781"),
+                    Text("Workspace defaults only · no extra context sources", style=palette.muted),
                     disabled=True,
                 )
             )
@@ -1484,7 +1562,7 @@ class ContextVisibilityScreen(ModalScreen[None]):
                 Text(
                     "Add AGENTS.md for repository instructions, /memory save for durable "
                     "conventions, or @mention a file in the composer.",
-                    style="#d1d1d6",
+                    style=palette.text,
                 )
             )
             return
@@ -1494,13 +1572,14 @@ class ContextVisibilityScreen(ModalScreen[None]):
         self._show(rows[0])
 
     def _show(self, row: dict[str, str]) -> None:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         detail = self.query_one("#context-detail", RichLog)
         detail.clear()
         detail.write(
             Text.assemble(
-                (f"{row.get('label', 'Context source')}\n", "bold #b8a9ff"),
-                (f"{row.get('kind', 'context').upper()}\n\n", "#777781"),
-                (row.get("detail", "Active context source"), "#d1d1d6"),
+                (f"{row.get('label', 'Context source')}\n", f"bold {palette.accent}"),
+                (f"{row.get('kind', 'context').upper()}\n\n", palette.muted),
+                (row.get("detail", "Active context source"), palette.text),
             )
         )
 
@@ -1528,6 +1607,7 @@ class WorkLedgerScreen(ModalScreen[None]):
         super().__init__()
         self.host = host
         self._records: dict[str, dict[str, Any]] = {}
+        self._selected_id: str | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="work-dialog"):
@@ -1550,9 +1630,11 @@ class WorkLedgerScreen(ModalScreen[None]):
 
     def on_mount(self) -> None:
         self._refresh()
+        self.query_one("#work-list", OptionList).focus()
         self.set_interval(1.0, self._refresh)
 
     def _refresh(self) -> None:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         snapshot = self.host.work_snapshot()
         records: list[tuple[str, dict[str, Any]]] = []
         for item in snapshot["agents"]:
@@ -1566,10 +1648,10 @@ class WorkLedgerScreen(ModalScreen[None]):
         terminals = sum(item.get("kind") == "terminal" for _key, item in records)
         self.query_one("#work-summary", Static).update(
             Text.assemble(
-                (f"{active} active", "bold #e6b673" if active else "#777781"),
-                (f"   {len(snapshot['agents'])} agent records", "#d1d1d6"),
-                (f"   {terminals} terminals", "#7dc4e4"),
-                ("   newest work appears last", "#777781"),
+                (f"{active} active", f"bold {palette.warning}" if active else palette.muted),
+                (f"   {len(snapshot['agents'])} agent records", palette.text),
+                (f"   {terminals} terminals", palette.accent),
+                ("   newest work appears last", palette.muted),
             ),
             layout=False,
         )
@@ -1584,13 +1666,13 @@ class WorkLedgerScreen(ModalScreen[None]):
             state = str(item.get("state", "unknown"))
             running = state in {"queued", "running", "stopping"}
             state_style = (
-                "#e6b673"
+                palette.warning
                 if running
-                else "#8bd5ca"
+                else palette.success
                 if state in {"completed", "stopped"}
-                else "#777781"
+                else palette.muted
                 if state == "cancelled"
-                else "#ed8796"
+                else palette.error
             )
             if item["unit"] == "agent":
                 title = f"agent · {item.get('agent', 'unknown')}"
@@ -1601,13 +1683,13 @@ class WorkLedgerScreen(ModalScreen[None]):
                 elapsed = float(item.get("elapsed", 0.0))
             prompt = Text()
             prompt.append(f"{state.upper():<10}", style=f"bold {state_style}")
-            prompt.append(f"{title}\n", style="#d1d1d6")
-            prompt.append(f"   {elapsed:.1f}s  {str(item.get('id', ''))}", style="#777781")
+            prompt.append(f"{title}\n", style=palette.text)
+            prompt.append(f"   {elapsed:.1f}s  {str(item.get('id', ''))}", style=palette.muted)
             options.append(Option(prompt, id=key))
         if not options:
             option_list.add_option(
                 Option(
-                    Text("No delegated work or terminal sessions", style="#777781"),
+                    Text("No delegated work or terminal sessions", style=palette.muted),
                     disabled=True,
                 )
             )
@@ -1617,7 +1699,7 @@ class WorkLedgerScreen(ModalScreen[None]):
                 Text(
                     "Noah opens named terminals with processes.open_terminal() and coordinates "
                     "teams with task.collaborate(). Work will appear here as it starts.",
-                    style="#d1d1d6",
+                    style=palette.text,
                 )
             )
             return
@@ -1627,8 +1709,6 @@ class WorkLedgerScreen(ModalScreen[None]):
             len(options) - 1,
         )
         option_list.highlighted = index
-        if not option_list.has_focus:
-            option_list.focus()
         self._show(records[index][1])
 
     @on(OptionList.OptionHighlighted, "#work-list")
@@ -1637,33 +1717,38 @@ class WorkLedgerScreen(ModalScreen[None]):
             self._show(self._records[event.option.id])
 
     def _show(self, item: dict[str, Any]) -> None:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         detail = self.query_one("#work-detail", RichLog)
+        selected_id = f"{item['unit']}:{item.get('id', '')}"
+        scroll_y = detail.scroll_y if selected_id == self._selected_id else 0
+        self._selected_id = selected_id
         detail.clear()
         text = Text()
         if item["unit"] == "agent":
-            text.append(f"{item.get('agent', 'agent')}\n", style="bold #b8a9ff")
+            text.append(f"{item.get('agent', 'agent')}\n", style=f"bold {palette.accent}")
             text.append(
                 f"{item.get('state')} · {item.get('mode')} · "
                 f"{'read-only' if item.get('readonly') else 'workspace writer'} · "
                 f"{float(item.get('duration', 0.0)):.1f}s\n\n",
-                style="#777781",
+                style=palette.muted,
             )
-            text.append("ASSIGNMENT\n", style="bold #7dc4e4")
-            text.append(str(item.get("prompt") or "No assignment text"), style="#d1d1d6")
+            text.append("ASSIGNMENT\n", style=f"bold {palette.accent}")
+            text.append(str(item.get("prompt") or "No assignment text"), style=palette.text)
             if item.get("result_preview"):
-                text.append("\n\nRESULT\n", style="bold #8bd5ca")
-                text.append(str(item["result_preview"]), style="#d1d1d6")
+                text.append("\n\nRESULT\n", style=f"bold {palette.success}")
+                text.append(str(item["result_preview"]), style=palette.text)
         else:
             kind = "terminal" if item.get("kind") == "terminal" else "background job"
-            text.append(f"{item.get('name', kind)}\n", style="bold #b8a9ff")
+            text.append(f"{item.get('name', kind)}\n", style=f"bold {palette.accent}")
             text.append(
                 f"{kind} · {item.get('state')} · {float(item.get('elapsed', 0.0)):.1f}s · "
                 f"cursor {item.get('cursor', 0)}\n\n",
-                style="#777781",
+                style=palette.muted,
             )
-            text.append("COMMAND\n", style="bold #7dc4e4")
-            text.append(str(item.get("command") or "Persistent shell"), style="#d1d1d6")
-        detail.write(text)
+            text.append("COMMAND\n", style=f"bold {palette.accent}")
+            text.append(str(item.get("command") or "Persistent shell"), style=palette.text)
+        detail.write(text, scroll_end=False)
+        self.call_after_refresh(lambda: detail.scroll_to(y=scroll_y, animate=False, force=True))
 
     def action_refresh(self) -> None:
         self._refresh()
@@ -1677,6 +1762,7 @@ class ActivityHistoryScreen(ModalScreen[None]):
 
     BINDINGS = [
         Binding("escape", "close", "Close", show=True),
+        Binding("ctrl+f,slash", "search", "Search", show=True),
         Binding("t", "toggle_thought", "Thought", show=True),
         Binding("a", "toggle_action", "Action", show=True),
         Binding("o", "toggle_output", "Output", show=True),
@@ -1693,6 +1779,7 @@ class ActivityHistoryScreen(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="detail-dialog"):
             yield Label("LONG-TASK TIMELINE", id="detail-title")
+            yield Input(placeholder="Search actions, errors, and captured output…", id="activity-filter")
             with Horizontal(id="detail-body"):
                 yield OptionList(id="activity-list", compact=True)
                 yield SelectableRichLog(
@@ -1704,13 +1791,27 @@ class ActivityHistoryScreen(ModalScreen[None]):
                     max_lines=2_000,
                 )
             yield Static(
-                "↑/↓ select · T thought · A action · O output · E expand all · Esc close",
+                "/ search · ↑/↓ select · T thought · A action · O output · E expand all · Esc close",
                 id="detail-hint",
             )
 
     def on_mount(self) -> None:
+        self._refresh_options()
+        self.query_one("#activity-list", OptionList).focus()
+
+    def _refresh_options(self) -> None:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
+        query = self.query_one("#activity-filter", Input).value.strip().casefold()
+        selected_id = self._selected.activity_id if self._selected else None
+        records = [
+            record for record in self.records
+            if query in " ".join((
+                record.label, record.tool, record.state, record.thought,
+                record.detail, record.output, record.result,
+            )).casefold()
+        ]
         options = []
-        for record in self.records:
+        for record in records:
             icon = (
                 "✓"
                 if record.state == "complete"
@@ -1727,20 +1828,34 @@ class ActivityHistoryScreen(ModalScreen[None]):
                 extras.append("⋮")
             suffix = f"  {''.join(extras)}" if extras else ""
             prompt = Text(
-                f"{icon} {record.label}  {record.duration:.1f}s{suffix}",
-                style="#d1d1d6",
+                f"{icon} {record.state.upper()} · {record.label}  {record.duration:.1f}s{suffix}",
+                style=palette.error if record.state == "error" else palette.text,
             )
             options.append(Option(prompt, id=record.activity_id))
         option_list = self.query_one("#activity-list", OptionList)
+        option_list.clear_options()
         if options:
             option_list.add_options(options)
-            option_list.highlighted = 0
-            self._show_record(self.records[0])
-            option_list.focus()
+            index = next((i for i, record in enumerate(records) if record.activity_id == selected_id), 0)
+            option_list.highlighted = index
+            self._show_record(records[index])
         else:
+            self._selected = None
+            self.query_one("#activity-detail", RichLog).clear()
             option_list.add_option(
-                Option(Text("No task events yet", style="#777781"), disabled=True)
+                Option(Text("No matching events" if query else "No task events yet", style=palette.muted), disabled=True)
             )
+
+    @on(Input.Changed, "#activity-filter")
+    def _filter(self) -> None:
+        self._refresh_options()
+
+    @on(Input.Submitted, "#activity-filter")
+    def _search_submitted(self) -> None:
+        self.query_one("#activity-list", OptionList).focus()
+
+    def action_search(self) -> None:
+        self.query_one("#activity-filter", Input).focus()
 
     def _sections_for(self, record: ActivityRecord) -> set[str]:
         expanded = self._expanded.setdefault(record.activity_id, {"output"})
@@ -1770,7 +1885,9 @@ class ActivityHistoryScreen(ModalScreen[None]):
         if self._selected is None:
             return
         sections = self._sections_for(self._selected)
-        available = {name for name in ("thought", "action") if getattr(self._selected, name)}
+        available = {name for name, content in (
+            ("thought", self._selected.thought), ("action", self._selected.detail),
+        ) if content}
         available.add("output")
         if available <= sections:
             sections.clear()
@@ -1780,58 +1897,61 @@ class ActivityHistoryScreen(ModalScreen[None]):
         self._show_record(self._selected)
 
     def _section_block(self, title: str, body: str, *, style: str) -> list[Any]:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         blocks: list[Any] = [Text(f"▼ {title}", style=f"bold {style}")]
         for line in (body or "").splitlines() or [""]:
-            blocks.append(Text(f"  {line}", style="#d1d1d6"))
+            blocks.append(Text(f"  {line}", style=palette.text))
         blocks.append(Text(""))
         return blocks
 
     def _collapsed_block(self, title: str, preview: str) -> list[Any]:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         preview = " ".join((preview or "").split())
         if len(preview) > 64:
             preview = preview[:61] + "…"
         return [
             Text.assemble(
-                (f"▶ {title}", "bold #777781"),
-                (f"  {preview}" if preview else "", "#777781"),
+                (f"▶ {title}", f"bold {palette.muted}"),
+                (f"  {preview}" if preview else "", palette.muted),
             ),
             Text(""),
         ]
 
     def _show_record(self, record: ActivityRecord) -> None:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         self._selected = record
         detail = self.query_one("#activity-detail", RichLog)
         detail.clear()
         detail.write(
             Text.assemble(
-                (f"{record.label}\n", "bold #b8a9ff"),
+                (f"{record.label}\n", f"bold {palette.accent}"),
                 (
                     f"{record.tool} · {record.state} · {record.duration:.2f}s · "
                     f"{record.line_count} lines\n\n",
-                    "#777781",
+                    palette.muted,
                 ),
             )
         )
         sections = self._sections_for(record)
         if record.thought:
             if "thought" in sections:
-                for block in self._section_block("THOUGHT", record.thought, style="#c6a0f6"):
+                for block in self._section_block("THOUGHT", record.thought, style=palette.accent):
                     detail.write(block)
             else:
                 for block in self._collapsed_block("THOUGHT", record.thought):
                     detail.write(block)
         if record.detail:
             if "action" in sections:
-                for block in self._section_block("ACTION", record.detail, style="#7dc4e4"):
+                for block in self._section_block("ACTION", record.detail, style=palette.accent):
                     detail.write(block)
             else:
                 for block in self._collapsed_block("ACTION", record.detail):
                     detail.write(block)
         output_body = record.output or record.result or ""
         if "output" in sections or not output_body:
-            detail.write(Text("▼ OUTPUT", style="bold #e6b673"))
+            detail.write(Text("▼ OUTPUT", style=f"bold {palette.warning}"))
             for line in output_body.splitlines() or ["(no captured output)"]:
-                detail.write(Text(f"  {line}", style="#d1d1d6"))
+                detail.write(Text(f"  {line}", style=palette.text))
         else:
             head = "\n".join(output_body.splitlines()[:4])
             for block in self._collapsed_block("OUTPUT", head):
@@ -1850,7 +1970,8 @@ class ConversationHistoryScreen(ModalScreen[None]):
     """Lazy, paginated persisted conversation viewer."""
 
     BINDINGS = [
-        Binding("home", "load_older", "Load older", show=True, priority=True),
+        Binding("ctrl+home", "load_older", "Load older", show=True),
+        Binding("ctrl+f,slash", "search", "Search", show=True),
         Binding("escape", "close", "Close", show=True),
     ]
 
@@ -1865,21 +1986,24 @@ class ConversationHistoryScreen(ModalScreen[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="history-dialog"):
             yield Label("CONVERSATION HISTORY", id="detail-title")
+            yield Input(placeholder="Search loaded messages…", id="history-filter")
             yield SelectableRichLog(
                 id="history-log",
                 markup=False,
                 highlight=False,
                 wrap=True,
                 min_width=0,
-                max_lines=MAX_TRANSCRIPT_LINES,
+                max_lines=None,
             )
-            yield Static("Home load older · Page Up/Down inspect · Esc close", id="detail-hint")
+            yield Static("/ search · Ctrl+Home load older · Page Up/Down inspect · Esc close", id="detail-hint")
 
     def on_mount(self) -> None:
+        self.query_one("#history-log", RichLog).focus()
         self._load_page()
 
     @work(exclusive=True, group="history-page")
     async def _load_page(self) -> None:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         if self._loading or not self._has_more:
             return
         self._loading = True
@@ -1891,26 +2015,56 @@ class ConversationHistoryScreen(ModalScreen[None]):
             if records:
                 self._before = min(record.insertion_order for record in records)
             entries = [entry for record in records for entry in _record_to_entries(record)]
-            if not entries and self._before is None:
-                self.query_one("#history-log", RichLog).write(
-                    Text("No persisted conversation yet.", style="#777781")
-                )
-            else:
-                self._entries = entries + self._entries
-                self._render_entries()
+            had_entries = bool(self._entries)
+            self._entries = entries + self._entries
+            self._render_entries(preserve_anchor=had_entries, latest=not had_entries)
         except Exception as exc:  # noqa: BLE001
             self.query_one("#history-log", RichLog).write(
-                Text(f"History could not be loaded: {exc}", style="#ed8796")
+                Text(f"History could not be loaded: {exc}", style=palette.error)
             )
         finally:
             self._loading = False
 
-    def _render_entries(self) -> None:
+    def _render_entries(self, *, preserve_anchor: bool = False, latest: bool = False) -> None:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         log = self.query_one("#history-log", RichLog)
+        old_rows, old_scroll = len(log.lines), log.scroll_y
+        query = self.query_one("#history-filter", Input).value.strip().casefold()
+        entries = [entry for entry in self._entries if query in f"{entry.role} {entry.text}".casefold()]
         log.clear()
-        for entry in self._entries:
-            log.write(_role_renderable(entry), scroll_end=False)
-        log.scroll_end(animate=False)
+        for entry in entries:
+            log.write(_role_renderable(entry, palette), scroll_end=False)
+        if not entries:
+            message = "No matching loaded messages." if query else "No persisted conversation yet."
+            log.write(Text(message, style=palette.muted), scroll_end=False)
+        more = "Ctrl+Home load older" if self._has_more else "All history loaded"
+        self.query_one("#detail-hint", Static).update(
+            f"{len(entries)} / {len(self._entries)} messages · {more} · / search · Enter read · Esc close"
+        )
+        if preserve_anchor:
+            target = old_scroll + max(len(log.lines) - old_rows, 0)
+            self.call_after_refresh(lambda: log.scroll_to(y=target, animate=False, force=True))
+        elif latest and not query:
+            self.call_after_refresh(lambda: log.scroll_end(animate=False))
+        else:
+            log.scroll_to(y=0, animate=False, force=True)
+
+    @on(Input.Changed, "#history-filter")
+    def _filter(self) -> None:
+        self._render_entries()
+
+    @on(Input.Submitted, "#history-filter")
+    def _search_submitted(self) -> None:
+        self.query_one("#history-log", RichLog).focus()
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "home" and not isinstance(self.focused, Input):
+            event.stop()
+            event.prevent_default()
+            self._load_page()
+
+    def action_search(self) -> None:
+        self.query_one("#history-filter", Input).focus()
 
     def action_load_older(self) -> None:
         self._load_page()
@@ -1919,14 +2073,73 @@ class ConversationHistoryScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+def _recorded_checks_text(results: Any, since: float) -> str:
+    """Report known check commands using their actual exit codes, never activity labels."""
+    import shlex
+
+    checks: list[str] = []
+    for finished, command, returncode in results:
+        if finished < since or "\n" in command or "\r" in command:
+            continue
+        try:
+            lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            tokens = list(lexer)
+        except ValueError:
+            continue
+        # Compound commands have only an aggregate exit code. Do not attribute
+        # that status to an individual check which may have failed earlier.
+        if not tokens or any(token in {";", "&&", "||", "|", "&", ">", ">>", "<", "(" , ")"} for token in tokens):
+            continue
+        if tokens[:2] == ["uv", "run"]:
+            tokens = tokens[2:]
+            while tokens and tokens[0] in {"--no-sync", "--locked", "--frozen", "--offline", "-q", "--quiet"}:
+                tokens.pop(0)
+        if tokens[:2] in (["python", "-m"], ["python3", "-m"]):
+            tokens = tokens[2:]
+        if not tokens:
+            continue
+        if any(flag in tokens for flag in {"--help", "-h", "--version", "-V", "--collect-only", "--co"}):
+            continue
+        executable = Path(tokens[0]).name
+        label = executable
+        if executable in {"pytest", "mypy", "pyright", "tsc", "jest", "vitest"}:
+            pass
+        elif executable == "ruff" and tokens[1:2] == ["check"]:
+            label = "ruff"
+        elif executable in {"npm", "pnpm", "yarn", "cargo", "go", "make"}:
+            arguments = tokens[1:]
+            if arguments[:1] == ["run"]:
+                arguments = arguments[1:]
+            if not arguments or arguments[0] not in {"test", "check", "lint", "build", "typecheck", "clippy", "vet"}:
+                continue
+            label = f"{executable} {arguments[0]}"
+        else:
+            continue
+        checks.append(f"{label} {'passed' if returncode == 0 else f'failed (exit {returncode})'}")
+    if not checks:
+        return "checks: no results recorded"
+    passed = sum(" passed" in result for result in checks)
+    failed = len(checks) - passed
+    if len(checks) > 3:
+        return f"recorded check commands: {passed} passed, {failed} failed"
+    return "recorded check commands: " + ", ".join(checks)
+
+
 class DiffReviewScreen(ModalScreen[None]):
-    """Keyboard-first change ledger with per-file patch and validation state."""
+    """Read-only, progressively loaded review with explicit mutation controls."""
 
     BINDINGS = [
-        Binding("j,down,n", "next_file", "Next file", show=True),
-        Binding("k,up,p", "previous_file", "Previous file", show=True),
+        Binding("j,down", "next_file", "Next file", show=True),
+        Binding("k,up", "previous_file", "Previous file", show=True),
+        Binding("n,]", "next_hunk", "Next hunk", show=True),
+        Binding("p,[", "previous_hunk", "Previous hunk", show=True),
+        Binding("slash", "filter", "Find file", show=True),
+        Binding("ctrl+r", "refresh_review", "Refresh", show=True),
+        Binding("o", "open_editor", "Open editor", show=True),
+        Binding("v", "toggle_diagnostics", "Diagnostics", show=True),
         Binding("r", "revert", "Revert file", show=True),
-        Binding("u", "undo", "Undo checkpoint", show=True),
+        Binding("u", "undo", "Undo turn", show=True),
         Binding("escape,q", "close", "Close", show=True),
     ]
 
@@ -1937,148 +2150,167 @@ class DiffReviewScreen(ModalScreen[None]):
         self._by_option: dict[str, Any] = {}
         self._symbols: dict[str, str] = {}
         self._selected_key: str | None = None
+        self._hunks: list[int] = []
+        self._hunk_index = -1
 
     def compose(self) -> ComposeResult:
         with Vertical(id="diff-dialog"):
-            yield Static("CHANGE LEDGER", id="diff-title")
+            yield Static("CHANGE REVIEW", id="diff-title")
             yield Static("", id="diff-summary")
+            yield Input(placeholder="Filter files… (/ to focus)", id="diff-filter")
             with Horizontal(id="diff-body"):
                 yield OptionList(id="diff-files", compact=True)
                 with Vertical(id="diff-inspector"):
                     yield Static("", id="diff-file-header")
                     yield SelectableRichLog(
-                        id="diff-patch",
-                        markup=False,
-                        highlight=False,
-                        wrap=False,
-                        min_width=0,
-                        max_lines=5_000,
+                        id="diff-patch", markup=False, highlight=False, wrap=False,
+                        min_width=0, max_lines=None,
                     )
                     yield Static("", id="diff-validation")
             yield Static("", id="diff-status")
             yield Static(
-                "J/K or ↑/↓ next file · R revert · U undo checkpoint · Esc close",
+                "J/K file · N/P hunk · / find · O editor · V diagnostics · Ctrl+R refresh · R revert · U undo · Esc close",
                 id="diff-hint",
             )
 
     def on_mount(self) -> None:
+        self.set_class(self.app.size.width < 100, "narrow")
         self._render_review()
+        self.query_one("#diff-files", OptionList).focus()
+
+    def on_resize(self) -> None:
+        self.set_class(self.app.size.width < 100, "narrow")
 
     def _render_review(self) -> None:
-        files = list(self.review.files)
-        summary = self.query_one("#diff-summary", Static)
-        summary.update(
-            Text.assemble(
-                (f"{len(files)} change view{'s' if len(files) != 1 else ''}", "bold #d1d1d6"),
-                (f"   +{self.review.additions}", "#8bd5ca"),
-                (f"  -{self.review.deletions}", "#ed8796"),
-                ("   staged and worktree are reviewed separately", "#777781"),
-            ),
-            layout=False,
+        palette: ThemePalette = self.app.theme_palette  # type: ignore[attr-defined]
+        query = self.query_one("#diff-filter", Input).value.casefold()
+        files = [item for item in self.review.files if query in item.path.casefold()]
+        captured = getattr(self.review, "captured_at", time.time())
+        stamp = time.strftime("%H:%M:%S", time.localtime(captured))
+        self.query_one("#diff-summary", Static).update(
+            Text(
+                f"{len(files)}/{len(self.review.files)} file views · list captured {stamp} · "
+                "details load on selection; Ctrl+R refreshes",
+                style=palette.muted,
+            ), layout=False,
         )
         option_list = self.query_one("#diff-files", OptionList)
         option_list.clear_options()
         self._by_option.clear()
-        options: list[Option] = []
+        selected = 0
         for index, item in enumerate(files):
             option_id = f"change-{index}"
             self._by_option[option_id] = item
+            if item.key == self._selected_key:
+                selected = index
             stage = "S" if item.scope == "staged" else "U"
-            diagnostic_style = (
-                "#8bd5ca"
-                if item.diagnostics == "clean"
-                else "#e6b673"
-                if "issue" in item.diagnostics
-                else "#777781"
-            )
-            prompt = Text()
-            prompt.append(f"{stage} ", style="bold #b8a9ff" if stage == "S" else "bold #7dc4e4")
-            prompt.append(f"{item.path}\n", style="#d1d1d6")
-            prompt.append(f"   {item.status}  ", style="#777781")
-            prompt.append(f"+{item.additions}", style="#8bd5ca")
-            prompt.append(f" -{item.deletions}  ", style="#ed8796")
-            prompt.append(item.diagnostics, style=diagnostic_style)
-            options.append(Option(prompt, id=option_id))
-        if options:
-            option_list.add_options(options)
-            option_list.highlighted = 0
-            option_list.focus()
-            self._show_item(files[0])
+            prompt = Text(f"{stage} ", style=f"bold {palette.accent}")
+            prompt.append(f"{item.path}\n", style=palette.text)
+            prompt.append(f"   {item.status}", style=palette.muted)
+            if getattr(item, "loaded", bool(item.patch)):
+                prompt.append(f"  +{item.additions}", style=palette.success)
+                prompt.append(f" -{item.deletions}", style=palette.error)
+            option_list.add_option(Option(prompt, id=option_id))
+        if files:
+            option_list.highlighted = selected
+            self._show_item(files[selected])
         else:
-            option_list.add_option(
-                Option(Text("No staged or unstaged changes", style="#777781"), disabled=True)
-            )
-            self.query_one("#diff-file-header", Static).update("Working tree clean")
+            option_list.add_option(Option("No matching files" if query else "Working tree clean", disabled=True))
+            self._selected_key = None
+            self.query_one("#diff-file-header", Static).update("")
             self.query_one("#diff-patch", RichLog).clear()
             self.query_one("#diff-validation", Static).update("")
+
+    @on(Input.Changed, "#diff-filter")
+    def _filter_changed(self) -> None:
+        self._render_review()
+
+    @on(Input.Submitted, "#diff-filter")
+    def _filter_submitted(self) -> None:
+        self.query_one("#diff-files", OptionList).focus()
+
+    def action_filter(self) -> None:
+        self.query_one("#diff-filter", Input).focus()
 
     @on(OptionList.OptionHighlighted, "#diff-files")
     def _highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option.id and event.option.id in self._by_option:
-            self._show_item(self._by_option[event.option.id])
+            item = self._by_option[event.option.id]
+            if item.key != self._selected_key:
+                self._show_item(item)
 
     def _show_item(self, item: Any) -> None:
         self._selected_key = item.key
+        palette: ThemePalette = self.app.theme_palette  # type: ignore[attr-defined]
+        captured = getattr(item, "captured_at", 0)
+        stamp = time.strftime("%H:%M:%S", time.localtime(captured)) if captured else "not recorded" if item.patch else "pending"
         self.query_one("#diff-file-header", Static).update(
-            Text.assemble(
-                (item.path, "bold #f1f1f3"),
-                (f"   {item.scope} · {item.status}", "#777781"),
-            ),
-            layout=False,
+            Text.assemble((item.path, f"bold {palette.text}"),
+                          (f"   {item.scope} · patch {stamp}", palette.muted)), layout=False,
         )
         patch = self.query_one("#diff-patch", RichLog)
         patch.clear()
-        patch.write(_diff_renderable(item.patch), scroll_end=False)
+        patch.write(_diff_renderable(item.patch or "Loading patch…", palette), scroll_end=False)
         patch.scroll_home(animate=False)
-        cached = self._symbols.get(item.path)
+        self._hunks = [index for index, line in enumerate(item.patch.splitlines()) if line.startswith("@@")]
+        self._hunk_index = -1
         self.query_one("#diff-validation", Static).update(
-            self._validation_text(item, cached or "Loading changed-file symbols…"),
-            layout=False,
+            self._validation_text(item, self._symbols.get(item.path, "Loading symbols…")), layout=False,
         )
-        if cached is None:
-            self._load_symbols(item)
+        if not getattr(item, "loaded", bool(item.patch)):
+            self._load_item(item)
+        elif item.diagnostics == "pending" or item.path not in self._symbols:
+            self._load_diagnostics(item)
 
-    @work(exclusive=True, group="diff-symbols")
-    async def _load_symbols(self, item: Any) -> None:
+    @work(exclusive=True, group="diff-details")
+    async def _load_item(self, item: Any) -> None:
         try:
-            symbols = await self.host.agent.lsp.document_symbols(item.path)
+            await self.host.diff_review_file(item)
         except Exception as exc:  # noqa: BLE001
-            symbols = f"unavailable — {exc}"
-        compact = " · ".join(
-            line.split("  ", 1)[-1] for line in symbols.splitlines()[:4] if line.strip()
-        )
-        if len(symbols.splitlines()) > 4:
-            compact += " · …"
+            item.patch = f"Patch unavailable: {exc}"
+            item.loaded = True
+        if any(current is item for current in self.review.files) and self._selected_key == item.key:
+            self._show_item(item)
+
+    @work(exclusive=True, group="diff-diagnostics")
+    async def _load_diagnostics(self, item: Any) -> None:
+        try:
+            async with asyncio.timeout(5):
+                if item.diagnostics == "pending":
+                    await self.host.diff_diagnostics(item)
+                symbols = await self.host.agent.lsp.document_symbols(item.path)
+            compact = " · ".join(line.split("  ", 1)[-1] for line in symbols.splitlines()[:4] if line.strip())
+            if len(symbols.splitlines()) > 4:
+                compact += " · …"
+        except Exception as exc:  # noqa: BLE001
+            if item.diagnostics == "pending":
+                item.diagnostics = "unavailable"
+            compact = f"unavailable — {exc}" if str(exc) else "unavailable — timed out"
+        if not any(current is item for current in self.review.files):
+            return
         self._symbols[item.path] = compact or "no declarations"
         if self._selected_key == item.key:
             self.query_one("#diff-validation", Static).update(
-                self._validation_text(item, self._symbols[item.path]),
-                layout=False,
+                self._validation_text(item, self._symbols[item.path]), layout=False,
             )
 
-    @staticmethod
-    def _validation_text(item: Any, symbols: str) -> Text:
-        text = Text()
-        validation_style = (
-            "#8bd5ca"
-            if item.diagnostics == "clean"
-            else "#e6b673"
-            if "issue" in item.diagnostics
-            else "#777781"
-        )
-        text.append("VALIDATION  ", style="bold #b8a9ff")
-        text.append(item.diagnostics, style=validation_style)
-        text.append("\nSYMBOLS     ", style="bold #b8a9ff")
-        text.append(symbols, style="#d1d1d6")
+    def _validation_text(self, item: Any, symbols: str) -> Text:
+        palette: ThemePalette = self.app.theme_palette  # type: ignore[attr-defined]
+        text = Text("EDITOR DIAGNOSTICS (current worktree)  ", style=f"bold {palette.accent}")
+        text.append(item.diagnostics, style=palette.success if item.diagnostics == "clean" else palette.warning)
+        text.append("\nSYMBOLS  ", style=f"bold {palette.accent}")
+        text.append(symbols, style=palette.text)
+        text.append("\nExecuted checks are reported in the turn receipt.", style=palette.muted)
         return text
+
+    def action_toggle_diagnostics(self) -> None:
+        diagnostics = self.query_one("#diff-validation", Static)
+        diagnostics.display = not diagnostics.display
 
     def _move(self, delta: int) -> None:
         option_list = self.query_one("#diff-files", OptionList)
-        count = len(self._by_option)
-        if not count:
-            return
-        current = option_list.highlighted or 0
-        option_list.highlighted = (current + delta) % count
+        if self._by_option:
+            option_list.highlighted = ((option_list.highlighted or 0) + delta) % len(self._by_option)
 
     def action_next_file(self) -> None:
         self._move(1)
@@ -2086,61 +2318,119 @@ class DiffReviewScreen(ModalScreen[None]):
     def action_previous_file(self) -> None:
         self._move(-1)
 
-    @work(exclusive=True, group="diff-mutation")
-    async def action_revert(self) -> None:
-        item = next((item for item in self.review.files if item.key == self._selected_key), None)
-        if item is None:
-            return
-        confirmation = await self.app.push_screen_wait(
-            TextPromptModal(
-                f"Revert {item.path}?",
-                "Type REVERT",
-                "This discards the selected file changes. Staged reverts also change the Git index.",
-            )
-        )
-        if confirmation != "REVERT":
-            self.query_one("#diff-status", Static).update("Revert cancelled")
-            return
+    def _move_hunk(self, delta: int) -> None:
+        if self._hunks:
+            if self._hunk_index < 0:
+                self._hunk_index = 0 if delta > 0 else len(self._hunks) - 1
+            else:
+                self._hunk_index = (self._hunk_index + delta) % len(self._hunks)
+            self.query_one("#diff-patch", RichLog).scroll_to(y=self._hunks[self._hunk_index], animate=False, force=True)
+            self.query_one("#diff-status", Static).update(f"Hunk {self._hunk_index + 1}/{len(self._hunks)}")
+
+    def action_next_hunk(self) -> None:
+        self._move_hunk(1)
+
+    def action_previous_hunk(self) -> None:
+        self._move_hunk(-1)
+
+    @work(exclusive=True, group="diff-refresh")
+    async def action_refresh_review(self) -> None:
         try:
-            status = await self.host.revert_diff_file(item.path, item.scope)
             self.review = await self.host.diff_review()
         except Exception as exc:  # noqa: BLE001
-            self.query_one("#diff-status", Static).update(
-                Text(f"Revert failed: {exc}", style="#ed8796")
-            )
+            self.query_one("#diff-status", Static).update(f"Refresh failed: {exc}")
             return
-        self.query_one("#diff-status", Static).update(Text(status, style="#8bd5ca"))
+        self._symbols.clear()
         self._render_review()
+        self.query_one("#diff-status", Static).update("Refreshed; select a file to capture its current patch")
+
+    @work(exclusive=True, group="diff-editor")
+    async def action_open_editor(self) -> None:
+        import shlex
+
+        item = self._selected_item()
+        if item is None:
+            return
+        try:
+            blocked = self.host.agent.git._review_path_error(item.path)
+            if blocked:
+                raise ValueError(blocked)
+            path = self.host.workspace.resolve(item.path)
+            if not path.is_file():
+                raise ValueError("The selected file no longer exists in the worktree")
+            editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
+            with self.app.suspend():
+                result = await asyncio.to_thread(subprocess.run, [*editor, str(path)], check=False)
+            self.query_one("#diff-status", Static).update(
+                f"Editor exited {result.returncode}; Ctrl+R refreshes the captured review"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#diff-status", Static).update(f"Editor unavailable: {exc}")
+
+    def _selected_item(self) -> Any:
+        return next((item for item in self.review.files if item.key == self._selected_key), None)
+
+    def _mutation_blocked(self) -> bool:
+        if self.host._turn_running() is True:
+            self.query_one("#diff-status", Static).update("Read-only review while working. Stop the active turn before reverting or undoing.")
+            return True
+        return False
+
+    @work(exclusive=True, group="diff-mutation")
+    async def action_revert(self) -> None:
+        if self._mutation_blocked():
+            return
+        item = self._selected_item()
+        if item is None:
+            return
+        revision = getattr(item, "revision", None)
+        if revision is None or await self.host.agent.git._review_signature(item.path) != revision:
+            self.query_one("#diff-status", Static).update("File or index changed, or patch not loaded. Ctrl+R refreshes before reverting.")
+            return
+        if self._mutation_blocked():
+            return
+        confirmation = await self.app.push_screen_wait(TextPromptModal(
+            f"Revert {item.path}?", "Type REVERT",
+            "This discards the selected file changes. Staged reverts also change the Git index.",
+        ))
+        if confirmation != "REVERT" or self._mutation_blocked():
+            return
+        try:
+            status = await self.host.revert_diff_file(item.path, item.scope, expected_revision=revision)
+            self.review = await self.host.diff_review()
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#diff-status", Static).update(f"Revert failed: {exc}")
+            return
+        self._symbols.clear()
+        self._render_review()
+        self.query_one("#diff-status", Static).update(status)
 
     @work(exclusive=True, group="diff-mutation")
     async def action_undo(self) -> None:
+        if self._mutation_blocked():
+            return
         preview = _undo_preview(self.host)
         if preview.startswith("There is no reversible") or "full undo is unavailable" in preview:
-            self.query_one("#diff-status", Static).update(
-                "Nothing to undo"
-                if preview.startswith("There is no reversible")
-                else "Undo unavailable after shell mutations"
-            )
+            self.query_one("#diff-status", Static).update(preview.splitlines()[-1])
             return
-        confirmed = await self.app.push_screen_wait(
-            ConfirmationModal("Undo last turn?", preview, "Undo turn")
-        )
-        if not confirmed:
-            self.query_one("#diff-status", Static).update("Undo cancelled")
+        confirmed = await self.app.push_screen_wait(ConfirmationModal("Undo last turn?", preview, "Undo turn"))
+        if not confirmed or self._mutation_blocked():
             return
         try:
             status = await self.host.undo_last_turn_async()
             self.review = await self.host.diff_review()
         except Exception as exc:  # noqa: BLE001
-            self.query_one("#diff-status", Static).update(
-                Text(f"Undo unavailable: {exc}", style="#ed8796")
-            )
+            self.query_one("#diff-status", Static).update(f"Undo unavailable: {exc}")
             return
-        self.query_one("#diff-status", Static).update(Text(status, style="#8bd5ca"))
+        self._symbols.clear()
         self._render_review()
+        self.query_one("#diff-status", Static).update(status)
 
     def action_close(self) -> None:
-        self.dismiss(None)
+        if self.query_one("#diff-filter", Input).has_focus:
+            self.query_one("#diff-files", OptionList).focus()
+        else:
+            self.dismiss(None)
 
 
 class TextualUI:
@@ -2219,7 +2509,7 @@ class NoahCodeApp(App[None]):
 
     BINDINGS = [
         Binding("ctrl+q", "quit_app", "Quit", show=True),
-        Binding("ctrl+c", "cancel_or_quit", "Cancel", show=True),
+        Binding("ctrl+c", "cancel_or_quit", "Stop", show=True, priority=True),
         Binding("super+a", "select_focused_text", "Select all", show=False, priority=True),
         Binding("super+c,ctrl+shift+c", "copy_selection", "Copy", show=True, priority=True),
         Binding("ctrl+v,super+v", "paste_clipboard", "Paste", show=False, priority=True),
@@ -2231,8 +2521,11 @@ class NoahCodeApp(App[None]):
         Binding("ctrl+n", "new_session", "New", show=True),
         Binding("ctrl+t", "toggle_activity_output", "Tool output", show=False),
         Binding("alt+up", "recall_queued_prompt", "Recall queued", show=False),
-        Binding("shift+tab", "reasoning_setup", "Reasoning", show=False, priority=True),
-        Binding("tab", "toggle_mode", "Build/Plan", show=True),
+        Binding("alt+e", "reasoning_setup", "Reasoning", show=False),
+        Binding("ctrl+b", "toggle_mode", "Build/Plan", show=True),
+        Binding("alt+enter", "expand_composer", "Expand prompt", show=False),
+        Binding("alt+z", "restore_draft", "Restore draft", show=False),
+        Binding("ctrl+d", "review_changes", "Review", show=True, priority=True),
         Binding("f1", "show_help", "Help", show=True),
         Binding("f2", "activity_history", "Timeline", show=True),
         Binding("f3", "conversation_history", "History", show=True),
@@ -2240,6 +2533,7 @@ class NoahCodeApp(App[None]):
         Binding("f5", "queue_manager", "Queue", show=True),
         Binding("f6", "notice_details", "Details", show=True),
         Binding("f7", "context_visibility", "Context", show=True),
+        Binding("f8", "toggle_context_rail", "Sidebar", show=True),
         Binding("shift+f7", "focus_context_rail", "Context rail", show=False),
         Binding("ctrl+]", "scroll_live", "Latest", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
@@ -2267,13 +2561,14 @@ class NoahCodeApp(App[None]):
         self._header_text = ""
         self._rail_text: Text | str = ""
         self._rail_dirty = True
+        self._sidebar_visible: bool | None = None
         self._repository_snapshot: RepositorySnapshot | None = None
         self._repository_status_loaded = False
+        self._repository_refreshed_at = 0.0
         self._agent_state = (
             AgentDisplayState.SETUP_REQUIRED if onboarding_required else AgentDisplayState.READY
         )
         self._state_detail = ""
-        self._phase = self._agent_state.value
         self._loader_index = 0
         self._loader_timer: Timer | None = None
         self._status_timer: Timer | None = None
@@ -2312,6 +2607,8 @@ class NoahCodeApp(App[None]):
         self._recent_commands: deque[str] = deque(maxlen=8)
         self._config_commands: list[CommandSuggestion] | None = None
         self._composer_rows = 4
+        self._composer_expanded = False
+        self._composer_drafts: list[str] = []
         self._input_context_signature = ""
         self._app_mounted = False
         host.on_session_changed = lambda _meta: self.call_later(self._session_changed)
@@ -2430,6 +2727,9 @@ class NoahCodeApp(App[None]):
             layout=False,
         )
         self._rerender_transcript()
+        self._working_loader_signature = None
+        self._working_status_signature = None
+        self._activity_title_signature = None
         self.update_chrome(force=True)
 
     @work(exclusive=True, group="update-check")
@@ -2555,24 +2855,39 @@ class NoahCodeApp(App[None]):
         self._apply_layout(event.size.width, event.size.height)
 
     def _apply_layout(self, width: int, height: int) -> None:
+        visible = (
+            width >= WIDE_MIN_COLUMNS and height >= 24
+            if self._sidebar_visible is None
+            else self._sidebar_visible and width >= 100
+        )
         with contextlib.suppress(Exception):
-            self.screen.set_class(width >= WIDE_MIN_COLUMNS, "wide")
+            self.screen.set_class(visible, "wide")
             self.screen.set_class(height <= COMPACT_MAX_ROWS, "compact")
+            self.screen.set_class(width < 100, "narrow")
         self._resize_composer(
             self.query_one("#composer", ComposerTextArea).text if self._app_mounted else ""
         )
+        if self._app_mounted:
+            self.update_chrome(force=True)
+
+    def action_toggle_context_rail(self) -> None:
+        self._sidebar_visible = not self.screen.has_class("wide")
+        if self._sidebar_visible and self.size.width < 100:
+            self._sidebar_visible = False
+            self._show_notice("Sidebar needs 100 columns. F7 opens context details.")
+        self._apply_layout(self.size.width, self.size.height)
+        if not self.screen.has_class("wide"):
+            self.query_one("#composer", ComposerTextArea).focus()
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        if self._app_mounted:
+            self.update_chrome()
 
     def _set_agent_state(self, state: AgentDisplayState, detail: str = "") -> None:
-        """Set semantic state while retaining ``_phase`` for compatibility."""
+        """Set the semantic state and its display detail."""
 
         self._agent_state = state
         self._state_detail = " ".join(detail.split())
-        if state == AgentDisplayState.ERROR and self._state_detail.lower().startswith("startup"):
-            self._phase = "startup failed"
-        elif state == AgentDisplayState.RUNNING and self._state_detail:
-            self._phase = self._state_detail
-        else:
-            self._phase = state.value.replace("_", " ")
         self._sync_status_timers()
 
     def _working_state_visible(self) -> bool:
@@ -2609,9 +2924,12 @@ class NoahCodeApp(App[None]):
             return
         self._update_working_status()
         self._update_activity_title()
+        if self.screen.has_class("wide") and time.monotonic() - self._repository_refreshed_at >= 5:
+            self._refresh_repository_snapshot()
 
     @work(exclusive=True, group="repository-status")
     async def _refresh_repository_snapshot(self) -> None:
+        self._repository_refreshed_at = time.monotonic()
         snapshot = await asyncio.to_thread(
             _read_repository_snapshot,
             self.host.workspace.root,
@@ -2732,20 +3050,22 @@ class NoahCodeApp(App[None]):
         self._thinking_timeline = None
 
     def _update_working_status(self) -> None:
+        palette = self.theme_palette
         label, elapsed, thought = self._working_status_content()
         signature = (label, elapsed, thought)
         if signature == self._working_status_signature:
             return
         parts: list[tuple[str, str]] = [
-            (label, "#d1d1d6"),
-            (elapsed, "#777781"),
+            (label, palette.text),
+            (elapsed, palette.muted),
         ]
         if thought:
-            parts.append((f"  ↳  {thought}", "#777781"))
+            parts.append((f"  ↳  {thought}", palette.muted))
         self.query_one("#working-status", Static).update(Text.assemble(*parts), layout=False)
         self._working_status_signature = signature
 
     def _update_activity_title(self) -> None:
+        palette = self.theme_palette
         activity_id = self._active_activity_id
         if not activity_id or activity_id not in self._activities:
             return
@@ -2777,12 +3097,12 @@ class NoahCodeApp(App[None]):
             return
         self.query_one("#activity-title", Static).update(
             Text.assemble(
-                (record.label, "#d1d1d6"),
-                (elapsed, "#777781"),
-                (progress_text, "#7dc4e4"),
-                (thought_text, "#777781"),
-                (unread, "#e6b673"),
-                (toggle, "#777781"),
+                (record.label, palette.text),
+                (elapsed, palette.muted),
+                (progress_text, palette.accent),
+                (thought_text, palette.muted),
+                (unread, palette.warning),
+                (toggle, palette.muted),
             ),
             layout=False,
         )
@@ -2823,25 +3143,26 @@ class NoahCodeApp(App[None]):
             frame = "◆         "
         if frame == self._working_loader_signature:
             return
+        palette = self.theme_palette
         loader_styles = {
-            "◆": "bold #ffd08a",
-            "◈": "#e6b673",
-            "•": "#8bd5ca",
-            "·": "#777781",
-            "!": "bold #e6b673",
-            "×": "bold #ed8796",
-            "*": "bold #ffd08a",
-            "x": "bold #ed8796",
-            " ": "#777781",
+            "◆": f"bold {palette.accent}",
+            "◈": palette.accent,
+            "•": palette.muted,
+            "·": palette.muted,
+            "!": f"bold {palette.warning}",
+            "×": f"bold {palette.error}",
+            "*": f"bold {palette.accent}",
+            "x": f"bold {palette.error}",
+            " ": palette.muted,
         }
         loader = self.query_one_optional("#working-loader", Static)
         if loader is None:
             return
         loader.update(
             Text.assemble(
-                ("NOAH  ", "bold #8bd5ca"),
+                ("NOAH  ", f"bold {palette.accent}"),
                 *((character, loader_styles[character]) for character in frame),
-                ("  ", "#777781"),
+                ("  ", palette.muted),
             ),
             layout=False,
         )
@@ -2866,7 +3187,8 @@ class NoahCodeApp(App[None]):
         branch = self._repository_snapshot.branch if self._repository_snapshot else ""
         location = f"{repository}  {branch}" if branch else repository
         header_location = _truncate_middle(location, 22)
-        header_model = _truncate_middle(str(model), 26)
+        model_width = max(8, min(26, self.size.width - len(header_location) - len(state) - 27))
+        header_model = _truncate_middle(str(model), model_width)
         header_signature = "|".join(
             (location, mode, str(model), effort_label, state, queued_bit, unread)
         )
@@ -2876,9 +3198,6 @@ class NoahCodeApp(App[None]):
             header.append(" NOAH ", style=f"bold {palette.accent}")
             header.append(f" {header_location} ", style=palette.text)
             header.append(f" {mode.upper()} ", style=f"bold {palette.canvas} on {palette.accent}")
-            header.append(f"  {header_model}", style=palette.text)
-            if effort_label != "auto":
-                header.append(f" · r:{effort_label}", style=palette.muted)
             header.append(
                 f"   {state}",
                 style=(
@@ -2893,26 +3212,28 @@ class NoahCodeApp(App[None]):
                 header.append(queued_bit, style=palette.warning)
             if unread:
                 header.append(unread, style=palette.accent)
+            if self.size.width >= 70:
+                header.append(f"  {header_model}", style=palette.muted)
+                if effort_label != "auto" and self.size.width >= 100:
+                    header.append(f" · r:{effort_label}", style=palette.muted)
             with contextlib.suppress(Exception):
                 self.query_one("#header", Static).update(header, layout=False)
 
-        compact = False
-        with contextlib.suppress(Exception):
-            compact = self.screen.has_class("compact")
-        if self.ui.busy and self._agent_ready:
-            hint = (
-                "Enter queue · Ctrl+C cancel · Ctrl+] latest · ? help"
-                if compact
-                else "Enter queue follow-up · Ctrl+C cancel · drag to copy · "
-                "Ctrl+] latest · ? help"
-            )
+        focused = getattr(self.focused, "id", None)
+        if focused == "conversation":
+            hint = "Conversation · ↑/↓ scroll · Ctrl+] latest · Tab next pane"
+        elif focused == "activity-output":
+            hint = "Tool output · ↑/↓ scroll · Ctrl+T resize · F2 history · Tab next pane"
+        elif focused == "context-rail":
+            hint = "Sidebar · ↑/↓ scroll · Ctrl+D review · F8 hide · Tab next pane"
+        elif self.ui.busy and self._agent_ready:
+            hint = "Enter queue · Ctrl+C stop · F5 queue · Ctrl+D review · F1 help"
+        elif getattr(self.host, "queue_paused", False) is True:
+            hint = "Queue paused · Enter queue · F5 manage · Ctrl+P commands · F1 help"
         else:
-            hint = (
-                "Enter send · / commands · Ctrl+R recall · ? help"
-                if compact
-                else "Enter send · Shift+Enter newline · Ctrl+R recall · "
-                "/ commands · ? help"
-            )
+            hint = "Enter send · / commands · Ctrl+D review · F1 help"
+            if self.size.width >= 150:
+                hint += " · Alt+Enter expand · Tab next pane"
         self._update_context_hint(hint)
 
         if force or self._rail_dirty:
@@ -2942,7 +3263,26 @@ class NoahCodeApp(App[None]):
         available = max(self.size.width - 6, 0)
         gap = available - len(hint) - len(telemetry)
         palette = self.theme_palette
-        content = Text(hint, style=palette.muted)
+        actions = {
+            "Enter send": "submit", "Enter queue": "submit",
+            "/ commands": "palette", "Ctrl+P commands": "palette",
+            "Ctrl+D review": "review_changes", "F1 help": "show_help",
+            "F5 queue": "queue_manager", "F5 manage": "queue_manager",
+            "Ctrl+C stop": "cancel_or_quit", "Ctrl+] latest": "scroll_live",
+            "F8 hide": "toggle_context_rail", "F2 history": "activity_history",
+            "Ctrl+T resize": "toggle_activity_output", "Tab next pane": "focus_next",
+            "Alt+Enter expand": "expand_composer",
+        }
+        content = Text(style=palette.muted)
+        for label in hint.split(" · "):
+            if content:
+                content.append(" · ")
+            action = actions.get(label)
+            content.append(
+                label,
+                style=Style(color=palette.text, meta={"@click": f"app.{action}"})
+                if action else palette.muted,
+            )
         if telemetry and gap >= 3:
             content.append(" " * gap)
             content.append(telemetry, style=palette.muted)
@@ -2968,7 +3308,8 @@ class NoahCodeApp(App[None]):
             parts.append(f"ATTACHED  {names}")
         if queued:
             preview = " ".join(str(queued[0].text).split())[:44]
-            parts.append(f"QUEUED  {len(queued)} · {preview}")
+            state = "PAUSED" if getattr(self.host, "queue_paused", False) is True else "QUEUED"
+            parts.append(f"{state}  {len(queued)} · {preview}")
         value = "   ".join(parts)
         if value:
             value += "   F5 manage"
@@ -2986,146 +3327,53 @@ class NoahCodeApp(App[None]):
         self.update_chrome(force=True)
 
     def _build_rail_text(self) -> Text:
-        meta = self.host.meta
         palette = self.theme_palette
-        mode = self.host.agent.mode if self.host._agent else self.host.config.mode
-        model = meta.model if meta else self.host.config.model
-        effort = getattr(meta, "reasoning_effort", self.host.config.reasoning_effort)
         text = Text()
-        text.append("NOW\n", style=f"bold {palette.accent}")
-        queued = self._steer_queued_label()
+        text.append("Now\n", style=f"bold {palette.accent}")
         if self._active_activity_id and self._active_activity_id in self._activities:
-            record = self._activities[self._active_activity_id]
-            text.append("Running\n", style=palette.warning)
-            text.append(_truncate_middle(record.label, 31), style=palette.text)
+            text.append(
+                _truncate_middle(self._activities[self._active_activity_id].label, 29),
+                style=palette.text,
+            )
         elif not self._session_has_prompt and self._pre_prompt_status:
-            text.append(self._pre_prompt_status, style=palette.muted)
-        elif self._agent_state in _PERSISTENT_STATES:
+            text.append(self._pre_prompt_status, style=palette.text)
+        elif self._agent_state != AgentDisplayState.READY:
             text.append(_STATE_LABELS[self._agent_state].capitalize(), style=palette.warning)
             if self._state_detail:
-                text.append(f"\n{_truncate_middle(self._state_detail, 62)}", style=palette.text)
+                text.append(f"\n{_truncate_middle(self._state_detail, 58)}", style=palette.text)
         else:
-            text.append("Waiting for your next turn", style=palette.muted)
-        thought = " ".join(self._last_thought.split())
-        if self.ui.busy and thought:
-            text.append(f"\n{_truncate_middle(thought, 62)}", style=palette.muted)
+            text.append("Ready for your next prompt", style=palette.muted)
+        queued = self._steer_queued_label()
         if queued:
-            text.append(f"\n{queued}", style=palette.warning)
+            text.append(f"\n{queued} · F5 manage", style=palette.warning)
 
-        work = self.host.work_snapshot()
-        agents = work["agents"]
-        jobs = work["jobs"]
-        active_agents = [
-            item for item in agents if item.get("state") in {"queued", "running"}
-        ]
-        active_jobs = [
-            item for item in jobs if item.get("state") in {"running", "stopping"}
-        ]
-        text.append("\n\nWORK\n", style=f"bold {palette.accent}")
-        if not active_agents and not active_jobs:
-            completed = len(agents) + sum(
-                item.get("state") not in {"running", "stopping"} for item in jobs
-            )
-            message = f"{completed} recent · F4 details" if completed else "No delegated work · F4 details"
-            text.append(message, style=palette.muted)
-        else:
-            for item in active_agents[:3]:
-                state = str(item.get("state", "running"))
-                text.append(f"{state} · ", style=palette.warning)
-                text.append(
-                    f"{str(item.get('agent', 'agent'))} · "
-                    f"{float(item.get('duration', 0.0)):.1f}s\n",
-                    style=palette.text,
-                )
-            for item in active_jobs[:3]:
-                kind = "terminal" if item.get("kind") == "terminal" else "job"
-                text.append(f"{kind} · ", style="#7dc4e4")
-                text.append(
-                    f"{str(item.get('name', 'work'))} · "
-                    f"{float(item.get('elapsed', 0.0)):.1f}s\n",
-                    style=palette.text,
-                )
-            text.append("F4 opens live ledger", style=palette.muted)
-
-        text.append("\n\nCHANGES\n", style=f"bold {palette.accent}")
+        text.append("\n\nChanges\n", style=f"bold {palette.accent}")
         snapshot = self._repository_snapshot
         if snapshot is None:
-            message = (
-                "Not a Git worktree" if self._repository_status_loaded else "Reading Git status…"
-            )
-            text.append(message, style=palette.muted)
-        else:
-            text.append(f"{snapshot.branch}\n", style=palette.text)
-            if snapshot.is_clean:
-                text.append("Working tree clean", style=palette.success)
-            else:
-                change_counts = []
-                if snapshot.staged:
-                    change_counts.append(f"{snapshot.staged} staged")
-                if snapshot.modified:
-                    change_counts.append(f"{snapshot.modified} modified")
-                if snapshot.untracked:
-                    change_counts.append(f"{snapshot.untracked} new")
-                text.append(" · ".join(change_counts), style=palette.warning)
-
-        text.append("\n\nCONTEXT\n", style=f"bold {palette.accent}")
-        context_rows: list[dict[str, str]] = []
-        with contextlib.suppress(Exception):
-            context_rows = list(self.host.context_snapshot())
-        if not context_rows:
-            text.append("Workspace defaults · F7 details", style=palette.muted)
-        else:
-            counts: dict[str, int] = {}
-            for row in context_rows:
-                kind = row.get("kind", "source")
-                counts[kind] = counts.get(kind, 0) + 1
-            visible = [
-                f"{count} {kind}"
-                for kind, count in counts.items()
-                if kind not in {"pending"}
-            ]
-            text.append(" · ".join(visible[:4]) + "\n", style=palette.text)
-            pending = counts.get("pending", 0)
-            suffix = f" · {pending} pending" if pending else ""
-            text.append(f"F7 inspect sources{suffix}", style=palette.muted)
-
-        text.append("\n\nSESSION\n", style=f"bold {palette.accent}")
-        text.append(
-            f"{meta.title if meta and meta.title != 'untitled' else 'Untitled session'}\n",
-            style=palette.text,
-        )
-        if meta:
-            text.append(f"{meta.session_id[:8]}", style=palette.muted)
-        if meta and meta.worktree_name:
-            text.append(f"\nworktree · {meta.worktree_name}", style=palette.muted)
-
-        text.append("\n\nMODEL\n", style=f"bold {palette.accent}")
-        text.append(f"{model}\n", style=palette.text)
-        text.append(
-            f"{mode.upper()} · reasoning {'auto' if effort == 'default' else effort}",
-            style=palette.muted,
-        )
-
-        if self._available_update is not None:
-            text.append("\n\nUPDATE\n", style=f"bold {palette.warning}")
             text.append(
-                f"{self._available_update.current} → {self._available_update.latest}\n",
-                style=palette.text,
-            )
-            text.append("run: noah update · restart", style=palette.muted)
-
-        with contextlib.suppress(Exception):
-            usage = self.host.usage_snapshot()
-            text.append("\n\nUSAGE\n", style=f"bold {palette.accent}")
-            text.append(
-                f"{usage.prompt_tokens:,} in · {usage.completion_tokens:,} out\n",
-                style=palette.text,
-            )
-            text.append(
-                f"{usage.cache_hit_ratio:.0%} cached · {usage.llm_seconds:.1f}s model\n",
+                "Not a Git worktree" if self._repository_status_loaded else "Reading Git status…",
                 style=palette.muted,
             )
-            text.append(f"${usage.cost_usd:.4f} · {usage.calls} calls", style=palette.muted)
+        elif snapshot.is_clean:
+            text.append("Working tree clean", style=palette.success)
+        else:
+            counts = []
+            if snapshot.staged:
+                counts.append(f"{snapshot.staged} staged")
+            if snapshot.modified:
+                counts.append(f"{snapshot.modified} modified")
+            if snapshot.untracked:
+                counts.append(f"{snapshot.untracked} new")
+            text.append(" · ".join(counts), style=palette.text)
+            for name in snapshot.paths[:4]:
+                display = name.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+                text.append(f"\n{_truncate_middle(display, 29)}", style=palette.text)
+            if len(snapshot.paths) > 4:
+                text.append(f"\n+{len(snapshot.paths) - 4} more files", style=palette.muted)
+            text.append(
+                "\nCtrl+D review changes",
+                style=Style(color=palette.accent, meta={"@click": "app.review_changes"}),
+            )
 
         todos: list[Any] = []
         if self.host._agent is not None:
@@ -3133,27 +3381,52 @@ class NoahCodeApp(App[None]):
                 candidate = self.host.agent.todos.list_todos()
                 if isinstance(candidate, list):
                     todos = candidate
-        text.append("\n\nPLAN\n", style=f"bold {palette.accent}")
         plan_text = ""
         with contextlib.suppress(Exception):
             from noah_code.project_notes import PlanStore
 
             plan_text = PlanStore(self.host.workspace.root).read().strip()
-        if plan_text:
-            first = plan_text.lstrip("# ").splitlines()[0].strip()[:40]
-            text.append(f"pinned · {first}\n", style=palette.text)
-        if not todos:
-            if not plan_text:
-                text.append("No active plan", style=palette.muted)
-            return text
-        done = sum(1 for todo in todos if getattr(todo, "status", "") == "done")
-        text.append(f"{done}/{len(todos)} complete\n", style=palette.muted)
-        visible = [todo for todo in todos if getattr(todo, "status", "") != "done"][:6]
-        for todo in visible:
-            status = getattr(todo, "status", "open")
-            icon = "●" if status == "blocked" else "○"
-            color = palette.error if status == "blocked" else palette.text
-            text.append(f"{icon} {str(getattr(todo, 'title', 'Untitled'))[:28]}\n", style=color)
+        if todos or plan_text:
+            text.append("\n\nPlan\n", style=f"bold {palette.accent}")
+            if plan_text:
+                first = plan_text.lstrip("# ").splitlines()[0].strip()
+                text.append(f"{_truncate_middle(first, 29)}\n", style=palette.text)
+            if todos:
+                done = sum(1 for todo in todos if getattr(todo, "status", "") == "done")
+                text.append(f"{done}/{len(todos)} complete", style=palette.muted)
+                visible = [todo for todo in todos if getattr(todo, "status", "") != "done"][:4]
+                for todo in visible:
+                    blocked = getattr(todo, "status", "") == "blocked"
+                    icon = "!" if blocked else "○"
+                    title = _truncate_middle(str(getattr(todo, "title", "Untitled")), 27)
+                    text.append(
+                        f"\n{icon} {title}", style=palette.error if blocked else palette.text
+                    )
+                remaining = len(todos) - done - len(visible)
+                if remaining > 0:
+                    text.append(f"\n+{remaining} more · /todos", style=palette.muted)
+
+        work = self.host.work_snapshot()
+        agents = [item for item in work["agents"] if item.get("state") in {"queued", "running"}]
+        jobs = [item for item in work["jobs"] if item.get("state") in {"running", "stopping"}]
+        if agents or jobs:
+            text.append("\n\nWork\n", style=f"bold {palette.accent}")
+            for item in agents[:2]:
+                text.append(
+                    f"{item.get('state')} · {item.get('agent', 'agent')}\n", style=palette.text
+                )
+            for item in jobs[:2]:
+                text.append(
+                    f"{item.get('state')} · {item.get('name', 'job')}\n", style=palette.text
+                )
+            text.append(
+                "F4 inspect work",
+                style=Style(color=palette.accent, meta={"@click": "app.work_ledger"}),
+            )
+        text.append(
+            "\n\nF7 context · F8 hide sidebar",
+            style=Style(color=palette.muted),
+        )
         return text
 
     def _at_transcript_end(self) -> bool:
@@ -3195,7 +3468,7 @@ class NoahCodeApp(App[None]):
         log = self.query_one("#conversation", SelectableRichLog)
         rows_before = len(log.lines)
         log.write(
-            _role_renderable(entry),
+            _role_renderable(entry, self.theme_palette),
             scroll_end=at_end,
         )
         # Deferred pre-mount renders report no new rows; the entry simply stays
@@ -3220,7 +3493,7 @@ class NoahCodeApp(App[None]):
         counts: list[int] = []
         for entry in self._transcript_entries:
             rows_before = len(log.lines)
-            log.write(_role_renderable(entry), scroll_end=False)
+            log.write(_role_renderable(entry, self.theme_palette), scroll_end=False)
             counts.append(max(len(log.lines) - rows_before, 0))
         self._transcript_line_counts = counts
         if at_end:
@@ -3516,7 +3789,7 @@ class NoahCodeApp(App[None]):
         follow = log.is_vertical_scroll_end or len(log.lines) == 0
         new_lines = 0
         for stream, fragments in grouped:
-            color = "#ed8796" if stream == "stderr" else "#d1d1d6"
+            color = self.theme_palette.error if stream == "stderr" else self.theme_palette.text
             chunk = "".join(fragments)
             new_lines += chunk.count("\n") + (0 if chunk.endswith("\n") else 1)
             log.write(Text(chunk, style=color), scroll_end=follow)
@@ -3794,13 +4067,44 @@ class NoahCodeApp(App[None]):
     def _resize_composer(self, text: str) -> None:
         if not self._app_mounted:
             return
-        rows = min(max(text.count("\n") + 3, 3), 8)
-        if self.screen.has_class("compact"):
-            rows = min(rows, 5)
+        composer = self.query_one("#composer", ComposerTextArea)
+        maximum = max(5, self.size.height // 2) if self._composer_expanded else 8
+        if self.screen.has_class("compact") and not self._composer_expanded:
+            maximum = 5
+        rows = min(max(composer.wrapped_document.height + 2, 3), maximum)
+        if self._composer_expanded:
+            rows = maximum
         if rows == self._composer_rows:
             return
         self._composer_rows = rows
-        self.query_one("#composer", ComposerTextArea).styles.height = rows
+        composer.styles.height = rows
+
+    def action_expand_composer(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        self._composer_expanded = not self._composer_expanded
+        composer = self.query_one("#composer", ComposerTextArea)
+        composer.set_class(self._composer_expanded, "composer-expanded")
+        self._resize_composer(composer.text)
+        composer.focus()
+        self.update_chrome(force=True)
+
+    def _replace_composer_draft(self, text: str) -> None:
+        composer = self.query_one("#composer", ComposerTextArea)
+        if composer.text.strip() and composer.text != text:
+            self._composer_drafts.append(composer.text)
+            self._show_notice("Draft saved · Alt+Z restores it", temporary=True)
+        composer.replace(text, (0, 0), composer.document.end)
+        composer.cursor_location = composer.document.end
+        composer.focus()
+
+    def action_restore_draft(self) -> None:
+        if isinstance(self.screen, ModalScreen) or not self._composer_drafts:
+            return
+        composer = self.query_one("#composer", ComposerTextArea)
+        composer.replace(self._composer_drafts.pop(), (0, 0), composer.document.end)
+        composer.cursor_location = composer.document.end
+        composer.focus()
 
     @on(TextArea.Changed, "#composer")
     def _composer_changed(self, event: TextArea.Changed) -> None:
@@ -3849,9 +4153,10 @@ class NoahCodeApp(App[None]):
     async def request_questions(self, prompts: list[QuestionPrompt]) -> QuestionAnswer:
         selections: list[str] = []
         custom_parts: list[str] = []
-        for prompt in prompts:
+        for number, prompt in enumerate(prompts, start=1):
             previous = self._agent_state
             result: QuestionAnswer | None = None
+            skipped = False
             timeline = self._timeline_begin(
                 f"Input requested · {prompt.header}",
                 "input",
@@ -3860,14 +4165,18 @@ class NoahCodeApp(App[None]):
             self._set_agent_state(AgentDisplayState.WAITING_INPUT, prompt.header)
             self.update_chrome(force=True)
             try:
-                result = await self.push_screen_wait(QuestionModal(prompt))
+                result = await self.push_screen_wait(
+                    QuestionModal(prompt, number=number, total=len(prompts))
+                )
+                skipped = result is None
             except asyncio.CancelledError:
                 self._dismiss_stranded_modal()
                 raise
             finally:
                 self._timeline_finish(
                     timeline,
-                    state="complete" if result is not None else "waiting",
+                    state="complete" if result is not None or skipped else "waiting",
+                    result="Skipped by user" if skipped else "",
                 )
                 if self._agent_state == AgentDisplayState.WAITING_INPUT:
                     self._set_agent_state(
@@ -3905,35 +4214,43 @@ class NoahCodeApp(App[None]):
             focus_name = str(focused.id or type(focused).__name__).replace("-", " ").title()
         shortcuts = [
             ("Enter", "Send prompt or selected command", "Composer"),
-            ("Shift+Enter", "Insert a new line", "Composer"),
+            ("Shift+Enter / Ctrl+J", "Insert a new line", "Composer"),
             ("/", "Search commands", "Composer"),
             ("@path", "Attach a workspace file", "Composer"),
             ("↑ / ↓", "Move through suggestions", "Composer"),
-            ("Tab", "Toggle Build and Plan when suggestions are closed", "Composer"),
+            ("Tab / Shift+Tab", "Complete suggestions or move focus forward / back", "Composer"),
+            ("Ctrl+B", "Toggle Build and Plan", "Global"),
+            ("Alt+Enter", "Expand or collapse the prompt editor", "Composer"),
+            ("Alt+Z", "Restore a draft replaced by a picker", "Composer"),
             ("Cmd+A / C / V", "Select all, copy, or paste", "Composer"),
-            ("Ctrl+C", "Cancel the active turn; press twice while idle to quit", "Global"),
+            ("Ctrl+C", "Stop the active turn and pause its queue; twice while idle quits", "Global"),
             ("Ctrl+P", "Open the command palette", "Global"),
             ("Ctrl+L", "Choose the session model", "Global"),
             ("Ctrl+O", "Browse all workspace sessions", "Global"),
             ("Ctrl+R", "Search and recall a prior prompt", "Composer"),
             ("Ctrl+T", "Expand or collapse live tool output", "Global"),
             ("Alt+↑", "Recall the newest queued prompt", "Composer"),
-            ("Shift+Tab", "Choose the reasoning effort", "Composer"),
+            ("Alt+E", "Choose the reasoning effort", "Global"),
             ("Ctrl+N", "Start a new session", "Global"),
-            ("F2", "Open the collapsible long-task timeline", "Global"),
-            ("F3", "Open persisted conversation history", "Global"),
+            ("F2", "Search the activity timeline and captured output", "Global"),
+            ("F3", "Search loaded conversation history", "Global"),
             ("F4", "Inspect agents, jobs, and terminals", "Global"),
             ("F5", "Manage queued prompts and attachments", "Global"),
             ("F6", "Expand the latest notice or error", "Global"),
             ("F7", "Inspect active context sources", "Global"),
+            ("F8", "Show or hide the context sidebar", "Global"),
+            ("Ctrl+D", "Review current file changes", "Global"),
             ("Shift+F7", "Focus or leave the scrollable context rail", "Global"),
             ("? / F1", "Search this keyboard reference", "Global"),
             ("Ctrl+]", "Jump to the latest transcript and tool output", "Transcript"),
             ("Mouse drag", "Select and copy transcript text", "Transcript"),
             ("Page Up / Down", "Read older or newer output", "Transcript"),
-            ("Home", "Load older persisted history", "History"),
+            ("Ctrl+Home", "Load older persisted history", "History"),
             ("U / J", "Reorder queued follow-up prompts", "Queue"),
             ("D", "Remove a queued prompt or attachment", "Queue"),
+            ("E", "Edit the selected waiting prompt", "Queue"),
+            ("R", "Resume waiting prompts", "Queue"),
+            ("X", "Discard all waiting prompts and attachments", "Queue"),
         ]
         ordered = sorted(
             enumerate(shortcuts),
@@ -3986,10 +4303,7 @@ class NoahCodeApp(App[None]):
             FilteredPicker("Commands", rows, "↑/↓ select · Enter insert · Esc close")
         )
         if choice:
-            composer = self.query_one("#composer", ComposerTextArea)
-            composer.text = choice
-            composer.cursor_location = (0, len(choice))
-            composer.focus()
+            self._replace_composer_draft(choice)
 
     @work(exclusive=True, group="prompt-history")
     async def action_prompt_history(self) -> None:
@@ -4019,10 +4333,7 @@ class NoahCodeApp(App[None]):
             FilteredPicker("Prompt history", rows, "Type to search · Enter recall · Esc keep draft")
         )
         if choice is not None:
-            composer = self.query_one("#composer", ComposerTextArea)
-            composer.text = choice
-            composer.cursor_location = composer.document.end
-            composer.focus()
+            self._replace_composer_draft(choice)
 
     @work(exclusive=True, group="skills")
     async def action_skills(self) -> None:
@@ -4084,8 +4395,7 @@ class NoahCodeApp(App[None]):
                     )
                     return
             composer = self.query_one("#composer", ComposerTextArea)
-            composer.text = f"${info.name} "
-            composer.cursor_location = (0, len(composer.text))
+            composer.replace(f"${info.name} ", *composer.selection, maintain_selection_offset=False)
             composer.focus()
         except Exception as exc:  # noqa: BLE001
             self._append_entry(TranscriptEntry("ERROR", f"Could not add or use skill: {exc}"))
@@ -4500,7 +4810,9 @@ class NoahCodeApp(App[None]):
     def _retry_startup_after_setup(self) -> None:
         """Retry startup after credentials are configured from a failed shell."""
 
-        if self._agent_ready or self._phase not in {"startup failed", "setup required"}:
+        if self._agent_ready or any(
+            worker.group == "startup" and not worker.is_finished for worker in self.workers
+        ):
             return
         self._onboarding_required = False
         self._set_agent_state(AgentDisplayState.STARTING)
@@ -4729,6 +5041,7 @@ class NoahCodeApp(App[None]):
         self.update_chrome(force=True)
 
     def action_quit_app(self) -> None:
+        self.host.cancel_active_turn()
         self.exit()
 
     def _emit_osc52(self, text: str) -> None:
@@ -4797,7 +5110,7 @@ class NoahCodeApp(App[None]):
             base_options = console.options
             counts: list[int] = []
             for entry in self._transcript_entries:
-                renderable = _role_renderable(entry)
+                renderable = _role_renderable(entry, self.theme_palette)
                 measured = measure_renderables(console, base_options, [renderable]).maximum
                 render_width = min(measured, width)
                 segments = console.render(
@@ -4886,7 +5199,7 @@ class NoahCodeApp(App[None]):
     def on_text_selected(self, _event: events.TextSelected) -> None:
         """Copy completed Textual selections and clear them without a notice redraw."""
 
-        selected = self.screen.get_selected_text() or ""
+        selected = self._mouse_selection_text() or self.screen.get_selected_text() or ""
         if selected.strip():
             self.copy_to_clipboard(selected)
         self.screen.clear_selection()
@@ -4969,7 +5282,7 @@ class NoahCodeApp(App[None]):
             return
         self._interrupt_count += 1
         if self._interrupt_count >= 2:
-            self.exit()
+            self.action_quit_app()
         else:
             self._append_entry(TranscriptEntry("STATUS", "Press Ctrl+C again to quit"))
 
@@ -4994,17 +5307,11 @@ class NoahCodeApp(App[None]):
         self._update_activity_title()
 
     def action_recall_queued_prompt(self) -> None:
-        composer = self.query_one("#composer", ComposerTextArea)
-        if composer.text.strip():
-            self._show_notice("Clear the composer before recalling a queued prompt", temporary=True)
-            return
         recall = getattr(self.host, "recall_queued_steer", None)
         item = recall() if callable(recall) else None
         if item is None:
             return
-        composer.text = str(item.text)
-        composer.cursor_location = composer.document.end
-        composer.focus()
+        self._replace_composer_draft(str(item.text))
         self.update_chrome(force=True)
 
     @work(exclusive=True, group="mode-switch")
@@ -5024,13 +5331,14 @@ class NoahCodeApp(App[None]):
         if queue is None:
             return ""
         count = queue.snapshot().get("count") or 0
-        return f"queued · {count}" if count else ""
+        state = "paused" if getattr(self.host, "queue_paused", False) is True else "queued"
+        return f"{state} · {count}" if count else ""
 
     def _submit_while_busy(self, composer: ComposerTextArea, text: str) -> None:
         slash = parse_slash(text)
         if slash:
             name = slash[0]
-            if name == "queue":
+            if name == "queue" and not slash[1].strip():
                 composer.text = ""
                 self.close_suggestions()
                 self.action_queue_manager()
@@ -5057,17 +5365,24 @@ class NoahCodeApp(App[None]):
                 self.host.cancel_active_turn()
                 self.exit()
                 return
-            composer.text = ""
             self.close_suggestions()
             self._append_entry(
                 TranscriptEntry("STATUS", f"/{name} is blocked while a turn is running")
             )
             return
+        self._enqueue_composer(composer, text)
+
+    def _enqueue_composer(self, composer: ComposerTextArea, text: str) -> bool:
+        try:
+            self.host.enqueue_steer(text)
+        except Exception as exc:  # noqa: BLE001
+            self._show_notice(f"Could not queue prompt: {exc}", kind="error", temporary=True)
+            return False
         composer.text = ""
         self.close_suggestions()
         self._append_entry(TranscriptEntry("YOU", text))
-        self.host.enqueue_steer(text)
         self.update_chrome(force=True)
+        return True
 
     @work(group="host-cmd")
     async def _run_host_command(self, text: str) -> None:
@@ -5083,7 +5398,7 @@ class NoahCodeApp(App[None]):
     def action_submit(self) -> None:
         composer = self.query_one("#composer", ComposerTextArea)
         text = composer.text.strip()
-        if not text or self._pending_submit is not None:
+        if not text:
             return
         if isinstance(self.screen, (ApprovalModal, QuestionModal)):
             return
@@ -5162,6 +5477,12 @@ class NoahCodeApp(App[None]):
             self.close_suggestions()
             self.action_confirm_undo()
             return
+        if self._pending_submit is not None:
+            return
+        if slash is None and getattr(self.host, "queue_paused", False) is True:
+            if self._enqueue_composer(composer, text):
+                self._show_notice("Queued and paused · F5 to edit or resume", temporary=True)
+            return
         composer.text = ""
         self.close_suggestions()
         self._append_entry(TranscriptEntry("YOU", text))
@@ -5175,6 +5496,27 @@ class NoahCodeApp(App[None]):
             self._set_agent_state(AgentDisplayState.THINKING)
         self._run_turn(text)
 
+    @work(exclusive=True, group="review-open")
+    async def action_review_changes(self) -> None:
+        if isinstance(self.screen, DiffReviewScreen):
+            return
+        try:
+            review = await self.host.diff_review()
+        except Exception as exc:  # noqa: BLE001
+            self.notify(f"Review unavailable: {exc}", severity="error")
+            return
+        self.push_screen(DiffReviewScreen(self.host, review))
+
+    def _resume_waiting_queue(self) -> None:
+        if (
+            not self.ui.busy
+            and (self._turn_task is None or self._turn_task.done())
+            and not self.host.queue_paused
+            and self.host.steer_queue.items()
+        ):
+            self.ui.set_busy(True)
+            self._run_turn("/queue resume")
+
     @work(exclusive=True, group="turn")
     async def _run_turn(self, text: str) -> None:
         self._turn_task = asyncio.current_task()
@@ -5185,7 +5527,6 @@ class NoahCodeApp(App[None]):
             "turn",
             detail=" ".join(text.split())[:500],
         )
-        known_activity_ids = {record.activity_id for record in self._activity_history}
         journal = getattr(getattr(self.host, "agent", None), "journal", None)
         latest = getattr(journal, "latest_turn", None)
         before_turn = latest() if callable(latest) else None
@@ -5194,11 +5535,17 @@ class NoahCodeApp(App[None]):
             before_cost = float(self.host.usage_snapshot().cost_usd)
         except (AttributeError, TypeError, ValueError):
             before_cost = None
+        before_files: dict[str, tuple[object, ...]] | None = None
         outcome = "complete"
         try:
+            if is_agent_turn:
+                self.ui.set_busy(True)
+                self.host._active_turn = self._turn_task
+                with contextlib.suppress(Exception):
+                    before_files = await self.host.agent.git.change_fingerprints()
             action = await self.host.handle_line(text)
             if action == "exit":
-                self.exit()
+                self.action_quit_app()
         except asyncio.CancelledError:
             outcome = "cancelled"
             raise
@@ -5209,61 +5556,89 @@ class NoahCodeApp(App[None]):
             self._last_notice_detail = str(exc)
             self._append_entry(TranscriptEntry("ERROR", str(exc)))
         finally:
-            self._finish_thinking_timeline(state="error" if outcome == "failed" else "complete")
-            self._timeline_finish(
-                turn_timeline,
-                state="error" if outcome == "failed" else "complete",
-                result=outcome,
-            )
-            if is_agent_turn:
-                if self._agent_state == AgentDisplayState.ERROR:
-                    outcome = "failed"
-                latest_turn = latest() if callable(latest) else None
-                changed_files = 0
-                if latest_turn is not None and latest_turn.turn_id != before_turn_id:
-                    changed_files = len({mutation.path for mutation in latest_turn.mutations})
-                new_records = [
-                    record
-                    for record in self._activity_history
-                    if record.activity_id not in known_activity_ids
-                ]
-                validation_pattern = re.compile(r"\b(pytest|test|ruff|mypy|lint|build)\b", re.I)
-                validations = sum(
-                    bool(validation_pattern.search(f"{record.label} {record.detail}"))
-                    for record in new_records
+            try:
+                self._finish_thinking_timeline(state="error" if outcome == "failed" else "complete")
+                self._timeline_finish(
+                    turn_timeline,
+                    state="error" if outcome == "failed" else "complete",
+                    result=outcome,
                 )
-                duration = time.monotonic() - started_at
-                outcome_label = {
-                    "complete": "Turn complete",
-                    "failed": "Turn failed",
-                    "cancelled": "Turn cancelled",
-                }[outcome]
-                receipt = f"{outcome_label} · {duration:.1f}s"
-                if changed_files:
-                    receipt += f" · {changed_files} file{'s' if changed_files != 1 else ''} changed"
-                if validations:
-                    receipt += f" · {validations} validation{'s' if validations != 1 else ''}"
-                after_cost: float | None
-                try:
-                    after_cost = float(self.host.usage_snapshot().cost_usd)
-                except (AttributeError, TypeError, ValueError):
-                    after_cost = None
-                if before_cost is not None and after_cost is not None and after_cost > before_cost:
-                    receipt += f" · ${after_cost - before_cost:.4f}"
-                if changed_files:
-                    receipt += " · /diff review · /undo revert"
-                if self._checkpoint_pending:
-                    receipt = f"◆ {receipt}"
-                    self._checkpoint_pending = False
-                self._append_entry(TranscriptEntry("RECEIPT", receipt))
-            self._turn_task = None
-            if self._agent_state not in {
-                AgentDisplayState.WAITING_INPUT,
-                AgentDisplayState.WAITING,
-                AgentDisplayState.ERROR,
-            }:
-                self._set_agent_state(AgentDisplayState.READY)
-            self._rail_dirty = True
-            self.update_chrome()
-            self._refresh_repository_snapshot()
-            self.query_one("#composer", ComposerTextArea).focus()
+                if is_agent_turn:
+                    self.ui.set_busy(True)
+                    self.host._active_turn = self._turn_task
+                    if self._agent_state == AgentDisplayState.ERROR:
+                        outcome = "failed"
+                    latest_turn = latest() if callable(latest) else None
+                    paths: set[str] = set()
+                    if latest_turn is not None and latest_turn.turn_id != before_turn_id:
+                        paths.update(str(mutation.path) for mutation in latest_turn.mutations)
+                    journal_paths = paths.copy()
+                    observed = False
+                    if before_files is not None:
+                        try:
+                            after_files = await self.host.agent.git.change_fingerprints()
+                            root = Path(self.host.workspace.root)
+                            paths.update(
+                                str(root / key.split(":", 1)[1])
+                                for key in before_files.keys() | after_files.keys()
+                                if before_files.get(key) != after_files.get(key)
+                            )
+                            observed = True
+                        except Exception:  # noqa: BLE001
+                            pass
+                    changed_files = len(paths)
+                    command_results = getattr(getattr(self.host.agent, "ws", None), "_command_results", ())
+                    checks = _recorded_checks_text(command_results, started_at)
+                    undo_status = "undo unavailable"
+                    if journal_paths and paths <= journal_paths:
+                        try:
+                            validate_undo = getattr(journal, "validate_undo", None)
+                            if callable(validate_undo):
+                                await asyncio.to_thread(validate_undo)
+                                undo_status = "undo available · /undo"
+                        except Exception:  # noqa: BLE001
+                            pass
+                    duration = time.monotonic() - started_at
+                    outcome_label = {
+                        "complete": "Turn complete",
+                        "failed": "Turn failed",
+                        "cancelled": "Turn cancelled",
+                    }[outcome]
+                    receipt = f"{outcome_label} · {duration:.1f}s"
+                    if changed_files:
+                        scope = "observed" if observed else "journaled"
+                        receipt += f" · {changed_files} file{'s' if changed_files != 1 else ''} changed ({scope})"
+                    receipt += f" · {checks}"
+                    after_cost: float | None
+                    try:
+                        after_cost = float(self.host.usage_snapshot().cost_usd)
+                    except (AttributeError, TypeError, ValueError):
+                        after_cost = None
+                    if before_cost is not None and after_cost is not None and after_cost > before_cost:
+                        receipt += f" · ${after_cost - before_cost:.4f}"
+                    if changed_files:
+                        receipt += f" · /diff review · {undo_status}"
+                    if self._checkpoint_pending:
+                        receipt = f"◆ {receipt}"
+                        self._checkpoint_pending = False
+                    self._append_entry(TranscriptEntry("RECEIPT", receipt))
+            finally:
+                if is_agent_turn:
+                    if self.host._active_turn is self._turn_task:
+                        self.host._active_turn = None
+                    self.ui.set_busy(False)
+                elif text.strip() == "/queue resume":
+                    self.ui.set_busy(False)
+                self._turn_task = None
+                if self._agent_state not in {
+                    AgentDisplayState.WAITING_INPUT,
+                    AgentDisplayState.WAITING,
+                    AgentDisplayState.ERROR,
+                }:
+                    self._set_agent_state(AgentDisplayState.READY)
+                self._rail_dirty = True
+                self.update_chrome()
+                self._refresh_repository_snapshot()
+                self.query_one("#composer", ComposerTextArea).focus()
+                if is_agent_turn and outcome == "complete":
+                    self.call_after_refresh(self._resume_waiting_queue)

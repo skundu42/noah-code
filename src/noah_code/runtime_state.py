@@ -18,6 +18,7 @@ import json
 import os
 import signal
 import sqlite3
+import stat
 import time
 import uuid
 from collections.abc import Iterator
@@ -150,6 +151,7 @@ class RuntimeStateStore:
         self.session_path.chmod(0o700)
         self.path = self.session_path / "runtime.db"
         self.artifact_dir = self.session_path / "artifacts"
+        self.recovery_dir = self.session_path / "recovery"
         self.process_log_dir = self.session_path / "process-logs"
         self.artifact_dir.mkdir(exist_ok=True, mode=0o700)
         self.process_log_dir.mkdir(exist_ok=True, mode=0o700)
@@ -375,7 +377,15 @@ class RuntimeStateStore:
             ).fetchone()
         return _run_record(row) if row is not None else None
 
-    def enqueue_inbox(self, text: str, attach_paths: list[Path] | None = None) -> int:
+    def enqueue_inbox(
+        self,
+        text: str,
+        attach_paths: list[Path] | None = None,
+        *,
+        input_state: dict[str, Any] | None = None,
+        discard_sequence: int | None = None,
+    ) -> int:
+        """Accept input and its queue metadata in one durable transaction."""
         paths = json.dumps([str(path) for path in (attach_paths or [])])
         with self._connect() as connection:
             cursor = connection.execute(
@@ -385,7 +395,21 @@ class RuntimeStateStore:
             if cursor.lastrowid is None:  # pragma: no cover - SQLite always supplies this
                 raise RuntimeStateError("SQLite did not return an inbox sequence")
             sequence = cursor.lastrowid
-        self.event("inbox.queued", {"sequence": sequence})
+            if input_state is not None:
+                state = {**input_state, "order": [*input_state.get("order", []), sequence]}
+                connection.execute(
+                    "INSERT INTO state(key, value, updated_at) VALUES ('input_queue', ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    (json.dumps(state), time.time()),
+                )
+            if discard_sequence is not None:
+                connection.execute(
+                    "UPDATE inbox SET status='dropped', acknowledged_at=? WHERE sequence=?",
+                    (time.time(), discard_sequence),
+                )
+        # Telemetry failure cannot turn an accepted prompt into a failed enqueue.
+        with contextlib.suppress(Exception):
+            self.event("inbox.queued", {"sequence": sequence})
         return sequence
 
     def pending_inbox(self, *, limit: int = 100) -> list[InboxRecord]:
@@ -500,7 +524,7 @@ class RuntimeStateStore:
             )
 
     def recover_file_operations(self) -> list[str]:
-        """Roll back edits whose durable intent was never committed."""
+        """Preserve current files, then roll back uncommitted durable intents."""
 
         with self._connect() as connection:
             rows = connection.execute(
@@ -508,11 +532,33 @@ class RuntimeStateStore:
                 "ORDER BY created_at DESC"
             ).fetchall()
         recovered: list[str] = []
+        if rows:
+            self.recovery_dir.mkdir(exist_ok=True, mode=0o700)
+            _fsync_directory(self.session_path)
         for row in rows:
             path = Path(str(row["path"]))
             existed = bool(row["existed_before"])
             before = bytes(row["pre_bytes"]) if row["pre_bytes"] is not None else None
             mode = int(row["pre_mode"]) if row["pre_mode"] is not None else None
+            # A later user repair is indistinguishable from an interrupted write.
+            # Fresh names also preserve the first backup if recovery itself crashes.
+            backup = self.recovery_dir / f"{row['operation_id']}-{uuid.uuid4().hex}"
+            displaced: dict[str, Any] = {"path": str(path), "operation_id": row["operation_id"]}
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                displaced["existed"] = False
+            else:
+                displaced.update(existed=True, mode=info.st_mode)
+                if stat.S_ISLNK(info.st_mode):
+                    displaced["symlink_target"] = os.readlink(path)
+                elif stat.S_ISREG(info.st_mode):
+                    content_path = backup.with_suffix(".bin")
+                    _restore_file(content_path, path.read_bytes(), 0o600)
+                    displaced["content_file"] = content_path.name
+                else:
+                    raise RuntimeStateError(f"refuse recovery of non-file target: {path}")
+            _restore_file(backup.with_suffix(".json"), json.dumps(displaced).encode(), 0o600)
             _restore_file(path, before if existed else None, mode)
             recovered.append(str(path))
             with self._connect() as connection:
@@ -522,7 +568,7 @@ class RuntimeStateStore:
                     (time.time(), row["operation_id"]),
                 )
         if recovered:
-            self.event("recovery.files", {"paths": recovered})
+            self.event("recovery.files", {"paths": recovered, "backups": str(self.recovery_dir)})
         return recovered
 
     @staticmethod
@@ -750,7 +796,7 @@ def _run_record(row: sqlite3.Row) -> RunRecord:
 
 def _restore_file(path: Path, data: bytes | None, mode: int | None) -> None:
     if data is None:
-        if path.exists():
+        if path.exists() or path.is_symlink():
             path.unlink()
             _fsync_directory(path.parent)
         return

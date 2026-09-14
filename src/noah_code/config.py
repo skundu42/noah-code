@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import tempfile
 import tomllib
+from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+import tomlkit
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from tomlkit.exceptions import TOMLKitError
 
 from noah_code.themes import ThemeName, get_theme
 
@@ -396,10 +397,6 @@ def _user_config_path() -> Path:
     return Path.home() / ".config" / "noah-code" / "config.toml"
 
 
-_TOP_LEVEL_MODEL_RE = re.compile(r"^(?P<indent>\s*)model\s*=.*$")
-_TOP_LEVEL_REASONING_RE = re.compile(r"^(?P<indent>\s*)reasoning_effort\s*=.*$")
-
-
 def user_default_model() -> str | None:
     """Return the explicitly configured cross-repository model, if any."""
 
@@ -407,242 +404,80 @@ def user_default_model() -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
-def save_user_default_model(model: str) -> Path:
-    """Persist a top-level model while preserving the rest of the user TOML file."""
-
-    selected = model.strip()
-    if not selected or any(character.isspace() for character in selected):
-        raise ValueError("model must be a non-empty name without whitespace")
+def _save_user_setting(key: str, value: str | bool, *, table: str | None = None) -> Path:
+    """Edit one setting without losing TOML syntax, comments, or other values."""
 
     path = _user_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     existing = path.read_text() if path.is_file() else ""
-    lines = existing.splitlines(keepends=True)
-    encoded = json.dumps(selected, ensure_ascii=False)
-    replacement = f"model = {encoded}\n"
+    try:
+        tomllib.loads(existing)
+        document = tomlkit.parse(existing)
+        target = document if table is None else document.setdefault(table, tomlkit.table())
+        if not isinstance(target, MutableMapping):
+            raise ConfigError(f"invalid configuration in {path}: {table} must be a table")
+        target[key] = value
+        content = tomlkit.dumps(document)
+        tomllib.loads(content)
+    except (tomllib.TOMLDecodeError, TOMLKitError) as exc:
+        raise ConfigError(f"cannot update configuration in {path}: {exc}") from exc
 
-    first_table = next(
-        (index for index, line in enumerate(lines) if line.lstrip().startswith("[")),
-        len(lines),
-    )
-    model_line = next(
-        (
-            index
-            for index, line in enumerate(lines[:first_table])
-            if _TOP_LEVEL_MODEL_RE.match(line)
-        ),
-        None,
-    )
-    if model_line is not None:
-        lines[model_line] = replacement
-    else:
-        if first_table and not lines[first_table - 1].endswith(("\n", "\r")):
-            lines[first_table - 1] += "\n"
-        insertion = [replacement]
-        if first_table < len(lines) and lines[first_table].lstrip().startswith("["):
-            insertion.append("\n")
-        lines[first_table:first_table] = insertion
-
-    content = "".join(lines) or replacement
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor, temporary_name = tempfile.mkstemp(prefix=".config-", dir=path.parent)
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w") as stream:
             stream.write(content)
-        os.chmod(temporary_path, 0o600)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary_path, path)
     finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
+        temporary_path.unlink(missing_ok=True)
     return path
 
 
+def save_user_default_model(model: str) -> Path:
+    """Persist the cross-repository default model."""
+
+    selected = model.strip()
+    if not selected or any(character.isspace() for character in selected):
+        raise ValueError("model must be a non-empty name without whitespace")
+    return _save_user_setting("model", selected)
+
+
 def save_user_reasoning_effort(effort: str) -> Path:
-    """Persist the cross-repository reasoning effort without disturbing other settings."""
+    """Persist the cross-repository reasoning effort."""
 
     selected = effort.strip().lower()
     if selected not in REASONING_EFFORTS:
         raise ValueError(
             "reasoning effort must be default, none, minimal, low, medium, high, or xhigh"
         )
-
-    path = _user_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    existing = path.read_text() if path.is_file() else ""
-    lines = existing.splitlines(keepends=True)
-    replacement = f"reasoning_effort = {json.dumps(selected)}\n"
-    first_table = next(
-        (index for index, line in enumerate(lines) if line.lstrip().startswith("[")),
-        len(lines),
-    )
-    effort_line = next(
-        (
-            index
-            for index, line in enumerate(lines[:first_table])
-            if _TOP_LEVEL_REASONING_RE.match(line)
-        ),
-        None,
-    )
-    if effort_line is not None:
-        lines[effort_line] = replacement
-    else:
-        if first_table and not lines[first_table - 1].endswith(("\n", "\r")):
-            lines[first_table - 1] += "\n"
-        insertion = [replacement]
-        if first_table < len(lines) and lines[first_table].lstrip().startswith("["):
-            insertion.append("\n")
-        lines[first_table:first_table] = insertion
-
-    content = "".join(lines) or replacement
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".config-", dir=path.parent)
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write(content)
-        os.chmod(temporary_path, 0o600)
-        os.replace(temporary_path, path)
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
-    return path
+    return _save_user_setting("reasoning_effort", selected)
 
 
 def save_user_theme(theme: str) -> Path:
-    """Persist the UI theme inside the user ``[ui]`` table."""
+    """Persist the UI theme."""
 
-    selected = get_theme(theme.strip().lower()).name
-    path = _user_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    existing = path.read_text() if path.is_file() else ""
-    lines = existing.splitlines(keepends=True)
-    replacement = f"theme = {json.dumps(selected)}\n"
-
-    table_start = next(
-        (index for index, line in enumerate(lines) if line.strip() == "[ui]"),
-        None,
-    )
-    if table_start is None:
-        if lines and not lines[-1].endswith(("\n", "\r")):
-            lines[-1] += "\n"
-        if lines and lines[-1].strip():
-            lines.append("\n")
-        lines.extend(["[ui]\n", replacement])
-    else:
-        table_end = next(
-            (
-                index
-                for index, line in enumerate(lines[table_start + 1 :], start=table_start + 1)
-                if line.lstrip().startswith("[")
-            ),
-            len(lines),
-        )
-        theme_line = next(
-            (
-                index
-                for index, line in enumerate(
-                    lines[table_start + 1 : table_end], start=table_start + 1
-                )
-                if re.match(r"^\s*theme\s*=", line)
-            ),
-            None,
-        )
-        if theme_line is None:
-            lines.insert(table_end, replacement)
-        else:
-            lines[theme_line] = replacement
-
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".config-", dir=path.parent)
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write("".join(lines))
-        os.chmod(temporary_path, 0o600)
-        os.replace(temporary_path, path)
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
-    return path
+    return _save_user_setting("theme", get_theme(theme.strip().lower()).name, table="ui")
 
 
 def save_user_animations(enabled: bool) -> Path:
-    """Persist the reduced-motion preference inside the user ``[ui]`` table."""
+    """Persist the reduced-motion preference."""
 
-    path = _user_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    existing = path.read_text() if path.is_file() else ""
-    lines = existing.splitlines(keepends=True)
-    replacement = f"animations = {'true' if enabled else 'false'}\n"
-
-    table_start = next(
-        (index for index, line in enumerate(lines) if line.strip() == "[ui]"),
-        None,
-    )
-    if table_start is None:
-        if lines and not lines[-1].endswith(("\n", "\r")):
-            lines[-1] += "\n"
-        if lines and lines[-1].strip():
-            lines.append("\n")
-        lines.extend(["[ui]\n", replacement])
-    else:
-        table_end = next(
-            (
-                index
-                for index, line in enumerate(lines[table_start + 1 :], start=table_start + 1)
-                if line.lstrip().startswith("[")
-            ),
-            len(lines),
-        )
-        animation_line = next(
-            (
-                index
-                for index, line in enumerate(
-                    lines[table_start + 1 : table_end], start=table_start + 1
-                )
-                if re.match(r"^\s*animations\s*=", line)
-            ),
-            None,
-        )
-        if animation_line is None:
-            lines.insert(table_end, replacement)
-        else:
-            lines[animation_line] = replacement
-
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".config-", dir=path.parent)
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write("".join(lines))
-        os.chmod(temporary_path, 0o600)
-        os.replace(temporary_path, path)
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
-    return path
+    return _save_user_setting("animations", enabled, table="ui")
 
 
 def _project_config_path(workspace: Path) -> Path:
     return workspace / ".noah-code" / "config.toml"
 
 
-# Repository-controlled configuration must not be able to weaken the host's
-# trust boundary. These settings are accepted only from user config, the
-# environment, or explicit CLI overrides.
-_USER_ONLY_CONFIG_KEYS = frozenset(
+# Only these settings may come from a repository. New options stay user-only
+# until explicitly reviewed; unknown names still reach validation for typo errors.
+_PROJECT_CONFIG_KEYS = frozenset(
     {
-        "auto_approve",
-        "budget",
-        "efficiency",
-        "enabled_skills",
-        "hooks",
-        "mcp",
-        "lsp",
-        "permission_rules",
-        "processes",
-        "reliability",
-        "session_dir",
-        "tracing",
-        "unsafe_inprocess_code_execution",
-        "updates",
+        "model", "reasoning_effort", "lightweight_model", "max_iterations",
+        "cell_timeout", "command_timeout", "summarization", "ui", "sampling",
+        "max_file_bytes", "max_output_chars", "undo_blob_limit",
     }
 )
 
@@ -661,7 +496,13 @@ def _load_toml(path: Path) -> dict[str, Any]:
 
 def _load_project_toml(path: Path) -> dict[str, Any]:
     data = _load_toml(path)
-    return {key: value for key, value in data.items() if key not in _USER_ONLY_CONFIG_KEYS}
+    return {
+        key: value
+        for key, value in data.items()
+        if key in _PROJECT_CONFIG_KEYS
+        or key not in NoahCodeConfig.model_fields
+        or (key == "mode" and value == "plan")
+    }
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -704,26 +545,6 @@ def _env_overrides() -> dict[str, Any]:
     return out
 
 
-def _normalize_raw(raw: dict[str, Any]) -> dict[str, Any]:
-    data = dict(raw)
-    if "permission_rules" in data and isinstance(data["permission_rules"], list):
-        data["permission_rules"] = [
-            rule if isinstance(rule, PermissionRule) else PermissionRule.model_validate(rule)
-            for rule in data["permission_rules"]
-        ]
-    if "summarization" in data and isinstance(data["summarization"], dict):
-        data["summarization"] = SummarizationPolicy.model_validate(data["summarization"])
-    if "tracing" in data and isinstance(data["tracing"], dict):
-        data["tracing"] = TracingConfig.model_validate(data["tracing"])
-    if "ui" in data and isinstance(data["ui"], dict):
-        data["ui"] = UIConfig.model_validate(data["ui"])
-    if "updates" in data and isinstance(data["updates"], dict):
-        data["updates"] = UpdateConfig.model_validate(data["updates"])
-    if "efficiency" in data and isinstance(data["efficiency"], dict):
-        data["efficiency"] = EfficiencyConfig.model_validate(data["efficiency"])
-    return data
-
-
 def _summarize_validation_error(exc: ValidationError, *, limit: int = 3) -> str:
     """Compress a pydantic ValidationError into a single-line summary."""
 
@@ -759,7 +580,7 @@ def load_config(
             existing = list(merged.get("permission_rules") or [])
             merged["permission_rules"] = [*existing, *extra_rules]
     try:
-        return NoahCodeConfig.model_validate(_normalize_raw(merged))
+        return NoahCodeConfig.model_validate(merged)
     except ValidationError as exc:
         files = [
             str(path)

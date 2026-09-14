@@ -178,6 +178,164 @@ def test_capture_drops_previously_committed_secret_paths(git_repo: Path) -> None
 
     assert _show(git_repo, snapshot["ref"], ".env").returncode != 0
     assert _show(git_repo, snapshot["ref"], "normal.txt").stdout == "hello\n"
+    (git_repo / ".env").write_text("staged secret change\n")
+    _git(git_repo, "add", ".env")
+    staged_secret = _show(git_repo, "", ".env").stdout
+    (git_repo / ".env").write_text("newer unstaged secret repair\n")
+    (git_repo / "normal.txt").write_text("changed\n")
+
+    manager.restore(snapshot["ref"])
+
+    assert (git_repo / ".env").read_text() == "newer unstaged secret repair\n"
+    assert _show(git_repo, "", ".env").stdout == staged_secret
+    assert (git_repo / "normal.txt").read_text() == "hello\n"
+
+
+def test_capture_batches_raw_hashing_and_updates_only_changed_index_entries(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for index in range(100):
+        (git_repo / f"file-{index}.txt").write_text(f"value {index}\n")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "many files")
+    manager = CheckpointManager(git_repo, "batch-capture")
+    calls = []
+    real_git = manager._git
+
+    def count_git(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_git", count_git)
+    snapshot = manager.capture()
+    assert snapshot is not None
+    assert len(calls) <= 12
+    assert sum(args[0] == "hash-object" for args, _kwargs in calls) == 1
+    assert not any(args[0] == "update-index" for args, _kwargs in calls)
+    expected_tree = real_git("rev-parse", "HEAD^{tree}").stdout.decode().strip()
+    assert snapshot["tree"] == expected_tree
+
+    calls.clear()
+    (git_repo / "file-1.txt").write_text("changed\n")
+    (git_repo / "file-2.txt").unlink()
+    (git_repo / "new.txt").write_text("new\n")
+    changed = manager.capture()
+    assert changed is not None
+    assert len(calls) <= 12
+    updates = [kwargs["input_bytes"] for args, kwargs in calls if args[0] == "update-index"]
+    assert len(updates) == 1
+    assert len(updates[0].split(b"\0")) - 1 == 3
+    assert _show(git_repo, changed["ref"], "file-1.txt").stdout == "changed\n"
+    assert _show(git_repo, changed["ref"], "file-2.txt").returncode != 0
+    assert _show(git_repo, changed["ref"], "new.txt").stdout == "new\n"
+
+
+def test_checkpoint_paths_are_literal_and_root_relative(git_repo: Path) -> None:
+    nested = git_repo / "nested"
+    nested.mkdir()
+    names = ['quote".txt', "back\\slash.txt", "line\nbreak.txt", "[literal].txt", "é.txt"]
+    for name in names:
+        (git_repo / name).write_text(name)
+    (git_repo / ".env").write_text("protected")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "literal paths")
+    manager = CheckpointManager(nested, "literal-paths")
+    for name in names:
+        (git_repo / name).write_text(f"captured {name}")
+    snapshot = manager.capture()
+    assert snapshot is not None
+    for name in names:
+        assert _show(git_repo, snapshot["ref"], name).stdout == f"captured {name}"
+        (git_repo / name).write_text("changed again")
+    (git_repo / ".env").write_text("latest secret")
+
+    manager.restore(snapshot["ref"])
+
+    for name in names:
+        assert (git_repo / name).read_text() == f"captured {name}"
+    assert (git_repo / ".env").read_text() == "latest secret"
+
+
+@pytest.mark.parametrize(
+    ("tracked_secret", "present_in_snapshot"), [(False, False), (False, True), (True, True)]
+)
+def test_restore_refuses_to_displace_protected_directory_children(
+    git_repo: Path, tracked_secret: bool, present_in_snapshot: bool
+) -> None:
+    target = git_repo / "replaced"
+    if present_in_snapshot:
+        target.write_text("checkpoint file")
+        _git(git_repo, "add", ".")
+    manager = CheckpointManager(git_repo, "nested-secret")
+    snapshot = manager.capture()
+    assert snapshot is not None
+    if not present_in_snapshot:
+        target.write_text("created after checkpoint")
+        _git(git_repo, "add", ".")
+    target.unlink()
+    target.mkdir()
+    secret = target / ".env"
+    secret.write_text("dummy protected repair")
+    if tracked_secret:
+        _git(git_repo, "add", ".")
+    index = (git_repo / ".git" / "index").read_bytes()
+    (git_repo / "base.txt").write_text("other change must also remain")
+
+    with pytest.raises(CheckpointError, match="protected path"):
+        manager.restore(snapshot["ref"])
+
+    assert secret.read_text() == "dummy protected repair"
+    assert (git_repo / ".git" / "index").read_bytes() == index
+    assert (git_repo / "base.txt").read_text() == "other change must also remain"
+
+
+def test_restore_refuses_to_displace_protected_ancestor(git_repo: Path) -> None:
+    protected = git_repo / ".env"
+    protected.mkdir()
+    (protected / "child.txt").write_text("checkpoint child")
+    manager = CheckpointManager(git_repo, "protected-parent")
+    snapshot = manager.capture()
+    assert snapshot is not None
+    (protected / "child.txt").unlink()
+    protected.rmdir()
+    protected.write_text("dummy protected repair")
+
+    with pytest.raises(CheckpointError, match="protected path"):
+        manager.restore(snapshot["ref"])
+
+    assert protected.read_text() == "dummy protected repair"
+
+
+@pytest.mark.parametrize("protected_is_parent", [False, True])
+def test_restore_keeps_protected_index_entries_absent_from_worktree(
+    git_repo: Path, protected_is_parent: bool
+) -> None:
+    target = git_repo / (".env" if protected_is_parent else "replaced")
+    if protected_is_parent:
+        target.mkdir()
+        (target / "child.txt").write_text("checkpoint child")
+    else:
+        target.write_text("checkpoint file")
+    manager = CheckpointManager(git_repo, "index-only-secret")
+    snapshot = manager.capture()
+    assert snapshot is not None
+    if protected_is_parent:
+        (target / "child.txt").unlink()
+        target.rmdir()
+        secret = target
+    else:
+        target.unlink()
+        target.mkdir()
+        secret = target / ".env"
+    secret.write_text("dummy staged secret")
+    _git(git_repo, "add", ".")
+    secret.unlink()
+    index = (git_repo / ".git" / "index").read_bytes()
+
+    with pytest.raises(CheckpointError, match="protected"):
+        manager.restore(snapshot["ref"])
+
+    assert (git_repo / ".git" / "index").read_bytes() == index
 
 
 def test_capture_does_not_execute_clean_filters(git_repo: Path) -> None:
@@ -232,6 +390,37 @@ def test_capture_records_deletions(git_repo: Path) -> None:
         check=False,
     )
     assert gone.returncode != 0
+
+
+def test_capture_handles_file_directory_replacements_and_keeps_gitlinks(git_repo: Path) -> None:
+    directory = git_repo / "directory"
+    directory.mkdir()
+    (directory / "child.txt").write_text("old child")
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-q", "-m", "directory")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=git_repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    _git(git_repo, "update-index", "--add", "--cacheinfo", f"160000,{head},submodule")
+    _git(git_repo, "commit", "-q", "-m", "gitlink")
+    (git_repo / "submodule").mkdir()
+    (git_repo / "base.txt").unlink()
+    (git_repo / "base.txt").mkdir()
+    (directory / "child.txt").unlink()
+    directory.rmdir()
+    directory.write_text("replacement file")
+
+    snapshot = CheckpointManager(git_repo, "replace-types").capture()
+
+    assert snapshot is not None
+    assert _show(git_repo, snapshot["ref"], "base.txt").returncode != 0
+    assert _show(git_repo, snapshot["ref"], "directory/child.txt").returncode != 0
+    assert _show(git_repo, snapshot["ref"], "directory").stdout == "replacement file"
+    tree = subprocess.run(
+        ["git", "ls-tree", snapshot["ref"], "submodule"],
+        cwd=git_repo, capture_output=True, text=True, check=True,
+    ).stdout
+    assert tree.startswith(f"160000 commit {head}")
 
 
 def test_capture_ignores_polluted_git_environment(

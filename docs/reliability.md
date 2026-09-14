@@ -53,16 +53,19 @@ fresh process-status snapshot, and continues the same journaled turn.
 
 Direct workspace writes and atomic multi-file patches record their pre-images in the runtime
 database before changing the checkout. A crash before the commit record restores those pre-images
-on the next launch. This protection complements the persistent edit journal used by `/undo` and
-`/redo`.
+on the next launch. Before rollback, the current contents and path metadata are saved in the session's
+`recovery/` directory, whose location is reported at startup. This preserves repairs made after the
+crash. If the backup cannot be saved, recovery stops before replacing that file. The persistent edit
+journal used by `/undo` and `/redo` retains the newest 20 turns in memory and across restarts.
 
 Git checkpoints are enabled by default. Noah captures them at turn boundaries and before mutating
 shell commands, stores them under `refs/noah-code/checkpoints/<session>/`, and keeps the newest 50
 by default. Capturing uses a temporary Git index and does not move `HEAD` or disturb the user's
-index. Capture is filter-free plumbing (`hash-object --no-filters` + `update-index --cacheinfo`),
+index. Capture batches filter-free hashing and index updates,
 so repository clean filters never execute during capture, and paths the permission engine
 classifies as secrets (`.env`, key stores, credential files) are never staged into checkpoint
-refs. Inspect and restore them with:
+refs. Restore also excludes these paths, preserving their current contents and index entries.
+Inspect and restore checkpoints with:
 
 ```text
 /checkpoints

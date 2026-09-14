@@ -23,6 +23,7 @@ SAFE_SLASH_WHILE_BUSY = frozenset(
         "context",
         "queue",
         "terminals",
+        "diff",
     }
 )
 

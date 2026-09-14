@@ -30,7 +30,13 @@ from noah_code.event_bridge import install_event_bridge
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.redaction import safe_error_message
 from noah_code.sessions import SessionEventRecord, SessionMeta, SessionStore
-from noah_code.steer import SAFE_SLASH_WHILE_BUSY, SteerItem, SteerQueue, expansion_failed
+from noah_code.steer import (
+    SAFE_SLASH_WHILE_BUSY,
+    STEER_QUEUE_CAP,
+    SteerItem,
+    SteerQueue,
+    expansion_failed,
+)
 from noah_code.telemetry import AgentTelemetry, setup_agent_telemetry
 from noah_code.themes import THEME_NAMES, get_theme
 from noah_code.ui.console import ConsoleUI
@@ -243,6 +249,7 @@ class AgentHost:
         self._mcp_errors: dict[str, str] = {}
         self._usage = UsageTracker()
         self.steer_queue = SteerQueue()
+        self.queue_paused = False
         self._wake_event = asyncio.Event()
         # Bounded poll interval for WAIT turns; re-checks job liveness each pass.
         self._wake_timeout_seconds = 30.0
@@ -377,7 +384,8 @@ class AgentHost:
             self.ui.render(
                 HostEvent(
                     HostEventKind.STATUS,
-                    f"recovered {len(recovered_files)} interrupted file operation(s)",
+                    f"recovered {len(recovered_files)} interrupted file operation(s); "
+                    f"displaced contents saved in {self._runtime.recovery_dir}",
                 )
             )
         if recovered_jobs:
@@ -394,11 +402,11 @@ class AgentHost:
                     f"expired {interrupted_interactions} interrupted interaction(s)",
                 )
             )
-        from noah_code.llm import reasoning_overrides, sampling_overrides
+        from noah_code.llm import reasoning_overrides
 
         client_kwargs: dict[str, Any] = {}
         if self._llm is None:
-            client_kwargs.update(sampling_overrides(self.config.sampling))
+            client_kwargs.update(self.config.sampling.overrides())
         llm = self._llm
         if llm is None:
             llm = await asyncio.to_thread(
@@ -469,8 +477,11 @@ class AgentHost:
             usage_tracker=self._usage,
             cache_namespace=f"noah:{self.meta.session_id}",
         )
-        # Restore snapshot if present.
+        # Legacy NOOA snapshots stored an empty list for these live agents.
+        # Keep the fresh instances, subscriptions and session artifact store.
+        summarizers = nooa_compat.summarizers(agent)
         restored = self._storage.restore_latest_snapshot(agent)
+        agent._summarizers = summarizers
         if restored:
             # Re-bind host-owned nosnapshot infrastructure after restore.
             agent._engine.load_session_rules(self.meta.permission_rules)
@@ -541,7 +552,12 @@ class AgentHost:
         self._agent = agent
 
         assert self._runtime is not None
-        for item in await asyncio.to_thread(self._runtime.pending_inbox):
+        queue_state = self._runtime.get_state("input_queue", {})
+        self.queue_paused = bool(queue_state.get("paused", False))
+        self._pending_attach_paths = [Path(path) for path in queue_state.get("attachments", [])]
+        pending = await asyncio.to_thread(self._runtime.pending_inbox)
+        order = {sequence: index for index, sequence in enumerate(queue_state.get("order", []))}
+        for item in sorted(pending, key=lambda item: order.get(item.sequence, len(order))):
             dropped = self.steer_queue.push_with_dropped(
                 item.text,
                 attach_paths=[Path(path) for path in item.attach_paths],
@@ -909,31 +925,46 @@ class AgentHost:
         return "\n".join(lines)
 
     async def diff_review(self) -> Any:
-        """Build a Git review model and enrich changed files with diagnostics."""
+        """List Git changes without waiting for individual patches or language servers."""
+        return await self.agent.git.review(eager=False)
 
-        review = await self.agent.git.review()
-        paths = list(dict.fromkeys(item.path for item in review.files))
-        diagnostics = await self.agent.lsp.diagnostics_for_paths(paths)
-        for item in review.files:
-            raw = diagnostics.get(item.path, "unavailable")
-            if raw.startswith("ok —"):
-                item.diagnostics = "clean"
-            elif raw.startswith("unavailable") or raw == "not supported":
-                item.diagnostics = raw
-            else:
-                issues = len([line for line in raw.splitlines() if line.strip()])
-                item.diagnostics = f"{issues} issue{'s' if issues != 1 else ''}"
-        return review
+    async def diff_review_file(self, item: Any) -> None:
+        await self.agent.git.review_file(item)
 
-    async def revert_diff_file(self, path: str, scope: str) -> str:
+    async def diff_diagnostics(self, item: Any) -> None:
+        """Editor diagnostics describe the current worktree, not executed test results."""
+        diagnostics = await self.agent.lsp.diagnostics_for_paths([item.path])
+        raw = diagnostics.get(item.path, "unavailable")
+        if raw.startswith("ok —"):
+            item.diagnostics = "clean"
+        elif raw.startswith("unavailable") or raw == "not supported":
+            item.diagnostics = raw
+        else:
+            issues = len([line for line in raw.splitlines() if line.strip()])
+            item.diagnostics = f"{issues} issue{'s' if issues != 1 else ''}"
+
+    def _require_review_idle(self) -> None:
+        if self._turn_running():
+            raise RuntimeError("Stop the active turn before reverting or undoing changes")
+
+    async def revert_diff_file(
+        self, path: str, scope: str, *, expected_revision: str | None = None
+    ) -> str:
         """Revert an explicitly confirmed review item as its own journal turn."""
 
+        self._require_review_idle()
+        self._active_turn = asyncio.current_task()
+        self.ui.set_busy(True)
         self.agent.journal.begin_turn()
         try:
-            result = await self.agent.git.revert(path, scope)
+            result = await self.agent.git.revert(path, scope, expected_revision=expected_revision)
         finally:
             self.agent.journal.end_turn()
-            await self._persist_async()
+            try:
+                await self._persist_async()
+            finally:
+                self._active_turn = None
+                self.ui.set_busy(False)
         return result
 
     def _undo_last_turn_state(self) -> str:
@@ -946,11 +977,25 @@ class AgentHost:
         return f"undid turn {undone.turn_id[:8]} ({len(undone.mutations)} files)"
 
     async def undo_last_turn_async(self) -> str:
-        status = await asyncio.to_thread(self._undo_last_turn_state)
-        # SQLiteStorageManager is thread-affine; only the filesystem-heavy undo
-        # runs in the worker, while snapshot persistence stays on this thread.
-        await self._persist_async()
-        return status
+        self._require_review_idle()
+        self._active_turn = asyncio.current_task()
+        self.ui.set_busy(True)
+        undo_task = asyncio.create_task(asyncio.to_thread(self._undo_last_turn_state))
+        try:
+            try:
+                status = await asyncio.shield(undo_task)
+            except asyncio.CancelledError:
+                # Cancellation cannot stop a filesystem worker. Keep the busy
+                # guard until it completes and persist its actual result.
+                await undo_task
+                await self._persist_async()
+                raise
+            # SQLite persistence remains on its owning event-loop thread.
+            await self._persist_async()
+            return status
+        finally:
+            self._active_turn = None
+            self.ui.set_busy(False)
 
     def _require_idle_turn(self) -> None:
         """Refuse session switches while a turn is still running."""
@@ -1429,8 +1474,12 @@ class AgentHost:
         )
 
     def cancel_active_turn(self) -> None:
-        """Cancel the in-flight turn and pending approvals (Ctrl-C)."""
-        self._clear_steer_state(drop_durable=True)
+        """Stop the current turn, preserving follow-ups for explicit resumption."""
+        self.queue_paused = True
+        try:
+            self._save_input_queue()
+        except Exception:
+            logger.warning("Could not persist the paused queue", exc_info=True)
         if self._agent is not None:
             self._agent.approvals.cancel_all()
         task = self._active_turn
@@ -1448,9 +1497,30 @@ class AgentHost:
                 if item.sequence is not None:
                     self._runtime.acknowledge_inbox(item.sequence, dropped=True)
         self._pending_attach_paths.clear()
+        self.queue_paused = False
+        if drop_durable:
+            self._save_input_queue()
+
+    def _save_input_queue(self) -> None:
+        if self._runtime is not None:
+            self._runtime.set_state("input_queue", {
+                "paused": self.queue_paused,
+                "attachments": [str(path) for path in self._pending_attach_paths],
+                "order": [item.sequence for item in self.steer_queue.items()],
+            })
+
+    def discard_queued_input(self) -> None:
+        """Explicitly discard waiting prompts and pending attachments."""
+        self._clear_steer_state(drop_durable=True)
+
+    def resume_queued_input(self) -> None:
+        self.queue_paused = False
+        self._save_input_queue()
+        self._wake_event.set()
 
     def take_pending_attaches(self) -> list[Path]:
         paths, self._pending_attach_paths = self._pending_attach_paths, []
+        self._save_input_queue()
         return paths
 
     def pending_attach_paths(self) -> tuple[Path, ...]:
@@ -1544,7 +1614,9 @@ class AgentHost:
     def remove_pending_attach(self, index: int) -> Path | None:
         if index < 0 or index >= len(self._pending_attach_paths):
             return None
-        return self._pending_attach_paths.pop(index)
+        path = self._pending_attach_paths.pop(index)
+        self._save_input_queue()
+        return path
 
     def remove_queued_steer(self, index: int) -> bool:
         item = self.steer_queue.remove(index)
@@ -1552,12 +1624,13 @@ class AgentHost:
             return False
         if self._runtime is not None and item.sequence is not None:
             self._runtime.acknowledge_inbox(item.sequence, dropped=True)
+        self._save_input_queue()
         return True
 
-    def recall_queued_steer(self) -> SteerItem | None:
-        """Move the newest queued prompt and its attachments back to the composer."""
+    def recall_queued_steer(self, index: int | None = None) -> SteerItem | None:
+        """Move a waiting prompt and its attachments back to the composer."""
 
-        item = self.steer_queue.pop_last()
+        item = self.steer_queue.pop_last() if index is None else self.steer_queue.remove(index)
         if item is None:
             return None
         if self._runtime is not None and item.sequence is not None:
@@ -1565,30 +1638,43 @@ class AgentHost:
         for path in item.attach_paths:
             if path not in self._pending_attach_paths:
                 self._pending_attach_paths.append(path)
+        self._save_input_queue()
         return item
 
     def move_queued_steer(self, index: int, delta: int) -> bool:
-        return self.steer_queue.move(index, delta)
+        moved = self.steer_queue.move(index, delta)
+        if moved:
+            self._save_input_queue()
+        return moved
 
     def enqueue_steer(self, text: str, attach_paths: list[Path] | None = None) -> bool:
         """Queue a follow-up for the current turn. Returns True if oldest dropped."""
 
-        paths = list(attach_paths or []) + self.take_pending_attaches()
+        paths = list(attach_paths or []) + self._pending_attach_paths
+        items = self.steer_queue.items()
         sequence = (
-            self._runtime.enqueue_inbox(text, paths or None)
+            self._runtime.enqueue_inbox(
+                text, paths or None,
+                input_state={
+                    "paused": self.queue_paused,
+                    "attachments": [],
+                    "order": [item.sequence for item in items[-(STEER_QUEUE_CAP - 1):]],
+                },
+                discard_sequence=items[0].sequence if len(items) >= STEER_QUEUE_CAP else None,
+            )
             if self._runtime is not None
             else None
         )
+        self._pending_attach_paths.clear()
         dropped_item = self.steer_queue.push_with_dropped(
             text,
             attach_paths=paths or None,
             sequence=sequence,
         )
         if dropped_item is not None:
-            if self._runtime is not None and dropped_item.sequence is not None:
-                self._runtime.acknowledge_inbox(dropped_item.sequence, dropped=True)
             self.ui.render(HostEvent(HostEventKind.STATUS, "steer dropped oldest"))
-        self._wake_event.set()
+        if not self.queue_paused:
+            self._wake_event.set()
         self.ui.set_status(self.status_prompt())
         return dropped_item is not None
 
@@ -1607,10 +1693,11 @@ class AgentHost:
                 self._runtime.latest_incomplete_run() if self._runtime is not None else None
             )
             run_id = continuable.run_id if continuable and continuable.state == "waiting_user" else None
+            attach_paths = self.take_pending_attaches()
             if run_id is None:
-                await self._run_user_turn(line)
+                await self._run_user_turn(line, attach_paths=attach_paths)
             else:
-                await self._run_user_turn(line, run_id=run_id)
+                await self._run_user_turn(line, run_id=run_id, attach_paths=attach_paths)
             return "continue"
         finally:
             self._active_turn = None
@@ -1668,6 +1755,7 @@ class AgentHost:
             if not path.is_absolute():
                 path = self.workspace.root / path
             self._pending_attach_paths.append(path)
+            self._save_input_queue()
             self.ui.render(HostEvent(HostEventKind.STATUS, f"attach queued · {path}"))
             return "handled"
         self.ui.render(
@@ -1955,9 +2043,24 @@ class AgentHost:
             self.ui.render(_command_output(self.work_status_text()))
             return "handled"
         if name == "queue":
+            if args.strip() == "discard":
+                self.discard_queued_input()
+            elif args.strip() == "resume":
+                self.resume_queued_input()
+                if not self._turn_running() and self.steer_queue.items():
+                    self.ui.set_busy(True)
+                    self._active_turn = asyncio.current_task()
+                    try:
+                        await self._run_user_turn(self.steer_queue.items()[0].text, queued=True)
+                    finally:
+                        self._active_turn = None
+                        self.ui.set_busy(False)
+                        self.ui.set_status(self.status_prompt())
+                    return "continue"
             queued = self.steer_queue.items()
             attached = self.pending_attach_paths()
-            lines = [f"Queued prompts: {len(queued)}", f"Pending attachments: {len(attached)}"]
+            state = "paused" if self.queue_paused else "waiting"
+            lines = [f"Queued prompts: {len(queued)} · {state}", f"Pending attachments: {len(attached)}"]
             for index, item in enumerate(queued, start=1):
                 preview = " ".join(item.text.split())[:80]
                 suffix = f" · {len(item.attach_paths)} file(s)" if item.attach_paths else ""
@@ -2054,11 +2157,10 @@ class AgentHost:
                 review = await self.diff_review()
                 if review.files:
                     lines = [
-                        f"Changes · {len(review.files)} views · +{review.additions} -{review.deletions}"
+                        f"Changes · {len(review.files)} views · select a file to load its patch"
                     ]
                     lines.extend(
-                        f"  {item.scope[0].upper()} {item.path} +{item.additions} -{item.deletions} "
-                        f"· {item.diagnostics}"
+                        f"  {item.scope[0].upper()} {item.path} · {item.status}"
                         for item in review.files
                     )
                     text = "\n".join(lines)
@@ -2233,12 +2335,12 @@ class AgentHost:
         return llm
 
     async def _switch_model(self, model: str, *, reasoning_effort: str | None = None) -> None:
-        from noah_code.llm import get_llm_client, reasoning_overrides, sampling_overrides
+        from noah_code.llm import get_llm_client, reasoning_overrides
 
         effort = reasoning_effort or (
             self.meta.reasoning_effort if self.meta else self.config.reasoning_effort
         )
-        client_kwargs = sampling_overrides(self.config.sampling)
+        client_kwargs = self.config.sampling.overrides()
         llm = await asyncio.to_thread(
             get_llm_client,
             model,
@@ -2289,6 +2391,8 @@ class AgentHost:
     def _apply_next_steer(self, agent: Any) -> bool:
         """Pop until one follow-up is queued. Returns False when the queue is empty."""
 
+        if self.queue_paused:
+            return False
         while True:
             item = self.steer_queue.pop()
             if item is None:
@@ -2349,6 +2453,7 @@ class AgentHost:
         attach_paths: list[Path] | None = None,
         run_id: str | None = None,
         recovery: bool = False,
+        queued: bool = False,
     ) -> HostResult:
         from nooa.interactive import RespondReason
 
@@ -2398,6 +2503,16 @@ class AgentHost:
                     "processes. Reinspect the workspace, check completed effects before repeating "
                     f"them, and continue the original request:\n\n{text}",
                 )
+            elif queued:
+                if not self._apply_next_steer(agent):
+                    exit_code = 1
+                    run_state = "failed"
+                    explanation = "No waiting prompt could be expanded"
+                    return HostResult(
+                        exit_code=exit_code,
+                        explanation=explanation,
+                        session_id=self.meta.session_id if self.meta else None,
+                    )
             else:
                 self._deliver_expanded(agent, self._expand_user_text(text, attach_paths))
 
@@ -2488,8 +2603,10 @@ class AgentHost:
                     exit_code = 130
                     run_state = "cancelled"
                     explanation = "cancelled"
-                    self._clear_steer_state(drop_durable=True)
-                    self.ui.render(HostEvent(HostEventKind.STATUS, "turn cancelled"))
+                    self.queue_paused = True
+                    with contextlib.suppress(Exception):
+                        self._save_input_queue()
+                    self.ui.render(HostEvent(HostEventKind.STATUS, "turn cancelled · queue paused"))
                     raise
                 except Exception as exc:
                     exit_code = 1

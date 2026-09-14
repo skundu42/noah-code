@@ -89,6 +89,7 @@ def _fake_host(tmp_path: Path):
     host.configure_provider = AsyncMock(return_value="provider configured")
     host._mcp_attached = set()
     host.steer_queue = SteerQueue()
+    host.queue_paused = False
     host._pending_attach_paths = []
     host.work_snapshot.return_value = {"agents": [], "jobs": []}
     host.context_snapshot.return_value = []
@@ -122,8 +123,8 @@ def _fake_host(tmp_path: Path):
     host.remove_queued_steer = lambda index: host.steer_queue.remove(index) is not None
     host.move_queued_steer = lambda index, delta: host.steer_queue.move(index, delta)
 
-    def recall_queued_steer():
-        item = host.steer_queue.pop_last()
+    def recall_queued_steer(index=None):
+        item = host.steer_queue.pop_last() if index is None else host.steer_queue.remove(index)
         if item is not None:
             host._pending_attach_paths.extend(item.attach_paths)
         return item
@@ -237,6 +238,7 @@ def test_git_status_parser_reports_branch_and_each_change_scope() -> None:
         staged=2,
         modified=2,
         untracked=1,
+        paths=("staged.py", "modified.py", "both.py", "new.py"),
     )
 
 
@@ -305,7 +307,8 @@ async def test_completed_mouse_selection_copies_and_clears_without_notice(
 
 
 @pytest.mark.asyncio
-async def test_copy_preserves_source_text_not_rendered_output(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mouse", [False, True])
+async def test_copy_preserves_source_text_not_rendered_output(tmp_path: Path, mouse: bool) -> None:
     """Copies must be byte-identical to what Noah wrote, not the rendered strips.
 
     Rendering mangles text: soft wraps become hard newlines, Markdown turns
@@ -340,7 +343,12 @@ async def test_copy_preserves_source_text_not_rendered_output(tmp_path: Path) ->
         )
 
         app.screen.selections = {transcript: SELECT_ALL}
-        await pilot.press("ctrl+shift+c")
+        if mouse:
+            app.screen.post_message(events.TextSelected())
+            await pilot.pause()
+            assert app.screen.selections == {}
+        else:
+            await pilot.press("ctrl+shift+c")
         # Byte-identical to the canonical transcript text (the pipeline
         # rstrips trailing newlines when journaling events).
         assert app.clipboard == message.rstrip()
@@ -808,7 +816,7 @@ async def test_active_context_rail_shows_semantic_tool_state_not_code(tmp_path: 
         await pilot.pause()
 
         rail = _rendered_text(app.query_one("#context-rail-content").content)
-        assert "Running\nBash pytest -q" in rail
+        assert "Now\nBash pytest -q" in rail
         assert "result = await" not in rail
 
         ui.render(
@@ -904,7 +912,7 @@ async def test_work_ledger_shows_agents_and_named_terminals(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_context_rail_prioritizes_changes_session_and_usage(
+async def test_context_rail_prioritizes_changes_and_keeps_metadata_in_header(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -933,13 +941,14 @@ async def test_context_rail_prioritizes_changes_session_and_usage(
             await pilot.pause()
 
         rail = _rendered_text(app.query_one("#context-rail-content").content)
-        assert "NOW" in rail
-        assert "CHANGES\nfeature/tui\n1 staged · 2 modified · 3 new" in rail
-        assert "SESSION" in rail
-        assert "MODEL\nfake-model" in rail
-        assert "USAGE\n12,000 in · 800 out" in rail
-        assert "75% cached · 4.2s model" in rail
-        assert "$0.1234 · 3 calls" in rail
+        assert "Now" in rail
+        assert "Changes\n1 staged · 2 modified · 3 new" in rail
+        assert "Ctrl+D review changes" in rail
+        assert "SESSION" not in rail and "USAGE" not in rail
+        header = _rendered_text(app.query_one("#header").content)
+        assert "fake-model" in header
+        footer = _rendered_text(app.query_one("#context-hint").content)
+        assert "↑12,000" in footer and "$0.1234" in footer
 
 
 @pytest.mark.asyncio
@@ -952,7 +961,7 @@ async def test_context_rail_finishes_non_git_status_probe(tmp_path: Path) -> Non
             await pilot.pause()
 
         rail = _rendered_text(app.query_one("#context-rail-content").content)
-        assert "CHANGES\nNot a Git worktree" in rail
+        assert "Changes\nNot a Git worktree" in rail
         assert "Reading Git status" not in rail
 
 
@@ -1341,7 +1350,8 @@ async def test_activity_drawer_replaces_busy_banner_without_cluttering_chat(
 
         banner = app.query_one("#working-banner")
         assert banner.styles.display == "none"
-        assert "queue follow-up" in _rendered_text(app.query_one("#context-hint").content)
+        assert "Enter queue" in _rendered_text(app.query_one("#context-hint").content)
+        assert "Ctrl+C stop" in _rendered_text(app.query_one("#context-hint").content)
         live = app.query_one("#live-activity")
         assert live.styles.display == "block"
         title = _rendered_text(app.query_one("#activity-title").content)
@@ -1370,7 +1380,7 @@ async def test_activity_drawer_replaces_busy_banner_without_cluttering_chat(
         ui.set_busy(False)
         await pilot.pause()
         assert banner.styles.display == "none"
-        assert "Shift+Enter newline" in _rendered_text(app.query_one("#context-hint").content)
+        assert "Enter send" in _rendered_text(app.query_one("#context-hint").content)
 
 
 @pytest.mark.asyncio
@@ -1472,6 +1482,9 @@ async def test_tui_paints_before_host_start_and_queues_first_prompt(tmp_path: Pa
         await pilot.press("enter")
         assert app._pending_submit == "Run after startup"
         host.handle_line.assert_not_awaited()
+        app._retry_startup_after_setup()
+        await pilot.pause()
+        host.start.assert_awaited_once()
 
         start_gate.set()
         for _ in range(40):
@@ -1482,7 +1495,10 @@ async def test_tui_paints_before_host_start_and_queues_first_prompt(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_first_run_opens_model_setup_before_starting_agent(tmp_path: Path) -> None:
+@pytest.mark.parametrize("queue_prompt", [False, True])
+async def test_first_run_opens_model_setup_before_starting_agent(
+    tmp_path: Path, queue_prompt: bool
+) -> None:
     host = _fake_host(tmp_path)
     host._agent = None
     host.meta = None
@@ -1522,6 +1538,20 @@ async def test_first_run_opens_model_setup_before_starting_agent(tmp_path: Path)
         assert "Connect one model provider" in _rendered_text(
             app.screen.query_one("#onboarding-lead").content
         )
+        if queue_prompt:
+            await pilot.press("escape")
+            await pilot.pause()
+            composer = app.query_one("#composer")
+            composer.text = "Run after setup"
+            await pilot.press("enter")
+            assert app._pending_submit == "Run after setup"
+            composer.text = "Preserve the first queued prompt"
+            await pilot.press("enter")
+            assert app._pending_submit == "Run after setup"
+            assert composer.text == "Preserve the first queued prompt"
+            composer.text = "/model"
+            await pilot.pause()
+            app.close_suggestions()
         await pilot.press("enter")
         for _ in range(20):
             if isinstance(app.screen, FilteredPicker):
@@ -1530,9 +1560,11 @@ async def test_first_run_opens_model_setup_before_starting_agent(tmp_path: Path)
         assert isinstance(app.screen, FilteredPicker)
         assert "MODEL SETUP" in app.screen.query_one("#picker-title").render().plain
         host.start.assert_not_awaited()
-        assert app.query_one("#welcome").styles.display == "block"
+        if not queue_prompt:
+            assert app.query_one("#welcome").styles.display == "block"
         rail = _rendered_text(app.query_one("#context-rail-content").content)
-        assert "Choose a model" in rail
+        if not queue_prompt:
+            assert "Choose a model" in rail
 
         await pilot.press("enter")
         await pilot.pause()
@@ -1548,16 +1580,23 @@ async def test_first_run_opens_model_setup_before_starting_agent(tmp_path: Path)
         await pilot.press("enter")
 
         for _ in range(40):
-            if app._agent_ready:
+            if app._agent_ready and (not queue_prompt or host.handle_line.await_count):
                 break
             await pilot.pause()
         assert app._agent_ready is True
         host.start.assert_awaited_once()
-        assert app.query_one("#welcome").styles.display == "block"
+        app._retry_startup_after_setup()
+        await pilot.pause()
+        host.start.assert_awaited_once()
+        assert app._pending_submit is None
+        if queue_prompt:
+            host.handle_line.assert_awaited_once_with("Run after setup")
+        else:
+            assert app.query_one("#welcome").styles.display == "block"
 
 
 @pytest.mark.asyncio
-async def test_available_update_uses_temporary_banner_and_persistent_rail(
+async def test_available_update_uses_temporary_banner_and_persistent_details(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1577,9 +1616,9 @@ async def test_available_update_uses_temporary_banner_and_persistent_rail(
         assert banner.styles.display == "block"
         assert "0.2.1 → 0.3.0" in _rendered_text(banner.content)
         assert "noah update" in _rendered_text(banner.content)
-        rail = _rendered_text(app.query_one("#context-rail-content").content)
-        assert "UPDATE" in rail
-        assert "0.2.1 → 0.3.0" in rail
+        app._hide_notice()
+        assert "0.3.0" in app._last_notice_detail
+        assert "noah update" in app._last_notice_detail
 
 
 @pytest.mark.asyncio
@@ -1628,7 +1667,7 @@ async def test_shift_enter_inserts_newline_without_submitting(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_tab_toggles_between_build_and_plan_modes(tmp_path: Path) -> None:
+async def test_ctrl_b_toggles_between_build_and_plan_modes(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
 
     async def _handle(line: str) -> str:
@@ -1641,7 +1680,7 @@ async def test_tab_toggles_between_build_and_plan_modes(tmp_path: Path) -> None:
         composer = app.query_one("#composer")
         composer.text = "Keep this draft"
 
-        await pilot.press("tab")
+        await pilot.press("ctrl+b")
         for _ in range(40):
             if host.handle_line.await_count:
                 break
@@ -1651,7 +1690,7 @@ async def test_tab_toggles_between_build_and_plan_modes(tmp_path: Path) -> None:
         assert composer.text == "Keep this draft"
 
         host.handle_line.reset_mock()
-        await pilot.press("tab")
+        await pilot.press("ctrl+b")
         for _ in range(40):
             if host.handle_line.await_count:
                 break
@@ -2003,7 +2042,7 @@ async def test_model_and_reasoning_shortcuts_preserve_composer_draft(tmp_path: P
         await pilot.pause()
         assert composer.text == "Keep this draft"
 
-        await pilot.press("shift+tab")
+        await pilot.press("alt+e")
         await pilot.pause()
         assert isinstance(app.screen, FilteredPicker)
         assert "REASONING EFFORT" in app.screen.query_one("#picker-title").render().plain
@@ -2025,13 +2064,13 @@ async def test_setup_shortcuts_explain_unavailable_states(tmp_path: Path) -> Non
         notice = _rendered_text(app.query_one("#notice-banner").content)
         assert "Finish or cancel the active turn" in notice
 
-        await pilot.press("shift+tab")
+        await pilot.press("alt+e")
         await pilot.pause()
         assert "before changing reasoning effort" in app._last_notice_detail
 
         ui.set_busy(False)
         app._agent_ready = False
-        await pilot.press("shift+tab")
+        await pilot.press("alt+e")
         await pilot.pause()
         notice = _rendered_text(app.query_one("#notice-banner").content)
         assert "Choose a model" in notice
@@ -2069,7 +2108,7 @@ async def test_model_setup_recovers_a_missing_credential_startup_failure(tmp_pat
 
     async with app.run_test() as pilot:
         for _ in range(20):
-            if app._phase == "startup failed":
+            if app._agent_state == AgentDisplayState.ERROR:
                 break
             await pilot.pause()
         banner = app.query_one("#notice-banner")
@@ -2110,7 +2149,8 @@ async def test_model_setup_recovers_a_missing_credential_startup_failure(tmp_pat
     [
         ((80, 24), False, True),
         ((109, 30), False, False),
-        ((110, 30), True, False),
+        ((110, 30), False, False),
+        ((128, 30), True, False),
         ((140, 40), True, False),
     ],
 )
@@ -2134,8 +2174,12 @@ async def test_context_rail_is_keyboard_scrollable(tmp_path: Path) -> None:
     host.agent.todos.list_todos.return_value = [
         SimpleNamespace(status="open", title=f"Task {index}") for index in range(8)
     ]
+    host.work_snapshot.return_value = {
+        "agents": [{"state": "running", "agent": "reviewer"}],
+        "jobs": [{"state": "running", "name": "tests"}],
+    }
     app = NoahCodeApp(host, TextualUI())
-    async with app.run_test(size=(120, 24)) as pilot:
+    async with app.run_test(size=(140, 24)) as pilot:
         rail = app.query_one("#context-rail")
         assert rail.max_scroll_y > 0
 
@@ -2163,7 +2207,9 @@ def test_completed_activity_label_keeps_file_paths() -> None:
     assert _completed_activity_label("Bash pytest -q", failed=False) == "✓ Bash pytest -q"
     assert _completed_activity_label("Think", failed=False) is None
     assert _completed_activity_label("Preparing", failed=False) is None
-    assert _completed_activity_label("Read src/parser.py", failed=True) is None
+    assert _completed_activity_label("Read src/parser.py", failed=True) == (
+        "✗ Read src/parser.py · failed · F2 details"
+    )
 
 
 def test_consecutive_file_activity_compacts_into_one_line() -> None:
@@ -2796,10 +2842,12 @@ async def test_alt_up_recalls_newest_queued_prompt_with_attachments(tmp_path: Pa
         await pilot.press("alt+up")
         await pilot.pause()
 
-        assert composer.text == "edit this prompt"
-        assert [item.text for item in host.steer_queue.items()] == ["keep queued"]
+        assert composer.text == "keep queued"
+        assert not host.steer_queue.items()
         notice = _rendered_text(app.query_one("#notice-banner").content)
-        assert "Clear the composer" in notice
+        assert "Draft saved" in notice
+        await pilot.press("alt+z")
+        assert composer.text == "edit this prompt"
 
 
 @pytest.mark.asyncio

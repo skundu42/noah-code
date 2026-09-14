@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from noah_code.snapshots import JOURNAL_MAX_TURNS
 from noah_code.workspace import Workspace
 from noah_code.worktree import family_id, infer_worktree_name, repo_id_for, worktree_storage_root
 
@@ -25,11 +26,6 @@ if TYPE_CHECKING:
 
 class SessionError(RuntimeError):
     """Session load/create failure."""
-
-
-# Undo-journal sidecars keep the most recent turns only; meta.json stays small
-# and fast to rewrite on every turn end.
-JOURNAL_SIDECAR_MAX_TURNS = 20
 
 
 @dataclass(frozen=True)
@@ -178,8 +174,8 @@ class SessionStore:
         """Persist the undo journal sidecar with bounded retention."""
 
         pruned = {
-            "turns": list(data.get("turns", []))[-JOURNAL_SIDECAR_MAX_TURNS:],
-            "redo": list(data.get("redo", []))[-JOURNAL_SIDECAR_MAX_TURNS:],
+            "turns": list(data.get("turns", []))[-JOURNAL_MAX_TURNS:],
+            "redo": list(data.get("redo", []))[-JOURNAL_MAX_TURNS:],
         }
         self._atomic_write_json(
             self._journal_path(session_id), json.dumps(pruned, indent=1)

@@ -5,8 +5,11 @@
 | Key | Action |
 |-----|--------|
 | `Enter` | Send the current message, or queue a follow-up while a turn is running |
-| `Shift+Enter` | Insert a newline without sending |
-| `Tab` | Toggle `build`/`plan` mode; accept the highlighted slash option while suggestions are open |
+| `Shift+Enter` or `Ctrl+J` | Insert a newline without sending |
+| `Alt+Enter` | Expand or collapse the composer |
+| `Alt+Z` | Restore the draft saved before a palette or history selection |
+| `Tab` / `Shift+Tab` | Move focus forward/back; Tab completes an open suggestion |
+| `Ctrl+B` | Switch between build and plan mode |
 | `Ctrl+P` | Open the command palette |
 | `Ctrl+G` | Open the searchable skills picker |
 | `Ctrl+L` | Open the model picker |
@@ -14,34 +17,43 @@
 | `Ctrl+R` | Search prior prompts and recall one into the composer |
 | `Ctrl+T` | Expand or collapse live tool output |
 | `Alt+Up` | Recall the newest queued prompt into the composer |
-| `Shift+Tab` | Open the reasoning-effort picker |
+| `Alt+E` | Open the reasoning-effort picker |
+| `Ctrl+D` | Review changed files, including while work is running |
 | `Ctrl+N` | Start a new session |
-| `Ctrl+C` | Cancel the active turn and clear queued follow-ups; press twice while idle to quit |
+| `Ctrl+C` | Stop the active turn and pause queued follow-ups, keeping attachments; press twice while idle to quit |
 | `Ctrl+Q` | Quit |
 | `F1` or `?` | Show help |
-| `F2` | Open recent activity and full captured output |
-| `F3` | Open paginated persisted conversation history |
+| `F2` | Search recent activity and inspect captured output |
+| `F3` | Search loaded conversation history; Ctrl+Home loads older messages |
 | `F4` | Open the live work ledger for agents, terminals, and background jobs |
+| `F5` | Manage queued prompts: E edit, R resume, X discard all |
+| `F6` | Inspect the latest notice or error |
+| `F7` | Inspect context sources |
+| `F8` | Show or hide the sidebar |
 | `Shift+F7` | Focus or leave the context rail on wide terminals |
 | `Ctrl+]` | Return to live transcript output and clear the new-output counter |
 
 At an approval prompt, press `1` to approve once, `2` to remember the approval for the current
-session, or `3`/`Esc` to reject it.
+session, or `3`/`Esc` to reject it. The dialog explains the matching scope and keeps the
+full target scrollable. Question cards accept numbered choices and show question progress;
+`Esc` skips that question.
 
 The TUI uses Atom One Dark by default and also includes Noah Ocean, Graphite, and High Contrast.
-Switch and persist the active palette with `/theme`. Its conversation-first layout adapts to
-terminal size. At 110 columns or wider, a change-ledger rail prioritizes the current action, Git
-branch and staged/modified/new counts, session, model usage, and up to six open or blocked todos.
-Narrow terminals retain the transcript, live activity, suggestions, and composer without the rail.
-Terminals 25 rows high or shorter use compact spacing.
+Switch and persist the active palette with `/theme`; dialogs and tool output use the same
+semantic colors. The sidebar appears automatically at 128 columns and 24 rows or larger,
+prioritizing the current action, changed filenames, and the active plan. Empty work sections
+stay hidden. `F8` toggles the sidebar and remembers that choice for the app run; below 100
+columns it stays hidden. Narrow terminals keep the full conversation width. Terminals 25
+rows high or shorter use compact spacing. Model and mode remain in the header; `/status`,
+`/tokens`, and the existing inspectors provide full metadata.
 
-The line below the composer keeps the active keyboard guidance on the left and, when space permits,
+The line below the composer keeps clickable, focused-pane keyboard guidance on the left and, when space permits,
 session input/output tokens, cache hit rate, and estimated cost on the right. This telemetry remains
 available even when the wide context rail is hidden.
 
 Live tool output stays in a compact two-line drawer so long commands do not push the conversation
-away. Press `Ctrl+T` to expand the drawer in place; `F2` retains the complete output after the tool
-finishes. The drawer replaces the animated working banner while a visible tool is active, avoiding
+away. Press `Ctrl+T` to expand the drawer in place; `F2` retains bounded captured output after the tool
+finishes, explicitly marking omitted middle output when the capture limit is reached. The drawer replaces the animated working banner while a visible tool is active, avoiding
 duplicate status lines; the banner returns between tools.
 
 Type `/` in the composer to open the inline command list; the list remains visible and filters
@@ -50,14 +62,18 @@ close the list. Press `Enter` again to run the completed command. Typing `/confi
 to every resolved configuration path and its current redacted value.
 
 Press `Ctrl+R` to search prompts already shown in the current session. Choosing one loads it into
-the composer without sending it; pressing `Esc` keeps the current draft unchanged.
+the composer without sending it and saves the displaced draft for `Alt+Z`. Palette choices
+use the same draft protection; skill selections insert at the cursor. Pressing `Esc` leaves
+the current draft unchanged. Commands blocked while busy remain editable.
 
-Until a session has its first user prompt, the main pane keeps the large Noah wordmark centered. Startup,
-repository changes, model, mode, usage, and update state live in the context rail on wide
-terminals. The rail scrolls when its sections exceed the available rows; press `Shift+F7`, then use
-arrows, Page Up/Down, Home, or End without leaving the keyboard. Git status is collected in a
-background worker at startup and turn boundaries; the animated Noah path updates only the working
-banner and live activity. Existing sessions with user history restore their transcript normally.
+Until a session has its first user prompt, the main pane keeps the Noah wordmark centered.
+The sidebar scrolls when needed; press Tab to focus it or use `Shift+F7`, then arrows,
+Page Up/Down, Home, or End. Git status is collected in a background worker at startup and
+turn boundaries, and every five seconds while working with the sidebar visible. Existing
+sessions restore their recent transcript. F3 preserves reading position when older pages
+load; its search covers the messages loaded so far. F2 searches captured action labels,
+commands, results, and output. Failed tool attempts remain visible in the conversation
+with an F2 details hint.
 
 Drag across transcript, activity, diff, or history text to select it. `Cmd+C` on macOS or
 `Ctrl+Shift+C` in other terminals copies the selection; when there is no selection, the same
@@ -85,15 +101,18 @@ The queue holds at most 100 items. A 101st `Enter` drops the oldest and status-p
 `steer dropped oldest`. `@path` mentions and `/attach` paths expand when the item is injected, not
 when it is queued. A follow-up that names files Noah cannot resolve is dropped; later items stay.
 Sequenced items are persisted in the session runtime database, so an unexpected process exit does
-not lose them. `Ctrl+C` cancels the turn and clears the queue. Switching or starting a session also
-clears it.
+not lose them. `Ctrl+C` stops the current turn and pauses delivery, keeping queued prompts
+and pending attachments. Pause state, order, and attachments survive reopening the session.
+F5 lets you edit a selected prompt, resume delivery with R, or explicitly discard everything
+with X. Switching or starting a session clears the active queue; durable state belongs to
+its originating session.
 
 Approval and `ask.question` modals keep the composer. Queueing resumes after the modal closes.
 
 These slash commands still run while a turn is in progress: `/status`, `/tokens`, `/todos`,
-`/health`, `/help`, `/trace`, `/work`, and `/terminals`. `/attach PATH` remembers the file for the next queued follow-up.
-`/exit` cancels the turn (and the queue) then leaves. Mutating commands wait until the turn
-finishes, including `/undo`, `/redo`, `/mode`, `/model`, `/diff`, `/new`, `/sessions`, `/worktree`,
+`/health`, `/help`, `/trace`, `/work`, `/diff`, and `/terminals`. `/attach PATH` remembers the file for the next queued follow-up.
+`/exit` stops the turn and leaves with queued input preserved. Mutating commands wait until the turn
+finishes, including `/undo`, `/redo`, `/mode`, `/model`, `/new`, `/sessions`, `/worktree`,
 `/pr`, `/plan`, `/memory`, and `/compact`.
 
 Tool and shell output is batched into a live execution panel instead of forcing one full-screen
@@ -103,6 +122,23 @@ the tool finishes, the panel collapses to one transcript line such as `✓ Read 
 Consecutive reads or writes merge into a single line (`✓ Read a.py, b.py +1`) so the chat stays
 compact. `F2` retains the latest 100 activity records, bounded by the configured
 `max_output_chars` per activity.
+
+
+### Reviewing results
+
+`Ctrl+D` or `/diff` opens the changed-file list first. Patches and editor diagnostics load
+when selected, with separate capture timestamps; Ctrl+R refreshes the list. Review is
+available during a run, with revert and undo disabled until work is idle. Type `/` to
+filter filenames, J/K to change files, N/P to move between hunks, V to toggle editor
+diagnostics, and O to open the selected
+file using `$VISUAL` or `$EDITOR` (falling back to `vi`). Large patch previews explicitly
+state when truncated. Editor diagnostics describe the current worktree, including when
+viewing staged changes.
+
+Completion receipts show recorded check commands and their actual exit statuses, separate
+from editor diagnostics. They include observable changed-file counts and advertise journal
+undo only when its preflight succeeds. When results are unavailable, the receipt says so;
+compound shell expressions are not treated as individual passing test commands.
 
 ## Built-in slash commands
 
