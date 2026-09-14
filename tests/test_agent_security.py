@@ -12,6 +12,8 @@ from types import SimpleNamespace
 import pytest
 from nooa.runtime.restrictions import RestrictionsConfig
 from nooa.runtime.sandbox.config import SandboxConfig
+from nooa.runtime.sandbox.errors import SandboxExecutionError
+from nooa.runtime.sandbox.serialization import effective_error_limit
 
 from noah_code.agent import (
     _codeact_config,
@@ -75,6 +77,7 @@ def test_sandbox_broker_exposes_only_permission_gated_capabilities() -> None:
 @pytest.mark.asyncio
 async def test_sandbox_cannot_call_the_host_only_readonly_runner() -> None:
     executor = object.__new__(_PermissionSandboxedExecutor)
+    executor._max_error = effective_error_limit(None)
     executor._agent = SimpleNamespace(
         ws=SimpleNamespace(run_trusted_readonly=lambda _command: "private host data")
     )
@@ -125,8 +128,10 @@ async def test_macos_sandbox_blocks_unbrokered_file_and_network_access() -> None
 
     assert safe.stdout.strip() == "2"
     assert safe.error is None
-    assert isinstance(blocked_file.error, PermissionError)
-    assert isinstance(blocked_network.error, PermissionError)
+    for blocked in (blocked_file, blocked_network):
+        assert isinstance(blocked.error, SandboxExecutionError)
+        assert blocked.error.original_type == "PermissionError"
+        assert isinstance(blocked.error.original_error, PermissionError)
 
 
 def test_spawn_safe_local_agent_drops_instance_file_descriptors() -> None:

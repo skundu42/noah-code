@@ -343,7 +343,7 @@ class WorkspaceTools(Skill):
         with resolved.open(encoding="utf-8") as stream:
             content = stream.read()
         total = len(content.splitlines(keepends=True))
-        return WorkspaceMatch(str(resolved), 1, total, content)
+        return WorkspaceMatch(str(resolved), 1, total, content, resolved_path=resolved)
 
     @staticmethod
     def _read_line_range(resolved: Path, lines: tuple[int, int]) -> WorkspaceMatch:
@@ -363,7 +363,7 @@ class WorkspaceTools(Skill):
             else:
                 # The file ended before the range did; clamp like a full read.
                 end = min(end, last)
-        return WorkspaceMatch(str(resolved), start, end, "".join(collected))
+        return WorkspaceMatch(str(resolved), start, end, "".join(collected), resolved_path=resolved)
 
     async def search(
         self,
@@ -1322,7 +1322,9 @@ class WorkspaceTools(Skill):
             if not candidate.is_absolute():
                 candidate = (base / candidate).resolve()
             rewritten.append(
-                WorkspaceMatch(str(candidate), match.start, match.end, match.text)
+                WorkspaceMatch(
+                    str(candidate), match.start, match.end, match.text, resolved_path=candidate
+                )
             )
         result.matches = rewritten
 

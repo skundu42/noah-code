@@ -17,10 +17,14 @@ from typing import Annotated, Any, Literal
 
 from nooa import Agent, Context, hidden, strategy
 from nooa.config import CodeActConfig, PredictConfig
+from nooa.context_blocks import RenderedMessage, ResolvedBlock, Role, ToolCallEvent
 from nooa.interactive import InteractiveAgent, RespondReason, RespondResult
+from nooa.runtime.channels import Channel
 from nooa.runtime.restrictions import RESTRICTED_MODULES, RestrictionsConfig
 from nooa.runtime.sandbox.config import FileRule, SandboxConfig, resolve_spec
 from nooa.runtime.sandbox.executor import SandboxedExecutor
+from nooa.runtime.sandbox.serialization import effective_error_limit
+from nooa.storage.markers import nosnapshot
 from nooa.strategies import CodeActStrategy
 from nooa.strategies.codeact_lite import PlainCodeActBlockFormatter
 from nooa.tools import TodoManager
@@ -284,6 +288,8 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
         cell_timeout: float | None,
         framework_builtins: dict[str, Any] | None = None,
         restrictions: Any = None,
+        max_error: int | None = None,
+        error_tail: int | None = None,
     ) -> None:
         # NOOA probes specifically for Linux Landlock/seccomp. Preserve
         # its worker and broker implementation, but install equivalent native
@@ -301,6 +307,8 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
         self._cell_timeout = cell_timeout
         self._framework_builtins = framework_builtins or {}
         self._restrictions = restrictions
+        self._max_error = effective_error_limit(max_error)
+        self._error_tail = error_tail
         self._spec = resolve_spec(worker_config)
         self._degraded: list[str] = []
         # Forking a multithreaded Textual process can deadlock in inherited
@@ -347,6 +355,8 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
                     ),
                     "restrictions": self._restrictions,
                     "spec": self._spec,
+                    "max_error": self._max_error,
+                    "error_tail": self._error_tail,
                 }
             )
         except Exception:
@@ -580,7 +590,29 @@ class _PermissionCodeActStrategy(CodeActStrategy):
             cell_timeout=self.config.cell_timeout,
             framework_builtins=framework_builtins,
             restrictions=self.config.restrictions,
+            max_error=runtime.truncation_config.capture.max_error,
+            error_tail=runtime.truncation_config.capture.tail,
         )
+
+
+class _ReasoningPlainCodeActBlockFormatter(PlainCodeActBlockFormatter):
+    """Retain opaque reasoning state omitted by NOOA 0.0.10's plain formatter."""
+
+    def format(self, blocks: list[ResolvedBlock]) -> list[RenderedMessage]:
+        messages = super().format(blocks)
+        # Plain formatting preserves event order; IDs may repeat across turns.
+        reasoning_items = iter(
+            block.event.reasoning_items
+            for block in blocks
+            if block.role not in (Role.SYSTEM, Role.RUNTIME_EVENT)
+            and isinstance(block.event, ToolCallEvent)
+        )
+        for index, message in enumerate(messages):
+            if message.tool_call is not None:
+                reasoning = next(reasoning_items)
+                if reasoning:
+                    messages[index] = message.model_copy(update={"reasoning_items": reasoning})
+        return messages
 
 
 class _LeanPermissionCodeActStrategy(_PermissionCodeActStrategy):
@@ -594,7 +626,9 @@ class _LeanPermissionCodeActStrategy(_PermissionCodeActStrategy):
         original = runtime.agent.render_config
         event_format = nooa_compat.truncation_event_format(runtime.agent)
         runtime.agent.render_config = original.model_copy(
-            update={"block_formatter": PlainCodeActBlockFormatter(event_format=event_format)}
+            update={
+                "block_formatter": _ReasoningPlainCodeActBlockFormatter(event_format=event_format)
+            }
         )
         try:
             return await super().execute(runtime, call)
@@ -630,6 +664,7 @@ class CodingAgent(InteractiveAgent):
 
     workspace_root: str = "."
     mode: Literal["build", "plan"] = "build"
+    _system_messages_in: Annotated[Channel, hidden, nosnapshot]
 
     def __init__(
         self,
@@ -656,6 +691,7 @@ class CodingAgent(InteractiveAgent):
 
         llm = wrap_conversational_replies(llm)
         super().__init__(llm=llm, storage=storage, **kwargs)
+        self._system_messages_in = self.queue_manager.queue("system_messages")
         if cache_namespace:
             # NOOA derives prompt_cache_key from this id. A durable Noah
             # session therefore keeps provider cache affinity across restart.

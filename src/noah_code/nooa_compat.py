@@ -1,7 +1,7 @@
 """Single seam for NOOA internals that have no public API yet.
 
 Every private-attribute reach-through into the framework lives here so an
-upgrade only requires auditing this one module. Pinned upstream: nooa==0.0.9.
+upgrade only requires auditing this one module. Pinned upstream: nooa==0.0.10.
 """
 
 from __future__ import annotations

@@ -1021,7 +1021,7 @@ wheels = [
 
 [[package]]
 name = "noah-code"
-version = "0.5.0"
+version = "0.5.1"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -1058,10 +1058,10 @@ requires-dist = [
     { name = "click", specifier = ">=8.1.0,<9.0.0" },
     { name = "litellm", specifier = ">=1.96.0,<1.99.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=2.3.1" },
-    { name = "nooa", specifier = "==0.0.9" },
-    { name = "nooa", extras = ["mcp"], marker = "extra == 'mcp'", specifier = "==0.0.9" },
-    { name = "nooa", extras = ["tracing"], marker = "extra == 'tracing'", specifier = "==0.0.9" },
-    { name = "nooa-cli", specifier = "==0.0.9" },
+    { name = "nooa", specifier = "==0.0.10" },
+    { name = "nooa", extras = ["mcp"], marker = "extra == 'mcp'", specifier = "==0.0.10" },
+    { name = "nooa", extras = ["tracing"], marker = "extra == 'tracing'", specifier = "==0.0.10" },
+    { name = "nooa-cli", specifier = "==0.0.10" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'tracing'", specifier = ">=1.44.0,<2.0.0" },
     { name = "packaging", specifier = ">=24.0,<27.0" },
     { name = "pydantic", specifier = ">=2.5.0,<3.0.0" },
@@ -1079,7 +1079,7 @@ provides-extras = ["dev", "mcp", "tracing"]
 
 [[package]]
 name = "nooa"
-version = "0.0.9"
+version = "0.0.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -1087,9 +1087,9 @@ dependencies = [
     { name = "openinference-instrumentation-litellm" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/34/6f/c4e3ea70b373f72f98c12d23fd61f8525462bcecb4a969b58fbb67092699/nooa-0.0.9.tar.gz", hash = "sha256:c7a90ffb5b54094180efcb845e74a00c4182766745245f4258e613f9c12cb522", size = 3315964, upload-time = "2026-08-18T15:00:15.26Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/27/90/f07e44b57d10e3687caba9b18a1b2064e7c9602f85fdeb9c9b0a4843aeba/nooa-0.0.10.tar.gz", hash = "sha256:91d44a48610b116561d2ddc42ed80a7c4011c7324a67236300d2fe78182d3c78", size = 3504802, upload-time = "2026-09-04T06:04:36.719Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ae/27/11b2754bc31994244418d0a55447f20bc0efbd9d2573802db13c7ca367b5/nooa-0.0.9-py3-none-any.whl", hash = "sha256:60b64663f34a47aec206137035d62e816c1147484bb74a8a4700a47d1a10b60c", size = 1104654, upload-time = "2026-08-18T15:00:13.588Z" },
+    { url = "https://files.pythonhosted.org/packages/02/84/ec56e26a39873862f046146bf677b1d259e7e923180f508747baa1076ed9/nooa-0.0.10-py3-none-any.whl", hash = "sha256:8a74d3e62bb4a216d6fcb1ba912b5d9e49ecc0bf8c2d685f808594a816cbe4ca", size = 1123235, upload-time = "2026-09-04T06:04:38.491Z" },
 ]
 
 [package.optional-dependencies]
@@ -1106,16 +1106,16 @@ tracing = [
 
 [[package]]
 name = "nooa-cli"
-version = "0.0.9"
+version = "0.0.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "nooa" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/41/0b/ab13465d13cfa6b29e1521e672ea44e02a70ebd4977df7c2b4ed34f0d038/nooa_cli-0.0.9.tar.gz", hash = "sha256:5bc45f6328fd4cb02531278db1779f51a83f3b8e631cba818caf133f3631e4c8", size = 68335, upload-time = "2026-08-18T14:59:30.3Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/36/c6/d1e555b461b508cf43b9c8ba55f3359dc94fbcbda231013c101ef5543297/nooa_cli-0.0.10.tar.gz", hash = "sha256:845d029afaed26166ca16ed15bfa69308703aac7aefc6afece5cddfa47ecbf6e", size = 89911, upload-time = "2026-09-04T06:04:33.448Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8a/34/9acdbac505979b0f765288db9272b10205674240689a9a3901d535412d38/nooa_cli-0.0.9-py3-none-any.whl", hash = "sha256:e8fad7b7a1601c9d7206c8d92c3cabeca2539af96c7e75923261b096a3616b09", size = 72613, upload-time = "2026-08-18T14:59:29.324Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/cd/c9a53e62e08394b30f0f2de466f6d61b2ab66b32de0be1e23be2ff9ffbfa/nooa_cli-0.0.10-py3-none-any.whl", hash = "sha256:0a9414898f12c51797b0ba2cf8ece97899dcf30e684690d72b54cceac6afdb4e", size = 86303, upload-time = "2026-09-04T06:04:34.245Z" },
 ]
 
 [[package]]
