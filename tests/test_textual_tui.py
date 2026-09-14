@@ -2291,7 +2291,11 @@ async def test_live_tool_output_stays_compact_until_expanded(tmp_path: Path) -> 
                 meta={"activity_id": "tool-1", "stream": "stdout"},
             )
         )
-        await pilot.pause(0.08)
+        # Stream output flushes on a separate timer after host events drain.
+        output = app.query_one("#activity-output")
+        async with asyncio.timeout(5):
+            while "five" not in _log_text(output):
+                await pilot.pause()
 
         live = app.query_one("#live-activity")
         assert live.styles.height.value == 6
