@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import os
 import sys
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -20,7 +23,8 @@ from noah_code.config import (
     save_user_reasoning_effort,
     user_default_model,
 )
-from noah_code.host import AgentHost
+from noah_code.host import AgentHost, HostResult
+from noah_code.redaction import safe_error_message
 from noah_code.sessions import SessionError, SessionStore
 from noah_code.ui.console import ConsoleUI
 from noah_code.updates import (
@@ -192,6 +196,7 @@ def cli_group() -> None:
 @click.argument("path", required=False, type=click.Path())
 @_common_options
 @click.option("--session", "session_id", default=None)
+@click.option("--json", "json_output", is_flag=True, help="Print one JSON outcome; send progress to stderr")
 def run_cmd(
     prompt: str,
     path: str | None,
@@ -203,6 +208,7 @@ def run_cmd(
     max_iterations: int | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
+    json_output: bool,
 ) -> None:
     """Run one coding task without opening the interactive interface."""
     code = _run_async(
@@ -217,6 +223,7 @@ def run_cmd(
             max_iterations=max_iterations,
             session_id=session_id,
             unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
+            json_output=json_output,
         )
     )
     raise SystemExit(code)
@@ -995,46 +1002,61 @@ async def _run_session(
     max_iterations: int | None,
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
+    json_output: bool = False,
 ) -> int:
     """Run one task through the normal host without automation-only adapters."""
 
-    prepared, code = await _prepare(
-        path=path,
-        model=model,
-        reasoning_effort=reasoning_effort,
-        auto=auto,
-        yolo=yolo,
-        mode=mode,
-        max_iterations=max_iterations,
-        session_id=session_id,
-        frontend="console",
-        unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
-        allow_auto_install=False,
-    )
-    if prepared is None:
-        return code
-    workspace, config, store, meta = prepared
-    host = AgentHost(
-        workspace,
-        config,
-        session_meta=meta,
-        store=store,
-        ui=ConsoleUI(markdown=config.ui.markdown),
-    )
-    try:
-        result = await host.run_once(prompt)
-        return result.exit_code
-    except KeyboardInterrupt:
-        host.cancel_active_turn()
-        return EXIT_SIGINT
-    except Exception as exc:  # noqa: BLE001 - keep one-shot failures concise
-        from noah_code.redaction import safe_error_message
-
-        click.echo(f"error: {safe_error_message(exc)}", err=True)
-        return EXIT_AGENT
-    finally:
-        # Startup can fail before run_once reaches its own cleanup block.
-        await host.close()
+    host: AgentHost | None = None
+    # Some provider libraries print directly; stdout stays machine-readable.
+    with contextlib.redirect_stdout(sys.stderr) if json_output else contextlib.nullcontext():
+        try:
+            prepared, code = await _prepare(
+                path=path,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                auto=auto,
+                yolo=yolo,
+                mode=mode,
+                max_iterations=max_iterations,
+                session_id=session_id,
+                frontend="console",
+                unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
+                allow_auto_install=False,
+            )
+            if prepared is None:
+                result = HostResult(
+                    code, "Could not prepare the task; see stderr for details.",
+                    session_id, status="failed",
+                )
+            else:
+                workspace, config, store, meta = prepared
+                host = AgentHost(
+                    workspace, config, session_meta=meta, store=store,
+                    ui=ConsoleUI(markdown=config.ui.markdown),
+                )
+                try:
+                    result = await host.run_once(prompt)
+                finally:
+                    # Startup can fail before run_once reaches its cleanup block.
+                    await host.close()
+        except (Exception, asyncio.CancelledError, KeyboardInterrupt) as exc:
+            cancelled = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt))
+            code = EXIT_SIGINT if cancelled else EXIT_CONFIG if isinstance(exc, ConfigError) else EXIT_AGENT
+            explanation = "cancelled" if cancelled else safe_error_message(exc)
+            previous = getattr(host, "last_result", None)
+            result = replace(
+                previous if isinstance(previous, HostResult) else HostResult(code, session_id=session_id),
+                exit_code=code, explanation=explanation,
+                status="cancelled" if cancelled else "failed",
+            )
+            if cancelled:
+                if host is not None:
+                    host.cancel_active_turn()
+            else:
+                click.echo(f"error: {explanation}", err=True)
+    if json_output:
+        click.echo(json.dumps(asdict(result), ensure_ascii=False))
+    return result.exit_code
 
 
 def main(argv: list[str] | None = None) -> None:

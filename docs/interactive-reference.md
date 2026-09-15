@@ -4,13 +4,13 @@
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Send the current message, or queue a follow-up while a turn is running |
+| `Enter` | Run the highlighted command, send the current message, or queue a follow-up while a turn is running |
 | `Shift+Enter` or `Ctrl+J` | Insert a newline without sending |
 | `Alt+Enter` | Expand or collapse the composer |
 | `Alt+Z` | Restore the draft saved before a palette or history selection |
 | `Tab` / `Shift+Tab` | Move focus forward/back; Tab completes an open suggestion |
 | `Ctrl+B` | Switch between build and plan mode |
-| `Ctrl+P` | Open the command palette |
+| `Ctrl+P` | Search and run slash commands |
 | `Ctrl+G` | Open the searchable skills picker |
 | `Ctrl+L` | Open the model picker |
 | `Ctrl+O` | Open the session picker |
@@ -57,9 +57,11 @@ finishes, explicitly marking omitted middle output when the capture limit is rea
 duplicate status lines; the banner returns between tools.
 
 Type `/` in the composer to open the inline command list; the list remains visible and filters
-continuously. Use `Up`/`Down` to highlight a command, `Enter` or `Tab` to complete it, and `Esc` to
-close the list. Press `Enter` again to run the completed command. Typing `/config` expands the list
-to every resolved configuration path and its current redacted value.
+continuously. Use `Up`/`Down` to highlight a command, then press `Enter` or click once to run it
+or open its picker. `Tab` completes the command for editing, and `Esc` closes the list. Commands
+requiring arguments and file mentions remain editable. Typing `/config` expands the list to every
+resolved configuration path and its current redacted value. `Ctrl+P` offers the same single-action
+selection in a searchable command picker.
 
 Press `Ctrl+R` to search prompts already shown in the current session. Choosing one loads it into
 the composer without sending it and saves the displaced draft for `Alt+Z`. Palette choices

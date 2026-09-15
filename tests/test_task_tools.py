@@ -449,20 +449,56 @@ async def test_subagent_handles_wait_and_input_outcomes(
         nested=True,
     )
     general = next(spec for spec in builtin_agents() if spec.name == "general")
+    tasks = TaskTools(parent.ws._workspace, parent.engine, parent.approvals, parent=parent)
     try:
         if job_state == "missing":
             with pytest.raises(RuntimeError, match="WAIT without a running"):
                 await asyncio.wait_for(run_subagent(parent, general, "verify"), timeout=5)
             assert llm.call_count == 1
             return
-        result = await asyncio.wait_for(run_subagent(parent, general, "verify"), timeout=5)
+        result = await asyncio.wait_for(
+            tasks.run("general", "verify")
+            if job_state in {"needs_input", "condensed_input"}
+            else run_subagent(parent, general, "verify"),
+            timeout=5,
+        )
     finally:
         await parent.close_tools()
 
     if job_state in {"needs_input", "condensed_input"}:
         assert "[NEED_INPUT] choose a target" in result
+        assert tasks.snapshot()[-1]["state"] == "needs_input"
         assert llm.call_count == 1
         return
     assert llm.call_count == 2
     assert "verified completion" in result
     assert "[completed]" in result and "exit=0" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "needs_input", "failed", "cancelled", "prose"])
+async def test_task_lifecycle_uses_typed_outcome(tmp_path: Path, outcome: str) -> None:
+    import asyncio
+
+    from noah_code.tools.task_tools import TaskResult
+
+    async def runner(_spec, _prompt):
+        if outcome == "failed":
+            raise RuntimeError("check failed")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+        if outcome == "prose":
+            return "[NEED_INPUT] is just quoted report text"
+        return TaskResult("report", "needs_input" if outcome == "needs_input" else "completed")
+
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    tasks = TaskTools(
+        Workspace(root=tmp_path), engine,
+        ApprovalBroker(engine, handler=_always_once), runner=runner,
+    )
+    if outcome in {"failed", "cancelled"}:
+        with pytest.raises(RuntimeError if outcome == "failed" else asyncio.CancelledError):
+            await tasks.run("explore", "inspect")
+    else:
+        assert isinstance(await tasks.run("explore", "inspect"), str)
+    assert tasks.snapshot()[-1]["state"] == ("completed" if outcome == "prose" else outcome)

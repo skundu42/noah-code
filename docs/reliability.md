@@ -142,6 +142,28 @@ unbounded growth. Delete sessions that are no longer needed with `noah sessions 
 
 ## Observability
 
+### Verification evidence
+
+Foreground and streamed check commands, subagents, background jobs, and persistent-terminal
+commands share a bounded verification ledger. The agent can inspect it with
+`await self.ws.checks()`. Each record includes the observed exit code, command, source, execution
+directory when known, and workspace fingerprints before and after execution. Records persist with
+the session and are included in `noah run --json` results.
+
+Turn receipts recompute check status against the current workspace. A check becomes `stale` if
+files changed during or after its execution; missing fingerprints produce `unknown`, and an
+interrupted check is `incomplete`. A successful rerun supersedes the earlier attempt in the receipt.
+Completion and verification are separate: `completed` means the agent finished its turn, while
+the check records show the evidence available for its changes.
+
+Fingerprints use file metadata and symlink targets without reading file contents. In Git checkouts
+they cover tracked files and non-ignored untracked files; outside Git, common cache, build, and
+vendor directories are excluded. Ignored artifacts, external dependencies, and metadata-preserving
+edits are outside this check. Commands containing shell chaining, redirection, or expansion are
+not credited as individual checks because their exit code cannot establish each check's result.
+
+### Runtime status
+
 Use `/health` during idle or active work. It reports runtime database and artifact sizes, pending
 inbox items and interactions, live jobs, retained runtime events, and the current non-terminal run.
 Use `/status` for workspace/session state, `/tokens` for model and cache usage, `F2` for activity,

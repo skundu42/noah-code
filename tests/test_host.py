@@ -1180,7 +1180,51 @@ async def test_empty_need_input_stops_without_another_handle(
     assert result.exit_code == 0
     assert handles["n"] == 1
     assert races["n"] == 1
+    assert result.status == "needs_input"
     await host.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [False, True])
+async def test_failed_turn_has_explicit_outcome(tmp_path: Path, monkeypatch, invalid: bool) -> None:
+    from types import SimpleNamespace
+
+    host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+
+    async def handle(_agent, _notification, render=None):
+        if invalid:
+            return SimpleNamespace(kind=None, explanation="not a valid completion")
+        raise RuntimeError("execution failed")
+
+    monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
+    try:
+        result = await host._run_user_turn("do work")
+        assert result.status == "failed"
+        assert result.exit_code == 1
+        assert result.run_id
+        assert result is host.last_result
+    finally:
+        await host.close()
+
+
+@pytest.mark.asyncio
+async def test_unexpandable_queued_turn_returns_finalized_checks(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
+    checks = [{"command": "pytest", "state": "stale", "returncode": 0}]
+    snapshot = AsyncMock(return_value=checks)
+    monkeypatch.setattr(host.agent.ws, "_verification", SimpleNamespace(snapshot=snapshot), raising=False)
+    try:
+        result = await host._run_user_turn("missing prompt", queued=True)
+        assert result is host.last_result
+        assert result.status == "failed"
+        assert result.exit_code == 1
+        assert result.checks == checks
+        snapshot.assert_awaited_once_with(since=0.0)
+    finally:
+        await host.close()
 
 
 @pytest.mark.asyncio
@@ -1204,6 +1248,10 @@ async def test_cancel_pauses_and_preserves_steer_queue(tmp_path: Path, monkeypat
     assert len(host.steer_queue) == 1
     assert host.queue_paused
     assert not host._apply_next_steer(host.agent)
+    assert host.last_result is not None
+    assert host.last_result.status == "cancelled"
+    assert host.last_result.exit_code == 130
+    assert host.last_result.run_id
     await host.close()
 
 

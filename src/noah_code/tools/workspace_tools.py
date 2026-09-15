@@ -13,9 +13,7 @@ import re
 import shlex
 import sys
 import tempfile
-import time
 import uuid
-from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from functools import lru_cache
@@ -41,6 +39,7 @@ from noah_code.permissions import (
 )
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tool_output import ToolOutputStore
+from noah_code.verification import CheckLedger
 from noah_code.workspace import Workspace, WorkspaceError
 
 if TYPE_CHECKING:
@@ -136,6 +135,7 @@ class WorkspaceMutationCoordinator:
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
+        self.verification: CheckLedger | None = None
 
 
 def _pattern_keeps_dir(pattern: str, name: str) -> bool:
@@ -226,6 +226,7 @@ class WorkspaceTools(Skill):
         lsp: Any = None,
         runtime: RuntimeStateStore | None = None,
         coordinator: WorkspaceMutationCoordinator | None = None,
+        verification_source: str = "main",
         output_store_root: Path | None = None,
         output_store_max_bytes: int = 2_000_000_000,
     ) -> None:
@@ -247,10 +248,13 @@ class WorkspaceTools(Skill):
         )
         self._default_timeout = default_timeout
         self._on_shell_chunk: Any = None
-        self._command_results: deque[tuple[float, str, int]] = deque(maxlen=512)
         self._lsp = lsp
         self._runtime = runtime
         self._coordinator = coordinator or WorkspaceMutationCoordinator()
+        if self._coordinator.verification is None:
+            self._coordinator.verification = CheckLedger(workspace.root, runtime)
+        self._verification = self._coordinator.verification
+        self._verification_source = verification_source
         self._mutation_checkpoint_handler: Any = None
         # NOOA 0.0.9 starts BashSession lazily without guarding concurrent
         # callers. Batched inspections can otherwise launch multiple shells
@@ -958,12 +962,20 @@ class WorkspaceTools(Skill):
             await self._ensure_shell_started()
             if before_run is not None:
                 await before_run()
-            result = await self._shell.run(
-                command,
-                stdin=stdin,
-                timeout=timeout or self._default_timeout,
+            check = await self._verification.begin(
+                command, source=self._verification_source, cwd=self._shell.session.cwd
             )
-        self._command_results.append((time.monotonic(), command, result.returncode))
+            result = None
+            try:
+                result = await self._shell.run(
+                    command,
+                    stdin=stdin,
+                    timeout=timeout or self._default_timeout,
+                )
+            finally:
+                await self._verification.finish(
+                    check, result.returncode if result is not None else None
+                )
         self._absolutize_harvested_matches(result)
         if self._on_shell_chunk is not None:
             with contextlib.suppress(Exception):
@@ -991,12 +1003,16 @@ class WorkspaceTools(Skill):
         mutating = not self._engine.is_readonly_command(command)
         async with self._mutation_guard(mutating), self._file_op_lock:
             await self._ensure_shell_started()
+            check = await self._verification.begin(
+                command, source=self._verification_source, cwd=self._shell.session.cwd
+            )
+            returncode = None
             try:
                 async for event in self._shell.run_stream(
                     command, timeout=timeout or self._default_timeout
                 ):
                     if isinstance(event, StreamDone):
-                        self._command_results.append((time.monotonic(), command, event.returncode))
+                        returncode = event.returncode
                     if self._on_shell_chunk is not None and hasattr(event, "kind"):
                         with contextlib.suppress(Exception):
                             self._on_shell_chunk(
@@ -1004,6 +1020,7 @@ class WorkspaceTools(Skill):
                             )
                     yield event
             finally:
+                await self._verification.finish(check, returncode)
                 # NOOA updates BashSession.cwd after a streamed command but
                 # currently leaves ShellTools.cwd stale.
                 self._shell.cwd = self._shell.session.cwd.resolve()
@@ -1087,8 +1104,18 @@ class WorkspaceTools(Skill):
             result = await self._shell.run(
                 command, stdin=stdin, timeout=self._default_timeout if timeout is None else timeout
             )
-        self._command_results.append((time.monotonic(), command, result.returncode))
         return self._cap_shell_result(result)
+
+    async def checks(self) -> str:
+        """Inspect shared verification results; stale checks need to be rerun."""
+        records = await self._verification.snapshot()
+        if not records:
+            return "No verification commands recorded."
+        return self._bound("\n".join(
+            f"{record['state']} · {record['command']} · source={record['source']} "
+            f"· cwd={record.get('cwd') or 'unknown'} · exit={record['returncode']}"
+            for record in records
+        ))
 
     async def _ensure_shell_started(self) -> None:
         """Single-flight NOOA's lazy persistent-shell startup."""

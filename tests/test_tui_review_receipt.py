@@ -7,6 +7,7 @@ import contextlib
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,44 +17,32 @@ from noah_code.host import AgentHost
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tools.git_tools import DiffFile, DiffReview
 from noah_code.ui.textual_app import DiffReviewScreen, NoahCodeApp, TextualUI, _recorded_checks_text
+from noah_code.verification import CheckLedger
 from noah_code.workspace import Workspace
 from test_git_tools import _git_workspace
 from test_textual_tui import (
     _disable_live_update_checks as _disable_live_update_checks,
 )
 from test_textual_tui import _fake_host, _log_text
-from test_workspace_tools import _make_ws
 
 
-def test_receipt_only_reports_actual_individual_check_exit_codes() -> None:
+def test_receipt_reports_latest_shared_check_attempts() -> None:
     records = [
-        (1, "pytest old.py", 0),
-        (3, "uv run --no-sync pytest -q", 0),
-        (3, "python -m mypy src", 2),
-        (3, "echo pytest", 0),
-        (3, "pytest --help", 0),
-        (3, "pytest --collect-only", 0),
-        (3, "pytest -q || true", 0),
-        (3, "pytest -q\ntrue", 0),
-        (3, "ruff format src", 0),
+        {"source": "main", "command": "pytest -q", "label": "pytest", "state": "failed", "returncode": 1},
+        {"source": "main", "command": "pytest -q", "label": "pytest", "state": "passed", "returncode": 0},
+        {"source": "child", "command": "pytest -q", "label": "pytest", "state": "stale", "returncode": 0},
+        {"source": "main:job:types", "command": "mypy src", "label": "mypy", "state": "failed", "returncode": 2},
     ]
-    assert _recorded_checks_text(records, 2) == "recorded check commands: pytest passed, mypy failed (exit 2)"
-    assert _recorded_checks_text([], 0) == "checks: no results recorded"
+    assert _recorded_checks_text(records) == (
+        "recorded check commands: pytest passed, pytest stale (last exit 0), mypy failed (exit 2)"
+    )
+    assert _recorded_checks_text([]) == "checks: no results recorded"
 
 
-@pytest.mark.asyncio
-async def test_command_results_cover_run_readonly_and_stream(tmp_path: Path) -> None:
-    ws = _make_ws(tmp_path, auto=False)
-    try:
-        await ws.run("false")
-        await ws.run_trusted_readonly("pwd")
-        async for _ in ws.run_stream("true"):
-            pass
-        assert [(command, code) for _, command, code in ws._command_results] == [
-            ("false", 1), ("pwd", 0), ("true", 0),
-        ]
-    finally:
-        await ws.close()
+@pytest.mark.parametrize("state", ["stale", "unknown", "running", "incomplete"])
+def test_receipt_never_calls_unverified_exit_zero_a_pass(state: str) -> None:
+    record = {"source": "main", "command": "pytest", "label": "pytest", "state": state, "returncode": 0}
+    assert "passed" not in _recorded_checks_text([record])
 
 
 @pytest.mark.asyncio
@@ -209,14 +198,15 @@ async def test_receipt_includes_observed_shell_edits_and_failed_checks(tmp_path:
     host = _fake_host(tmp_path)
     journal = SnapshotJournal()
     host.agent.journal = journal
-    host.agent.ws._command_results = []
+    ledger = host.agent.ws._verification = CheckLedger(tmp_path)
     host.agent.git.change_fingerprints = AsyncMock(side_effect=[{}, {"unstaged:shell.py": ("modified", 1)}])
 
     async def run(_text):
         journal.begin_turn()
         journal.mark_shell_bypass()
         journal.end_turn()
-        host.agent.ws._command_results.append((time.monotonic(), "ruff check src", 1))
+        check = await ledger.begin("ruff check src")
+        await ledger.finish(check, 1)
         return "continue"
 
     host.handle_line = AsyncMock(side_effect=run)
@@ -229,6 +219,55 @@ async def test_receipt_includes_observed_shell_edits_and_failed_checks(tmp_path:
         assert "ruff failed (exit 1)" in receipt
         assert "undo unavailable" in receipt
         assert "undo available" not in receipt
+
+
+@pytest.mark.asyncio
+async def test_receipt_includes_stale_prior_checks_and_current_child_and_job_checks(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host.agent.journal = SnapshotJournal()
+    ledger = host.agent.ws._verification = CheckLedger(tmp_path)
+    prior = await ledger.begin("pytest -q")
+    await ledger.finish(prior, 0)
+    host.agent.git.change_fingerprints = AsyncMock(return_value={})
+
+    async def run(_text):
+        (tmp_path / "changed.py").write_text("new code\n")
+        child = await ledger.begin("mypy src", source="subagent:types")
+        await ledger.finish(child, 0)
+        background = await ledger.begin("ruff check src", source="main:job:lint")
+        await ledger.finish(background, 1)
+        return "continue"
+
+    host.handle_line = AsyncMock(side_effect=run)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        await app._run_turn("fix it").wait()
+        await pilot.pause()
+        receipt = next(entry.text for entry in app._transcript_entries if entry.role == "RECEIPT")
+        assert "pytest stale (last exit 0)" in receipt
+        assert "pytest passed" not in receipt
+        assert "mypy passed" in receipt
+        assert "ruff failed (exit 1)" in receipt
+
+
+@pytest.mark.asyncio
+async def test_receipt_preserves_needs_input_outcome(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host.agent.journal = SnapshotJournal()
+    host.agent.git.change_fingerprints = AsyncMock(return_value={})
+
+    async def run(_text):
+        host.last_result = SimpleNamespace(status="needs_input")
+        return "continue"
+
+    host.handle_line = AsyncMock(side_effect=run)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        await app._run_turn("fix it").wait()
+        await pilot.pause()
+        receipt = next(entry.text for entry in app._transcript_entries if entry.role == "RECEIPT")
+        assert "Input needed" in receipt
+        assert "Turn complete" not in receipt
 
 
 def test_undo_preflight_is_reused_and_does_not_write(tmp_path: Path) -> None:

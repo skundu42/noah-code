@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -53,6 +53,7 @@ from noah_code.steer import SAFE_SLASH_WHILE_BUSY
 from noah_code.themes import THEMES, ThemePalette, get_theme
 from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt
 from noah_code.updates import UpdateStatus, maybe_check_for_update
+from noah_code.verification import CheckLedger
 
 if TYPE_CHECKING:
     from noah_code.host import AgentHost
@@ -858,7 +859,7 @@ class ComposerTextArea(TextArea):
         if suggestions_open and event.key == "enter":
             event.stop()
             event.prevent_default()
-            app.enter_suggestion_or_submit()  # type: ignore[attr-defined]
+            app.accept_suggestion(submit=True)  # type: ignore[attr-defined]
             return
         if suggestions_open and event.key == "escape":
             event.stop()
@@ -2093,56 +2094,28 @@ class ConversationHistoryScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
-def _recorded_checks_text(results: Any, since: float) -> str:
-    """Report known check commands using their actual exit codes, never activity labels."""
-    import shlex
-
-    checks: list[str] = []
-    for finished, command, returncode in results:
-        if finished < since or "\n" in command or "\r" in command:
-            continue
-        try:
-            lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-            lexer.whitespace_split = True
-            tokens = list(lexer)
-        except ValueError:
-            continue
-        # Compound commands have only an aggregate exit code. Do not attribute
-        # that status to an individual check which may have failed earlier.
-        if not tokens or any(token in {";", "&&", "||", "|", "&", ">", ">>", "<", "(" , ")"} for token in tokens):
-            continue
-        if tokens[:2] == ["uv", "run"]:
-            tokens = tokens[2:]
-            while tokens and tokens[0] in {"--no-sync", "--locked", "--frozen", "--offline", "-q", "--quiet"}:
-                tokens.pop(0)
-        if tokens[:2] in (["python", "-m"], ["python3", "-m"]):
-            tokens = tokens[2:]
-        if not tokens:
-            continue
-        if any(flag in tokens for flag in {"--help", "-h", "--version", "-V", "--collect-only", "--co"}):
-            continue
-        executable = Path(tokens[0]).name
-        label = executable
-        if executable in {"pytest", "mypy", "pyright", "tsc", "jest", "vitest"}:
-            pass
-        elif executable == "ruff" and tokens[1:2] == ["check"]:
-            label = "ruff"
-        elif executable in {"npm", "pnpm", "yarn", "cargo", "go", "make"}:
-            arguments = tokens[1:]
-            if arguments[:1] == ["run"]:
-                arguments = arguments[1:]
-            if not arguments or arguments[0] not in {"test", "check", "lint", "build", "typecheck", "clippy", "vet"}:
-                continue
-            label = f"{executable} {arguments[0]}"
-        else:
-            continue
-        checks.append(f"{label} {'passed' if returncode == 0 else f'failed (exit {returncode})'}")
-    if not checks:
+def _recorded_checks_text(results: list[dict[str, Any]]) -> str:
+    """Summarize the latest attempt of each shared check against current code."""
+    latest = {
+        (record["source"], record.get("cwd"), record["command"]): record for record in results
+    }
+    if not latest:
         return "checks: no results recorded"
-    passed = sum(" passed" in result for result in checks)
-    failed = len(checks) - passed
-    if len(checks) > 3:
-        return f"recorded check commands: {passed} passed, {failed} failed"
+    if len(latest) > 3:
+        counts = Counter(record["state"] for record in latest.values())
+        return "recorded check commands: " + ", ".join(
+            f"{count} {state}" for state, count in counts.items()
+        )
+    checks = []
+    for record in latest.values():
+        status = record["state"]
+        if status == "failed":
+            status += f" (exit {record['returncode']})"
+        elif status == "stale":
+            status += f" (last exit {record['returncode']})"
+        elif status == "unknown":
+            status = "unverified (workspace state unavailable)"
+        checks.append(f"{record['label']} {status}")
     return "recorded check commands: " + ", ".join(checks)
 
 
@@ -2526,6 +2499,7 @@ class NoahCodeApp(App[None]):
 
     TITLE = "Noah Code"
     CSS_PATH = "textual.css"
+    ENABLE_COMMAND_PALETTE = False
 
     BINDINGS = [
         Binding("ctrl+q", "quit_app", "Quit", show=True),
@@ -3665,7 +3639,7 @@ class NoahCodeApp(App[None]):
                         AgentDisplayState.RUNNING,
                         f"Agent {event.meta.get('agent', '')}".strip(),
                     )
-                if state in {"queued", "completed", "failed", "cancelled"}:
+                if state in {"queued", "completed", "needs_input", "failed", "cancelled"}:
                     self._append_entry(TranscriptEntry("ACTIVITY", text))
             elif kind == "background_job":
                 self._append_entry(TranscriptEntry("ACTIVITY", text))
@@ -4004,27 +3978,24 @@ class NoahCodeApp(App[None]):
         ]
         for offset, item in enumerate(visible):
             index = start + offset
-            if index == self._suggestion_index:
-                active_style = f"bold {palette.canvas} on {palette.accent}"
-                lines.append(
-                    Text.assemble(
-                        ("› ", active_style),
-                        (item.invocation, active_style),
-                        (f"  {item.description}", f"{palette.canvas} on {palette.accent}"),
-                    )
-                )
-                continue
-            lines.append(
-                Text.assemble(
-                    ("  ", palette.accent),
-                    (item.invocation, palette.text),
-                    (f"  {item.description}", palette.muted),
-                )
+            active = index == self._suggestion_index
+            active_style = f"bold {palette.canvas} on {palette.accent}"
+            line = Text.assemble(
+                ("› " if active else "  ", active_style if active else palette.accent),
+                (item.invocation, active_style if active else palette.text),
+                (
+                    f"  {item.description}",
+                    f"{palette.canvas} on {palette.accent}" if active else palette.muted,
+                ),
+                no_wrap=True,
+                overflow="ellipsis",
             )
+            line.stylize(Style(meta={"@click": f"app.select_suggestion({index})"}))
+            lines.append(line)
         widget.update(Group(*lines))
         widget.styles.display = "block"
         self._update_context_hint(
-            "↑/↓ choose · Tab complete · Enter select/send · Esc close"
+            "↑/↓ choose · Enter/click run · Tab edit · Esc close"
         )
 
     def move_suggestion(self, delta: int) -> None:
@@ -4033,14 +4004,26 @@ class NoahCodeApp(App[None]):
         self._suggestion_index = (self._suggestion_index + delta) % len(self._suggestion_matches)
         self._render_suggestions()
 
-    def accept_suggestion(self) -> None:
+    def action_select_suggestion(self, index: int) -> None:
+        if 0 <= index < len(self._suggestion_matches):
+            self._suggestion_index = index
+            self.accept_suggestion(submit=True)
+
+    def accept_suggestion(self, *, submit: bool = False) -> None:
         if not self._suggestion_matches:
             return
         invocation = self._suggestion_matches[self._suggestion_index].invocation
         insertion = _command_insertion(invocation)
         composer = self.query_one("#composer", ComposerTextArea)
         current = composer.text
-        if current.lstrip().startswith("/") and "\n" not in current:
+        if invocation.startswith("/"):
+            query = current.strip().lower()
+            head = invocation.split(" [", 1)[0].rstrip().lower()
+            if submit and (
+                query == invocation.lower()
+                or (query.startswith(head + " ") and not invocation.lower().startswith(query))
+            ):
+                insertion = current.strip()
             self._skip_suggestion_text = insertion
             composer.text = insertion
             composer.cursor_location = (0, len(insertion))
@@ -4051,34 +4034,17 @@ class NoahCodeApp(App[None]):
             composer.cursor_location = (0, len(replaced))
         self.close_suggestions()
         composer.focus()
+        if submit:
+            self._submit_command_choice(invocation)
 
-    def enter_suggestion_or_submit(self) -> None:
-        """Send an exactly-matched command at once; complete partial matches.
-
-        Selecting a fully typed option (`/diff`, `/mode plan`) executes it on
-        Enter instead of requiring a second press. Prefix states still
-        complete: `/the` → `/theme `, bare `/mode ` picks the highlighted
-        option, and `@` mentions always complete in place.
-        """
-        if not self._suggestion_matches:
-            return
-        highlighted = self._suggestion_matches[self._suggestion_index]
-        composer = self.query_one("#composer", ComposerTextArea)
-        raw = composer.text
-        stripped = raw.strip().lower()
-        if stripped.startswith("@"):
-            self.accept_suggestion()
-            return
-        invocation = highlighted.invocation.lower()
-        head = invocation.split(" [", 1)[0].rstrip()
-        ends_with_space = raw != raw.rstrip()
-        exact = stripped in {invocation, head}
-        args_typed = not invocation.startswith(stripped) and stripped.startswith(head + " ")
-        if (exact or args_typed) and not ends_with_space:
-            self.close_suggestions()
+    def _submit_command_choice(self, invocation: str) -> None:
+        """Run chosen commands; leave mentions and required arguments editable."""
+        if (
+            invocation.startswith("/")
+            and not invocation.endswith(" ")
+            and _command_insertion(invocation).strip() != "/attach"
+        ):
             self.action_submit()
-            return
-        self.accept_suggestion()
 
     def close_suggestions(self) -> None:
         self._suggestion_matches = []
@@ -4233,7 +4199,8 @@ class NoahCodeApp(App[None]):
         else:
             focus_name = str(focused.id or type(focused).__name__).replace("-", " ").title()
         shortcuts = [
-            ("Enter", "Send prompt or selected command", "Composer"),
+            ("Enter / Click", "Run the selected command", "Composer"),
+            ("Enter", "Send prompt", "Composer"),
             ("Shift+Enter / Ctrl+J", "Insert a new line", "Composer"),
             ("/", "Search commands", "Composer"),
             ("@path", "Attach a workspace file", "Composer"),
@@ -4319,16 +4286,17 @@ class NoahCodeApp(App[None]):
             seen_ids.add(insertion)
             rows.append(
                 (
-                    insertion,
+                    command.invocation,
                     command.invocation,
                     command.description,
                 )
             )
         choice = await self.push_screen_wait(
-            FilteredPicker("Commands", rows, "↑/↓ select · Enter insert · Esc close")
+            FilteredPicker("Commands", rows, "↑/↓ choose · Enter/click run · Esc close")
         )
         if choice:
-            self._replace_composer_draft(choice)
+            self._replace_composer_draft(_command_insertion(choice))
+            self._submit_command_choice(choice)
 
     @work(exclusive=True, group="prompt-history")
     async def action_prompt_history(self) -> None:
@@ -5580,6 +5548,14 @@ class NoahCodeApp(App[None]):
                 with contextlib.suppress(Exception):
                     before_files = await self.host.agent.git.change_fingerprints()
             action = await self.host.handle_line(text)
+            if is_agent_turn:
+                status = str(getattr(getattr(self.host, "last_result", None), "status", ""))
+                outcome = {
+                    "completed": "complete",
+                    "needs_input": "needs_input",
+                    "failed": "failed",
+                    "cancelled": "cancelled",
+                }.get(status, outcome)
             if action == "exit":
                 self.action_quit_app()
         except asyncio.CancelledError:
@@ -5596,7 +5572,10 @@ class NoahCodeApp(App[None]):
                 self._finish_thinking_timeline(state="error" if outcome == "failed" else "complete")
                 self._timeline_finish(
                     turn_timeline,
-                    state="error" if outcome == "failed" else "complete",
+                    state=(
+                        "waiting" if outcome == "needs_input"
+                        else "error" if outcome == "failed" else "complete"
+                    ),
                     result=outcome,
                 )
                 if is_agent_turn:
@@ -5623,8 +5602,9 @@ class NoahCodeApp(App[None]):
                         except Exception:  # noqa: BLE001
                             pass
                     changed_files = len(paths)
-                    command_results = getattr(getattr(self.host.agent, "ws", None), "_command_results", ())
-                    checks = _recorded_checks_text(command_results, started_at)
+                    ledger = getattr(getattr(self.host.agent, "ws", None), "_verification", None)
+                    records = await ledger.snapshot() if isinstance(ledger, CheckLedger) else []
+                    checks = _recorded_checks_text(records)
                     undo_status = "undo unavailable"
                     if journal_paths and paths <= journal_paths:
                         try:
@@ -5639,6 +5619,7 @@ class NoahCodeApp(App[None]):
                         "complete": "Turn complete",
                         "failed": "Turn failed",
                         "cancelled": "Turn cancelled",
+                        "needs_input": "Input needed",
                     }[outcome]
                     receipt = f"{outcome_label} · {duration:.1f}s"
                     if changed_files:

@@ -123,6 +123,7 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("workspace_root",),
             ("ws", "edit"),
             ("ws", "inspect"),
+            ("ws", "checks"),
             ("ws", "apply_patch"),
             ("ws", "apply_unified_diff"),
             ("ws", "list"),
@@ -484,6 +485,8 @@ call is async: always `await` it before iterating or accessing the result.
   returncode/stdout/stderr. `read_only=True` skips approval only for commands
   the engine recognizes as read-only (Git inspection, search, listing, text
   filters). It is rejected for pytest, uv, Python, builds, and mutations.
+- Inspect `await self.ws.checks()` for shared verification results. Rerun stale
+  checks after edits; a completed command alone does not prove the task is done.
 - Use `self.processes.start/logs/status/input/stop` for long jobs and consume
   logs by cursor. Persistent shells use `open_terminal`, `terminal_run`,
   `terminal_status`, and `close_terminal`; raw terminal input is blocked.
@@ -829,6 +832,7 @@ class CodingAgent(InteractiveAgent):
             lsp=self.lsp,
             runtime=runtime,
             coordinator=self._coordinator,
+            verification_source=f"subagent:{self.agent_id}" if nested else "main",
             output_store_root=runtime.artifact_dir if runtime is not None else None,
             output_store_max_bytes=config.reliability.artifact_max_bytes,
         )

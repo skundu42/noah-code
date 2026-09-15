@@ -19,6 +19,7 @@ from textual.widgets import Input
 
 from noah_code.approvals import ApprovalChoice, ApprovalRequest
 from noah_code.config import NoahCodeConfig
+from noah_code.custom_commands import CustomCommand
 from noah_code.events import HostEvent, HostEventKind
 from noah_code.permissions import PermissionDecision
 from noah_code.sessions import SessionEventRecord
@@ -1710,7 +1711,8 @@ async def test_ctrl_b_toggles_between_build_and_plan_modes(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_at_mention_suggestions_complete_in_place(tmp_path: Path) -> None:
+@pytest.mark.parametrize("prefix", ["Fix", "/review"])
+async def test_at_mention_suggestions_complete_in_place(tmp_path: Path, prefix: str) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "parser.py").write_text("x = 1\n")
     host = _fake_host(tmp_path)
@@ -1718,12 +1720,12 @@ async def test_at_mention_suggestions_complete_in_place(tmp_path: Path) -> None:
     app = NoahCodeApp(host, ui)
     async with app.run_test() as pilot:
         composer = app.query_one("#composer")
-        composer.text = "Fix @src/par"
+        composer.text = f"{prefix} @src/par"
         await pilot.pause()
         rendered = _rendered_text(app.query_one("#command-suggestions").content)
         assert "@src/parser.py" in rendered
         await pilot.press("enter")
-        assert "Fix @src/parser.py" in composer.text
+        assert composer.text == f"{prefix} @src/parser.py "
         host.handle_line.assert_not_awaited()
 
 
@@ -1755,16 +1757,13 @@ async def test_slash_suggestions_filter_navigate_and_complete(tmp_path: Path) ->
         assert "/mode plan" in rendered
 
         await pilot.press("enter")
-        assert composer.text == "/mode build"
         assert suggestions.styles.display == "none"
-        host.handle_line.assert_not_awaited()
-
-        await pilot.press("enter")
         for _ in range(40):
             if host.handle_line.await_count:
                 break
             await pilot.pause()
         host.handle_line.assert_awaited_once_with("/mode build")
+        assert composer.text == ""
 
         composer.text = "/config ui."
         await pilot.pause()
@@ -1808,6 +1807,134 @@ async def test_slash_suggestion_selection_remains_visible_after_first_page(
         assert "› /model" in rendered
         assert "MODEL     /model" not in rendered
         assert "/help" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_enter_on_selected_model_opens_setup_immediately(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "/mo"
+        await pilot.pause()
+        await pilot.press("down", "enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, FilteredPicker)
+        assert "MODEL SETUP" in app.screen.query_one("#picker-title").render().plain
+        assert composer.text == ""
+        host.handle_line.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "key", "insertion"),
+    [
+        ("/hel", "tab", "/help"),
+        ("/attach", "enter", "/attach "),
+        ("/memory save", "enter", "/memory save "),
+    ],
+)
+async def test_slash_completion_keeps_unsubmitted_text_editable(
+    tmp_path: Path,
+    query: str,
+    key: str,
+    insertion: str,
+) -> None:
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = query
+        await pilot.pause()
+        await pilot.press(key)
+        await pilot.pause()
+
+        assert composer.text == insertion
+        assert composer.cursor_location == composer.document.end
+        assert composer.has_focus
+        assert not app.suggestions_open
+        host.handle_line.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("size", "query", "moves", "invocation", "description"),
+    [
+        ((160, 50), "/hel", 0, "/help", False),
+        ((160, 50), "/mode ", 0, "/mode plan", True),
+        ((160, 50), "/", 5, "/model", False),
+        ((80, 24), "/", 5, "/model", True),
+    ],
+)
+async def test_slash_suggestion_single_click_activates_visible_row(
+    tmp_path: Path,
+    size: tuple[int, int],
+    query: str,
+    moves: int,
+    invocation: str,
+    description: bool,
+) -> None:
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=size) as pilot:
+        composer = app.query_one("#composer")
+        suggestions = app.query_one("#command-suggestions")
+        composer.text = query
+        await pilot.pause()
+        if moves:
+            await pilot.press(*(["down"] * moves))
+        lines = _rendered_text(suggestions.content).splitlines()
+        row = next(index for index, line in enumerate(lines) if invocation in line)
+        item = next(
+            item
+            for item in app._suggestion_matches
+            if item.invocation.split(" [", 1)[0] == invocation
+        )
+        column = len(item.invocation) + 4 if description else 3
+        offset = suggestions.content_region.offset - suggestions.region.offset
+        assert await pilot.click(suggestions, offset=(offset.x + column, offset.y + row))
+        await pilot.pause()
+
+        if invocation == "/model":
+            assert isinstance(app.screen, FilteredPicker)
+            assert "MODEL SETUP" in app.screen.query_one("#picker-title").render().plain
+            host.handle_line.assert_not_awaited()
+        else:
+            host.handle_line.assert_awaited_once_with(invocation)
+        assert composer.text == ""
+        assert not app.suggestions_open
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ["enter", "click"])
+async def test_command_palette_runs_once_and_preserves_prior_draft(
+    tmp_path: Path,
+    selection: str,
+) -> None:
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "Keep this draft"
+        await pilot.press("ctrl+p")
+        await pilot.pause()
+        assert isinstance(app.screen, FilteredPicker)
+        app.screen.query_one("#picker-filter", Input).value = "help"
+        await pilot.pause()
+        if selection == "click":
+            options = app.screen.query_one("#picker-list")
+            offset = options.content_region.offset - options.region.offset
+            assert await pilot.click(options, offset=(offset.x + 3, offset.y))
+        else:
+            await pilot.press("enter")
+        await pilot.pause()
+
+        host.handle_line.assert_awaited_once_with("/help")
+        assert composer.text == ""
+        await pilot.press("alt+z")
+        assert composer.text == "Keep this draft"
+        host.handle_line.assert_awaited_once_with("/help")
 
 
 @pytest.mark.asyncio
@@ -2754,14 +2881,22 @@ async def test_session_actions_are_refused_while_turn_is_busy(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_enter_on_exact_command_submits_directly(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("query", "invocation"),
+    [("/help", "/help"), ("/hel", "/help"), ("/mode p", "/mode plan")],
+)
+async def test_enter_on_command_submits_selected_match_once(
+    tmp_path: Path,
+    query: str,
+    invocation: str,
+) -> None:
     host = _fake_host(tmp_path)
     ui = TextualUI()
     app = NoahCodeApp(host, ui)
     async with app.run_test() as pilot:
         composer = app.query_one("#composer")
 
-        composer.text = "/help"
+        composer.text = query
         await pilot.pause()
         assert app.suggestions_open
         await pilot.press("enter")
@@ -2769,7 +2904,7 @@ async def test_enter_on_exact_command_submits_directly(tmp_path: Path) -> None:
             if host.handle_line.await_count:
                 break
             await pilot.pause()
-        host.handle_line.assert_awaited_once_with("/help")
+        host.handle_line.assert_awaited_once_with(invocation)
         assert not app.suggestions_open
         assert composer.text == ""
 
@@ -2794,20 +2929,27 @@ async def test_enter_on_fully_typed_option_submits_without_second_press(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_enter_with_args_beyond_placeholder_submits(tmp_path: Path) -> None:
+@pytest.mark.parametrize("command", ["/config model", "/deploy Prod"])
+async def test_enter_with_args_beyond_placeholder_submits(tmp_path: Path, command: str) -> None:
     host = _fake_host(tmp_path)
+    host._custom_commands = {
+        "deploy": CustomCommand(
+            "deploy", "Use /deploy prod to deploy production", "Deploy to $ARGUMENTS"
+        ),
+    }
     ui = TextualUI()
     app = NoahCodeApp(host, ui)
     async with app.run_test() as pilot:
         composer = app.query_one("#composer")
-        composer.text = "/config model"
+        composer.text = command
         await pilot.pause()
+        assert app.suggestions_open
         await pilot.press("enter")
         for _ in range(40):
             if host.handle_line.await_count:
                 break
             await pilot.pause()
-        host.handle_line.assert_awaited_once_with("/config model")
+        host.handle_line.assert_awaited_once_with(command)
 
 
 @pytest.mark.asyncio

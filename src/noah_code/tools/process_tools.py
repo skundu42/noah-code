@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 from nooa import Skill, hidden, spec
 
 from noah_code.tools.workspace_tools import WorkspaceTools
+from noah_code.verification import CheckRecord
 
 if TYPE_CHECKING:
     from noah_code.runtime_state import RuntimeStateStore
@@ -56,6 +57,7 @@ class BackgroundJob:
     tasks: list[asyncio.Task[Any]] = field(default_factory=list)
     command_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_event: asyncio.Event = field(default_factory=asyncio.Event)
+    check: CheckRecord | None = None
 
     @property
     def elapsed(self) -> float:
@@ -201,13 +203,20 @@ class ProcessTools(Skill):
                 payload = f"{command}\r\necho {marker}:%errorlevel%\r\n"
             else:
                 payload = f"{command}\nprintf '\\n{marker}:%s\\n' \"$?\"\n"
-            await self._write_input(job, payload)
-            output, returncode = await self._wait_for_terminal_marker(
-                job,
-                cursor=cursor,
-                marker=marker,
-                timeout=wait_timeout,
+            check = await self._ws._verification.begin(
+                command, source=f"{self._ws._verification_source}:terminal:{job.name}"
             )
+            returncode = None
+            try:
+                await self._write_input(job, payload)
+                output, returncode = await self._wait_for_terminal_marker(
+                    job,
+                    cursor=cursor,
+                    marker=marker,
+                    timeout=wait_timeout,
+                )
+            finally:
+                await self._ws._verification.finish(check, returncode)
         bounded = output.strip()
         if len(bounded) > 32_000:
             bounded = bounded[:16_000] + "\n… terminal output bounded …\n" + bounded[-16_000:]
@@ -253,16 +262,24 @@ class ProcessTools(Skill):
                 for job in self._jobs.values()
             ):
                 raise ValueError(f"terminal name already exists: {name}")
-            process = await asyncio.create_subprocess_exec(
-                *argv,
+            check = await self._ws._verification.begin(
+                command, source=f"{self._ws._verification_source}:job:{name}",
                 cwd=self._ws._workspace.root,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=(
-                    asyncio.subprocess.STDOUT if kind == "terminal" else asyncio.subprocess.PIPE
-                ),
-                start_new_session=os.name != "nt",
-            )
+            ) if kind == "process" else None
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=self._ws._workspace.root,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=(
+                        asyncio.subprocess.STDOUT if kind == "terminal" else asyncio.subprocess.PIPE
+                    ),
+                    start_new_session=os.name != "nt",
+                )
+            except BaseException:
+                await self._ws._verification.finish(check, None)
+                raise
             job_id = uuid.uuid4().hex[:8]
             log_path = self._runtime.process_log_dir / f"{job_id}.jsonl" if self._runtime else None
             job = BackgroundJob(
@@ -272,6 +289,7 @@ class ProcessTools(Skill):
                 process=process,
                 log_path=log_path,
                 kind=kind,
+                check=check,
             )
             self._jobs[job_id] = job
         try:
@@ -287,6 +305,7 @@ class ProcessTools(Skill):
                     log_path=log_path or self._runtime.process_log_dir / f"{job_id}.jsonl",
                 )
         except Exception:
+            await self._ws._verification.finish(job.check, None)
             with contextlib.suppress(Exception):
                 await self._terminate(job)
             self._close_transport(process)
@@ -671,6 +690,9 @@ class ProcessTools(Skill):
         elif job.state == "stopping":
             job.state = "stopped"
         job.returncode = returncode
+        await self._ws._verification.finish(
+            job.check, returncode if job.state in {"completed", "failed"} else None
+        )
         job.finished_at = time.monotonic()
         job.output_event.set()
         if self._runtime is not None:

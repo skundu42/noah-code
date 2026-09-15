@@ -10,7 +10,7 @@ import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from nooa import Skill
 
@@ -20,7 +20,14 @@ from noah_code.approvals import ApprovalBroker
 from noah_code.permissions import PermissionCategory, PermissionEngine
 from noah_code.workspace import Workspace
 
-TaskRunner = Callable[[AgentSpec, str], Awaitable[str]]
+
+@dataclass(frozen=True)
+class TaskResult:
+    text: str
+    status: Literal["completed", "needs_input"] = "completed"
+
+
+TaskRunner = Callable[[AgentSpec, str], Awaitable[str | TaskResult]]
 
 _DISTILL_INPUT_LIMIT = 24_000
 
@@ -224,9 +231,10 @@ class TaskTools(Skill):
             else:
                 async with semaphore:
                     result = await self._run_activity(activity, spec, prompt, runner)
-            activity.state = "completed"
-            activity.result_preview = " ".join(str(result).split())[:500]
-            return result
+            activity.state = result.status if isinstance(result, TaskResult) else "completed"
+            text = result.text if isinstance(result, TaskResult) else result
+            activity.result_preview = " ".join(text.split())[:500]
+            return text
         except asyncio.CancelledError:
             activity.state = "cancelled"
             activity.result_preview = "cancelled"
@@ -247,7 +255,7 @@ class TaskTools(Skill):
         spec: AgentSpec,
         prompt: str,
         runner: TaskRunner,
-    ) -> str:
+    ) -> str | TaskResult:
         async with self._agent_lane(spec):
             activity.state = "running"
             self._emit(activity)
@@ -303,8 +311,8 @@ def _default_runner(parent: Any | None) -> TaskRunner | None:
     if parent is None:
         return None
 
-    async def _run(spec: AgentSpec, prompt: str) -> str:
-        return await run_subagent(parent, spec, prompt)
+    async def _run(spec: AgentSpec, prompt: str) -> TaskResult:
+        return await _run_subagent(parent, spec, prompt)
 
     return _run
 
@@ -322,6 +330,11 @@ def _child_engine(parent_engine: PermissionEngine, mode: str) -> PermissionEngin
 
 
 async def run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> str:
+    """Return a nested agent's report as text for existing callers."""
+    return (await _run_subagent(parent, spec, prompt)).text
+
+
+async def _run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> TaskResult:
     """Start a nested CodingAgent with isolated storage and a per-run permission engine."""
 
     from nooa.interactive import RespondReason
@@ -402,6 +415,10 @@ async def run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> str:
                 notification.setdefault(name, []).append(item)
             result = await child.handle(notification)
             if getattr(result, "kind", None) != RespondReason.WAIT:
+                if getattr(result, "kind", None) not in {
+                    RespondReason.DONE, RespondReason.NEED_INPUT, RespondReason.GET_USER_INPUT,
+                }:
+                    raise RuntimeError(f"Subagent returned an invalid stop reason: {getattr(result, 'kind', None)!r}")
                 break
             if not child.processes.has_running() and not wake.is_set():
                 raise RuntimeError("subagent returned WAIT without a running background job")
@@ -421,14 +438,16 @@ async def run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> str:
                 "then continue the assigned task.",
             )
         explanation = str(getattr(result, "explanation", "") or "").strip()
-        prefix = "[NEED_INPUT] " if getattr(result, "kind", None) in {
+        needs_input = getattr(result, "kind", None) in {
             RespondReason.NEED_INPUT, RespondReason.GET_USER_INPUT
-        } else ""
+        }
+        prefix = "[NEED_INPUT] " if needs_input else ""
         body = "\n\n".join(part for part in [*messages, explanation] if part)
         raw = body or f"{spec.name} finished with no message."
-        return prefix + await bound_result(
+        text = prefix + await bound_result(
             child, spec.name, raw, max_chars=_result_budget(parent) - len(prefix)
         )
+        return TaskResult(text, "needs_input" if needs_input else "completed")
     finally:
         await child.close_tools()
 

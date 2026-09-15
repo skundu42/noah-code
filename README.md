@@ -91,6 +91,9 @@ noah --mode plan .
 # Run one task and exit
 noah run "Explain how authentication is wired" .
 
+# Emit one structured result on stdout (progress goes to stderr)
+noah run --json "Fix the failing unit test" .
+
 # Allow actions that would normally ask; explicit deny rules still apply
 noah run --auto "Fix the failing unit test" .
 
@@ -101,6 +104,13 @@ noah --session SESSION_ID .
 # Use the line-oriented interface
 noah --console .
 ```
+
+`run --json` reports `status` (`completed`, `needs_input`, `failed`, or `cancelled`),
+`exit_code`, `explanation`, `session_id`, `run_id`, session `usage`, and recorded `checks`.
+Check `status` when automating: a request for input keeps the existing exit code 0,
+but its status is `needs_input`. Check results are separate from task completion;
+an empty list means no checks were recorded. Errors keep nonzero exit codes and
+Ctrl+C returns 130. Delegated agents also retain `needs_input` in the work ledger.
 
 Check the installation and resolved configuration with:
 
@@ -131,6 +141,7 @@ Type `/` to search the full command and configuration reference. The most common
 | Drag, then `Cmd+C` / `Ctrl+Shift+C` | Select and copy TUI text |
 | `Ctrl+Shift+C` with no selection | Copy the latest Noah reply |
 | `Ctrl+G` | Open the searchable skills picker |
+| `Ctrl+P` | Search and run slash commands |
 | `Ctrl+L` | Open the model picker |
 | `Ctrl+R` | Search and recall a prior prompt |
 | `Ctrl+T` | Expand or collapse live tool output |
@@ -138,6 +149,7 @@ Type `/` to search the full command and configuration reference. The most common
 | `Alt+Up` | Recall the newest queued prompt for editing |
 | `Ctrl+]` | Return to live transcript output |
 | `Tab` / `Shift+Tab` | Navigate focus; Tab completes suggestions |
+| `Enter` or click a command | Run the selected slash command or open its picker; required arguments stay editable |
 | `Ctrl+B` | Switch between build and plan mode |
 | `Ctrl+D` | Review changes while working or idle |
 | `Ctrl+C` | Stop the current run and pause queued follow-ups |

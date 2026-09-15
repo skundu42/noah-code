@@ -9,7 +9,7 @@ import logging
 import re
 import shlex
 from collections.abc import Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -197,6 +197,10 @@ class HostResult:
     exit_code: int
     explanation: str = ""
     session_id: str | None = None
+    status: Literal["completed", "needs_input", "failed", "cancelled"] = "completed"
+    run_id: str | None = None
+    usage: dict[str, int | float] | None = None
+    checks: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -238,6 +242,7 @@ class AgentHost:
         self._hooks: Any = None
         self._checkpoints: Any = None
         self.last_checkpoint: dict[str, Any] | None = None
+        self.last_result: HostResult | None = None
         self._post_hook_tasks: list[asyncio.Task[Any]] = []
         self._trace_info = "session jsonl"
         self._telemetry = AgentTelemetry()
@@ -750,7 +755,7 @@ class AgentHost:
         prompt = " ".join(str(activity.get("prompt", "")).split())[:80]
         duration = float(activity.get("duration", 0.0) or 0.0)
         detail = f" · {prompt}" if prompt else ""
-        elapsed = f" · {duration:.1f}s" if state in {"completed", "failed", "cancelled"} else ""
+        elapsed = f" · {duration:.1f}s" if state in {"completed", "needs_input", "failed", "cancelled"} else ""
         self.ui.render(
             HostEvent(
                 HostEventKind.STATUS,
@@ -2493,6 +2498,9 @@ class AgentHost:
         explanation = ""
         run_state: Any = "running"
         telemetry_error_type = ""
+        turn_result = HostResult(
+            exit_code=0, session_id=self.meta.session_id if self.meta else None, run_id=run_id,
+        )
         try:
             agent.journal.begin_turn()
             if recovery:
@@ -2508,11 +2516,7 @@ class AgentHost:
                     exit_code = 1
                     run_state = "failed"
                     explanation = "No waiting prompt could be expanded"
-                    return HostResult(
-                        exit_code=exit_code,
-                        explanation=explanation,
-                        session_id=self.meta.session_id if self.meta else None,
-                    )
+                    return turn_result
             else:
                 self._deliver_expanded(agent, self._expand_user_text(text, attach_paths))
 
@@ -2590,9 +2594,11 @@ class AgentHost:
                             "and consume any relevant logs, then continue the task.",
                         )
                         continue
-                    else:
+                    elif kind == RespondReason.DONE:
                         exit_code = 0
                         run_state = "completed"
+                    else:
+                        raise RuntimeError(f"Agent returned an invalid stop reason: {kind!r}")
                 except PermissionError as exc:
                     exit_code = 3
                     run_state = "failed"
@@ -2665,6 +2671,8 @@ class AgentHost:
                     )
             except Exception as persist_error:
                 run_state = "failed"
+                exit_code = 1
+                explanation = safe_error_message(persist_error)
                 telemetry_error_type = type(persist_error).__name__
                 if runtime is not None and run_id is not None:
                     with contextlib.suppress(Exception):
@@ -2680,12 +2688,21 @@ class AgentHost:
                     outcome=outcome,
                     error_type=telemetry_error_type,
                 )
+                turn_result.exit_code = exit_code or (1 if outcome == "failed" else 0)
+                turn_result.explanation = explanation
+                turn_result.status = (
+                    "needs_input" if outcome == "waiting_user" else
+                    "completed" if outcome == "completed" else
+                    "cancelled" if outcome == "cancelled" else "failed"
+                )
+                turn_result.usage = self.usage_snapshot().to_dict()
+                self.last_result = turn_result
                 self._current_run_id = None
-        return HostResult(
-            exit_code=exit_code,
-            explanation=explanation,
-            session_id=self.meta.session_id if self.meta else None,
-        )
+                ledger = getattr(agent.ws, "_verification", None)
+                if ledger is not None:
+                    with contextlib.suppress(Exception):
+                        turn_result.checks = await ledger.snapshot(since=0.0)
+        return turn_result
 
     def _background_task_origin(self, agent: Any) -> _BackgroundTaskOrigin:
         if self.meta is None:
@@ -2909,6 +2926,7 @@ class AgentHost:
 
     async def run_once(self, prompt: str) -> HostResult:
         await self.start()
+        ledger = getattr(self.agent.ws, "_verification", None)
         try:
             if self.config.auto_approve:
 
@@ -2926,7 +2944,15 @@ class AgentHost:
                 self.agent.approvals.set_handler(_reject)
 
             await self.resume_interrupted_run()
-            result = await self._run_user_turn(prompt)
+            continuable = self._runtime.latest_incomplete_run() if self._runtime else None
+            run_id = continuable.run_id if continuable and continuable.state == "waiting_user" else None
+            result = await self._run_user_turn(prompt, run_id=run_id)
             return result
         finally:
-            await self.close()
+            try:
+                await self.close()
+            finally:
+                # Teardown may terminate a check that was still running at DONE.
+                if self.last_result is not None and ledger is not None:
+                    with contextlib.suppress(Exception):
+                        self.last_result.checks = await ledger.snapshot(since=0.0)

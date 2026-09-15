@@ -564,3 +564,79 @@ async def test_run_always_closes_host_even_when_startup_fails(
 
     assert await _run_session(prompt="fix", **kwargs) == (1 if failure else 0)
     host.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("status, code", [("completed", 0), ("needs_input", 0), ("failed", 1), ("cancelled", 130)])
+def test_run_json_emits_one_outcome_and_sends_progress_to_stderr(
+    monkeypatch, tmp_path: Path, status: str, code: int,
+) -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from noah_code.config import NoahCodeConfig
+    from noah_code.events import HostEvent, HostEventKind
+    from noah_code.host import HostResult
+    from noah_code.workspace import Workspace
+
+    class FakeHost:
+        def __init__(self, *args, ui, **kwargs):
+            self.ui = ui
+            self.last_result = HostResult(
+                code, "choose a target", "session-1", status=status,
+                run_id="run-1", usage={"calls": 2}, checks=[{"state": "passed"}],
+            )
+
+        async def run_once(self, prompt):
+            print("provider diagnostic")
+            self.ui.render(HostEvent(HostEventKind.MESSAGE, "agent progress"))
+            if status == "failed":
+                raise RuntimeError("execution failed")
+            if status == "cancelled":
+                raise asyncio.CancelledError
+            return self.last_result
+
+        def cancel_active_turn(self):
+            pass
+
+        async def close(self):
+            print("cleanup diagnostic")
+
+    monkeypatch.setattr("noah_code.cli.AgentHost", FakeHost)
+    monkeypatch.setattr(
+        "noah_code.cli._prepare",
+        AsyncMock(return_value=((Workspace(root=tmp_path), NoahCodeConfig(), object(), None), 0)),
+    )
+    result = CliRunner().invoke(cli_group, ["run", "--json", "fix", str(tmp_path)])
+
+    assert result.exit_code == code, result.output
+    payload = json.loads(result.stdout)
+    assert payload["status"] == status
+    assert payload["exit_code"] == code
+    assert payload["session_id"] == "session-1"
+    assert payload["run_id"] == "run-1"
+    assert payload["usage"] == {"calls": 2}
+    assert payload["checks"] == [{"state": "passed"}]
+    assert payload["explanation"] == (
+        "execution failed" if status == "failed" else "cancelled" if status == "cancelled" else "choose a target"
+    )
+    assert "provider diagnostic" in result.stderr
+    assert "cleanup diagnostic" in result.stderr
+    assert "agent progress" in result.stderr
+
+
+@pytest.mark.parametrize("failure", ["config", "workspace"])
+def test_run_json_reports_preparation_failures(monkeypatch, tmp_path: Path, failure: str) -> None:
+    from unittest.mock import AsyncMock
+
+    from noah_code.config import ConfigError
+
+    prepare = AsyncMock(side_effect=ConfigError("invalid model")) if failure == "config" else AsyncMock(return_value=(None, 2))
+    monkeypatch.setattr("noah_code.cli._prepare", prepare)
+    result = CliRunner().invoke(cli_group, ["run", "--json", "fix", str(tmp_path)])
+
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "failed"
+    assert payload["exit_code"] == 2
+    assert payload["explanation"]
+    assert payload["run_id"] is None
