@@ -813,6 +813,26 @@ def _record_to_entries(record: SessionEventRecord) -> list[TranscriptEntry]:
 class ComposerTextArea(TextArea):
     """Composer with send/newline behavior and inline suggestion navigation."""
 
+    BINDINGS = [
+        Binding("ctrl+a", "select_all", "Select all", show=False),
+        Binding("ctrl+home", "cursor_document(False)", show=False),
+        Binding("ctrl+end", "cursor_document(True)", show=False),
+        Binding("ctrl+shift+home", "cursor_document(False, True)", show=False),
+        Binding("ctrl+shift+end", "cursor_document(True, True)", show=False),
+        Binding("f6", "app.notice_details", show=False),
+        Binding("f7", "app.context_visibility", show=False),
+    ]
+
+    def action_cursor_document(self, end: bool, select: bool = False) -> None:
+        self.move_cursor(self.document.end if end else (0, 0), select=select)
+
+    def scroll_cursor_visible(self, center: bool = False, animate: bool = False) -> Offset:
+        # Textual 8.2 refreshes scrollbars before restoring an undo/redo selection.
+        # Wait for that selection update if its old cursor is outside the new text.
+        if self.cursor_location != self.clamp_visitable(self.cursor_location):
+            return Offset(0, 0)
+        return super().scroll_cursor_visible(center=center, animate=animate)
+
     class Submitted(Message):
         def __init__(self, text_area: ComposerTextArea) -> None:
             super().__init__()
@@ -3961,9 +3981,7 @@ class NoahCodeApp(App[None]):
         if not self._suggestion_matches:
             widget.update("")
             widget.styles.display = "none"
-            self._update_context_hint(
-                "Enter send · Shift+Enter newline · Tab build/plan · / commands · F4 work"
-            )
+            self.update_chrome()
             return
         total = len(self._suggestion_matches)
         # The panel's border and vertical padding leave room for a heading plus
@@ -4224,7 +4242,12 @@ class NoahCodeApp(App[None]):
             ("Ctrl+B", "Toggle Build and Plan", "Global"),
             ("Alt+Enter", "Expand or collapse the prompt editor", "Composer"),
             ("Alt+Z", "Restore a draft replaced by a picker", "Composer"),
-            ("Cmd+A / C / V", "Select all, copy, or paste", "Composer"),
+            ("Ctrl+A / Cmd+A", "Select all prompt text", "Composer"),
+            ("Ctrl+X / Cmd+X", "Cut selected prompt text, or the current line", "Composer"),
+            ("Ctrl+C / V", "Copy a selection or paste into the prompt", "Composer"),
+            ("Ctrl+Z / Ctrl+Y", "Undo or redo prompt edits", "Composer"),
+            ("Home / End", "Move to the start or end of the prompt line", "Composer"),
+            ("Ctrl+Home / Ctrl+End", "Move to the start or end of the whole prompt; Shift selects", "Composer"),
             ("Ctrl+C", "Stop the active turn and pause its queue; twice while idle quits", "Global"),
             ("Ctrl+P", "Open the command palette", "Global"),
             ("Ctrl+L", "Choose the session model", "Global"),
@@ -5258,10 +5281,21 @@ class NoahCodeApp(App[None]):
         )
 
     async def _paste_native_clipboard(self, target: Input | TextArea) -> None:
+        original = target.text if isinstance(target, TextArea) else target.value
+        selection, session_id = target.selection, self._session_id
+        if self._native_clipboard_task is not None:
+            await asyncio.shield(self._native_clipboard_task)
         pasted = await asyncio.to_thread(read_os_clipboard)
         if pasted is None:
             pasted = self.clipboard
         if pasted and target.is_attached:
+            current = target.text if isinstance(target, TextArea) else target.value
+            if (
+                self.focused is not target or self._session_id != session_id
+                or current != original or target.selection != selection
+            ):
+                self._show_notice("Paste cancelled because the input changed", temporary=True)
+                return
             handled = target._on_paste(events.Paste(pasted))  # noqa: SLF001
             if inspect.isawaitable(handled):
                 await handled

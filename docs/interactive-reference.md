@@ -88,6 +88,28 @@ Inside the composer, `Cmd+C`/`Ctrl+C` copies the composer's
 own selection; `Ctrl+C` with no composer selection keeps its cancel-turn behavior. Selection uses a
 high-contrast highlight in every Noah theme.
 
+The prompt input supports mouse placement, drag selection, and normal text editing:
+
+| Prompt control | Action |
+| --- | --- |
+| Click / arrow keys | Place or move the cursor within the prompt |
+| `Shift` + arrow keys | Extend a selection |
+| `Ctrl+A` / `Cmd+A` | Select the entire prompt |
+| `Ctrl+X` / `Cmd+X` | Cut selected text; with no selection, cut the current line |
+| `Ctrl+C` / `Cmd+C` | Copy selected prompt text |
+| `Ctrl+V` / `Cmd+V` | Paste, replacing the selected text |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo prompt edits |
+| `Home` / `End` | Move to the beginning / end of the current line |
+| `Ctrl+Home` / `Ctrl+End` | Move to the beginning / end of the entire prompt |
+| `Ctrl+Shift+Home` / `Ctrl+Shift+End` | Select to the beginning / end of the entire prompt |
+| `Ctrl+Left` / `Ctrl+Right` | Move by word; hold Shift to select |
+| `Alt+Enter` | Expand the prompt for longer edits |
+
+`Ctrl+A` now selects all; use `Home` for the former line-start behavior. Prompt undo is
+separate from `/undo`, which reverts workspace edits. A paste waits for an in-progress
+cut/copy to reach the clipboard; if the draft, selection, focus, or session changes while
+the clipboard is being read, that paste is cancelled to protect the newer input.
+
 ### Mid-turn follow-ups
 
 While Noah is working, the composer stays open. `Enter` queues the current text instead of starting

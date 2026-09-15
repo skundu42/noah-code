@@ -124,6 +124,10 @@ Type `/` to search the full command and configuration reference. The most common
 | `Shift+Enter` / `Ctrl+J` | Insert a newline |
 | `Alt+Enter` | Expand or collapse the composer |
 | `Alt+Z` | Restore a displaced draft |
+| Click / arrows in the prompt | Position the editing cursor |
+| `Ctrl+A` / `Ctrl+X` / `Ctrl+V` | Select all / cut / paste prompt text |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo prompt edits |
+| `Ctrl+Home` / `Ctrl+End` | Jump to the beginning / end of the prompt; Shift selects |
 | Drag, then `Cmd+C` / `Ctrl+Shift+C` | Select and copy TUI text |
 | `Ctrl+Shift+C` with no selection | Copy the latest Noah reply |
 | `Ctrl+G` | Open the searchable skills picker |
