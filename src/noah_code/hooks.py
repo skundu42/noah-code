@@ -26,11 +26,36 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fnmatch
+import json
 import os
 import signal
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from noah_code.config import HooksConfig, HookSpec
+
+LIFECYCLE_EVENTS = frozenset(
+    {"session_start", "session_end", "turn_start", "turn_end", "worktree_created"}
+)
+MAX_LIFECYCLE_PAYLOAD_CHARS = 16_384
+
+
+def _lifecycle_payload(payload: Mapping[str, Any]) -> str:
+    """Retain valid bounded JSON, including an explicit truncation marker."""
+
+    encoder = json.JSONEncoder(ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    chunks: list[str] = []
+    size = 0
+    for chunk in encoder.iterencode(dict(payload)):
+        remaining = MAX_LIFECYCLE_PAYLOAD_CHARS - size
+        chunks.append(chunk[:remaining])
+        size += len(chunk)
+        if size > MAX_LIFECYCLE_PAYLOAD_CHARS:
+            # Escaping the preview can double its size. Keep ample room for
+            # the wrapper and guarantee consumers always receive valid JSON.
+            return json.dumps({"truncated": True, "preview": "".join(chunks)[:6000]})
+    return "".join(chunks)
 
 
 @dataclass(frozen=True)
@@ -48,7 +73,7 @@ class HookRunner:
 
     @property
     def active(self) -> bool:
-        return bool(self._config.pre_tool or self._config.post_tool)
+        return bool(self._config.pre_tool or self._config.post_tool or self._config.lifecycle)
 
     @staticmethod
     def _matches(spec: HookSpec, names: list[str]) -> bool:
@@ -62,6 +87,8 @@ class HookRunner:
         tool: str,
         category: str,
         target: str,
+        event: str = "",
+        payload: str = "",
     ) -> tuple[int, str]:
         env = os.environ.copy()
         env.update(
@@ -69,6 +96,8 @@ class HookRunner:
             NOAH_HOOK_TOOL=tool,
             NOAH_HOOK_CATEGORY=category,
             NOAH_HOOK_TARGET=target[:2000],
+            NOAH_HOOK_EVENT=event,
+            NOAH_HOOK_PAYLOAD=payload,
         )
         try:
             process = await asyncio.create_subprocess_exec(
@@ -118,9 +147,7 @@ class HookRunner:
             return 124, f"hook timed out after {spec.timeout_seconds:g}s"
         return int(process.returncode or 0), output
 
-    async def run_pre(
-        self, *, tool: str, category: str, target: str
-    ) -> HookOutcome:
+    async def run_pre(self, *, tool: str, category: str, target: str) -> HookOutcome:
         names = [tool, category]
         for spec in self._config.pre_tool:
             if not self._matches(spec, names):
@@ -155,4 +182,37 @@ class HookRunner:
             )
             if code != 0:
                 failures.append(f"post-tool hook for {tool} exited {code}: {output}")
+        return failures
+
+    async def run_lifecycle(self, event: str, payload: Mapping[str, Any]) -> list[str]:
+        """Observe host lifecycle changes; failures never authorize or veto work.
+
+        The host chooses metadata to expose. Payload is JSON in an environment
+        variable, never interpolated into trusted shell command text. Hooks run
+        in configuration order with the same timeout and child cleanup as tool
+        hooks. Cancellation is propagated so the host can shut down promptly.
+        """
+
+        if event not in LIFECYCLE_EVENTS:
+            return [f"unknown lifecycle hook event: {event}"]
+        specs = [spec for spec in self._config.lifecycle if self._matches(spec, [event])]
+        if not specs:
+            return []
+        try:
+            encoded = _lifecycle_payload(payload)
+        except (TypeError, ValueError, RecursionError) as exc:
+            return [f"lifecycle hook payload for {event} is not JSON: {type(exc).__name__}"]
+        failures: list[str] = []
+        for spec in specs:
+            code, output = await self._invoke(
+                spec,
+                phase="lifecycle",
+                tool=event,
+                category="lifecycle",
+                target=event,
+                event=event,
+                payload=encoded,
+            )
+            if code != 0:
+                failures.append(f"lifecycle hook for {event} exited {code}: {output}")
         return failures

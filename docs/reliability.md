@@ -58,6 +58,18 @@ on the next launch. Before rollback, the current contents and path metadata are 
 crash. If the backup cannot be saved, recovery stops before replacing that file. The persistent edit
 journal used by `/undo` and `/redo` retains the newest 20 turns in memory and across restarts.
 
+Workspace edit tools validate the complete contents of `.py` and `.pyi` files with Python's
+compiler before recording or writing a change. A syntax error reports its location and leaves
+the entire patch batch untouched. An already broken file must be repaired completely in one
+write or patch. This checks syntax using Noah's Python interpreter, without importing or executing
+the file; it does not establish type or behavioral correctness, and newer Python syntax may
+require running Noah with a newer interpreter. Shell writes remain outside this preflight.
+
+Inside CodeAct, `print(self.tools.help("ws"))` returns tool signatures, return shapes, and
+executable examples through the sandbox. `self.tools.list()` lists supported groups. Read/search
+anchors preserve the preimage for `await self.ws.replace(anchor, new_text)`; batch patches require
+explicit `path`, `old`, and `new` fields. Invalid calls receive concise recovery guidance.
+
 Git checkpoints are enabled by default. Noah captures them at turn boundaries and before mutating
 shell commands, stores them under `refs/noah-code/checkpoints/<session>/`, and keeps the newest 50
 by default. Capturing uses a temporary Git index and does not move `HEAD` or disturb the user's
@@ -108,6 +120,13 @@ fallback_models = ["openrouter/anthropic/claude-sonnet-4", "openai/gpt-5-mini"]
 A successful model response is not replayed by the retry wrapper. Tool execution begins only after
 that response returns, and tool-side durability handles structured external mutations separately.
 
+If a CodeAct response consumes its output allowance without producing text or a tool call, Noah
+adds an explicitly host-authored continuation notice instead of immediately abandoning the task.
+The original response, finish reason, reasoning and usage remain available for audit. Continuation
+uses the same session and unchanged output limit, counts toward the existing iteration and budget
+limits, and stops after three consecutive incomplete responses. No additional provider request is
+made inside the response adapter.
+
 ## Bounds and unattended-operation controls
 
 The defaults favor long-running work while keeping growth finite:
@@ -156,10 +175,20 @@ interrupted check is `incomplete`. A successful rerun supersedes the earlier att
 Completion and verification are separate: `completed` means the agent finished its turn, while
 the check records show the evidence available for its changes.
 
+When the workspace changes during a CodeAct execution, Noah defers `DONE` if the latest observed
+attempt for any command/directory in that execution is failed, stale, incomplete, running, or
+unknown. It asks the model to repair and rerun the check within the existing iteration and budget
+limits, or return `NEED_INPUT` with the blocker. Read-only investigations may report failures and
+finish, including read-only children sharing a parent's failed checks. Simple edits with no
+recorded checks are not blocked. This guard does not invent tests or
+guarantee task correctness. Common test commands, including `python -m unittest`, are recorded.
+
 Fingerprints use file metadata and symlink targets without reading file contents. In Git checkouts
-they cover tracked files and non-ignored untracked files; outside Git, common cache, build, and
-vendor directories are excluded. Ignored artifacts, external dependencies, and metadata-preserving
-edits are outside this check. Commands containing shell chaining, redirection, or expansion are
+they cover every tracked file and non-ignored untracked files outside common cache, build and
+vendor directories. Outside Git those directories are also excluded. Test-generated `__pycache__`
+files therefore do not stale their own results, while tracked files in those directories still
+count. Ignored artifacts, external dependencies, and metadata-preserving edits are outside this
+check. Commands containing shell chaining, redirection, or expansion are
 not credited as individual checks because their exit code cannot establish each check's result.
 
 ### Runtime status

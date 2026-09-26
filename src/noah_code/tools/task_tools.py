@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextlib
+import json
+import re
 import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from nooa import Skill
@@ -116,6 +119,179 @@ class TaskTools(Skill):
         self._activities: dict[str, TaskActivity] = {}
         self._history: deque[TaskActivity] = deque(maxlen=50)
         self._on_lifecycle: Any = None
+        self._jobs: dict[str, asyncio.Task[str]] = {}
+        self._start_lock = asyncio.Lock()
+        self._closed = False
+        self._slots = asyncio.Semaphore(self._max_concurrent())
+        self._runtime = getattr(parent, "_runtime", None)
+        self._records: dict[str, dict[str, Any]] = (
+            self._runtime.get_state("child_sessions", {}) if self._runtime is not None else {}
+        )
+        for record in self._records.values():
+            if record.get("state") in {"queued", "running"}:
+                record["state"] = "interrupted"
+        self._save_records()
+
+    def _save_records(self) -> None:
+        if self._runtime is not None:
+            self._runtime.set_state("child_sessions", self._records)
+
+    def _record(self, task_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[0-9a-f]{12}", task_id) or task_id not in self._records:
+            raise ValueError(f"unknown child session: {task_id}")
+        return self._records[task_id]
+
+    async def start(self, name: str, prompt: str, isolate: bool = False) -> str:
+        """Start a background child; writable children require an isolated worktree.
+
+        Returns a session ID for status, wait, cancel, and follow_up. Worktrees
+        start from committed HEAD and are retained for review after completion.
+        """
+        async with self._start_lock:
+            if self._closed:
+                raise RuntimeError("child session runner is closed")
+            return await self._start_child(name, prompt, isolate)
+
+    async def _start_child(self, name: str, prompt: str, isolate: bool) -> str:
+        spec = self._resolve(name)
+        await self._authorize(spec, prompt.strip())
+        if not spec.readonly and not isolate:
+            raise ValueError("background writers require isolate=True; use run for shared edits")
+        if self._runtime is None:
+            raise RuntimeError("background children require a durable parent session")
+        if sum(not job.done() for job in self._jobs.values()) >= self._max_concurrent():
+            raise RuntimeError("concurrent child session limit reached")
+        task_id = uuid.uuid4().hex[:12]
+        directory = self._workspace.root
+        manager = None
+        info = None
+        warnings: list[str] = []
+        if isolate:
+            if self._engine.mode == "plan":
+                raise PermissionError("plan mode cannot create worktrees")
+            from noah_code.worktree import WorktreeManager, worktree_storage_root
+
+            assert self._parent is not None
+            manager = WorktreeManager(
+                directory, worktree_storage_root(self._parent._config.session_dir)
+            )
+            creating = asyncio.create_task(asyncio.to_thread(manager.create, f"task-{task_id}"))
+            try:
+                # Cancelling to_thread does not stop Git. Keep ownership until
+                # creation finishes so cancellation cannot orphan a worktree.
+                info = await asyncio.shield(creating)
+            except asyncio.CancelledError:
+                with contextlib.suppress(Exception):
+                    info = await creating
+                    await asyncio.to_thread(manager.remove, info.name)
+                raise
+            directory = info.directory
+        try:
+            if isolate:
+                from noah_code.hooks import HookRunner
+
+                assert self._parent is not None
+                warnings = await HookRunner(
+                    self._parent._config.hooks, cwd=self._workspace.root
+                ).run_lifecycle("worktree_created", {
+                    "child_id": task_id, "directory": str(directory), "agent": spec.name,
+                })
+            self._records[task_id] = {
+                "id": task_id, "agent": spec.name, "directory": str(directory),
+                "isolated": isolate, "state": "queued", "result": "",
+            }
+            if warnings:
+                self._records[task_id]["warnings"] = warnings
+            self._save_records()
+            self._launch(task_id, spec, prompt.strip())
+        except BaseException:
+            self._records.pop(task_id, None)
+            with contextlib.suppress(Exception):
+                self._save_records()
+            if manager is not None and info is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(manager.remove, info.name)
+            raise
+        return json.dumps(self._records[task_id])
+
+    def _launch(self, task_id: str, spec: AgentSpec, prompt: str) -> None:
+        runner = self._runner or _default_runner(self._parent)
+        if runner is None:
+            raise RuntimeError("subagent runner is not configured")
+        job = asyncio.create_task(
+            self._execute(spec, prompt, runner, task_id=task_id), name=f"noah-child-{task_id}"
+        )
+        self._jobs[task_id] = job
+        # Retrieve errors even when the caller chooses status instead of wait.
+        job.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+
+    async def follow_up(self, task_id: str, prompt: str, background: bool = False) -> str:
+        """Continue a saved child conversation, including after a parent restart."""
+        async with self._start_lock:
+            if self._closed:
+                raise RuntimeError("child session runner is closed")
+            await self._continue_child(task_id, prompt, background)
+        if background:
+            return self.status(task_id)
+        return await self._jobs[task_id]
+
+    async def _continue_child(self, task_id: str, prompt: str, background: bool) -> None:
+        record = self._record(task_id)
+        job = self._jobs.get(task_id)
+        if job is not None and not job.done():
+            raise RuntimeError("child is running; wait or cancel before sending a follow-up")
+        spec = self._resolve(record["agent"])
+        await self._authorize(spec, prompt.strip())
+        if background and not spec.readonly and not record.get("isolated"):
+            raise ValueError("background writers require an isolated worktree")
+        if background and sum(not job.done() for job in self._jobs.values()) >= self._max_concurrent():
+            raise RuntimeError("concurrent child session limit reached")
+        record["state"] = "queued"
+        self._save_records()
+        self._launch(task_id, spec, prompt.strip())
+
+    def status(self, task_id: str = "") -> str:
+        """Read saved child state, workspace, and bounded last result."""
+        return json.dumps(self._record(task_id) if task_id else list(self._records.values())[-50:])
+
+    async def wait(self, task_id: str, timeout: float = 30) -> str:
+        """Wait up to 60 seconds without cancelling the child on timeout."""
+        self._record(task_id)
+        if not 0 <= timeout <= 60:
+            raise ValueError("timeout must be between 0 and 60 seconds")
+        job = self._jobs.get(task_id)
+        if job is not None:
+            await asyncio.wait({job}, timeout=timeout)
+        return self.status(task_id)
+
+    async def cancel(self, task_id: str) -> str:
+        """Interrupt one child and retain its conversation and worktree."""
+        self._record(task_id)
+        job = self._jobs.get(task_id)
+        if job is not None and not job.done():
+            job.cancel()
+            await asyncio.gather(job, return_exceptions=True)
+            self._records[task_id]["state"] = "cancelled"
+            self._save_records()
+        return self.status(task_id)
+
+    async def close(self) -> None:
+        """Drain children before parent tools and storage are closed."""
+        async with self._start_lock:
+            self._closed = True
+            await self._close_jobs()
+
+    async def _close_jobs(self) -> None:
+        jobs = list(self._jobs.values())
+        for job in jobs:
+            if not job.done():
+                job.cancel()
+        await asyncio.gather(*jobs, return_exceptions=True)
+        for task_id, job in self._jobs.items():
+            if job.cancelled():
+                self._records[task_id]["state"] = "cancelled"
+        self._save_records()
+        self._jobs.clear()
 
     def list(self) -> str:
         """List built-in and markdown agents available to ``run``."""
@@ -340,8 +516,9 @@ class TaskTools(Skill):
         runner: TaskRunner,
         *,
         semaphore: asyncio.Semaphore | None = None,
+        task_id: str | None = None,
     ) -> str:
-        result = await self._execute_result(spec, prompt, runner, semaphore=semaphore)
+        result = await self._execute_result(spec, prompt, runner, semaphore=semaphore, task_id=task_id)
         return result.text
 
     async def _execute_result(
@@ -355,9 +532,10 @@ class TaskTools(Skill):
         workflow: str | None = None,
         phase: str | None = None,
         display_prompt: str | None = None,
+        task_id: str | None = None,
     ) -> TaskResult:
         activity = TaskActivity(
-            task_id=uuid.uuid4().hex[:8],
+            task_id=task_id or uuid.uuid4().hex[:12],
             agent=spec.name,
             prompt=" ".join((display_prompt if display_prompt is not None else prompt).split())[:500],
             mode=spec.mode,
@@ -367,6 +545,13 @@ class TaskTools(Skill):
             phase=phase,
         )
         self._activities[activity.task_id] = activity
+        record = self._records.setdefault(activity.task_id, {
+            "id": activity.task_id, "agent": spec.name, "directory": str(self._workspace.root),
+            "isolated": False, "state": "queued", "result": "",
+        })
+        record["prompt"] = prompt[:24_000]
+        record["state"] = "queued"
+        self._save_records()
         self._emit(activity)
         try:
             if semaphore is None:
@@ -377,6 +562,7 @@ class TaskTools(Skill):
             activity.state = result.status if isinstance(result, TaskResult) else "completed"
             text = result.text if isinstance(result, TaskResult) else result
             activity.result_preview = " ".join(text.split())[:500]
+            record["result"] = _truncate_result(text, _result_budget(self._parent) if self._parent else 4000)
             return result if isinstance(result, TaskResult) else TaskResult(text)
         except asyncio.CancelledError:
             activity.state = "cancelled"
@@ -390,6 +576,11 @@ class TaskTools(Skill):
             activity.finished_at = time.monotonic()
             self._activities.pop(activity.task_id, None)
             self._history.append(activity)
+            record["state"] = activity.state
+            record["updated_at"] = time.time()
+            if activity.state in {"failed", "cancelled"}:
+                record["result"] = activity.result_preview
+            self._save_records()
             self._emit(activity)
 
     async def _run_activity(
@@ -399,9 +590,18 @@ class TaskTools(Skill):
         prompt: str,
         runner: TaskRunner,
     ) -> str | TaskResult:
-        async with self._agent_lane(spec):
+        record = self._records[activity.task_id]
+        lane = contextlib.nullcontext() if record["isolated"] else self._agent_lane(spec)
+        async with self._slots, lane:
             activity.state = "running"
+            record["state"] = "running"
+            self._save_records()
             self._emit(activity)
+            if self._runner is None and self._parent is not None and self._runtime is not None:
+                return await _run_subagent(
+                    self._parent, spec, prompt, task_id=activity.task_id,
+                    directory=Path(record["directory"]), isolated=record["isolated"],
+                )
             return await runner(spec, prompt)
 
     def set_lifecycle_handler(self, handler: Any) -> None:
@@ -508,7 +708,10 @@ async def run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> str:
     return (await _run_subagent(parent, spec, prompt)).text
 
 
-async def _run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> TaskResult:
+async def _run_subagent(
+    parent: Any, spec: AgentSpec, prompt: str, *, task_id: str | None = None,
+    directory: Path | None = None, isolated: bool = False,
+) -> TaskResult:
     """Start a nested CodingAgent with isolated storage and a per-run permission engine."""
 
     from nooa.interactive import RespondReason
@@ -545,49 +748,103 @@ async def _run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> TaskResult
             child_llm = SharedBudgetLLM(child_llm, guard, prefix_observer=usage)
         elif usage is not None:
             child_llm = _PrefixObserverOnly(child_llm, usage)
+    from noah_code.runtime_state import WorkspaceLease
+    from noah_code.snapshots import SnapshotJournal
+
+    runtime = getattr(parent, "_runtime", None)
+    storage: Any = InMemoryStorageManager()
+    lease = None
+    child_workspace = Workspace(directory) if directory is not None else parent.ws._workspace
+    if not child_workspace.root.is_dir():
+        raise ValueError(f"child workspace missing: {child_workspace.root}")
+    journal = SnapshotJournal(blob_limit=config.undo_blob_limit) if isolated else parent.journal
+    if task_id is not None and runtime is not None:
+        from nooa.storage import SQLiteStorageManager
+
+        child_path = runtime.session_path / "children" / task_id
+        child_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if isolated:
+            lease = WorkspaceLease.acquire(
+                config.session_dir / ".leases", child_workspace.root, task_id
+            )
+        try:
+            if isolated:
+                journal.load_dict(runtime.get_state(f"child:{task_id}:journal", {}))
+            storage = SQLiteStorageManager(child_path / "session.db")
+            (child_path / "session.db").chmod(0o600)
+        except BaseException:
+            close_storage = getattr(storage, "close", None)
+            if callable(close_storage):
+                with contextlib.suppress(Exception):
+                    close_storage()
+            if lease is not None:
+                lease.close()
+            raise
     messages: list[str] = []
-    child = CodingAgent(
-        parent.ws._workspace,  # noqa: SLF001
-        config,
-        llm=child_llm,
-        lightweight_llm=(
-            child_llm
-            if spec.model
-            else getattr(parent, "_lightweight_llm", parent._llm)  # noqa: SLF001
-        ),
-        storage=InMemoryStorageManager(),
-        engine=_child_engine(parent.engine, spec.mode),
-        approvals=parent.approvals,
-        journal=parent.journal,
-        runtime=getattr(parent, "_runtime", None),
-        coordinator=getattr(parent, "_coordinator", None),
-        budget_guard=getattr(parent, "_budget_guard", None),
-        usage_tracker=getattr(parent, "_usage_tracker", None),
-        cache_namespace=f"{parent.agent_id}:task:{spec.name}",
-        observability_event_manager=getattr(
-            parent,
-            "_observability_event_manager",
-            parent.event_manager,
-        ),
-        nested=True,
-        nested_prompt=spec.prompt,
-    )
-    if spec.todos:
-        child.todos.add("Complete the assigned task", notes=prompt[:500])
-    child.inject_status_snapshot(force=True)
-    child._render_message = lambda text, **_kwargs: messages.append(str(text))  # noqa: SLF001, ARG005
-    wake = asyncio.Event()
-    child.processes.set_lifecycle_handler(
-        lambda _id, _name, _message, terminal=False: wake.set() if terminal else None
-    )
+    child = None
     try:
+        child = CodingAgent(
+            child_workspace,
+            config,
+            llm=child_llm,
+            lightweight_llm=(
+                child_llm
+                if spec.model
+                else getattr(parent, "_lightweight_llm", parent._llm)  # noqa: SLF001
+            ),
+            storage=storage,
+            engine=_child_engine(parent.engine, spec.mode),
+            approvals=parent.approvals,
+            journal=journal,
+            runtime=runtime,
+            coordinator=None if isolated else getattr(parent, "_coordinator", None),
+            budget_guard=getattr(parent, "_budget_guard", None),
+            usage_tracker=getattr(parent, "_usage_tracker", None),
+            cache_namespace=f"{parent.agent_id}:task:{task_id or spec.name}",
+            observability_event_manager=getattr(
+                parent,
+                "_observability_event_manager",
+                parent.event_manager,
+            ),
+            nested=True,
+            nested_prompt=spec.prompt,
+        )
+        if task_id is not None and runtime is not None:
+            summarizers = nooa_compat.summarizers(child)
+            storage.restore_latest_snapshot(child)
+            child._summarizers = summarizers
+            child.set_mode(spec.mode)
+            if isolated:
+                from noah_code.checkpoints import CheckpointManager
+
+                checkpoints = CheckpointManager(child_workspace.root, task_id)
+
+                async def checkpoint(command: str) -> None:
+                    await asyncio.to_thread(checkpoints.capture, "child shell · " + command[:60])
+
+                child.ws.set_mutation_checkpoint_handler(checkpoint)
+        if spec.todos:
+            child.todos.add("Complete the assigned task", notes=prompt[:500])
+        child.inject_status_snapshot(force=True)
+        child._render_message = lambda text, **_kwargs: messages.append(str(text))  # noqa: SLF001, ARG005
+        wake = asyncio.Event()
+        child.processes.set_lifecycle_handler(
+            lambda _id, _name, _message, terminal=False: wake.set() if terminal else None
+        )
+        if isolated:
+            journal.begin_turn()
         nooa_compat.queue_user_message(child, prompt)
         while True:
             wins = await child.queue_manager.race()
             notification: dict[str, list] = {}
             for name, item in wins:
                 notification.setdefault(name, []).append(item)
-            result = await child.handle(notification)
+            from noah_code.model_streaming import model_stream
+
+            with model_stream(None):
+                result = await child.handle(notification)
+            if task_id is not None and runtime is not None:
+                storage.save_snapshot(child)
             if getattr(result, "kind", None) != RespondReason.WAIT:
                 if getattr(result, "kind", None) not in {
                     RespondReason.DONE, RespondReason.NEED_INPUT, RespondReason.GET_USER_INPUT,
@@ -623,7 +880,23 @@ async def _run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> TaskResult
         )
         return TaskResult(text, "needs_input" if needs_input else "completed")
     finally:
-        await child.close_tools()
+        try:
+            if child is not None:
+                await child.close_tools()
+        finally:
+            if task_id is not None and runtime is not None:
+                try:
+                    if child is not None:
+                        storage.save_snapshot(child)
+                    if isolated:
+                        journal.end_turn()
+                        runtime.set_state(f"child:{task_id}:journal", journal.to_dict())
+                finally:
+                    try:
+                        storage.close()
+                    finally:
+                        if lease is not None:
+                            lease.close()
 
 
 def _result_budget(parent: Any) -> int:

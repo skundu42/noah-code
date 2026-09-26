@@ -562,7 +562,17 @@ class WorkspaceTools(Skill):
             return await self._replace_locked(match, new_text, new)
 
     async def _replace_locked(self, match: Any, new_text: str, new: str | None) -> Any:
+        if not isinstance(new_text, str) or (new is not None and not isinstance(new, str)):
+            raise TypeError(
+                "replacement text must be a string; use replace(match, new_text) "
+                "or replace(path, old_text, new_text)"
+            )
         if isinstance(match, Match):
+            if new is not None:
+                raise ValueError(
+                    "replace(match, new_text) accepts two arguments; "
+                    "the third argument is only for replace(path, old_text, new_text)"
+                )
             resolved = await self._authorize_path(
                 match.path, PermissionCategory.EDIT, tool="ws_edit"
             )
@@ -574,20 +584,7 @@ class WorkspaceTools(Skill):
                         f"stale edit anchor: {self._workspace.relpath(resolved)} changed "
                         "since read(); call read() again to refresh the Match"
                     )
-            oversized = self._preimage_exceeds_blob_limit(resolved)
-            durable = self._begin_durable_file_operation(resolved)
-            mut = self._journal.record_preimage(resolved)
-            try:
-                result = self._native_replace_match(resolved, match, new_text)
-                self._journal.record_postimage(mut, resolved)
-                self._complete_durable_file_operation(durable, resolved)
-            except Exception:
-                self._journal.discard_mutation(mut)
-                self._rollback_durable_file_operation(durable)
-                raise
-            if oversized:
-                result.message += self._durable_skip_note()
-            return result
+            return self._native_replace_match(resolved, match, new_text)
         if isinstance(match, str):
             if new is None:
                 raise ValueError(
@@ -595,20 +592,7 @@ class WorkspaceTools(Skill):
                     "Did you mean replace(match, new_text)?"
                 )
             resolved = await self._authorize_path(match, PermissionCategory.EDIT, tool="ws_edit")
-            oversized = self._preimage_exceeds_blob_limit(resolved)
-            durable = self._begin_durable_file_operation(resolved)
-            mut = self._journal.record_preimage(resolved)
-            try:
-                result = self._native_replace_string(resolved, match, new_text, new)
-                self._journal.record_postimage(mut, resolved)
-                self._complete_durable_file_operation(durable, resolved)
-            except Exception:
-                self._journal.discard_mutation(mut)
-                self._rollback_durable_file_operation(durable)
-                raise
-            if oversized:
-                result.message += self._durable_skip_note()
-            return result
+            return self._native_replace_string(resolved, match, new_text, new)
         raise TypeError("replace expects a Match or path string")
 
     async def edit(
@@ -631,18 +615,29 @@ class WorkspaceTools(Skill):
             return await self._write_file_locked(path, content)
 
     async def _write_file_locked(self, path: str, content: str) -> Any:
+        if not isinstance(content, str):
+            raise TypeError("write_file(path, content) requires the full file content as a string")
         resolved = await self._authorize_path(path, PermissionCategory.EDIT, tool="write_file")
+        return self._commit_file_write(resolved, content.encode("utf-8"), content)
+
+    def _commit_file_write(
+        self, resolved: Path, data: bytes, content: str, *, mode: int | None = None,
+        result: FileWrite | None = None,
+    ) -> FileWrite:
+        """Validate a complete postimage before opening a journaled mutation."""
+        self._validate_python_source(resolved, data)
         oversized = self._preimage_exceeds_blob_limit(resolved)
         durable = self._begin_durable_file_operation(resolved)
         mut = self._journal.record_preimage(resolved)
         try:
-            result = self._atomic_write_bytes(resolved, content.encode("utf-8"), content)
+            written = self._atomic_write_bytes(resolved, data, content, mode=mode)
             self._journal.record_postimage(mut, resolved)
             self._complete_durable_file_operation(durable, resolved)
         except Exception:
             self._journal.discard_mutation(mut)
             self._rollback_durable_file_operation(durable)
             raise
+        result = result or written
         if oversized:
             result.message += self._durable_skip_note()
         return result
@@ -679,6 +674,9 @@ class WorkspaceTools(Skill):
             return await self._apply_patch_locked(changes)
 
     async def _apply_patch_locked(self, changes: PatchChanges) -> str:
+        example = 'apply_patch([{"path": "file.py", "old": "exact old text", "new": "new text"}])'
+        if not isinstance(changes, list):
+            raise TypeError(f"patch changes must be a list of dictionaries; use {example}")
         if not changes:
             raise ValueError("patch requires at least one change")
         if len(changes) > 50:
@@ -687,10 +685,21 @@ class WorkspaceTools(Skill):
         prepared: list[dict[str, Any]] = []
         seen: set[Path] = set()
         # Resolve and authorize the entire batch before reading preimages.
-        for raw in changes:
-            path = str(raw.get("path") or "").strip()
-            if not path:
-                raise ValueError("every patch change requires path")
+        for index, raw in enumerate(changes):
+            if not isinstance(raw, dict):
+                raise TypeError(f"patch change {index + 1} must be a dictionary; use {example}")
+            if set(raw) != {"path", "old", "new"}:
+                raise ValueError(
+                    f"patch change {index + 1} requires exactly path, old, and new keys; "
+                    "old=None creates a new file, new=None deletes a whole file. "
+                    f"For updates use {example}; write(path, content) overwrites a whole file."
+                )
+            if not isinstance(raw["path"], str) or not raw["path"].strip():
+                raise TypeError(f"patch change {index + 1} requires a nonempty path string")
+            path = raw["path"].strip()
+            for key in ("old", "new"):
+                if raw[key] is not None and not isinstance(raw[key], str):
+                    raise TypeError(f"patch {key} must be a string or None for {path}; use {example}")
             resolved = await self._authorize_path(
                 path, PermissionCategory.EDIT, tool="apply_patch"
             )
@@ -701,8 +710,8 @@ class WorkspaceTools(Skill):
                 {
                     "path": path,
                     "resolved": resolved,
-                    "old": raw.get("old"),
-                    "new": raw.get("new"),
+                    "old": raw["old"],
+                    "new": raw["new"],
                 }
             )
 
@@ -724,7 +733,10 @@ class WorkspaceTools(Skill):
             before = before_bytes.decode("utf-8") if before_bytes is not None else None
             if old is None:
                 if exists:
-                    raise ValueError(f"create preimage failed; file already exists: {item['path']}")
+                    raise ValueError(
+                        f"create preimage failed; file already exists: {item['path']}. "
+                        "Use exact old text for an update, or write(path, content) to overwrite it."
+                    )
                 if new is None:
                     raise ValueError(f"create requires new content: {item['path']}")
                 after = new
@@ -739,20 +751,28 @@ class WorkspaceTools(Skill):
                 after = None
                 operation = "delete"
             else:
+                if old == "":
+                    raise ValueError(
+                        f"update requires nonempty old text in {item['path']}; "
+                        "use write(path, content) to replace an empty file"
+                    )
                 current_text = before or ""
-                occurrences = current_text.count(str(old))
+                occurrences = current_text.count(old)
                 if occurrences != 1:
                     raise ValueError(
                         f"update preimage must match exactly once in {item['path']} "
                         f"(found {occurrences})"
                     )
-                after = current_text.replace(str(old), str(new), 1)
+                after = current_text.replace(old, new, 1)
                 operation = "update"
+            candidate_bytes = after.encode("utf-8") if after is not None else None
+            if candidate_bytes is not None:
+                self._validate_python_source(target, candidate_bytes, before=before_bytes)
             item.update(
                 before=before,
                 before_bytes=before_bytes,
                 after=after,
-                after_bytes=after.encode() if after is not None else None,
+                after_bytes=candidate_bytes,
                 operation=operation,
                 mode=target.stat().st_mode if exists else None,
             )
@@ -888,6 +908,11 @@ class WorkspaceTools(Skill):
             parse_unified_diff,
         )
 
+        if not isinstance(diff_text, str):
+            raise TypeError(
+                "apply_unified_diff(diff_text) requires unified diff text as a string; "
+                "use apply_patch(changes) for a list of path/old/new dictionaries"
+            )
         if not diff_text or not diff_text.strip():
             raise ValueError("diff text is required")
         parsed = parse_unified_diff(diff_text)
@@ -1207,6 +1232,11 @@ class WorkspaceTools(Skill):
         temp+fsync+rename.
         """
 
+        if not old:
+            raise ValueError(
+                "replace(path, old_text, new_text) requires nonempty old_text; "
+                "use write(path, content) to replace an empty file"
+            )
         data = resolved.read_bytes()
         if b"\0" in data:
             raise ValueError("binary files are not editable via replace()")
@@ -1229,12 +1259,14 @@ class WorkspaceTools(Skill):
             )
         new_content = text.replace(old, new, 1)
         mode = resolved.stat().st_mode & 0o7777
-        self._atomic_write_bytes(resolved, new_content.encode(codec), new_content, mode=mode)
-        return FileWrite(
+        result = FileWrite(
             path=path_display,
             message=f"Edited {path_display}",
             diff=f"--- a/{path_display}\n+++ b/{path_display}",
             new_text=new,
+        )
+        return self._commit_file_write(
+            resolved, new_content.encode(codec), new_content, mode=mode, result=result
         )
 
     def _native_replace_match(
@@ -1258,11 +1290,12 @@ class WorkspaceTools(Skill):
             text = data.decode(codec)
         all_lines = text.splitlines(keepends=True)
         total = len(all_lines)
-        start = max(1, int(match.start))
-        end = min(total, int(match.end))
-        if start > total:
+        start = int(match.start)
+        end = int(match.end)
+        if not 1 <= start <= end <= total:
             raise ValueError(
-                f"stale edit anchor: {self._workspace.relpath(resolved)} has {total} lines; "
+                f"stale edit anchor: {self._workspace.relpath(resolved)} has {total} lines "
+                f"but the anchor requests {start}-{end}; "
                 "call read() again to refresh the Match"
             )
         removed = all_lines[start - 1 : end]
@@ -1277,15 +1310,59 @@ class WorkspaceTools(Skill):
             replacement += eol
         new_content = "".join(all_lines[: start - 1]) + replacement + "".join(all_lines[end:])
         mode = resolved.stat().st_mode & 0o7777
-        self._atomic_write_bytes(resolved, new_content.encode(codec), new_content, mode=mode)
         diff = f"--- a/{match.path}\n+++ b/{match.path}\n"
         diff += f"@@ -{start},{end - start + 1} @@\n"
-        return FileWrite(
+        result = FileWrite(
             path=match.path,
             message=f"Edited {match.path} (replaced lines {start}-{end})",
             diff=diff,
             new_text=replacement,
         )
+        return self._commit_file_write(
+            resolved, new_content.encode(codec), new_content, mode=mode, result=result
+        )
+
+    def _validate_python_source(
+        self, resolved: Path, data: bytes, *, before: bytes | None = None
+    ) -> None:
+        """Compile Python postimages in memory; never import or execute their code.
+
+        A pre-existing syntax error is not a bypass: a repair must leave the
+        entire file syntactically valid. Python decodes bytes itself, honoring
+        encoding declarations and BOMs without rewriting untouched bytes.
+        """
+        if resolved.suffix.lower() not in {".py", ".pyi"}:
+            return
+        display = self._workspace.relpath(resolved)
+        try:
+            compile(data, str(resolved), "exec", dont_inherit=True)
+        except SyntaxError as exc:
+            if before is None and resolved.is_file():
+                before = resolved.read_bytes()
+            already_invalid = False
+            if before is not None:
+                try:
+                    compile(before, str(resolved), "exec", dont_inherit=True)
+                except SyntaxError:
+                    already_invalid = True
+            line = (exc.text or "").rstrip("\r\n")
+            column = max(1, exc.offset or 1)
+            # Keep the offending area readable even for generated long lines.
+            left = max(0, column - 81)
+            excerpt = line[left : left + 200]
+            caret = " " * min(200, max(0, column - left - 1)) + "^"
+            context = f"\n{excerpt}\n{caret}" if excerpt else ""
+            guidance = (
+                "The existing file also has a syntax error. Submit a complete repair "
+                "that leaves the whole file valid, using one write or atomic patch."
+                if already_invalid else
+                "Re-read the edit anchor and check the complete replacement, including indentation."
+            )
+            raise ValueError(
+                f"Python syntax validation failed: {display}:{exc.lineno or 1}:{column}: "
+                f"{exc.msg}. No files changed.{context}\n{guidance} "
+                f"Validation uses Python {sys.version_info.major}.{sys.version_info.minor}."
+            ) from exc
 
     def _atomic_write_bytes(
         self,

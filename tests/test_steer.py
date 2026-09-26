@@ -70,6 +70,7 @@ def test_safe_slash_allowlist_matches_spec() -> None:
             "help",
             "trace",
             "work",
+            "tasks",
             "timeline",
             "context",
             "queue",

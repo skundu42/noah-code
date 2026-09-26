@@ -39,7 +39,8 @@ noah .
 
 Noah is compatible with macOS on Apple Silicon and Intel, plus Linux on arm64 and x86_64.
 
-On the first launch, the TUI walks through provider, API key, model, and reasoning setup. Keys are
+On the first launch, choose Normal, Auto, or YOLO permissions, then a provider, model, and reasoning
+level. Choose **Codex / ChatGPT account** to sign in through your browser, or enter a provider API key. Keys are
 stored in Noah's private auth file with owner-only permissions; they are never written to project
 configuration or session history.
 
@@ -97,6 +98,16 @@ use `F4` to inspect live team progress. In the console, `/team` lists the workfl
 
 Useful launch modes:
 
+First-time interactive setup asks you to choose a permission mode, with **Normal** selected
+by default. Your choice is saved for future launches:
+
+- **Normal (recommended):** Ask before commands that need approval; keep protective blocks enabled.
+- **Auto:** Approve routine actions automatically; block interpreters and keep risky-action approvals.
+- **YOLO:** Skip permission checks and approval prompts; use only in isolated, trusted workspaces.
+
+This choice is separate from the AI model and build/plan mode. Use `--permissions normal`,
+`--permissions auto`, or `--permissions yolo` to override it for one launch.
+
 ```bash
 # Open another workspace
 noah /path/to/repository
@@ -110,8 +121,11 @@ noah run "Explain how authentication is wired" .
 # Emit one structured result on stdout (progress goes to stderr)
 noah run --json "Fix the failing unit test" .
 
-# Allow actions that would normally ask; explicit deny rules still apply
-noah run --auto "Fix the failing unit test" .
+# Use Normal permissions even if you previously saved YOLO
+noah --permissions normal .
+
+# Auto-approve routine actions; interpreter commands remain blocked
+noah --auto .
 
 # Resume previous work
 noah --continue .
@@ -233,11 +247,22 @@ independent agents need to work concurrently. See
 [Reliability and long-running sessions](docs/reliability.md) for the recovery model, provider retry
 controls, quotas, and operational limits.
 
+Child agents also retain their own conversation snapshots and task IDs. Noah can start,
+inspect, cancel, wait for, and follow up with a child independently. Background writers use
+an optional Git worktree created from committed `HEAD`; local uncommitted changes stay in
+the parent checkout. See [persistent child tasks](docs/persistent-tasks.md).
+
 ## Models and providers
 
 Noah supports OpenAI, Anthropic, OpenRouter, NVIDIA, and custom OpenAI-compatible providers. It
 also works with vLLM, LM Studio, Ollama, Azure OpenAI, Bedrock, Gemini, Groq, Mistral, xAI,
 DeepSeek, Together AI, and Perplexity.
+
+You can also connect your **Codex / ChatGPT account** directly in `/model`, without an API key.
+Install the [Codex CLI](https://learn.chatgpt.com/docs/cli) (0.153.4 or newer), then select that
+option or run `noah providers login codex`. On a headless machine, add `--device-code`.
+Noah uses the official Codex app server and a separate Codex-managed login store; account usage
+counts toward your Codex limits. See [account setup](docs/configuration.md#codex--chatgpt-account).
 
 The guided `/model` flow is the easiest way to configure a provider. Environment variables and
 the CLI remain available for scripts and headless environments:
@@ -248,6 +273,12 @@ noah providers list
 noah providers add openai --model MODEL_NAME
 noah .
 ```
+
+Setup offers a searchable model picker, live model discovery for compatible endpoints, and
+manual model entry. Catalog entries whose account access has not been checked are labeled.
+Supported completion clients show incremental generation in a temporary terminal preview;
+the parsed answer is saved when generation completes. Responses clients retain their existing
+completed-response behavior.
 
 `/model MODEL` changes only the current session and remembers that choice when resumed. Use
 `/model --global MODEL` to set the default for future sessions in every repository.
@@ -262,6 +293,18 @@ noah --model openai/MODEL --reasoning-effort high .
 See the [provider configuration guide](docs/configuration.md#bring-your-own-api-provider) for
 gateway-specific setup. Provider request deadlines, exponential retry, and ordered fallback models
 are configured under `[reliability.retries]`.
+
+## Integrations
+
+`noah serve` exposes authenticated loopback HTTP and resumable event streams; set
+`NOAH_CODE_SERVER_TOKEN` to a random token of at least 32 characters before starting it.
+`noah acp` exposes the same agent host through ACP v1 for compatible editors. See
+[service and ACP](docs/service.md) for endpoints and supported capabilities.
+
+`noah browser setup` configures the pinned Playwright MCP browser preset. It uses an isolated
+browser profile and Noah's tool permissions; Node.js and a supported browser are required.
+See [browser tools](docs/browser.md). Trusted user configuration can also run
+[lifecycle hooks](docs/lifecycle-hooks.md) for session, turn, and worktree events.
 
 ## Updates
 
@@ -281,6 +324,13 @@ noah update
 - [Reliability and long-running sessions](docs/reliability.md)
 - [Generated-code security](docs/security.md)
 - [Custom commands, skills, MCP, and tracing](docs/extensions.md)
+- [Persistent child tasks](docs/persistent-tasks.md)
+- [HTTP service and ACP](docs/service.md)
+- [Browser tools](docs/browser.md)
+- [Lifecycle hooks](docs/lifecycle-hooks.md)
+- [Matched agent evaluation](docs/evaluation.md)
+- [Recorded comparison results](docs/evaluation-results.md)
+- [OpenCode v2 comparison and remaining gaps](docs/opencode-v2-comparison.md)
 - [Development, CI, and releases](docs/development.md)
 - [Release notes](docs/releases/)
 

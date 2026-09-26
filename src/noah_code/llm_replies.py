@@ -1,4 +1,4 @@
-"""Turn CodeAct prose replies into a visible answer plus DONE."""
+"""Normalize CodeAct prose replies and recover bounded output truncation."""
 
 from __future__ import annotations
 
@@ -18,6 +18,42 @@ def _reply_text(response: Any) -> str:
     if content is None or hasattr(content, "model_dump"):
         return ""
     return str(content).strip()
+
+
+def recover_empty_truncated_response(response: Any) -> Any:
+    """Let CodeAct's existing bounded continuation path handle empty truncation.
+
+    NOOA otherwise aborts immediately when reasoning consumes the output limit.
+    Keep ``length`` so this notice cannot become DONE: its synthetic-comment
+    route counts an iteration and stops after repeated incomplete responses.
+    There is no extra provider call here; the session and budget wrappers retain
+    control of every continuation. Preserve the provider payload and accounting,
+    and label the replacement content so persisted traces cannot mistake it for
+    model output.
+    """
+    content = getattr(response, "content", None)
+    if (
+        getattr(response, "finish_reason", None) != "length"
+        or getattr(response, "tool_calls", None)
+        or (content is not None and (not isinstance(content, str) or content.strip()))
+    ):
+        return response
+    notice = (
+        "[Noah host recovery notice; not model output]\n"
+        "The previous response reached its output limit without any answer or tool call. "
+        "Continue the same task with shorter reasoning and one concrete execute_python "
+        "action within the unchanged output limit. The task is not complete.\n"
+        f"Original response: finish_reason=length; content={json.dumps(content)}; tool_calls=[]"
+    )
+    return LLMResponse(
+        raw_response=getattr(response, "raw_response", None),
+        content=notice,
+        tool_calls=getattr(response, "tool_calls", []),
+        finish_reason="length",
+        assistant_message=getattr(response, "assistant_message", {}),
+        reasoning=getattr(response, "reasoning", None),
+        usage=getattr(response, "usage", None),
+    )
 
 
 def coerce_text_only_response(response: Any) -> Any:
@@ -61,6 +97,7 @@ class ConversationalReplyLLM:
     def _coerce(self, response: Any, tools: Any) -> Any:
         if not _codeact_session(tools):
             return response
+        response = recover_empty_truncated_response(response)
         return coerce_text_only_response(response)
 
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:

@@ -59,9 +59,7 @@ def build_macos_profile(read_paths: Iterable[str]) -> str:
             if next_parent == parent:
                 break
             parent = next_parent
-    metadata_rules = "\n".join(
-        f"    (literal {_profile_path(path)})" for path in sorted(ancestors)
-    )
+    metadata_rules = "\n".join(f"    (literal {_profile_path(path)})" for path in sorted(ancestors))
     read_rules = "\n".join(f"    (subpath {_profile_path(path)})" for path in sorted(roots))
     return f"""(version 1)
 (deny default)
@@ -157,6 +155,9 @@ def macos_worker_main(
         init = conn.recv()
         if not isinstance(init, dict):
             raise TypeError(f"sandbox worker init must be a dict, got {type(init).__name__}")
+        from noah_code.nooa_compat import install_cell_literal_preservation
+
+        install_cell_literal_preservation()
         _ensure_return_result(init)
         _apply_resource_limits(
             max_memory_mb=max_memory_mb,

@@ -244,6 +244,32 @@ def test_git_status_parser_reports_branch_and_each_change_scope() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_stream_is_transient_and_retry_replaces_preview(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        for phase, text in [("start", ""), ("text", "partial code "), ("text", "continues")]:
+            ui.render(HostEvent(HostEventKind.MODEL_STREAM, text, meta={"phase": phase, "call_id": "a"}))
+        await pilot.pause()
+        preview = app.query_one("#model-stream-preview")
+        assert preview.display
+        assert app._model_preview == "partial code continues"
+        assert "partial code" not in _log_text(app.query_one("#conversation"))
+        ui.render(HostEvent(HostEventKind.MODEL_STREAM, "", meta={"phase": "start", "call_id": "b"}))
+        ui.render(HostEvent(HostEventKind.MODEL_STREAM, "late", meta={"phase": "text", "call_id": "a"}))
+        await pilot.pause()
+        assert not preview.display
+        assert app._model_preview == ""
+        ui.render(HostEvent(HostEventKind.MODEL_STREAM, "answer", meta={"phase": "text", "call_id": "b"}))
+        ui.render(HostEvent(HostEventKind.MODEL_STREAM, "", meta={"phase": "finish", "call_id": "b"}))
+        ui.render(HostEvent(HostEventKind.MESSAGE, "Final answer"))
+        await pilot.pause()
+        assert not preview.display
+        assert "Final answer" in _log_text(app.query_one("#conversation"))
+
+
+@pytest.mark.asyncio
 async def test_tui_renders_host_events_and_header(tmp_path: Path) -> None:
     host = _fake_host(tmp_path)
     ui = TextualUI()
@@ -1508,8 +1534,16 @@ async def test_tui_paints_before_host_start_and_queues_first_prompt(tmp_path: Pa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("queue_prompt", [False, True])
 async def test_first_run_opens_model_setup_before_starting_agent(
-    tmp_path: Path, queue_prompt: bool
+    tmp_path: Path, queue_prompt: bool, monkeypatch
 ) -> None:
+    from noah_code.provider_discovery import ModelDiscoveryResult, ModelInfo
+
+    monkeypatch.setattr(
+        "noah_code.provider_discovery.discover_models",
+        AsyncMock(return_value=ModelDiscoveryResult(
+            (ModelInfo("listed-model", "Bundled catalog"),), "catalog", "Account access not checked"
+        )),
+    )
     host = _fake_host(tmp_path)
     host._agent = None
     host.meta = None
@@ -1585,6 +1619,11 @@ async def test_first_run_opens_model_setup_before_starting_agent(
             if host.set_provider_api_key.await_count:
                 break
             await pilot.pause()
+        assert isinstance(app.screen, FilteredPicker)
+        app.screen.query_one("#picker-filter").value = "manually"
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
         app.screen.query_one("#prompt-input").value = "example-model"
         await pilot.press("enter")
         await pilot.pause()
@@ -2019,7 +2058,13 @@ async def test_mcp_has_dedicated_searchable_connection_picker(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_providers_have_searchable_secret_free_setup(tmp_path: Path) -> None:
+async def test_providers_have_searchable_secret_free_setup(tmp_path: Path, monkeypatch) -> None:
+    from noah_code.provider_discovery import ModelDiscoveryResult, ModelInfo
+
+    discovery = AsyncMock(return_value=ModelDiscoveryResult(
+        (ModelInfo("example-model", "Reported by endpoint"),), "endpoint", "Live model list"
+    ))
+    monkeypatch.setattr("noah_code.provider_discovery.discover_models", discovery)
     host = _fake_host(tmp_path)
     host.list_provider_infos.return_value = [
         SimpleNamespace(
@@ -2057,8 +2102,9 @@ async def test_providers_have_searchable_secret_free_setup(tmp_path: Path) -> No
 
         await pilot.press("enter")
         await pilot.pause()
-        model_input = app.screen.query_one("#prompt-input")
-        model_input.value = "example-model"
+        assert isinstance(app.screen, FilteredPicker)
+        app.screen.query_one("#picker-filter").value = "example-model"
+        await pilot.pause()
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, FilteredPicker)
@@ -2071,10 +2117,18 @@ async def test_providers_have_searchable_secret_free_setup(tmp_path: Path) -> No
         host.configure_provider.assert_awaited_once_with(
             "openai", "example-model", reasoning_effort="default"
         )
+        discovery.assert_awaited_once_with("openai", base_url=None, api_key_env=None)
 
 
 @pytest.mark.asyncio
-async def test_exact_model_command_runs_masked_provider_key_model_setup(tmp_path: Path) -> None:
+async def test_exact_model_command_runs_masked_provider_key_model_setup(tmp_path: Path, monkeypatch) -> None:
+    from noah_code.provider_discovery import ModelDiscoveryResult, ModelInfo
+
+    monkeypatch.setattr("noah_code.provider_discovery.discover_models", AsyncMock(
+        return_value=ModelDiscoveryResult(
+            (ModelInfo("listed-model", "Bundled catalog"),), "catalog", "Account access not checked"
+        )
+    ))
     host = _fake_host(tmp_path)
     host.list_provider_infos.return_value = [
         SimpleNamespace(
@@ -2114,6 +2168,11 @@ async def test_exact_model_command_runs_masked_provider_key_model_setup(tmp_path
                 break
             await pilot.pause()
 
+        assert isinstance(app.screen, FilteredPicker)
+        app.screen.query_one("#picker-filter").value = "manually"
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
         model_input = app.screen.query_one("#prompt-input")
         assert model_input.password is False
         model_input.value = "example-model"
@@ -2214,7 +2273,15 @@ async def test_setup_shortcuts_explain_unavailable_states(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_model_setup_recovers_a_missing_credential_startup_failure(tmp_path: Path) -> None:
+async def test_model_setup_recovers_a_missing_credential_startup_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from noah_code.provider_discovery import ModelDiscoveryResult
+
+    monkeypatch.setattr(
+        "noah_code.provider_discovery.discover_models",
+        AsyncMock(return_value=ModelDiscoveryResult((), "unavailable", "Enter a model manually")),
+    )
     host = _fake_host(tmp_path)
     host._agent = None
     host.list_provider_infos.return_value = [

@@ -47,6 +47,22 @@ _MUTATING_MCP_TOOL = re.compile(
     r"merge|close|write|set|add|upload|publish|execute|run|trigger|cancel|approve|reject)(?:_|$)",
     re.IGNORECASE,
 )
+_READ_ONLY_BROWSER_TOOLS = frozenset(
+    {"browser_snapshot", "browser_console_messages", "browser_network_requests"}
+)
+
+
+def browser_tool_mutates(name: str, arguments: dict[str, Any] | None = None) -> bool:
+    """Fail closed for browser actions, including arbitrary script evaluation.
+
+    Even navigation can trigger server-side changes. The narrow read catalog
+    stops being read-only when asked to save output to a file.
+    """
+
+    name = name.lower()
+    if not name.startswith("browser_"):
+        return False
+    return name not in _READ_ONLY_BROWSER_TOOLS or bool((arguments or {}).get("filename"))
 
 
 @dataclass(frozen=True)
@@ -273,16 +289,14 @@ async def attach_mcp_server(
         **_normalized_spec(spec),
     )
     runtime = getattr(agent, "_runtime", None)
-    if runtime is not None:
+    if runtime is not None or callable(getattr(tool, "_call_tool", None)):
         original_call = tool._call_tool
+        browser_effect_lock = asyncio.Lock()
 
-        async def _durable_mcp_call(
-            _self: Any,
-            tool_name: str,
-            arguments: dict[str, Any] | None = None,
-        ) -> Any:
-            clean = {key: value for key, value in (arguments or {}).items() if value is not None}
-            if _MUTATING_MCP_TOOL.match(tool_name) is None:
+        async def _invoke(tool_name: str, clean: dict[str, Any], *, browser_mutation: bool) -> Any:
+            if runtime is None or (
+                not browser_mutation and _MUTATING_MCP_TOOL.match(tool_name) is None
+            ):
                 return await original_call(tool_name, clean)
             effect_key, cached, result, recovering = runtime.begin_effect(
                 "mcp",
@@ -290,7 +304,13 @@ async def attach_mcp_server(
                 clean,
             )
             if cached:
-                return result
+                if not browser_mutation:
+                    return result
+                # A repeated click or navigation is a fresh explicit action,
+                # not an idempotent operation. Reopen the completed journal
+                # record; an interruption here safely blocks the next retry.
+                runtime.fail_effect(effect_key, "starting another browser invocation")
+                runtime.begin_effect("mcp", f"{name}.{tool_name}", clean)
             if recovering:
                 runtime.fail_effect(
                     effect_key,
@@ -307,6 +327,28 @@ async def attach_mcp_server(
                 raise
             runtime.complete_effect(effect_key, value)
             return value
+
+        async def _durable_mcp_call(
+            _self: Any,
+            tool_name: str,
+            arguments: dict[str, Any] | None = None,
+        ) -> Any:
+            clean = {key: value for key, value in (arguments or {}).items() if value is not None}
+            browser_mutation = browser_tool_mutates(tool_name, clean)
+            if browser_mutation:
+                decision = engine.decide(
+                    PermissionCategory.MCP, f"{name}.{tool_name}", tool=f"mcp.{tool_name}"
+                )
+                if engine.mode == "plan":
+                    decision = replace(
+                        decision, action="deny", reason="plan mode forbids browser mutations"
+                    )
+                await approvals.require(decision)
+                # Serialize browser effects so an identical concurrent action
+                # cannot confuse an in-flight operation with crash recovery.
+                async with browser_effect_lock:
+                    return await _invoke(tool_name, clean, browser_mutation=True)
+            return await _invoke(tool_name, clean, browser_mutation=False)
 
         tool._call_tool = types.MethodType(_durable_mcp_call, tool)
     attr = re_attr(name)

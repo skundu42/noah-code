@@ -85,6 +85,8 @@ BUILTIN_COMMANDS: list[CommandSpec] = [
     CommandSpec("undo", "Undo last WorkspaceTools turn"),
     CommandSpec("redo", "Redo last undone turn"),
     CommandSpec("agents", "List built-in and markdown subagents"),
+    CommandSpec("tasks", "Inspect, cancel, or continue a persistent child task",
+                "tasks [ID | cancel ID | follow ID PROMPT]"),
     CommandSpec(
         "team",
         "Launch a coordinated build, review, or investigation team",
@@ -133,6 +135,7 @@ _COMMAND_CATEGORIES = {
     "tokens": "Runtime",
     "trace": "Runtime",
     "agents": "Work",
+    "tasks": "Work",
     "team": "Work",
     "work": "Work",
     "timeline": "Work",

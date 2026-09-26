@@ -9,6 +9,7 @@ import site
 import sys
 import sysconfig
 import threading
+import time
 import types
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -38,6 +39,7 @@ from noah_code.permissions import PermissionEngine
 from noah_code.predict import ISOLATED_PREDICT_CONTEXT, LeanPredictStrategy
 from noah_code.secure_files import read_text_bounded
 from noah_code.snapshots import SnapshotJournal
+from noah_code.tool_contracts import ToolContracts
 from noah_code.tools.git_tools import GitTools
 from noah_code.tools.github_tools import GithubTools
 from noah_code.tools.lsp_tools import LSPTools
@@ -50,6 +52,8 @@ from noah_code.tools.task_tools import TaskTools
 from noah_code.tools.web_tools import WebTools
 from noah_code.tools.workspace_tools import WorkspaceMutationCoordinator, WorkspaceTools
 from noah_code.workspace import Workspace, WorkspaceError
+
+nooa_compat.install_cell_literal_preservation()
 
 
 def _interpreter_read_rules() -> tuple[FileRule, ...]:
@@ -121,6 +125,8 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("message",),
             ("mode",),
             ("workspace_root",),
+            ("tools", "list"),
+            ("tools", "help"),
             ("ws", "edit"),
             ("ws", "inspect"),
             ("ws", "checks"),
@@ -155,6 +161,11 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("task", "run_many"),
             ("task", "collaborate"),
             ("task", "team"),
+            ("task", "start"),
+            ("task", "follow_up"),
+            ("task", "status"),
+            ("task", "wait"),
+            ("task", "cancel"),
             ("processes", "input"),
             ("processes", "open_terminal"),
             ("processes", "terminal_run"),
@@ -259,7 +270,14 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             # Even a picklable capability stays behind the broker. Variables and
             # scalar metadata cross as copies; tools cross only as proxies.
             return {"ok": True, "result": None, "proxy": True}
-        return await super()._dispatch_tool_call(msg)
+        response = await super()._dispatch_tool_call(msg)
+        if kind == "call" and response.get("error_type") in {"TypeError", "ValueError"}:
+            contracts = getattr(self._agent, "tools", None)
+            if isinstance(contracts, ToolContracts):
+                hint = contracts.hint(normalized)
+                if hint:
+                    response["call_hint"] = hint
+        return response
 
 
 def _spawn_safe_local_agent(agent: Any) -> Any:
@@ -473,29 +491,32 @@ def _summarization_token_limit(config: NoahCodeConfig, llm: Any) -> int:
 
 _NOAH_CODEACT_INSTRUCTIONS = """## Noah CodeAct
 
-Work through tool calls; plain assistant prose cannot run code or end a turn.
-Use `execute_python(code)` for work and `return_result(...)` to finish. Python
-cell state persists. Parameters and `self` are preloaded. Every `self.ws.*`
-call is async: always `await` it before iterating or accessing the result.
+Use `execute_python(code)` for work and `return_result(...)` to finish; plain
+prose does neither. Cell state persists; parameters and `self` are preloaded.
+Every `self.ws.*` call is async: `await` it before accessing the result.
 `self.message(text)` is synchronous—never await it.
 
 ### Tools
 
-- Explore with focused `self.ws.list/search/read` and `self.lsp` queries. Edit a
-  Match with `self.ws.replace`. `self.ws.edit(path, old, new)` takes exactly
-  three arguments; two-argument calls are invalid. Prefer one atomic
-  `self.ws.apply_patch(changes)` for a
-  coherent batch; `self.ws.apply_unified_diff` accepts git-style hunks.
-- Common shapes: `await ws.search(pattern, path=".", paths=None, regex=True)`
-  returns iterable Matches plus `.stdout`; `await ws.read(path, lines=None)`
-  returns text with `.text`/`.content`; `lines=60` reads the first 60 lines;
-  `await ws.list(pattern="**/*", path=".")` returns paths.
-- Run commands with `await self.ws.run(command)` and inspect
-  returncode/stdout/stderr. `read_only=True` skips approval only for commands
-  the engine recognizes as read-only (Git inspection, search, listing, text
-  filters). It is rejected for pytest, uv, Python, builds, and mutations.
-- Inspect `await self.ws.checks()` for shared verification results. Rerun stale
-  checks after edits; a completed command alone does not prove the task is done.
+- Get signatures, return types and examples with
+  `print(self.tools.help("ws"))`; `self.tools.list()` lists groups. After a tool
+  argument error, read its help before retrying.
+- `await self.ws.list(pattern="**/*", path=".")` returns list[str], not objects.
+  `await self.ws.read(path, lines=None)` returns an anchor with raw `.text`;
+  `lines=60` reads the first 60 lines. Search returns Matches plus `.stdout`.
+- Prefer `anchor = await self.ws.read(path)` then
+  `await self.ws.replace(anchor, new_text)`. Reuse read/search anchors instead
+  of retyping old whitespace. `self.ws.edit(path, old, new)` takes exactly three
+  arguments; two-argument calls are invalid.
+  Batch schema: `await self.ws.apply_patch([{"path": "a.py", "old": "return 1",
+  "new": "return 2"}])`. Keys are exactly path/old/new; old=None creates a file,
+  new=None deletes it. `self.ws.apply_unified_diff` accepts git-style hunks.
+- Run `await self.ws.run(command)` and inspect returncode/stdout/stderr.
+  `read_only=True` skips approval only for commands the engine recognizes as
+  read-only. It is rejected for pytest, uv, Python, builds, and mutations.
+- After edits, run the requested acceptance command and inspect its output.
+  Inspect `await self.ws.checks()`; fix failures and rerun stale checks before
+  DONE. A successful write is not validation. If blocked, explain and NEED_INPUT.
 - Use `self.processes.start/logs/status/input/stop` for long jobs and consume
   logs by cursor. Persistent shells use `open_terminal`, `terminal_run`,
   `terminal_status`, and `close_terminal`; raw terminal input is blocked.
@@ -505,19 +526,20 @@ call is async: always `await` it before iterating or accessing the result.
   `set_mode`. Save standing conventions with `self.memory.save`.
 - Delegate bounded units with `self.task.run`, independent units with
   `run_many`, and lead synthesis with `collaborate`.
-- For coordinated workflows, await `self.task.team(objective, workflow="build")`.
-  Build analyzes, implements, and reviews; `review` and `investigate` are
-  read-only and available in plan mode. Inspect the returned reports, resolve
-  blockers, and report observed validation; delegation alone is not completion.
+  Use `start(name, prompt, isolate=True)` for background work in a retained
+  worktree, then `status`, `wait`, `cancel`, or `follow_up` with its task ID.
+  Shared-checkout background tasks must be read-only. Isolation starts at HEAD.
+- `await self.task.team(objective, workflow="build")` analyzes, implements and
+  reviews. Workflows `review`/`investigate` are read-only. Resolve reported
+  blockers and validate; delegation alone is not completion.
 - If `self.media` has pending images, `show()` each consumed image first.
 
 ### Workflow and safety
 
-Understand the requested end state before acting. For a conversational answer,
-call `self.message(...)` and finish without editing. Otherwise inspect repository
-instructions and nearby code, use todos only for multi-step work, preserve
-unrelated changes, make the smallest coherent edit, and validate proportional
-to risk. Never claim a command passed unless its successful result was observed.
+For a conversational answer, call `self.message(...)` and finish. For coding,
+inspect repository instructions and nearby code, use todos for multi-step work,
+preserve unrelated changes, edit narrowly and validate proportional to risk.
+Never claim a command passed unless its successful result was observed.
 In plan mode do not mutate; follow an active plan without expanding scope.
 Do not commit, push, publish, or create external resources unless explicitly
 asked. Do not read secrets or expose sensitive values. `--yolo` applies only
@@ -525,7 +547,7 @@ when the host was explicitly launched for a throwaway workspace.
 
 Sandboxed cells forbid host/system imports (including os, sys, subprocess,
 shutil, nooa, and noah_code), dynamic execution, input, and attaching callables
-to `self`. Use dedicated tools instead; use `doc(self)` for API help.
+to `self`. Use dedicated tools and `self.tools.help` for API help.
 
 End with exactly one RespondResult: DONE, NEED_INPUT, or WAIT (WAIT requires a
 registered running job). In code call
@@ -538,8 +560,8 @@ _NOAH_EXECUTION_CONTEXT = """## Execution Context
 
 Inside `execute_python`, method parameters and `self` are already in scope and
 state persists across cells. Always available: `print`, `pprint`, `doc`,
-`return_result`, `RespondReason`, `asyncio`, and `typing`. Inspect only the API
-you need with `doc(self)`; nested sandbox proxies are not introspectable. Noah's
+`return_result`, `RespondReason`, `asyncio`, and `typing`. Inspect the API
+with `print(self.tools.help("ws.read"))`; nested proxies hide signatures. Noah's
 internal module imports are intentionally not part of the agent-facing contract.
 """
 
@@ -620,6 +642,82 @@ class _AuxiliaryPredictor(Agent):
 
 
 class _PermissionCodeActStrategy(CodeActStrategy):
+    async def execute(self, runtime: Any, call: Any) -> Any:
+        ledger = runtime.agent._coordinator.verification
+        self._verification_since = time.time()
+        self._verification_started_in_plan = runtime.agent.engine.mode == "plan"
+        self._verification_revision = await ledger.revision() if ledger is not None else None
+        return await super().execute(runtime, call)
+
+    async def _process_tool_calls(
+        self,
+        tool_calls: list[Any],
+        runtime: Any,
+        builtins: dict[str, Any],
+        session: Any,
+        call: Any,
+        return_type: Any,
+        event_id: str,
+        reasoning_items: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        prior_event_tags = set(runtime.event_manager.keys())
+        result = await super()._process_tool_calls(
+            tool_calls, runtime, builtins, session, call, return_type, event_id, reasoning_items
+        )
+        if not result.completed or getattr(result.final_value, "kind", None) != RespondReason.DONE:
+            return result
+        # Shared checkout changes/checks can belong to a concurrent parent.
+        # A role forbidden to edit may finish by reporting those failures.
+        if runtime.agent._readonly or (
+            self._verification_started_in_plan and runtime.agent.engine.mode == "plan"
+        ):
+            return result
+        ledger = runtime.agent._coordinator.verification
+        if ledger is None:
+            return result
+        current = await ledger.revision()
+        # A read-only investigation may legitimately finish by reporting failures.
+        # Only hold edited work to validation observed during this same execution.
+        if current is not None and current == self._verification_revision:
+            return result
+        blockers = await ledger.completion_blockers(since=self._verification_since)
+        if blockers:
+            from nooa.context_blocks import ResultStatus, ToolResult
+            from nooa.events import Feedback
+
+            evidence = "\n".join(
+                f"- {row['state']}: {row['command'][:400]}" for row in blockers[:8]
+            )
+            deferred = (
+                "Completion deferred: workspace changes have unresolved verification.\n"
+                f"{evidence}\n"
+                "Fix failures and rerun these checks against the current files. "
+                "If blocked, report the reason and return NEED_INPUT. "
+                "Use self.ws.checks() for details."
+            )
+            # NOOA records acceptance before returning the completion candidate.
+            # Correct only return events produced by this batch, including the
+            # synthetic event emitted for an inline/explicit Python return.
+            for tag, event in runtime.event_manager.items():
+                if (
+                    tag not in prior_event_tags
+                    and isinstance(event, ToolCallEvent)
+                    and event.name == "return_result"
+                ):
+                    runtime.event_manager.update(
+                        tag,
+                        result=ToolResult(
+                            tool_call_id=event.tool_call_id,
+                            content=deferred,
+                            result_status=ResultStatus.ERROR,
+                        ),
+                    )
+            runtime.event_manager.add(Feedback(content=deferred))
+            # Stay inside this session: do not reset iteration, token or time budgets.
+            result.completed = False
+            result.final_value = None
+        return result
+
     async def strategy_instructions(self, runtime: Any) -> str:
         """Use one stable Noah-specific contract instead of generic duplicate guidance."""
 
@@ -748,6 +846,7 @@ class CodingAgent(InteractiveAgent):
     mode: Literal["build", "plan"] = "build"
     _system_messages_in: Annotated[Channel, hidden, nosnapshot]
     _summarizers: Annotated[list[Any], hidden, nosnapshot]
+    tools: Annotated[ToolContracts, nosnapshot]
 
     def __init__(
         self,
@@ -892,6 +991,18 @@ class CodingAgent(InteractiveAgent):
                 self._approvals,
                 parent=self,
             )
+
+        self.tools = ToolContracts(
+            {
+                name: getattr(self, name)
+                for name in (
+                    "ws", "git", "github", "lsp", "processes", "web", "ask",
+                    "plan", "memory", "media", "todos", "task",
+                )
+                if hasattr(self, name)
+            },
+            allowed_paths=_PermissionSandboxedExecutor._EXACT_PATHS,
+        )
 
         from noah_code.skills_setup import install_skills
 
@@ -1185,12 +1296,17 @@ class CodingAgent(InteractiveAgent):
     async def close_tools(self) -> None:
         """Close every owned shell, LSP server, and background process."""
 
-        for unsubscribe in self._observability_unsubs:
-            unsubscribe()
-        self._observability_unsubs.clear()
-        await asyncio.gather(
-            self.processes.close(),
-            self.lsp.close(),
-            self.ws.close(),
-            return_exceptions=True,
-        )
+        task_tools = getattr(self, "task", None)
+        try:
+            if task_tools is not None:
+                await task_tools.close()
+        finally:
+            try:
+                for unsubscribe in self._observability_unsubs:
+                    unsubscribe()
+                self._observability_unsubs.clear()
+            finally:
+                await asyncio.gather(
+                    self.processes.close(), self.lsp.close(), self.ws.close(),
+                    return_exceptions=True,
+                )

@@ -19,6 +19,7 @@ SAFE_SLASH_WHILE_BUSY = frozenset(
         "help",
         "trace",
         "work",
+        "tasks",
         "timeline",
         "context",
         "queue",

@@ -106,7 +106,11 @@ def test_custom_openai_provider_saves_secret_free_nooa_alias(tmp_path: Path) -> 
         )
 
 
-@pytest.mark.parametrize("url", ["llm.example.com/v1", "file:///tmp/llm", ""])
+@pytest.mark.parametrize("url", [
+    "llm.example.com/v1", "file:///tmp/llm", "", "https://host:bad/v1",
+    "https://user:secret@host/v1", "https://host/v1?key=secret",
+    "https://host/v1#secret", "https://ho st/v1", "https://host:99999/v1",
+])
 def test_custom_openai_provider_rejects_invalid_base_url(tmp_path: Path, url: str) -> None:
     with pytest.raises(ValueError, match="base URL"):
         save_custom_openai_provider(

@@ -15,6 +15,7 @@ class HostEventKind(StrEnum):
     TOOL_START = "tool_start"
     TOOL_FINISH = "tool_finish"
     SHELL_CHUNK = "shell_chunk"
+    MODEL_STREAM = "model_stream"
     ERROR = "error"
     SUMMARY = "summary"
     STATUS = "status"

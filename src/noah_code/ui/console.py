@@ -7,6 +7,7 @@ import sys
 from typing import TextIO
 
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
@@ -24,6 +25,9 @@ class ConsoleUI:
         self.markdown = markdown
         self._status_line = ""
         self._busy = False
+        self._model_live: Live | None = None
+        self._model_preview = ""
+        self._model_call_id = ""
 
     def set_status(self, text: str) -> None:
         self._status_line = text
@@ -32,6 +36,25 @@ class ConsoleUI:
         self._busy = busy
 
     def render(self, event: HostEvent) -> None:
+        if event.kind == HostEventKind.MODEL_STREAM:
+            if not self.console.is_terminal:
+                return
+            phase = event.meta.get("phase")
+            if phase == "start":
+                if self._model_live is not None:
+                    self._model_live.stop()
+                self._model_call_id = str(event.meta.get("call_id", ""))
+                self._model_preview = ""
+                self._model_live = Live(Text("Generating…"), console=self.console, transient=True)
+                self._model_live.start()
+            elif event.meta.get("call_id") == self._model_call_id and self._model_live is not None:
+                if phase == "text":
+                    self._model_preview = (self._model_preview + event.text)[-1800:]
+                    self._model_live.update(Text(self._model_preview))
+                elif phase in {"finish", "error", "cancel"}:
+                    self._model_live.stop()
+                    self._model_live = None
+            return
         if event.kind == HostEventKind.MESSAGE:
             if self.markdown and event.meta.get("format", "markdown") == "markdown":
                 self.console.print(Markdown(event.text))

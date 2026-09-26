@@ -35,3 +35,9 @@ class LeanPredictStrategy(PredictStrategy):
         # enforces and is rendered after the dynamic task event. Keeping the
         # equivalent contract in the leading system block makes it cacheable.
         return {"strategy_prompt": None}
+
+    async def execute(self, runtime, call):
+        from noah_code.model_streaming import model_stream
+
+        with model_stream(None):
+            return await super().execute(runtime, call)

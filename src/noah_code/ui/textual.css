@@ -48,6 +48,14 @@ Screen {
     height: 1fr;
 }
 
+#model-stream-preview {
+    display: none;
+    height: auto;
+    max-height: 6;
+    padding: 0 2;
+    color: $nc-muted;
+}
+
 #welcome {
     display: block;
     width: 1fr;
@@ -226,6 +234,7 @@ Screen {
 ApprovalModal,
 QuestionModal,
 OnboardingScreen,
+CodexLoginScreen,
 FilteredPicker,
 KeyboardHelpScreen,
 TextPromptModal,
@@ -367,6 +376,7 @@ DiffReviewScreen {
 
 #approval-dialog,
 #onboarding-dialog,
+#codex-login-dialog,
 #picker-dialog,
 #prompt-dialog,
 #detail-dialog,
@@ -427,6 +437,34 @@ DiffReviewScreen {
     height: 1;
     color: $nc-muted;
     content-align: center middle;
+}
+
+#codex-login-title {
+    height: 1;
+    color: $nc-accent;
+    text-style: bold;
+}
+
+#codex-login-status,
+#codex-login-help,
+#codex-login-code,
+#codex-login-link {
+    width: 1fr;
+    height: auto;
+    margin-top: 1;
+}
+
+#codex-login-help {
+    color: $nc-muted;
+}
+
+#codex-login-buttons {
+    height: 3;
+    margin-top: 1;
+}
+
+#codex-login-buttons Button {
+    margin-right: 1;
 }
 
 #confirmation-dialog,

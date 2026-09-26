@@ -97,12 +97,20 @@ def test_completed_stop_protocol_summary_is_hidden() -> None:
     assert buffer.getvalue() == ""
 
 
-@pytest.mark.parametrize("kind", list(HostEventKind))
+@pytest.mark.parametrize("kind", [kind for kind in HostEventKind if kind != HostEventKind.MODEL_STREAM])
 def test_console_event_data_is_literal(kind: HostEventKind) -> None:
     ui, buffer = _make_ui(markdown=False)
     value = "[bold]literal[/] [/unmatched]"
     ui.render(HostEvent(kind, value))
     assert value in buffer.getvalue()
+
+
+def test_model_stream_preview_does_not_pollute_piped_output() -> None:
+    ui, buffer = _make_ui(markdown=False)
+    for phase in ("start", "text", "finish"):
+        ui.render(HostEvent(HostEventKind.MODEL_STREAM, "provisional", meta={"phase": phase, "call_id": "a"}))
+    ui.render(HostEvent(HostEventKind.MESSAGE, "Final answer"))
+    assert buffer.getvalue() == "Final answer\n"
 
 
 def test_shell_stream_preserves_chunk_boundaries_and_blank_lines() -> None:

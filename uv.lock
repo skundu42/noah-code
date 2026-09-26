@@ -1021,10 +1021,11 @@ wheels = [
 
 [[package]]
 name = "noah-code"
-version = "0.8.0"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
+    { name = "httpx" },
     { name = "litellm" },
     { name = "nooa" },
     { name = "nooa-cli" },
@@ -1057,6 +1058,7 @@ tracing = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.1.0,<9.0.0" },
+    { name = "httpx", specifier = ">=0.28.1,<1.0.0" },
     { name = "litellm", specifier = ">=1.96.0,<1.99.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=2.3.1" },
     { name = "nooa", specifier = "==0.0.10" },

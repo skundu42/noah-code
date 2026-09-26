@@ -406,7 +406,9 @@ class _CloseTrackingHost:
     async def run_interactive(self) -> int:
         raise KeyboardInterrupt
 
-    async def run_tui(self, *, onboarding_required: bool = False) -> int:
+    async def run_tui(
+        self, *, onboarding_required: bool = False, permission_setup_required: bool = False,
+    ) -> int:
         raise RuntimeError("Textual is required for the TUI but could not be imported.")
 
     async def close(self) -> None:
@@ -437,6 +439,7 @@ async def test_interactive_closes_host_on_all_exit_paths(
 
     _CloseTrackingHost.closed = []
     monkeypatch.setattr("noah_code.cli.user_default_model", lambda: "openai/gpt")
+    monkeypatch.setattr("noah_code.cli.user_permission_mode", lambda: "normal")
     monkeypatch.setattr("noah_code.cli.AgentHost", _CloseTrackingHost)
     monkeypatch.setattr("noah_code.config._user_config_path", lambda: tmp_path / "missing.toml")
     monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))

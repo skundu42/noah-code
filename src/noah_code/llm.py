@@ -33,6 +33,11 @@ def get_llm_client(name: str, **overrides: Any) -> Any:
     placeholder so LiteLLM never consults the OpenAI environment fallback.
     """
 
+    if name.startswith("codex/"):
+        from noah_code.codex_client import CodexClient
+
+        return CodexClient(name, **overrides)
+
     from noah_code.credentials import hydrate_provider_credentials_for_model
 
     hydrate_provider_credentials_for_model(name)
@@ -62,7 +67,9 @@ def get_llm_client(name: str, **overrides: Any) -> Any:
             f"custom model alias {name!r} must declare api_key_env or noah_no_auth; "
             "Noah will not guess which credential is safe for that endpoint"
         )
-    return nooa_get_llm_client(name, **overrides)
+    from noah_code.model_streaming import with_model_streaming
+
+    return with_model_streaming(nooa_get_llm_client(name, **overrides))
 
 
 _TRANSIENT_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})

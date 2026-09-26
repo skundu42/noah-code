@@ -46,6 +46,14 @@ class ProviderInfo:
 
 PROVIDER_PRESETS: tuple[ProviderPreset, ...] = (
     ProviderPreset(
+        "codex",
+        "Codex / ChatGPT account",
+        "codex",
+        (),
+        "Sign in with your ChatGPT account through the Codex CLI; no API key needed",
+        "codex/MODEL_NAME",
+    ),
+    ProviderPreset(
         "openai",
         "OpenAI",
         "openai",
@@ -172,10 +180,16 @@ def resolve_provider_model(provider: str, model: str) -> str:
     if not selected or any(character.isspace() for character in selected):
         raise ValueError("model must be a non-empty name without whitespace")
     prefix = f"{preset.prefix}/"
+    if selected == prefix:
+        raise ValueError("model must include a name after the provider prefix")
     return selected if selected.startswith(prefix) else f"{prefix}{selected}"
 
 
 def _credentials_ready(preset: ProviderPreset) -> bool:
+    if preset.key == "codex":
+        from noah_code.codex_account import codex_account_ready
+
+        return codex_account_ready()
     if not preset.credential_groups:
         return True
     if any(all(os.environ.get(name) for name in group) for group in preset.credential_groups):
@@ -188,6 +202,8 @@ def _credentials_ready(preset: ProviderPreset) -> bool:
 
 
 def _credential_hint(preset: ProviderPreset) -> str:
+    if preset.key == "codex":
+        return "ChatGPT account sign-in managed by Codex · noah providers login codex"
     if not preset.credential_groups:
         return "No API key required"
     alternatives = [" + ".join(group) for group in preset.credential_groups]
@@ -232,7 +248,8 @@ def format_providers(active_model: str = "") -> str:
         "are never saved in Noah config or session files.",
     ]
     for info in list_providers(active_model):
-        state = "active" if info.active else "ready" if info.configured else "key missing"
+        missing = "sign-in needed" if info.key == "codex" else "key missing"
+        state = "active" if info.active else "ready" if info.configured else missing
         lines.extend(
             [
                 "",
@@ -263,6 +280,33 @@ def _validate_alias(alias: str) -> str:
     return selected
 
 
+def validate_provider_base_url(base_url: str) -> str:
+    """Validate an endpoint without allowing credentials in persisted URLs."""
+
+    selected = base_url.strip().rstrip("/")
+    if any(character.isspace() or ord(character) < 32 for character in selected):
+        raise ValueError("base URL must not contain whitespace or control characters")
+    try:
+        parsed = urlparse(selected)
+        valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+        # Accessing port validates malformed and out-of-range port numbers.
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("base URL must be an absolute http:// or https:// URL") from exc
+    if not valid:
+        raise ValueError("base URL must be an absolute http:// or https:// URL")
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise ValueError("base URL must not include credentials, a query, or a fragment; use an API key environment variable")
+    return selected
+
+
+def validate_api_key_env(api_key_env: str | None) -> str | None:
+    selected = (api_key_env or "").strip()
+    if selected and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", selected):
+        raise ValueError("API key environment variable has an invalid name")
+    return selected or None
+
+
 def save_custom_openai_provider(
     alias: str,
     model: str,
@@ -281,13 +325,8 @@ def save_custom_openai_provider(
     model_name = (
         selected_model if selected_model.startswith("openai/") else f"openai/{selected_model}"
     )
-    selected_url = base_url.strip().rstrip("/")
-    parsed = urlparse(selected_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("base URL must be an absolute http:// or https:// URL")
-    selected_env = (api_key_env or "").strip()
-    if selected_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", selected_env):
-        raise ValueError("API key environment variable has an invalid name")
+    selected_url = validate_provider_base_url(base_url)
+    selected_env = validate_api_key_env(api_key_env)
     if client_type not in {"completion", "responses"}:
         raise ValueError("client type must be completion or responses")
 

@@ -10,10 +10,34 @@ Configuration is merged in this order, with later layers taking precedence:
 4. `NOAH_CODE_*` environment variables.
 5. CLI flags.
 
-### First-run model setup
+### First-run permissions and model setup
 
-The first TUI launch opens one guided provider → API key → model → reasoning flow before starting
-the agent. Noah Code saves the selected model as the top-level `model` in
+The first interactive launch asks for a permission mode before starting the agent. Each choice
+has a one-line explanation, and **Normal** is initially selected:
+
+| Choice | Behavior |
+| --- | --- |
+| Normal (recommended) | Ask before commands that need approval; keep protective blocks enabled. |
+| Auto | Approve routine actions automatically; block interpreters and keep risky-action approvals. |
+| YOLO | Skip permission checks and approval prompts; use only in isolated, trusted workspaces. |
+
+The choice atomically saves both `auto_approve` and `yolo` in the trusted user config. Existing
+explicit settings are respected. Users without a saved permission preference are asked once,
+even if their model is already configured. Cancelling leaves setup pending; it does not select
+YOLO or start the agent. The console offers the same choices with Normal as its default.
+
+Override the saved preference for one launch with `--permissions normal|auto|yolo`. Existing
+`--auto` and `--yolo` flags select those modes and clear the other flag for that launch; conflicting
+choices are rejected. Explicit CLI choices, `NOAH_CODE_AUTO`, resumed sessions, and noninteractive
+`run`/`serve`/`acp` launches do not trigger the new setup question. Model configuration and build/plan
+mode remain separate, and the execution sandbox is unchanged. `NOAH_CODE_AUTO=true` selects Auto,
+and `NOAH_CODE_AUTO=false` selects Normal; both clear a saved YOLO setting for that launch. Explicit
+CLI choices take precedence over the environment. To change the saved preference,
+set both top-level booleans in your user config (`false`/`false` for Normal, `true`/`false` for Auto,
+`false`/`true` for YOLO).
+
+The TUI then opens the guided provider → account sign-in or API key → model → reasoning flow when model setup is
+needed. Noah Code saves the selected model as the top-level `model` in
 `~/.config/noah-code/config.toml`, making it the default for every repository, and stores provider
 credentials separately in its private auth file. The classic `--console` frontend retains a
 line-oriented model prompt for environments that cannot open the TUI.
@@ -31,8 +55,8 @@ Inside an interactive session, switch only the current session or replace the gl
 /model --global anthropic/MODEL_NAME
 ```
 
-Bare `/model` opens a guided TUI flow: search for a provider, enter its API key in a masked
-field, enter the model ID, and select reasoning effort. Noah saves the credential in
+Bare `/model` opens a guided TUI flow: search for a provider, connect your Codex account or enter
+an API key in a masked field, choose a model, and select reasoning effort. Noah saves API keys in
 `~/.local/share/noah-code/auth.json`, using the same provider-keyed record shape as OpenCode.
 The containing directory uses mode `0700` and the file uses mode `0600`. If the file cannot be
 written, the key remains active only in the current Noah process and the TUI says so. Keys are
@@ -41,6 +65,43 @@ never written to Noah configuration or session metadata. `XDG_DATA_HOME` relocat
 Model switches take effect between turns and are stored in the current session metadata, so a
 resumed session continues with its most recently selected model. A session-only `/model MODEL`
 does not change the user configuration or affect new sessions.
+
+### Codex / ChatGPT account
+
+Choose **Codex / ChatGPT account** in the first-run provider picker or `/model`.
+Install the [official Codex CLI](https://learn.chatgpt.com/docs/cli), version 0.153.4 or newer,
+and complete the browser sign-in shown by Noah. Then choose a model from Codex's model list
+and select reasoning effort. In the console's first-run model prompt, enter `codex`.
+
+```bash
+noah providers login codex
+# For SSH or a machine without a browser:
+noah providers login codex --device-code
+# Select a known Codex model explicitly:
+noah providers login codex --model MODEL_NAME
+```
+
+The saved route is `codex/MODEL_NAME`. This uses your ChatGPT account's Codex access and usage
+limits; it does not require `OPENAI_API_KEY`. Available models and reasoning levels depend on
+your account and Codex version. Codex account usage is not metered as API-dollar spend by Noah.
+Token usage is recorded when Codex reports it; calls handed back to Noah for tool execution may
+end before usage arrives. Use a time budget for a local cap, and check Codex for account limits.
+
+Sign-in uses the [official app-server account flow](https://learn.chatgpt.com/docs/app-server#auth-endpoints)
+over a local stdio process. Codex stores and refreshes credentials in
+`~/.local/share/noah-code/codex` (`$XDG_DATA_HOME/noah-code/codex` when set), with owner-only
+access. Noah does not copy credentials from the desktop app or the regular Codex CLI login.
+The first connection requires sign-in; subsequent connections reuse Noah's Codex login.
+OAuth tokens never enter Noah config, its API-key store, or session history. Cancel the
+sign-in dialog to stop a pending login without changing the selected model.
+
+Noah continues running its own tools and enforcing your chosen Normal, Auto, or YOLO mode.
+The adapter uses ephemeral Codex threads with environment access disabled; Codex does not
+run commands or edit the workspace itself. This integration uses experimental app-server
+fields and requires the version check above. Unsupported protocol behavior fails with an
+error instead of falling back to a different provider or bypassing Noah permissions.
+Sampling overrides (`temperature`, `top_p`, `seed`) and per-call `max_tokens` are not supported
+by this transport; remove them from Noah settings when selecting an account model.
 
 ### Bring your own API provider
 

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "page-ranges",
+      "fixture": "fixtures/page-ranges",
+      "prompt": "Fix parse_pages in pages.py. It must parse comma-separated positive page numbers and inclusive ascending ranges, trim whitespace, return sorted unique integers, and reject empty items, zero/negative pages, reversed ranges, non-integers, and results containing more than 10000 pages with ValueError. Preserve the function signature. Do not modify tests. Run the acceptance suite: python -m unittest discover -s tests -p acceptance.py. Keep the change focused and report the actual result.",
+      "acceptance": [
+        "{python}",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "acceptance.py"
+      ],
+      "implementation": [
+        "pages.py"
+      ],
+      "expected_tests": 5
+    },
+    {
+      "id": "config-merge",
+      "fixture": "fixtures/config-merge",
+      "prompt": "Fix merge_config in config_merge.py. Merge nested dictionaries recursively; override non-dictionary values including lists, None, false and zero; preserve keys missing from overrides. Neither input may be mutated, and the returned structure must not share mutable descendants with either input. Preserve the signature. Do not modify tests. Run python -m unittest discover -s tests -p acceptance.py. Keep the change focused and report the actual result.",
+      "acceptance": [
+        "{python}",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "acceptance.py"
+      ],
+      "implementation": [
+        "config_merge.py"
+      ],
+      "expected_tests": 3
+    }
+  ]
+}

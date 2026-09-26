@@ -115,6 +115,23 @@ def has_provider_auth(provider: str) -> bool:
         return False
 
 
+def provider_api_key(provider: str) -> str | None:
+    """Read a provider's active credential without changing the environment.
+
+    Only use this for that provider's own endpoint. Custom endpoint discovery
+    reads its explicitly selected environment variable instead.
+    """
+
+    preset = provider_preset(provider)
+    if preset.api_key_env is None:
+        return None
+    try:
+        stored = _stored_api_key(preset.key)
+    except (CredentialStoreError, OSError):
+        stored = None
+    return stored or os.environ.get(preset.api_key_env) or None
+
+
 def store_provider_api_key(provider: str, api_key: str) -> CredentialStoreResult:
     """Activate and persist a provider API key or bearer token.
 

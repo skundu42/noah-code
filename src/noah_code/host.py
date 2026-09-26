@@ -615,7 +615,24 @@ class AgentHost:
         if self.on_session_changed:
             with contextlib.suppress(Exception):
                 self.on_session_changed(self.meta)
+        await self._run_lifecycle("session_start")
         return self.meta
+
+    async def _run_lifecycle(self, event: str, **metadata: Any) -> None:
+        hooks = self._hooks
+        if hooks is None:
+            return
+        payload = {
+            "session_id": self.meta.session_id if self.meta else "",
+            "workspace": str(self.workspace.root),
+            **metadata,
+        }
+        try:
+            failures = await hooks.run_lifecycle(event, payload)
+        except Exception as exc:
+            failures = [safe_error_message(exc)]
+        for failure in failures:
+            self.ui.render(HostEvent(HostEventKind.STATUS, f"{event} hook: {safe_error_message(failure)}"))
 
     def _emit_with_hooks(self, event: HostEvent) -> None:
         """Render an event; schedule post-tool hooks for tool completions."""
@@ -663,7 +680,7 @@ class AgentHost:
             logger.debug("post-tool hook crashed", exc_info=True)
             return
         for failure in failures:
-            self.ui.render(HostEvent(HostEventKind.STATUS, f"hook warning: {failure}"))
+            self.ui.render(HostEvent(HostEventKind.STATUS, f"hook warning: {safe_error_message(failure)}"))
 
     async def _flush_post_hooks(self, *, cancel: bool = False) -> None:
         tasks, self._post_hook_tasks = self._post_hook_tasks, []
@@ -767,6 +784,13 @@ class AgentHost:
     def _on_agent_message(self, text: str, **_kwargs: Any) -> None:
         self.ui.render(HostEvent(HostEventKind.MESSAGE, text))
 
+    def _on_model_stream(self, event: Any) -> None:
+        self.ui.render(HostEvent(
+            HostEventKind.MODEL_STREAM, event.text,
+            meta={"phase": event.kind, "call_id": event.call_id, "model": event.model,
+                  "attempt": event.attempt, "error_type": event.error_type},
+        ))
+
     def _persist_state(self) -> dict:
         """Serialize agent-owned state for persistence. Thread-safe; touches no SQLite."""
 
@@ -831,6 +855,8 @@ class AgentHost:
             await self._cancel_background_tasks()
             await self._flush_post_hooks()
             await self._persist_async()
+            if self._agent is not None:
+                await self._run_lifecycle("session_end")
         finally:
             # Also cover cancellation/failure before the normal drain above.
             # Each step suppresses fresh cancellation so one delivery cannot
@@ -855,6 +881,7 @@ class AgentHost:
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.to_thread(self._telemetry.shutdown)
             self._agent = None
+            self._hooks = None
             self._runtime = None
             self._release_workspace_lease()
 
@@ -1022,6 +1049,8 @@ class AgentHost:
         self._active_context_paths.clear()
         await self._cancel_background_tasks()
         await self._persist_async()
+        if self._agent is not None:
+            await self._run_lifecycle("session_end")
         if workspace is not None:
             self.workspace = workspace
         self._pending_worktree_name = worktree_name
@@ -1051,6 +1080,8 @@ class AgentHost:
         self._active_context_paths.clear()
         await self._cancel_background_tasks()
         await self._persist_async()
+        if self._agent is not None:
+            await self._run_lifecycle("session_end")
         self._teardown_event_bridge()
         if self._agent is not None:
             with contextlib.suppress(Exception):
@@ -1081,9 +1112,11 @@ class AgentHost:
         self._require_idle_turn()
         info = await asyncio.to_thread(self.worktree_manager().create, name)
         try:
-            return await self.start_new_session(
+            meta = await self.start_new_session(
                 Workspace(root=info.directory), worktree_name=info.name
             )
+            await self._run_lifecycle("worktree_created", name=info.name, directory=str(info.directory))
+            return meta
         except Exception:
             with contextlib.suppress(Exception):
                 self.worktree_manager().remove(info.name)
@@ -1340,6 +1373,25 @@ class AgentHost:
 
         return await asyncio.to_thread(store_provider_api_key, provider, api_key)
 
+    def codex_login(self) -> Any:
+        """Open a cancellable Codex-managed account login ceremony."""
+        from noah_code.codex_account import CodexLogin
+
+        return CodexLogin()
+
+    async def configure_permission_mode(self, mode: str) -> str:
+        """Save the onboarding choice before creating the agent or its permission engine."""
+        from noah_code.config import save_user_permission_mode
+        from noah_code.permission_modes import permission_mode_flags
+
+        if self._agent is not None:
+            raise RuntimeError("Choose permissions before starting a session")
+        flags = permission_mode_flags(mode)
+        path = await asyncio.to_thread(save_user_permission_mode, mode)
+        self.config.auto_approve = flags["auto_approve"]
+        self.config.yolo = flags["yolo"]
+        return f"Permission mode set to {mode}; default saved in {path}"
+
     async def configure_provider(
         self,
         provider: str,
@@ -1381,12 +1433,9 @@ class AgentHost:
 
             preset = provider_preset(provider)
             selected_model = resolve_provider_model(provider, model)
-            credential_hint = (
-                " or ".join(" + ".join(group) for group in preset.credential_groups) or "no API key"
-            )
-            provider_info = next(
-                info for info in list_providers(selected_model) if info.key == provider
-            )
+            provider_infos = await asyncio.to_thread(list_providers, selected_model)
+            provider_info = next(info for info in provider_infos if info.key == provider)
+            credential_hint = provider_info.credential_hint
             credential_hint += " [ready]" if provider_info.configured else " [missing]"
             provider_label = preset.label
             config_path = None
@@ -1690,9 +1739,20 @@ class AgentHost:
             if slash[0] == "team":
                 return await self._handle_team(slash[1])
             return await self._handle_slash(slash[0], slash[1])
+        result = await self.submit_prompt(line)
+        return "continue" if result is not None else "handled"
+
+    async def submit_prompt(self, text: str) -> HostResult | None:
+        """Submit text without interpreting commands that change session identity.
+
+        Network and editor clients own their session lifecycle. Keep their prompts
+        on the ordinary turn path, including explicit skills and waiting-user runs.
+        """
+        self._require_idle_turn()
+        line = text
         skill_prompt = await self._activate_explicit_skill(line)
         if skill_prompt is None:
-            return "handled"
+            return None
         line = skill_prompt
         self.ui.set_busy(True)
         self._active_turn = asyncio.current_task()
@@ -1703,10 +1763,8 @@ class AgentHost:
             run_id = continuable.run_id if continuable and continuable.state == "waiting_user" else None
             attach_paths = self.take_pending_attaches()
             if run_id is None:
-                await self._run_user_turn(line, attach_paths=attach_paths)
-            else:
-                await self._run_user_turn(line, run_id=run_id, attach_paths=attach_paths)
-            return "continue"
+                return await self._run_user_turn(line, attach_paths=attach_paths)
+            return await self._run_user_turn(line, run_id=run_id, attach_paths=attach_paths)
         finally:
             self._active_turn = None
             self.ui.set_busy(False)
@@ -2119,6 +2177,37 @@ class AgentHost:
                 agent.task.list() if getattr(agent, "task", None) is not None else "(no agents)"
             )
             self.ui.render(_command_output(listing))
+            return "handled"
+        if name == "tasks":
+            parts = args.strip().split(maxsplit=2)
+            tasks = getattr(agent, "task", None)
+            try:
+                if tasks is None:
+                    text = "(no child tasks)"
+                elif not parts or len(parts) == 1:
+                    text = tasks.status(parts[0] if parts else "")
+                elif parts[0] == "cancel" and len(parts) == 2:
+                    text = await tasks.cancel(parts[1])
+                elif parts[0] == "follow" and len(parts) == 3:
+                    if self._turn_running():
+                        raise RuntimeError("wait for the current turn before following up with a child")
+                    self._active_turn = asyncio.current_task()
+                    self.ui.set_busy(True)
+                    agent.journal.begin_turn()
+                    try:
+                        text = await tasks.follow_up(parts[1], parts[2])
+                    finally:
+                        agent.journal.end_turn()
+                        try:
+                            await self._persist_async()
+                        finally:
+                            self._active_turn = None
+                            self.ui.set_busy(False)
+                else:
+                    text = "usage: /tasks [ID | cancel ID | follow ID PROMPT]"
+                self.ui.render(_command_output(text))
+            except Exception as exc:
+                self.ui.render(HostEvent(HostEventKind.ERROR, safe_error_message(exc)))
             return "handled"
         if name == "work":
             self.ui.render(_command_output(self.work_status_text()))
@@ -2578,6 +2667,7 @@ class AgentHost:
             exit_code=0, session_id=self.meta.session_id if self.meta else None, run_id=run_id,
         )
         try:
+            await self._run_lifecycle("turn_start", run_id=run_id, recovery=recovery)
             agent.journal.begin_turn()
             if recovery:
                 nooa_compat.queue_system_message(
@@ -2608,9 +2698,12 @@ class AgentHost:
                     notification: dict[str, list] = {}
                     for name, item in wins:
                         notification.setdefault(name, []).append(item)
-                    result = await _handle_with_overflow_recovery(
-                        agent, notification, render=self.ui.render
-                    )
+                    from noah_code.model_streaming import model_stream
+
+                    with model_stream(self._on_model_stream):
+                        result = await _handle_with_overflow_recovery(
+                            agent, notification, render=self.ui.render
+                        )
                     explanation = getattr(result, "explanation", "") or ""
                     kind = getattr(result, "kind", None)
                     self._sync_budget_cost()
@@ -2774,6 +2867,7 @@ class AgentHost:
                 turn_result.usage = self.usage_snapshot().to_dict()
                 self.last_result = turn_result
                 self._current_run_id = None
+                await self._run_lifecycle("turn_end", run_id=run_id, status=turn_result.status)
                 ledger = getattr(agent.ws, "_verification", None)
                 if ledger is not None:
                     with contextlib.suppress(Exception):
@@ -2984,7 +3078,9 @@ class AgentHost:
         finally:
             await self.close()
 
-    async def run_tui(self, *, onboarding_required: bool = False) -> int:
+    async def run_tui(
+        self, *, onboarding_required: bool = False, permission_setup_required: bool = False,
+    ) -> int:
         """Full-screen Textual UI. App owns input; host owns turns."""
         try:
             from noah_code.ui.textual_app import NoahCodeApp, TextualUI
@@ -2993,7 +3089,10 @@ class AgentHost:
 
         ui = TextualUI()
         self.ui = ui
-        app = NoahCodeApp(self, ui, onboarding_required=onboarding_required)
+        app = NoahCodeApp(
+            self, ui, onboarding_required=onboarding_required,
+            permission_setup_required=permission_setup_required,
+        )
         try:
             await app.run_async(mouse=True)
             return 0

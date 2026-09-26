@@ -20,10 +20,13 @@ from noah_code.config import (
     config_sources,
     load_config,
     save_user_default_model,
+    save_user_permission_mode,
     save_user_reasoning_effort,
     user_default_model,
+    user_permission_mode,
 )
 from noah_code.host import AgentHost, HostResult
+from noah_code.permission_modes import PERMISSION_MODES, permission_mode_flags
 from noah_code.redaction import safe_error_message
 from noah_code.sessions import SessionError, SessionStore
 from noah_code.ui.console import ConsoleUI
@@ -65,6 +68,10 @@ def _common_options(fn):  # noqa: ANN001
     )(fn)
     fn = click.option("--mode", type=click.Choice(["build", "plan"]), default=None)(fn)
     fn = click.option(
+        "--permissions", type=click.Choice(["normal", "auto", "yolo"]), default=None,
+        help="Permission mode for this launch; overrides the saved default",
+    )(fn)
+    fn = click.option(
         "--auto",
         is_flag=True,
         help="Auto-approve routine asks (never overrides deny or elevated-risk approval)",
@@ -93,7 +100,36 @@ def _common_options(fn):  # noqa: ANN001
     return fn
 
 
+def _permission_override(auto: bool, yolo: bool, permissions: str | None) -> str | None:
+    choices = {
+        choice for choice in (permissions, "auto" if auto else None, "yolo" if yolo else None)
+        if choice is not None
+    }
+    if len(choices) > 1:
+        raise click.UsageError("Choose only one of --permissions, --auto, or --yolo")
+    return next(iter(choices), None)
+
+
+def _configure_first_run_permissions() -> str:
+    """Choose and save a permission default separately from the model provider."""
+    click.secho("Noah Code · permission mode", fg="bright_blue", bold=True, err=True)
+    for option in PERMISSION_MODES:
+        click.echo(f"  {option.key} · {option.label}: {option.description}", err=True)
+    click.echo("Saved for future launches; override with --permissions MODE.", err=True)
+    selected = click.prompt(
+        "Default permission mode", type=click.Choice([option.key for option in PERMISSION_MODES]),
+        default="normal", show_default=True, err=True,
+    )
+    path = save_user_permission_mode(selected)
+    click.echo(f"Saved {selected} permission mode in {path}.", err=True)
+    return selected
+
+
 def _configure_first_run_model(model_override: str | None) -> str | None:
+    return asyncio.run(_configure_first_run_model_async(model_override))
+
+
+async def _configure_first_run_model_async(model_override: str | None) -> str | None:
     """Prompt once for a cross-repository default before an interactive launch."""
 
     if user_default_model() is not None:
@@ -111,7 +147,11 @@ def _configure_first_run_model(model_override: str | None) -> str | None:
         err=True,
     )
     click.echo(
-        "Enter a LiteLLM model name or a configured NOOA model alias. "
+        "  codex · Connect your Codex account in the browser; no API key needed.",
+        err=True,
+    )
+    click.echo(
+        "Enter codex to connect, a LiteLLM model name, or a configured NOOA model alias. "
         "Repository config, environment variables, and --model can override it later.",
         err=True,
     )
@@ -128,6 +168,8 @@ def _configure_first_run_model(model_override: str | None) -> str | None:
     while True:
         selected = click.prompt("Default model", default=suggested, show_default=True).strip()
         try:
+            if selected == "codex" or selected.startswith("codex/"):
+                selected = await _select_codex_model(None if selected == "codex" else selected)
             path = save_user_default_model(selected)
         except ValueError as exc:
             click.echo(f"Invalid model: {exc}", err=True)
@@ -154,6 +196,7 @@ def interactive_cmd(
     reasoning_effort: str | None,
     auto: bool,
     yolo: bool,
+    permissions: str | None,
     mode: str | None,
     max_iterations: int | None,
     continue_session: bool,
@@ -174,6 +217,7 @@ def interactive_cmd(
             reasoning_effort=reasoning_effort,
             auto=auto,
             yolo=yolo,
+            permissions=permissions,
             mode=mode,
             max_iterations=max_iterations,
             continue_session=continue_session,
@@ -191,6 +235,83 @@ def cli_group() -> None:
     """noah-code - terminal coding agent on NVIDIA OO Agents."""
 
 
+@cli_group.command("serve")
+@click.argument("path", required=False, type=click.Path())
+@click.option("--port", type=click.IntRange(0, 65535), default=0, show_default=True)
+@click.option("--token-env", default="NOAH_CODE_SERVER_TOKEN", show_default=True,
+              help="Environment variable containing a bearer token of at least 32 characters")
+@_common_options
+def serve_cmd(path: str | None, port: int, token_env: str, **options: Any) -> None:
+    """Serve persistent agent sessions over authenticated loopback HTTP/SSE."""
+    token = os.environ.get(token_env, "")
+    if len(token) < 32:
+        raise click.UsageError(f"{token_env} must contain a bearer token of at least 32 characters")
+    raise SystemExit(_run_async(_run_transport(path, token=token, port=port, **options)))
+
+
+@cli_group.command("acp")
+@click.argument("path", required=False, type=click.Path())
+@_common_options
+def acp_cmd(path: str | None, **options: Any) -> None:
+    """Run an Agent Client Protocol adapter on stdin/stdout."""
+    raise SystemExit(_run_async(_run_transport(path, **options)))
+
+
+async def _run_transport(
+    path: str | None, *, token: str | None = None, port: int = 0, **options: Any,
+) -> int:
+    from noah_code.service import AgentService, ServiceError, serve_http
+
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            prepared, code = await _prepare(
+                path=path, frontend="console", allow_auto_install=False, **options,
+            )
+        if prepared is None:
+            return code
+        workspace, config, _store, _meta = prepared
+        service = AgentService(workspace, config)
+        try:
+            if token is None:
+                from noah_code.acp import run_stdio
+
+                await run_stdio(service)
+            else:
+                endpoint = await serve_http(service, token=token, port=port)
+                assert endpoint.server is not None
+                address = endpoint.server.sockets[0].getsockname()
+                click.echo(f"Noah service listening on http://127.0.0.1:{address[1]}", err=True)
+                with contextlib.redirect_stdout(sys.stderr):
+                    await endpoint.serve_forever()
+        finally:
+            await service.close()
+        return EXIT_OK
+    except (ServiceError, OSError, ValueError) as exc:
+        click.echo(f"error: {safe_error_message(exc)}", err=True)
+        return EXIT_CONFIG
+
+
+@cli_group.group("browser")
+def browser_group() -> None:
+    """Configure browser tools for coding sessions."""
+
+
+@browser_group.command("setup")
+@click.option("--browser", type=click.Choice(["chrome", "firefox", "webkit", "msedge"]),
+              default="chrome", show_default=True)
+@click.option("--headed", is_flag=True, help="Show the browser window")
+@click.option("--name", default="browser", show_default=True, help="MCP server name")
+def browser_setup_cmd(browser: str, headed: bool, name: str) -> None:
+    """Save the isolated Playwright MCP preset in user configuration."""
+    from noah_code.browser import configure_browser
+
+    try:
+        path = configure_browser(name=name, browser=browser, headless=not headed)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(safe_error_message(exc)) from exc
+    click.echo(f"Browser tools configured in {path}. Start a new session to connect.")
+
+
 @cli_group.command("run")
 @click.argument("prompt")
 @click.argument("path", required=False, type=click.Path())
@@ -204,6 +325,7 @@ def run_cmd(
     reasoning_effort: str | None,
     auto: bool,
     yolo: bool,
+    permissions: str | None,
     mode: str | None,
     max_iterations: int | None,
     session_id: str | None,
@@ -211,6 +333,7 @@ def run_cmd(
     json_output: bool,
 ) -> None:
     """Run one coding task without opening the interactive interface."""
+    _permission_override(auto, yolo, permissions)
     code = _run_async(
         _run_session(
             prompt=prompt,
@@ -219,6 +342,7 @@ def run_cmd(
             reasoning_effort=reasoning_effort,
             auto=auto,
             yolo=yolo,
+            permissions=permissions,
             mode=mode,
             max_iterations=max_iterations,
             session_id=session_id,
@@ -609,7 +733,7 @@ def config_cmd(action: str, path: str | None, model: str | None, auto: bool) -> 
 
 @cli_group.group("providers")
 def providers_group() -> None:
-    """Inspect and configure model providers without storing API keys."""
+    """Inspect providers, connect an account, or configure API credentials."""
 
 
 @providers_group.command("list")
@@ -625,11 +749,71 @@ def providers_list() -> None:
         raise SystemExit(EXIT_CONFIG) from exc
 
 
+async def _connect_codex_account(*, device_code: bool = False) -> None:
+    from noah_code.codex_account import CodexLogin
+
+    async with CodexLogin(method="device" if device_code else "browser") as login:
+        challenge = await login.start()
+        if challenge is None:
+            click.echo("Codex account is already connected.", err=True)
+            return
+        click.echo(f"Open this page to connect your Codex account: {challenge.url}", err=True)
+        if challenge.code:
+            click.echo(f"Enter this one-time code: {challenge.code}", err=True)
+        if not device_code:
+            try:
+                await asyncio.to_thread(click.launch, challenge.url)
+            except OSError:
+                click.echo("The browser could not open; use the sign-in link above.", err=True)
+        click.echo("Waiting for sign-in to finish…", err=True)
+        await login.wait()
+        click.echo("Codex account connected.", err=True)
+
+
+async def _select_codex_model(model: str | None = None, *, device_code: bool = False) -> str:
+    from noah_code.provider_discovery import discover_models
+    from noah_code.providers import resolve_provider_model
+
+    # Validate an explicit model before asking the user to sign in.
+    selected = resolve_provider_model("codex", model) if model is not None else None
+    await _connect_codex_account(device_code=device_code)
+    if selected is not None:
+        return selected
+    inventory = await discover_models("codex")
+    click.echo(inventory.message, err=True)
+    for item in inventory.models[:30]:
+        click.echo(f"  {item.id} · {item.description}", err=True)
+    suggested = inventory.models[0].id if inventory.models else None
+    while True:
+        model = click.prompt(
+            "Codex model", default=suggested, show_default=True, err=True,
+        )
+        try:
+            return resolve_provider_model("codex", model)
+        except ValueError as exc:
+            click.echo(f"Invalid model: {exc}", err=True)
+
+
+@providers_group.command("login")
+@click.argument("provider", type=click.Choice(["codex"]))
+@click.option("--device-code", is_flag=True, help="Use a one-time code for headless sign-in")
+@click.option("--model", default=None, help="Codex model to save as the default; prompts if omitted")
+def providers_login(provider: str, device_code: bool, model: str | None) -> None:
+    """Connect a Codex account and save an account model as the default."""
+    try:
+        selected = asyncio.run(_select_codex_model(model, device_code=device_code))
+        path = save_user_default_model(selected)
+    except (ConfigError, OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(safe_error_message(exc)) from exc
+    click.echo(f"Default model {selected} saved in {path}.")
+
+
 @providers_group.command("add")
 @click.argument(
     "provider",
     type=click.Choice(
         [
+            "codex",
             "openai",
             "anthropic",
             "openrouter",
@@ -675,7 +859,7 @@ def providers_add(
     client_type: str,
     set_default: bool,
 ) -> None:
-    """Configure a provider using environment-based credentials."""
+    """Configure a provider using account sign-in or environment credentials."""
 
     from noah_code.providers import (
         provider_preset,
@@ -710,18 +894,23 @@ def providers_add(
                 raise ValueError("--client-type is only configurable for custom providers")
             preset = provider_preset(provider)
             selected_model = resolve_provider_model(provider, model)
-            groups = [" + ".join(group) for group in preset.credential_groups]
-            ready = not groups or any(
-                all(os.environ.get(variable) for variable in group)
-                for group in preset.credential_groups
-            )
+            if provider == "codex":
+                asyncio.run(_connect_codex_account())
             click.echo(f"provider: {preset.label}")
             click.echo(f"model: {selected_model}")
-            click.echo(
-                "credentials: "
-                + ("ready" if ready else f"missing ({' or '.join(groups)})")
-                + "; values are never printed or stored"
-            )
+            if provider == "codex":
+                click.echo("credentials: Codex account sign-in; no API key required")
+            else:
+                groups = [" + ".join(group) for group in preset.credential_groups]
+                ready = not groups or any(
+                    all(os.environ.get(variable) for variable in group)
+                    for group in preset.credential_groups
+                )
+                click.echo(
+                    "credentials: "
+                    + ("ready" if ready else f"missing ({' or '.join(groups)})")
+                    + "; values are never printed or stored"
+                )
         if set_default:
             path = save_user_default_model(selected_model)
             if reasoning_effort is not None:
@@ -734,8 +923,8 @@ def providers_add(
                 f" --reasoning-effort {reasoning_effort}" if reasoning_effort is not None else ""
             )
             click.echo(f"use once with: noah --model {selected_model}{suffix} .")
-    except (FileExistsError, OSError, ValueError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    except (ConfigError, OSError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(safe_error_message(exc)) from exc
 
 
 @cli_group.command("update")
@@ -814,7 +1003,9 @@ async def _prepare(
     frontend: Literal["tui", "console"] | None = None,
     unsafe_inprocess_code_execution: bool = False,
     allow_auto_install: bool = True,
+    permissions: str | None = None,
 ):
+    permission_choice = _permission_override(auto, yolo, permissions)
     try:
         workspace = open_workspace(path)
     except WorkspaceError as exc:
@@ -826,10 +1017,8 @@ async def _prepare(
         overrides["model"] = model
     if reasoning_effort:
         overrides["reasoning_effort"] = reasoning_effort
-    if auto:
-        overrides["auto_approve"] = True
-    if yolo:
-        overrides["yolo"] = True
+    if permission_choice is not None:
+        overrides.update(permission_mode_flags(permission_choice))
     if max_iterations is not None:
         overrides["max_iterations"] = max_iterations
     if mode:
@@ -893,13 +1082,15 @@ async def _interactive(
     session_id: str | None,
     use_console: bool,
     unsafe_inprocess_code_execution: bool,
+    permissions: str | None = None,
 ) -> int:
+    permission_choice = _permission_override(auto, yolo, permissions)
     first_run = user_default_model() is None
     if first_run and (model is not None or (use_console and not (continue_session or session_id))):
         try:
-            model = _configure_first_run_model(model)
-        except (OSError, ValueError) as exc:
-            click.echo(f"error: first-run model setup failed: {exc}", err=True)
+            model = await _configure_first_run_model_async(model)
+        except (ConfigError, OSError, ValueError, RuntimeError) as exc:
+            click.echo(f"error: first-run model setup failed: {safe_error_message(exc)}", err=True)
             return EXIT_CONFIG
         except click.Abort:
             click.echo("error: first-run model setup was cancelled", err=True)
@@ -912,6 +1103,7 @@ async def _interactive(
         reasoning_effort=reasoning_effort,
         auto=auto,
         yolo=yolo,
+        permissions=permissions,
         mode=mode,
         max_iterations=max_iterations,
         continue_session=continue_session,
@@ -925,9 +1117,9 @@ async def _interactive(
     use_tui = config.ui.frontend == "tui" and not use_console
     if first_run and model is None and not use_tui and meta is None:
         try:
-            model = _configure_first_run_model(model)
-        except (OSError, ValueError) as exc:
-            click.echo(f"error: first-run model setup failed: {exc}", err=True)
+            model = await _configure_first_run_model_async(model)
+        except (ConfigError, OSError, ValueError, RuntimeError) as exc:
+            click.echo(f"error: first-run model setup failed: {safe_error_message(exc)}", err=True)
             return EXIT_CONFIG
         except click.Abort:
             click.echo("error: first-run model setup was cancelled", err=True)
@@ -938,6 +1130,7 @@ async def _interactive(
             reasoning_effort=reasoning_effort,
             auto=auto,
             yolo=yolo,
+            permissions=permissions,
             mode=mode,
             max_iterations=max_iterations,
             continue_session=continue_session,
@@ -948,6 +1141,24 @@ async def _interactive(
         if prepared is None:
             return code
         workspace, config, store, meta = prepared
+    permission_setup_required = (
+        meta is None and not (continue_session or session_id)
+        and permission_choice is None
+        and not os.environ.get("NOAH_CODE_AUTO")
+        and user_permission_mode() is None
+    )
+    if permission_setup_required and not use_tui:
+        try:
+            selected_permissions = _configure_first_run_permissions()
+        except (OSError, ValueError, ConfigError) as exc:
+            click.echo(f"error: permission setup failed: {exc}", err=True)
+            return EXIT_CONFIG
+        except click.Abort:
+            click.echo("error: permission setup was cancelled", err=True)
+            return EXIT_CONFIG
+        flags = permission_mode_flags(selected_permissions)
+        config.auto_approve = flags["auto_approve"]
+        config.yolo = flags["yolo"]
     if use_tui:
         from noah_code.providers import model_setup_required
 
@@ -964,7 +1175,10 @@ async def _interactive(
         )
         try:
             try:
-                return await host.run_tui(onboarding_required=onboarding_required)
+                return await host.run_tui(
+                    onboarding_required=onboarding_required,
+                    permission_setup_required=permission_setup_required,
+                )
             except RuntimeError as exc:
                 click.echo(f"error: {exc}", err=True)
                 return EXIT_CONFIG
@@ -1003,6 +1217,7 @@ async def _run_session(
     session_id: str | None,
     unsafe_inprocess_code_execution: bool,
     json_output: bool = False,
+    permissions: str | None = None,
 ) -> int:
     """Run one task through the normal host without automation-only adapters."""
 
@@ -1016,6 +1231,7 @@ async def _run_session(
                 reasoning_effort=reasoning_effort,
                 auto=auto,
                 yolo=yolo,
+                permissions=permissions,
                 mode=mode,
                 max_iterations=max_iterations,
                 session_id=session_id,

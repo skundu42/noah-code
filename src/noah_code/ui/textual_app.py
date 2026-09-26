@@ -34,7 +34,7 @@ from textual.screen import ModalScreen
 from textual.selection import Selection
 from textual.strip import Strip
 from textual.timer import Timer
-from textual.widgets import Button, Input, Label, OptionList, RichLog, Static, TextArea
+from textual.widgets import Button, Input, Label, Link, OptionList, RichLog, Static, TextArea
 from textual.widgets.option_list import Option
 from textual.widgets.text_area import TextAreaTheme
 
@@ -48,6 +48,7 @@ from noah_code.commands import (
 from noah_code.composer import _resolve, mention_suggestions, mention_text
 from noah_code.event_bridge import _describe_code_activity
 from noah_code.events import HostEvent, HostEventKind
+from noah_code.permission_modes import PERMISSION_MODES
 from noah_code.sessions import SessionEventRecord
 from noah_code.steer import SAFE_SLASH_WHILE_BUSY
 from noah_code.themes import THEMES, ThemePalette, get_theme
@@ -1128,9 +1129,9 @@ class OnboardingScreen(ModalScreen[bool]):
             yield Static(
                 Text.assemble(
                     ("1  PROVIDER\n", f"bold {palette.accent}"),
-                    ("   Choose OpenAI, Anthropic, OpenRouter, a local model, or another provider.\n\n", palette.text),
+                    ("   Connect a Codex / ChatGPT account, an API provider, or a local model.\n\n", palette.text),
                     ("2  CREDENTIALS\n", f"bold {palette.accent}"),
-                    ("   Keys are masked and stored in Noah's private auth file, never in this repository.\n\n", palette.text),
+                    ("   Sign in through Codex, or enter a masked API key stored in Noah's private auth file.\n\n", palette.text),
                     ("3  MODEL + REASONING\n", f"bold {palette.warning}"),
                     ("   Pick the exact model ID and reasoning level. You can change both later with /model.", palette.text),
                 ),
@@ -1162,6 +1163,78 @@ class OnboardingScreen(ModalScreen[bool]):
     @on(Button.Pressed, "#onboarding-later")
     def _later(self) -> None:
         self.action_later()
+
+
+class CodexLoginScreen(ModalScreen[bool]):
+    """Keep account authorization inside a cancellable, transient dialog."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel sign-in", show=True)]
+
+    def __init__(self, host: AgentHost) -> None:
+        super().__init__()
+        self.host = host
+        self._login_url = ""
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="codex-login-dialog"):
+            yield Label("CODEX / CHATGPT ACCOUNT", id="codex-login-title")
+            yield Static("Checking your Codex sign-in…", id="codex-login-status", markup=False)
+            yield Link("", id="codex-login-link", disabled=True)
+            yield Static("", id="codex-login-code", markup=False)
+            yield Static(
+                "Complete sign-in in your browser. If it does not open, copy the link above. "
+                "Your account credentials stay with Codex.",
+                id="codex-login-help",
+                markup=False,
+            )
+            with Horizontal(id="codex-login-buttons"):
+                yield Button("Open browser", id="codex-login-open", variant="primary", disabled=True)
+                yield Button("Cancel [Esc]", id="codex-login-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#codex-login-cancel", Button).focus()
+        self._connect()
+
+    @work(exclusive=True, group="codex-login")
+    async def _connect(self) -> None:
+        try:
+            async with self.host.codex_login() as login:
+                challenge = await login.start()
+                if challenge is not None:
+                    self._login_url = challenge.url
+                    link = self.query_one("#codex-login-link", Link)
+                    link.text = challenge.url
+                    link.url = challenge.url
+                    link.disabled = False
+                    self.query_one("#codex-login-code", Static).update(
+                        f"Device code: {challenge.code}" if challenge.code else ""
+                    )
+                    self.query_one("#codex-login-status", Static).update(
+                        "Waiting for you to finish signing in…"
+                    )
+                    self.query_one("#codex-login-open", Button).disabled = False
+                    await login.wait()
+            self.dismiss(True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#codex-login-status", Static).update(f"Sign-in failed: {exc}")
+            self.query_one("#codex-login-help", Static).update(
+                "Close this dialog and select Codex / ChatGPT account to try again."
+            )
+            self.query_one("#codex-login-open", Button).disabled = True
+            self.query_one("#codex-login-link", Link).disabled = True
+
+    @on(Button.Pressed, "#codex-login-open")
+    def _open_browser(self) -> None:
+        if self._login_url:
+            self.app.open_url(self._login_url)
+
+    @on(Button.Pressed, "#codex-login-cancel")
+    def action_cancel(self) -> None:
+        # Unmount cancels screen workers. Cancelling here as well can interrupt
+        # the login context's asynchronous cleanup with a second cancellation.
+        self.dismiss(False)
 
 
 class FilteredPicker(ModalScreen[str | None]):
@@ -2692,6 +2765,7 @@ class NoahCodeApp(App[None]):
         ui: TextualUI,
         *,
         onboarding_required: bool = False,
+        permission_setup_required: bool = False,
     ) -> None:
         self.host = host
         self.ui = ui
@@ -2700,8 +2774,14 @@ class NoahCodeApp(App[None]):
         self._turn_task: asyncio.Task[None] | None = None
         self._agent_ready = host._agent is not None
         self._onboarding_required = onboarding_required
+        self._permission_setup_required = permission_setup_required
+        self._permission_setup_open = False
         self._session_has_prompt = False
-        self._pre_prompt_status = "Choose a model to finish setup" if onboarding_required else ""
+        self._pre_prompt_status = (
+            "Choose a permission mode to finish setup"
+            if permission_setup_required
+            else "Choose a model to finish setup" if onboarding_required else ""
+        )
         self._pending_submit: str | None = None
         self._session_id = host.meta.session_id if host.meta else None
         self._interrupt_count = 0
@@ -2713,7 +2793,9 @@ class NoahCodeApp(App[None]):
         self._repository_status_loaded = False
         self._repository_refreshed_at = 0.0
         self._agent_state = (
-            AgentDisplayState.SETUP_REQUIRED if onboarding_required else AgentDisplayState.READY
+            AgentDisplayState.SETUP_REQUIRED
+            if onboarding_required or permission_setup_required
+            else AgentDisplayState.READY
         )
         self._state_detail = ""
         self._loader_index = 0
@@ -2731,6 +2813,8 @@ class NoahCodeApp(App[None]):
         self._pending_native_clipboard: str | None = None
         self._available_update: UpdateStatus | None = None
         self._stream_fragments: list[tuple[str, str]] = []
+        self._model_preview = ""
+        self._model_call_id = ""
         self._activities: dict[str, ActivityRecord] = {}
         self._activity_history: deque[ActivityRecord] = deque(maxlen=MAX_ACTIVITY_HISTORY)
         self._timeline_history: deque[ActivityRecord] = deque(maxlen=MAX_TIMELINE_HISTORY)
@@ -2794,6 +2878,7 @@ class NoahCodeApp(App[None]):
                 with Horizontal(id="working-banner"):
                     yield Static("", id="working-loader")
                     yield Static("", id="working-status")
+                yield Static("", id="model-stream-preview", markup=False)
                 with Vertical(id="live-activity"):
                     yield Static("", id="activity-title")
                     yield SelectableRichLog(
@@ -2839,7 +2924,10 @@ class NoahCodeApp(App[None]):
         self.update_chrome(force=True)
         self._refresh_repository_snapshot()
         self._check_update_notice()
-        if self._onboarding_required:
+        if self._permission_setup_required:
+            self._set_agent_state(AgentDisplayState.SETUP_REQUIRED)
+            self.call_after_refresh(self.action_permission_setup)
+        elif self._onboarding_required:
             self._set_agent_state(AgentDisplayState.SETUP_REQUIRED)
             self.call_after_refresh(self.action_onboarding)
         elif self._agent_ready:
@@ -2956,6 +3044,10 @@ class NoahCodeApp(App[None]):
     async def _start_host(self) -> None:
         """Warm the agent after the first frame instead of blocking launch."""
 
+        if self._permission_setup_required:
+            self.ui.set_busy(False)
+            self.action_permission_setup()
+            return
         try:
             await self.host.start()
         except Exception as exc:  # noqa: BLE001
@@ -3731,7 +3823,22 @@ class NoahCodeApp(App[None]):
 
     def _process_host_event(self, event: HostEvent) -> None:
         text = event.text.rstrip()
-        if event.kind == HostEventKind.MESSAGE:
+        if event.kind == HostEventKind.MODEL_STREAM:
+            preview = self.query_one("#model-stream-preview", Static)
+            phase = event.meta.get("phase")
+            if phase == "start":
+                self._model_call_id = str(event.meta.get("call_id", ""))
+                self._model_preview = ""
+                preview.display = False
+            elif event.meta.get("call_id") == self._model_call_id:
+                if phase in {"finish", "error", "cancel"}:
+                    self._model_preview = ""
+                    preview.display = False
+                elif phase == "text" or (phase == "reasoning" and self.host.config.ui.show_reasoning):
+                    self._model_preview = (self._model_preview + event.text)[-12_000:]
+                    preview.update(Text("Generating…\n" + self._model_preview[-1800:]))
+                    preview.display = bool(self._model_preview)
+        elif event.kind == HostEventKind.MESSAGE:
             self._session_has_prompt = True
             self._pre_prompt_status = ""
             self._finish_orphan_activity()
@@ -4609,15 +4716,20 @@ class NoahCodeApp(App[None]):
     async def action_providers(self) -> None:
         """Open searchable, secret-free model-provider setup."""
 
+        if not await self._ensure_permission_mode():
+            return
         try:
-            infos = self.host.list_provider_infos()
+            infos = await asyncio.to_thread(self.host.list_provider_infos)
             rows = []
             ordered_infos = sorted(
                 infos,
                 key=lambda info: (not info.active, not info.configured, info.label.lower()),
             )
             for info in ordered_infos:
-                state = "active" if info.active else "ready" if info.configured else "key missing"
+                state = (
+                    "active" if info.active else "ready" if info.configured
+                    else "sign-in needed" if info.key == "codex" else "key missing"
+                )
                 rows.append(
                     (
                         f"provider:{info.key}",
@@ -4636,7 +4748,7 @@ class NoahCodeApp(App[None]):
                 FilteredPicker(
                     "Model providers",
                     rows,
-                    "Type to search · Enter configure · API keys stay in environment variables",
+                    "Type to search · Enter configure · credentials never appear in model lists",
                 )
             )
             if not choice:
@@ -4651,15 +4763,6 @@ class NoahCodeApp(App[None]):
                     )
                 )
                 if not alias:
-                    return
-                model = await self.push_screen_wait(
-                    TextPromptModal(
-                        "Endpoint model id",
-                        "my-model",
-                        "Noah routes this through the OpenAI-compatible protocol",
-                    )
-                )
-                if not model:
                     return
                 base_url = await self.push_screen_wait(
                     TextPromptModal(
@@ -4679,6 +4782,15 @@ class NoahCodeApp(App[None]):
                 )
                 if not api_key_env:
                     return
+                model = await self._pick_provider_model(
+                    "custom",
+                    "Endpoint models",
+                    "my-model",
+                    base_url=base_url,
+                    api_key_env=None if api_key_env == "-" else api_key_env,
+                )
+                if not model:
+                    return
                 reasoning_effort = await self._pick_reasoning_effort("Provider setup · Reasoning")
                 if reasoning_effort is None:
                     return
@@ -4692,12 +4804,10 @@ class NoahCodeApp(App[None]):
                 )
             else:
                 info = next(item for item in infos if item.key == provider)
-                model = await self.push_screen_wait(
-                    TextPromptModal(
-                        f"{info.label} model",
-                        info.model_hint,
-                        f"Credentials: {info.credential_hint} · values are never stored",
-                    )
+                if provider == "codex" and not await self.push_screen_wait(CodexLoginScreen(self.host)):
+                    return
+                model = await self._pick_provider_model(
+                    provider, f"{info.label} models", info.model_hint
                 )
                 if not model:
                     return
@@ -4723,6 +4833,33 @@ class NoahCodeApp(App[None]):
             else:
                 self._pre_prompt_status = "Provider setup failed"
                 self._show_notice(message, kind="error")
+
+    async def _pick_provider_model(
+        self,
+        provider: str,
+        title: str,
+        manual_hint: str,
+        *,
+        base_url: str | None = None,
+        api_key_env: str | None = None,
+    ) -> str | None:
+        """Select discovered models while retaining access to unlisted model IDs."""
+
+        from noah_code.provider_discovery import discover_models
+
+        self._show_notice("Loading available models…", temporary=True)
+        result = await discover_models(provider, base_url=base_url, api_key_env=api_key_env)
+        if result.models:
+            rows = [(f"model:{model.id}", model.id, model.description) for model in result.models]
+            rows.append(("__manual__", "Enter a model ID manually", "Use a new, private, or unlisted model"))
+            choice = await self.push_screen_wait(FilteredPicker(title, rows, result.message))
+            if not choice:
+                return None
+            if choice != "__manual__":
+                return choice.removeprefix("model:")
+        return await self.push_screen_wait(
+            TextPromptModal(f"{title} · Model ID", manual_hint, result.message)
+        )
 
     async def _pick_reasoning_effort(self, title: str) -> str | None:
         """Choose a portable LiteLLM reasoning effort or leave it provider-controlled."""
@@ -4823,10 +4960,59 @@ class NoahCodeApp(App[None]):
         except Exception as exc:  # noqa: BLE001
             self._show_notice(f"Theme setup failed: {exc}", kind="error")
 
+    async def _ensure_permission_mode(self) -> bool:
+        """Save an explicit first-run choice before any agent startup."""
+
+        if not self._permission_setup_required:
+            return True
+        if self._permission_setup_open or isinstance(self.screen, ModalScreen):
+            return False
+        self._permission_setup_open = True
+        self._set_agent_state(AgentDisplayState.SETUP_REQUIRED)
+        self._pre_prompt_status = "Choose a permission mode to finish setup"
+        self.ui.set_busy(False)
+        self.update_chrome(force=True)
+        try:
+            choice = await self.push_screen_wait(
+                FilteredPicker(
+                    "First-time setup · Permission mode",
+                    [(mode.key, mode.label, mode.description) for mode in PERMISSION_MODES],
+                    "Saved as your default · Enter select · Esc decide later",
+                )
+            )
+            if not choice:
+                self._pre_prompt_status = "Permission setup needed · open /model to continue"
+                self.update_chrome(force=True)
+                return False
+            status = await self.host.configure_permission_mode(choice)
+        except Exception as exc:  # noqa: BLE001
+            self._pre_prompt_status = "Permission setup failed · open /model to retry"
+            self._show_notice(f"Permission setup failed: {exc}", kind="error")
+            self.update_chrome(force=True)
+            return False
+        finally:
+            self._permission_setup_open = False
+        self._permission_setup_required = False
+        self._show_notice(status, temporary=True)
+        return True
+
+    @work(group="permission-setup")
+    async def action_permission_setup(self) -> None:
+        """Finish permissions, then continue provider setup or start the agent."""
+
+        if not await self._ensure_permission_mode():
+            return
+        if self._onboarding_required:
+            self.action_onboarding()
+        else:
+            self._retry_startup_after_setup()
+
     @work(exclusive=True, group="onboarding")
     async def action_onboarding(self, reason: str = "") -> None:
         """Explain setup before entering the credential/model picker."""
 
+        if not await self._ensure_permission_mode():
+            return
         model = self.host.meta.model if self.host.meta else self.host.config.model
         proceed = await self.push_screen_wait(OnboardingScreen(str(model), reason))
         if proceed:
@@ -4842,6 +5028,8 @@ class NoahCodeApp(App[None]):
 
         if isinstance(self.screen, ModalScreen):
             return
+        if not await self._ensure_permission_mode():
+            return
         if self.ui.busy and self._agent_ready:
             self._show_notice(
                 "Finish or cancel the active turn before changing models",
@@ -4851,12 +5039,12 @@ class NoahCodeApp(App[None]):
         try:
             from noah_code.providers import provider_preset
 
-            infos = self.host.list_provider_infos()
+            infos = await asyncio.to_thread(self.host.list_provider_infos)
             quick_infos = [
                 info
                 for info in infos
                 if info.key not in {"azure", "bedrock"}
-                and (provider_preset(info.key).api_key_env is not None or info.key == "ollama")
+                and (provider_preset(info.key).api_key_env is not None or info.key in {"codex", "ollama"})
             ]
             ordered_infos = sorted(
                 quick_infos,
@@ -4864,7 +5052,10 @@ class NoahCodeApp(App[None]):
             )
             rows = []
             for info in ordered_infos:
-                state = "active" if info.active else "ready" if info.configured else "key needed"
+                state = (
+                    "active" if info.active else "ready" if info.configured
+                    else "sign-in needed" if info.key == "codex" else "key needed"
+                )
                 rows.append(
                     (
                         f"provider:{info.key}",
@@ -4896,6 +5087,8 @@ class NoahCodeApp(App[None]):
             info = next(item for item in infos if item.key == provider)
             preset = provider_preset(provider)
             credential_result = None
+            if provider == "codex" and not await self.push_screen_wait(CodexLoginScreen(self.host)):
+                return
             if preset.api_key_env is not None and not info.configured:
                 api_key = await self.push_screen_wait(
                     TextPromptModal(
@@ -4909,12 +5102,10 @@ class NoahCodeApp(App[None]):
                     return
                 credential_result = await self.host.set_provider_api_key(provider, api_key)
 
-            model = await self.push_screen_wait(
-                TextPromptModal(
-                    f"Model setup · {'3 of 4' if credential_result else '2 of 3'} · Model",
-                    info.model_hint,
-                    f"Choose the model ID for {info.label}",
-                )
+            model = await self._pick_provider_model(
+                provider,
+                f"Model setup · {'3 of 4' if credential_result else '2 of 3'} · Model",
+                info.model_hint,
             )
             if not model:
                 if credential_result:
@@ -4953,11 +5144,14 @@ class NoahCodeApp(App[None]):
     def _retry_startup_after_setup(self) -> None:
         """Retry startup after credentials are configured from a failed shell."""
 
+        self._onboarding_required = False
+        if self._permission_setup_required:
+            self.action_permission_setup()
+            return
         if self._agent_ready or any(
             worker.group == "startup" and not worker.is_finished for worker in self.workers
         ):
             return
-        self._onboarding_required = False
         self._set_agent_state(AgentDisplayState.STARTING)
         self.ui.set_busy(True)
         self._start_host()
@@ -5679,6 +5873,8 @@ class NoahCodeApp(App[None]):
             self._pending_submit = text
             self._set_agent_state(AgentDisplayState.QUEUED)
             self.update_chrome(force=True)
+            if self._permission_setup_required:
+                self.action_permission_setup()
             return
         if slash is None:
             self._set_agent_state(AgentDisplayState.THINKING)

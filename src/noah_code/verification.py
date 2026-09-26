@@ -69,9 +69,14 @@ def check_label(command: str) -> str | None:
         }:
             tokens.pop(0)
     if tokens and re.fullmatch(r"python(?:3(?:\.\d+)?)?", Path(tokens[0]).name):
-        if tokens[1:2] != ["-m"]:
+        tokens = tokens[1:]
+        # Interpreter switches with no operand may precede -m. Do not skip
+        # arbitrary options: -c, -W, and -X can consume the following token.
+        while tokens and re.fullmatch(r"-[BIEsSPOubq]+", tokens[0]):
+            tokens.pop(0)
+        if tokens[:1] != ["-m"]:
             return None
-        tokens = tokens[2:]
+        tokens = tokens[1:]
     if not tokens or any(
         token.split("=", 1)[0]
         in {
@@ -86,7 +91,7 @@ def check_label(command: str) -> str | None:
     ):
         return None
     executable = Path(tokens[0]).name
-    if executable in {"pytest", "mypy", "pyright", "tsc", "jest", "vitest"}:
+    if executable in {"pytest", "unittest", "mypy", "pyright", "tsc", "jest", "vitest"}:
         return executable
     if executable == "ruff" and tokens[1:2] == ["check"]:
         return "ruff"
@@ -163,7 +168,7 @@ class CheckLedger:
                 logger.warning("Could not load verification checks (%s)", type(exc).__name__)
 
     def _fingerprint(self) -> str | None:
-        # ponytail: metadata, not content hashes; ignored untracked files are outside
+        # Metadata, not content hashes; ignored untracked files are outside
         # this evidence scope. Add content hashing if metadata-preserving edits matter.
         try:
             env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
@@ -177,7 +182,7 @@ class CheckLedger:
                 break
             if repository:
                 listed = subprocess.run(
-                    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+                    ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-t", "-z"],
                     cwd=self.root,
                     env=env,
                     capture_output=True,
@@ -186,7 +191,20 @@ class CheckLedger:
                 )
                 if listed.returncode:
                     return None
-                paths = {os.fsdecode(path) for path in listed.stdout.split(b"\0") if path}
+                paths = set()
+                for listed_row in listed.stdout.split(b"\0"):
+                    if not listed_row:
+                        continue
+                    if len(listed_row) < 3 or listed_row[1:2] != b" ":
+                        return None
+                    relative = os.fsdecode(listed_row[2:])
+                    # -t distinguishes untracked outputs (?) from index entries.
+                    # Always include tracked files, even under generated dirs.
+                    if listed_row[:1] == b"?" and any(
+                        part in _IGNORED_DIRS for part in Path(relative).parts[:-1]
+                    ):
+                        continue
+                    paths.add(relative)
             else:
                 paths = set()
                 for directory, dirs, files in os.walk(self.root, followlinks=False, onerror=_raise):
@@ -306,6 +324,23 @@ class CheckLedger:
                     state = "passed" if record.returncode == 0 else "failed"
                 rows.append({**asdict(record), "state": state})
             return rows
+
+    async def revision(self) -> str | None:
+        """Return current workspace metadata evidence, or None when unavailable."""
+        async with self._lock:
+            return await asyncio.to_thread(self._fingerprint)
+
+    async def completion_blockers(self, since: float = 0) -> list[dict[str, Any]]:
+        """Latest observed check per command/cwd since an epoch timestamp.
+
+        A successful rerun supersedes that command's previous failure. Missing
+        checks create no blocker; failed, stale, incomplete, unknown, and active
+        checks do. Sources share evidence when checking the same command/cwd.
+        """
+        latest: dict[tuple[str, str | None], dict[str, Any]] = {}
+        for row in await self.snapshot(since=since):
+            latest[(row["command"], row["cwd"])] = row
+        return [row for row in latest.values() if row["state"] != "passed"]
 
 
 def _raise(error: OSError) -> None:

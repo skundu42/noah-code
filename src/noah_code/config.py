@@ -14,6 +14,7 @@ import tomlkit
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from tomlkit.exceptions import TOMLKitError
 
+from noah_code.permission_modes import PermissionMode, permission_mode_flags
 from noah_code.themes import ThemeName, get_theme
 
 
@@ -211,6 +212,7 @@ class HooksConfig(BaseModel):
 
     pre_tool: list[HookSpec] = Field(default_factory=list)
     post_tool: list[HookSpec] = Field(default_factory=list)
+    lifecycle: list[HookSpec] = Field(default_factory=list)
 
 
 class CheckpointConfig(BaseModel):
@@ -394,6 +396,8 @@ DEFAULT_PERMISSION_RULES: list[PermissionRule] = [
 
 
 def _user_config_path() -> Path:
+    if configured := os.environ.get("NOAH_CODE_CONFIG"):
+        return Path(configured).expanduser().resolve()
     return Path.home() / ".config" / "noah-code" / "config.toml"
 
 
@@ -404,8 +408,26 @@ def user_default_model() -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def user_permission_mode() -> PermissionMode | None:
+    """Return an explicitly saved permission preference, including existing flag settings."""
+    data = _load_toml(_user_config_path())
+    if not any(key in data for key in ("auto_approve", "yolo")):
+        return None
+    for key in ("auto_approve", "yolo"):
+        if key in data and not isinstance(data[key], bool):
+            raise ConfigError(f"invalid configuration: {key} must be a boolean")
+    if data.get("yolo"):
+        return "yolo"
+    return "auto" if data.get("auto_approve") else "normal"
+
+
 def _save_user_setting(key: str, value: str | bool, *, table: str | None = None) -> Path:
     """Edit one setting without losing TOML syntax, comments, or other values."""
+    return _save_user_settings({key: value}, table=table)
+
+
+def _save_user_settings(values: dict[str, Any], *, table: str | None = None) -> Path:
+    """Atomically save related settings without losing other values or comments."""
 
     path = _user_config_path()
     existing = path.read_text() if path.is_file() else ""
@@ -415,7 +437,8 @@ def _save_user_setting(key: str, value: str | bool, *, table: str | None = None)
         target = document if table is None else document.setdefault(table, tomlkit.table())
         if not isinstance(target, MutableMapping):
             raise ConfigError(f"invalid configuration in {path}: {table} must be a table")
-        target[key] = value
+        for key, value in values.items():
+            target[key] = value
         content = tomlkit.dumps(document)
         tomllib.loads(content)
     except (tomllib.TOMLDecodeError, TOMLKitError) as exc:
@@ -433,6 +456,11 @@ def _save_user_setting(key: str, value: str | bool, *, table: str | None = None)
     finally:
         temporary_path.unlink(missing_ok=True)
     return path
+
+
+def save_user_permission_mode(mode: str) -> Path:
+    """Persist the cross-repository permission default in one atomic write."""
+    return _save_user_settings(permission_mode_flags(mode))
 
 
 def save_user_default_model(model: str) -> Path:
@@ -524,7 +552,8 @@ def _env_overrides() -> dict[str, Any]:
     if reasoning_effort := os.environ.get("NOAH_CODE_REASONING_EFFORT"):
         out["reasoning_effort"] = reasoning_effort.lower()
     if auto := os.environ.get("NOAH_CODE_AUTO"):
-        out["auto_approve"] = auto.lower() in {"1", "true", "yes", "on"}
+        selected = "auto" if auto.lower() in {"1", "true", "yes", "on"} else "normal"
+        out.update(permission_mode_flags(selected))
     if session_dir := os.environ.get("NOAH_CODE_SESSION_DIR"):
         out["session_dir"] = session_dir
     if mode := os.environ.get("NOAH_CODE_MODE"):
