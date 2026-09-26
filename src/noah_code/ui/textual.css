@@ -150,8 +150,9 @@ Screen {
     display: none;
     height: auto;
     max-height: 10;
+    max-width: 110;
     margin: 0 2;
-    padding: 1 2;
+    padding: 1 1;
     background: $nc-surface;
     color: $nc-text;
     border: round $nc-border;
@@ -234,7 +235,8 @@ QueueManagerScreen,
 ContextVisibilityScreen,
 ActivityHistoryScreen,
 ConversationHistoryScreen,
-WorkLedgerScreen {
+WorkLedgerScreen,
+TeamLauncherScreen {
     align: center middle;
     background: $nc-canvas 75%;
 }
@@ -318,7 +320,8 @@ DiffReviewScreen {
 
 #diff-filter,
 #history-filter,
-#activity-filter {
+#activity-filter,
+#work-filter {
     height: 3;
     margin: 0;
     border: round $nc-border;
@@ -326,7 +329,8 @@ DiffReviewScreen {
 
 #diff-filter:focus,
 #history-filter:focus,
-#activity-filter:focus {
+#activity-filter:focus,
+#work-filter:focus {
     border: round $nc-accent;
 }
 
@@ -561,13 +565,82 @@ DiffReviewScreen {
 }
 
 ApprovalModal #approval-dialog {
-    height: 80%;
+    width: 70;
+    height: auto;
+    padding: 0 2;
+}
+
+ApprovalModal #approval-title {
+    margin-bottom: 0;
+    color: $nc-warning;
+}
+
+ApprovalModal #approval-body,
+#approval-scope,
+#approval-details {
+    height: auto;
+    margin: 0;
+}
+
+#approval-scroll,
+#approval-scope-scroll,
+#approval-details-scroll {
+    height: auto;
+    min-height: 1;
+    max-height: 3;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: $nc-border;
+    scrollbar-color-active: $nc-accent;
+    scrollbar-color-hover: $nc-muted;
 }
 
 #approval-scroll {
-    height: 1fr;
-    min-height: 3;
-    scrollbar-size-vertical: 1;
+    padding: 0 1;
+    background: $nc-canvas;
+}
+
+#approval-scope-scroll {
+    margin-top: 1;
+}
+
+#approval-details-scroll {
+    display: none;
+}
+
+#approval-risk {
+    height: 1;
+    color: $nc-warning;
+}
+
+#approval-toggle {
+    height: 1;
+    width: auto;
+    min-width: 0;
+    padding: 0;
+    border: none;
+    background: $nc-surface;
+    color: $nc-accent;
+}
+
+#approval-toggle:focus {
+    text-style: bold reverse;
+}
+
+ApprovalModal #approval-buttons {
+    height: 3;
+}
+
+ApprovalModal #approval-buttons Button {
+    width: 1fr;
+    height: 3;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+}
+
+ApprovalModal #approval-buttons #once {
+    background: $nc-accent;
+    color: $nc-canvas;
 }
 
 #question-progress {
@@ -635,8 +708,24 @@ ApprovalModal #approval-dialog {
 }
 
 #work-dialog {
-    width: 108;
-    height: 34;
+    width: 120;
+    height: 40;
+    max-height: 96%;
+}
+
+#work-filters {
+    height: 3;
+}
+
+#work-filters Button {
+    min-width: 8;
+    width: auto;
+    padding: 0 1;
+    margin-right: 1;
+}
+
+#work-new {
+    margin-left: 1;
 }
 
 #work-title {
@@ -678,6 +767,101 @@ ApprovalModal #approval-dialog {
     height: 1;
     margin-top: 1;
     color: $nc-muted;
+}
+
+.narrow #work-dialog {
+    padding: 0 1;
+}
+
+.narrow #work-body {
+    layout: vertical;
+}
+
+.narrow #work-list {
+    width: 1fr;
+    height: 4;
+    min-width: 0;
+    border-right: none;
+    border-bottom: solid $nc-border;
+}
+
+.narrow #work-detail {
+    width: 1fr;
+    padding: 0 1;
+}
+
+.narrow #work-summary {
+    height: 1;
+    padding: 0;
+}
+
+.narrow #work-hint {
+    margin-top: 0;
+}
+
+#team-dialog {
+    width: 84;
+    max-width: 94%;
+    height: auto;
+    max-height: 96%;
+    padding: 1 2;
+    background: $nc-surface;
+    border: round $nc-border;
+}
+
+#team-title {
+    height: 1;
+    text-style: bold;
+    color: $nc-accent;
+}
+
+#team-intro {
+    height: auto;
+    margin: 1 0;
+    color: $nc-muted;
+}
+
+#team-workflows {
+    height: 8;
+    background: $nc-canvas;
+    border: none;
+    scrollbar-color: $nc-border;
+}
+
+#team-preview {
+    height: auto;
+    padding: 1;
+    background: $nc-raised;
+}
+
+#team-buttons {
+    height: 3;
+    margin-top: 1;
+}
+
+#team-buttons Button {
+    margin-right: 1;
+}
+
+#team-hint {
+    height: 1;
+    color: $nc-muted;
+}
+
+.narrow #team-dialog {
+    padding: 0 1;
+}
+
+.narrow #team-intro {
+    margin: 0;
+}
+
+.narrow #team-preview {
+    padding: 0 1;
+}
+
+.narrow #team-buttons {
+    margin-top: 0;
 }
 
 #detail-body {

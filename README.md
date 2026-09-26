@@ -12,12 +12,12 @@
 
 </div>
 
-![Noah Code handling a repository change in its terminal interface](https://raw.githubusercontent.com/skundu42/noah-code/main/docs/assets/noah-in-action.svg)
+![Noah Code showing a sample build team, conversation, changed files, and review progress](https://raw.githubusercontent.com/skundu42/noah-code/main/docs/assets/noah-in-action.svg)
 
-<p align="center"><sub>The real Textual interface, captured from a deterministic Noah Code session.</sub></p>
+<p align="center"><sub>The real Textual interface with deterministic sample data: a build team hands pagination changes to a read-only reviewer.</sub></p>
 
 Noah keeps the conversation central while the sidebar tracks the current action, changed files,
-and the active plan. Tool execution stays visible, completed work compacts into
+active plan, and agent handoffs. Tool execution stays visible, completed work compacts into
 readable records, and every session remains scoped to its repository.
 
 Built on the [NVIDIA OO Agents (NOOA)](https://github.com/NVIDIA-NeMo/labs-OO-Agents) runtime.
@@ -63,6 +63,10 @@ configuration or session history.
   **plan** mode, with ordered `allow`, `ask`, and `deny` permission rules.
 - **Extensible workflows.** Add slash commands, opt-in skills, MCP servers, or markdown subagents;
   attach `@files` and images when the task needs more context.
+- **Coordinated agent teams.** Launch a build, review, or investigation workflow from `F9` or
+  `/team`. Specialists hand off findings between phases, and the live work ledger shows progress.
+  Teams share session budgets and approvals; read-only work can run concurrently while edits
+  use one serialized mutation lane.
 - **Long-running by design.** Provider retries and configurable fallback models handle transient
   failures, while workspace leases, bounded artifacts, durable process ownership, and `/health`
   keep unattended sessions observable.
@@ -78,6 +82,18 @@ Describe the outcome you want rather than prescribing every edit:
 Find the cause of the failing parser tests, implement the smallest safe fix, and run the
 focused test file.
 ```
+
+For work that benefits from several perspectives, give a team one clear objective:
+
+```text
+/team build Add pagination to the search endpoint and cover its edge cases
+/team review Find regressions in the current changes
+/team investigate Trace why login fails after a session expires
+```
+
+Build teams analyze, implement, then review. Review and investigation teams stay read-only,
+including in plan mode. Press `F9` to choose a workflow and edit its objective before sending;
+use `F4` to inspect live team progress. In the console, `/team` lists the workflows.
 
 Useful launch modes:
 
@@ -126,6 +142,15 @@ means netcat, `noah` or `noah-code` is recommended.
 
 ## Inside the TUI
 
+The interface keeps frequent actions within reach:
+
+- **Readable commands.** Aligned descriptions, muted argument hints, and a subtle selection row
+  make slash commands easier to scan. Use arrows, Enter, Tab, or the mouse.
+- **Compact approvals.** See the command and session scope together; expand the reason and rule
+  with `D`. Long targets scroll, and approval buttons stay visible in small terminals.
+- **Inspectable teams.** Use `F9` to launch a workflow and `F4` to search assignments, filter work
+  needing attention, and read agent results.
+
 Type `/` to search the full command and configuration reference. The most common controls are:
 
 | Control | Action |
@@ -158,6 +183,7 @@ Type `/` to search the full command and configuration reference. The most common
 | `F4` | Open the live agent, terminal, and job ledger |
 | `F5` | Edit, reorder, resume, or discard queued follow-ups |
 | `F8` | Show or hide the sidebar |
+| `F9` | Choose a build, review, or investigation team workflow |
 | `Shift+F7` | Focus or leave the scrollable context rail |
 | `/model` | Configure a provider or switch the session model |
 | `/theme` | Choose Atom One Dark, Noah Ocean, Graphite, or High Contrast |
@@ -167,6 +193,7 @@ Type `/` to search the full command and configuration reference. The most common
 | `/health` | Inspect durable run, job, inbox, event, and artifact state |
 | `/tokens` | Inspect tokens, cache usage, prefix stability, model wait, and tool output |
 | `/efficiency` | Switch between `fast`, `balanced`, and `deep` budgets |
+| `/team WORKFLOW OBJECTIVE` | Run a coordinated team, or queue it while another turn is active |
 
 On wide terminals, the side rail prioritizes the active operation, delegated agents, named
 terminals, Git branch and change counts, session, model usage, update state, and plan. Git status is refreshed in the background at turn
@@ -174,6 +201,20 @@ boundaries, so the animated working state stays responsive. The main pane remain
 large Noah wordmark until the first prompt, then becomes the conversation and execution timeline.
 The composer footer keeps contextual keys and compact token, cache, and cost telemetry visible at
 every terminal width where they fit.
+
+<details>
+<summary>See the command menu and compact approval dialog</summary>
+
+![Noah Code command menu with aligned descriptions and a subtle selection highlight](https://raw.githubusercontent.com/skundu42/noah-code/main/docs/assets/noah-command-menu.svg)
+
+*The real command menu, captured with deterministic sample conversation data.*
+
+![Noah Code compact permission dialog showing a shell command, session scope, and approval choices](https://raw.githubusercontent.com/skundu42/noah-code/main/docs/assets/noah-permissions.svg)
+
+*The real approval dialog with a sample request. Screenshots illustrate UI behavior, not a live
+provider run or test result.*
+
+</details>
 
 ## Sessions and crash recovery
 
@@ -251,6 +292,10 @@ uv run ruff check src tests
 uv run pytest tests
 uv build
 ```
+
+Regenerate the README screenshots from deterministic sample data with
+`uv run python scripts/capture_readme.py`. This renders the real Textual widgets without making
+provider calls or changing a workspace.
 
 See the [development guide](docs/development.md) for platform checks and the release process.
 

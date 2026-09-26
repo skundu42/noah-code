@@ -288,6 +288,43 @@ async def test_run_many_validates_before_spawning(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_many_child_cancellation_drains_writer_and_releases_mutation_lane(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    started = []
+    settled = []
+    both_started = asyncio.Event()
+
+    async def runner(spec, prompt):
+        if prompt == "recover":
+            return "recovered"
+        started.append(spec.name)
+        if len(started) == 2:
+            both_started.set()
+        try:
+            await both_started.wait()
+            if spec.name == "explore":
+                raise asyncio.CancelledError
+            await asyncio.Event().wait()
+        finally:
+            settled.append(spec.name)
+
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    tasks = TaskTools(
+        Workspace(root=tmp_path), engine, ApprovalBroker(engine), runner=runner,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(
+            tasks.run_many([("explore", "read"), ("general", "edit")]), timeout=2,
+        )
+    assert set(settled) == {"explore", "general"}
+    assert {row["state"] for row in tasks.snapshot()} == {"cancelled"}
+    assert await asyncio.wait_for(tasks.run("general", "recover"), timeout=2) == "recovered"
+
+
+@pytest.mark.asyncio
 async def test_task_lifecycle_snapshot_exposes_live_and_completed_work(tmp_path: Path) -> None:
     import asyncio
 

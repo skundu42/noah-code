@@ -909,7 +909,8 @@ class AgentHost:
         jobs = snapshot["jobs"]
         lines = ["Work ledger", "", "Agents"]
         if not agents:
-            lines.append("  No delegated work yet. Noah can use task.run_many or task.collaborate.")
+            lines.append("  No delegated work yet. Start /team build OBJECTIVE or choose a team with F9.")
+            lines.append("  Noah can also use task.run_many or task.collaborate for custom assignments.")
         for item in agents:
             mode = "read" if item.get("readonly") else "write"
             lines.append(
@@ -1686,6 +1687,8 @@ class AgentHost:
     async def handle_line(self, line: str) -> Literal["continue", "exit", "handled"]:
         slash = parse_slash(line)
         if slash:
+            if slash[0] == "team":
+                return await self._handle_team(slash[1])
             return await self._handle_slash(slash[0], slash[1])
         skill_prompt = await self._activate_explicit_skill(line)
         if skill_prompt is None:
@@ -1708,6 +1711,79 @@ class AgentHost:
             self._active_turn = None
             self.ui.set_busy(False)
             self.ui.set_status(self.status_prompt())
+
+    def team_status_text(self) -> str:
+        """Describe coordinated workflows without starting model work."""
+
+        from noah_code.teams import team_workflows
+
+        lines = ["Agent teams", ""]
+        for workflow in team_workflows():
+            mode = "read-only" if workflow.readonly else "build mode required"
+            phases = " → ".join(phase.title for phase in workflow.phases)
+            lines.extend(
+                [
+                    f"  /team {workflow.name} OBJECTIVE · {mode}",
+                    f"    {workflow.description}",
+                    f"    {phases}",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "Example: /team review Find regressions in the current changes",
+                "Track progress with /work or F4. Teams share this session's budget and approvals.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def prepare_team_prompt(self, args: str) -> str:
+        """Validate a team request and route it through the normal agent lifecycle."""
+
+        from noah_code.teams import get_team_workflow
+
+        parts = args.strip().split(maxsplit=1)
+        if not parts:
+            raise ValueError("usage: /team <build|review|investigate> OBJECTIVE")
+        workflow = get_team_workflow(parts[0].lower())
+        if len(parts) < 2 or not parts[1].strip():
+            raise ValueError(f"Add an objective: /team {workflow.name} OBJECTIVE")
+        if not workflow.readonly and self.agent.mode != "build":
+            raise ValueError(
+                "The build team requires build mode. Use /mode build first, "
+                "or choose /team review or /team investigate for read-only work."
+            )
+        objective = parts[1].strip()
+        access_instruction = (
+            "This is a read-only request: do not modify files or switch to build mode. "
+            if workflow.readonly else ""
+        )
+        return (
+            f"Run the {workflow.title} team workflow for the objective below. "
+            f"Call await self.task.team(objective, workflow={workflow.name!r}) with that "
+            "objective, then inspect the returned reports and provide one consolidated answer "
+            "with observed validation and any unresolved blockers. Respect the active mode, "
+            "repository instructions, and existing user changes. "
+            f"{access_instruction}\n\n"
+            f"Objective:\n{objective}"
+        )
+
+    async def _handle_team(self, args: str) -> Literal["continue", "exit", "handled"]:
+        if not args.strip():
+            self.ui.render(_command_output(self.team_status_text()))
+            return "handled"
+        try:
+            prompt = self.prepare_team_prompt(args)
+        except ValueError as exc:
+            self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
+            return "handled"
+        another_turn_running = self._turn_running() and self._active_turn is not asyncio.current_task()
+        if another_turn_running or self.queue_paused:
+            self.enqueue_steer(prompt)
+            state = "paused" if self.queue_paused else "queued"
+            self.ui.render(HostEvent(HostEventKind.STATUS, f"team {state} · /work to track progress"))
+            return "handled"
+        return await self.handle_line(prompt)
 
     async def _activate_explicit_skill(self, line: str) -> str | None:
         """Resolve ``$name task``, approve it, and expose its instructions."""

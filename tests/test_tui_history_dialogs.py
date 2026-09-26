@@ -72,9 +72,10 @@ async def test_long_approval_keeps_decisions_visible_and_uses_active_palette(
         await pilot.pause()
         body = app.screen.query_one("#approval-body", Static).content
         assert target in body.plain
-        assert "without asking again" in body.plain
-        assert "Session pattern: src/*.py" in body.plain
-        assert any(span.style == THEMES["high-contrast"].muted for span in body.spans)
+        scope = app.screen.query_one("#approval-scope", Static).content
+        assert "Session pattern" in scope.plain
+        assert "src/*.py" in scope.plain
+        assert any(span.style == THEMES["high-contrast"].muted for span in scope.spans)
         reject = app.screen.query_one("#reject")
         assert app.screen.focused is reject
         assert reject.region.bottom <= app.size.height

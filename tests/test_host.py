@@ -1051,6 +1051,142 @@ async def test_agents_command_lists_builtins(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_team_command_lists_workflows_without_starting_a_turn(tmp_path: Path) -> None:
+    host = AgentHost(
+        Workspace(root=tmp_path.resolve()),
+        NoahCodeConfig(session_dir=tmp_path / "sessions"),
+        llm=FakeLLMClient(),
+    )
+    await host.start()
+    host.ui.render = MagicMock()
+    host._run_user_turn = AsyncMock()
+
+    assert await host.handle_line("/team") == "handled"
+
+    output = host.ui.render.call_args.args[0]
+    for workflow in ("build", "review", "investigate"):
+        assert f"/team {workflow} OBJECTIVE" in output.text
+    assert "read-only" in output.text
+    assert "budget and approvals" in output.text
+    assert output.meta == {"format": "plain", "source": "command"}
+    host._run_user_turn.assert_not_awaited()
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_team_command_uses_normal_turn_and_pending_attachments(tmp_path: Path) -> None:
+    host = AgentHost(
+        Workspace(root=tmp_path.resolve()),
+        NoahCodeConfig(session_dir=tmp_path / "sessions"),
+        llm=FakeLLMClient(),
+    )
+    await host.start()
+    host._run_user_turn = AsyncMock()
+    attachment = tmp_path / "context.md"
+    host._pending_attach_paths.append(attachment)
+    # The TUI marks its own turn active before dispatching an agent command.
+    host._active_turn = asyncio.current_task()
+
+    assert await host.handle_line("/team BUILD Improve the parser\nKeep compatibility") == "continue"
+
+    host._run_user_turn.assert_awaited_once()
+    call = host._run_user_turn.call_args
+    assert "await self.task.team(objective, workflow='build')" in call.args[0]
+    assert call.args[0].endswith("Objective:\nImprove the parser\nKeep compatibility")
+    assert call.kwargs == {"attach_paths": [attachment]}
+    assert not host.pending_attach_paths()
+    assert not host.steer_queue.items()
+    assert host._active_turn is None
+    await host.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "mode", "message"),
+    [
+        ("/team unsupported Fix it", "build", "unknown"),
+        ("/team review", "build", "Add an objective"),
+        ("/team build Fix it", "plan", "requires build mode"),
+    ],
+)
+async def test_team_command_rejects_invalid_requests_before_a_turn(
+    tmp_path: Path, command: str, mode: str, message: str
+) -> None:
+    host = AgentHost(
+        Workspace(root=tmp_path.resolve()),
+        NoahCodeConfig(session_dir=tmp_path / "sessions", mode=mode),
+        llm=FakeLLMClient(),
+    )
+    await host.start()
+    host.ui.render = MagicMock()
+    host._run_user_turn = AsyncMock()
+
+    assert await host.handle_line(command) == "handled"
+
+    output = host.ui.render.call_args.args[0]
+    assert output.kind == HostEventKind.ERROR
+    assert message.lower() in output.text.lower()
+    host._run_user_turn.assert_not_awaited()
+    assert host.agent.mode == mode
+    await host.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workflow", ["review", "investigate"])
+async def test_readonly_team_command_preserves_plan_mode(tmp_path: Path, workflow: str) -> None:
+    host = AgentHost(
+        Workspace(root=tmp_path.resolve()),
+        NoahCodeConfig(session_dir=tmp_path / "sessions", mode="plan"),
+        llm=FakeLLMClient(),
+    )
+    await host.start()
+    host._run_user_turn = AsyncMock()
+
+    assert await host.handle_line(f"/team {workflow} Explain the failing tests") == "continue"
+
+    assert f"workflow='{workflow}'" in host._run_user_turn.call_args.args[0]
+    assert host.agent.mode == "plan"
+    await host.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("paused", [False, True])
+async def test_team_command_queues_through_existing_followup_lifecycle(
+    tmp_path: Path, paused: bool
+) -> None:
+    host = AgentHost(
+        Workspace(root=tmp_path.resolve()),
+        NoahCodeConfig(session_dir=tmp_path / "sessions"),
+        llm=FakeLLMClient(),
+    )
+    await host.start()
+    host._run_user_turn = AsyncMock()
+    host.queue_paused = paused
+    attachment = tmp_path / "context.md"
+    host._pending_attach_paths.append(attachment)
+    running = asyncio.create_task(asyncio.Event().wait()) if not paused else None
+    host._active_turn = running
+    try:
+        assert await host.handle_line("/team review Check error handling") == "handled"
+
+        host._run_user_turn.assert_not_awaited()
+        item = host.steer_queue.items()[0]
+        assert "workflow='review'" in item.text
+        assert item.text.endswith("Objective:\nCheck error handling")
+        assert item.attach_paths == (attachment,)
+        assert host.queue_paused == paused
+        assert host._active_turn is running
+        assert not host.pending_attach_paths()
+    finally:
+        if running is not None:
+            running.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await running
+        host._active_turn = None
+        await host.close()
+
+
+@pytest.mark.asyncio
 async def test_work_and_terminals_commands_are_actionable(tmp_path: Path) -> None:
     workspace = Workspace(root=tmp_path.resolve())
     config = load_config(
@@ -1064,6 +1200,7 @@ async def test_work_and_terminals_commands_are_actionable(tmp_path: Path) -> Non
     assert await host.handle_line("/work") == "handled"
     work = host.ui.render.call_args.args[0].text
     assert "Work ledger" in work
+    assert "/team build OBJECTIVE" in work
     assert "task.collaborate" in work
     assert "processes.open_terminal" in work
 

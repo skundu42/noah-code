@@ -69,12 +69,77 @@ def test_sandbox_broker_exposes_only_permission_gated_capabilities() -> None:
     assert _PermissionSandboxedExecutor._path_allowed(("task", "run"))
     assert _PermissionSandboxedExecutor._path_allowed(("task", "run_many"))
     assert _PermissionSandboxedExecutor._path_allowed(("task", "collaborate"))
+    assert _PermissionSandboxedExecutor._path_allowed(("task", "team"))
     assert _PermissionSandboxedExecutor._path_allowed(("media", "consume"))
     assert _PermissionSandboxedExecutor._path_allowed(("git", "status"))
     assert not _PermissionSandboxedExecutor._path_allowed(("runtime", "execute_code"))
     assert not _PermissionSandboxedExecutor._path_allowed(("_shell", "run"))
     assert not _PermissionSandboxedExecutor._path_allowed(("ws", "raw_shell", "run"))
     assert not _PermissionSandboxedExecutor._path_allowed(("ws", "run_trusted_readonly"))
+
+
+@pytest.mark.asyncio
+async def test_readonly_subagent_broker_rejects_notes_and_mode_mutations() -> None:
+    executor = object.__new__(_PermissionSandboxedExecutor)
+    executor._max_error = effective_error_limit(None)
+    executor._agent = SimpleNamespace(
+        _readonly=True,
+        _sandbox_approved_roots={"plan", "memory"},
+    )
+    for path in (
+        ["plan", "write"], ["plan", "exit_to_build"],
+        ["memory", "save"], ["memory", "forget"],
+    ):
+        for kind in ("attr", "call"):
+            result = await executor._dispatch_tool_call({"kind": kind, "path": path})
+            assert result["ok"] is False, (kind, path)
+            assert result["error_type"] == "PermissionError"
+        with pytest.raises(PermissionError):
+            executor._walk_path(path)
+    for path in (["plan"], ["plan", "read"], ["memory"], ["memory", "list"]):
+        result = await executor._dispatch_tool_call({"kind": "attr", "path": path})
+        assert result["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_readonly_subagent_tool_guards_prevent_notes_and_mode_escape(tmp_path: Path) -> None:
+    from nooa.unifiedllm import FakeLLMClient
+
+    from noah_code.agent import CodingAgent
+    from noah_code.config import NoahCodeConfig
+    from noah_code.workspace import Workspace
+
+    notes = tmp_path / ".noah-code"
+    notes.mkdir()
+    (notes / "plan.md").write_text("Keep the existing plan.\n")
+    (notes / "memory.md").write_text("- Keep the project convention.\n")
+    child = CodingAgent(
+        Workspace(root=tmp_path),
+        NoahCodeConfig(mode="plan", auto_approve=True, unsafe_inprocess_code_execution=True),
+        llm=FakeLLMClient(), nested=True,
+    )
+    try:
+        assert "existing plan" in await child.plan.read()
+        assert "project convention" in await child.memory.list()
+        for method, args in (
+            (child.plan.write, ("Replace the plan",)),
+            (child.plan.exit_to_build, ()),
+            (child.memory.save, ("Replace the convention",)),
+            (child.memory.forget, ("project convention",)),
+        ):
+            with pytest.raises(PermissionError, match="read-only subagents"):
+                await method(*args)
+        with pytest.raises(PermissionError, match="read-only subagents"):
+            child.set_mode("build")
+        assert child.mode == child.engine.mode == "plan"
+        with pytest.raises(PermissionError):
+            await child.ws.write("escaped.txt", "not allowed")
+    finally:
+        await child.close_tools()
+
+    assert (notes / "plan.md").read_text() == "Keep the existing plan.\n"
+    assert (notes / "memory.md").read_text() == "- Keep the project convention.\n"
+    assert not (tmp_path / "escaped.txt").exists()
 
 
 @pytest.mark.asyncio

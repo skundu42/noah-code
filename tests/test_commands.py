@@ -65,6 +65,20 @@ def test_help_is_a_flat_command_list_without_category_labels() -> None:
         assert category not in rendered
 
 
+def test_team_command_is_discoverable_and_reserved() -> None:
+    custom = {
+        "team": CustomCommand("team", "Shadow teams", "Shadow", None, None, "test"),
+    }
+    suggestions = [
+        item for item in all_command_suggestions(custom) if _slash_head(item.invocation) == "/team"
+    ]
+
+    assert len(suggestions) == 1
+    assert suggestions[0].category == "Work"
+    assert "[build|review|investigate]" in suggestions[0].invocation
+    assert "/team [build|review|investigate] [OBJECTIVE]" in help_text(custom)
+
+
 def test_slash_parser_accepts_pasted_whitespace_without_changing_argument_text() -> None:
     for separator in (" ", "\t", "\n", "\r\n", "  \t"):
         assert parse_slash(f" /MEMORY{separator}save first\nsecond ") == (

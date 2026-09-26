@@ -30,7 +30,7 @@ class AgentSpec:
 
 
 def builtin_agents() -> list[AgentSpec]:
-    """OpenCode-style Explore and General subagents."""
+    """Focused implementation, exploration, and read-only team specialists."""
 
     return [
         AgentSpec(
@@ -59,6 +59,46 @@ def builtin_agents() -> list[AgentSpec]:
             todos=False,
             source="builtin",
         ),
+        AgentSpec(
+            name="planner",
+            description="Read-only planning specialist for requirements, implementation strategy, and validation.",
+            prompt=(
+                "You are a read-only planning specialist. Inspect the code and its tests, "
+                "identify constraints and risks, and propose the smallest coherent plan. "
+                "Cite evidence, distinguish assumptions, and do not modify files or run "
+                "mutating commands. Return a concise handoff without managing todos."
+            ),
+            mode="plan",
+            readonly=True,
+            todos=False,
+        ),
+        AgentSpec(
+            name="reviewer",
+            description="Read-only reviewer for concrete bugs, regression risks, security issues, and test gaps.",
+            prompt=(
+                "You are an independent read-only code reviewer. Inspect the actual code "
+                "and changes; verify teammate claims against evidence. Prioritize concrete, "
+                "actionable findings with file locations and failure scenarios. Do not "
+                "modify files or run mutating commands. State unresolved uncertainty and "
+                "validation gaps; never claim checks ran unless you have evidence."
+            ),
+            mode="plan",
+            readonly=True,
+            todos=False,
+        ),
+        AgentSpec(
+            name="investigator",
+            description="Read-only investigator for debugging, root-cause analysis, and competing hypotheses.",
+            prompt=(
+                "You are a read-only debugging investigator. Trace the behavior, rank "
+                "hypotheses, and seek evidence that confirms or falsifies each. Cite paths "
+                "and observations, separate facts from assumptions, and recommend a small "
+                "fix with verification steps. Do not modify files or run mutating commands."
+            ),
+            mode="plan",
+            readonly=True,
+            todos=False,
+        ),
     ]
 
 
@@ -66,7 +106,10 @@ def discover_agents(workspace: Path, *, home: Path | None = None) -> list[AgentS
     """Built-ins plus user and project markdown agents."""
 
     found = {spec.name: spec for spec in builtin_agents()}
-    reserved = frozenset(found)
+    # Preserve the original protected names while allowing existing specialist
+    # definitions to keep their project-specific behavior. Teams validate their
+    # read-only role requirements before starting any work.
+    reserved = frozenset({"explore", "general"})
     workspace = workspace.expanduser().resolve()
     user_home = (home or Path.home()).expanduser()
     user_dir = user_home / ".config" / "noah-code" / "agents"

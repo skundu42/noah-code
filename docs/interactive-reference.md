@@ -30,12 +30,15 @@
 | `F6` | Inspect the latest notice or error |
 | `F7` | Inspect context sources |
 | `F8` | Show or hide the sidebar |
+| `F9` | Choose an agent team workflow and prepare its objective in the composer |
 | `Shift+F7` | Focus or leave the context rail on wide terminals |
 | `Ctrl+]` | Return to live transcript output and clear the new-output counter |
 
 At an approval prompt, press `1` to approve once, `2` to remember the approval for the current
-session, or `3`/`Esc` to reject it. The dialog explains the matching scope and keeps the
-full target scrollable. Question cards accept numbered choices and show question progress;
+session, or `3`/`Esc` to reject it. The compact dialog sizes itself to the request, keeps the
+session pattern visible, and lets you scroll long targets. Press `D` or click Show details
+to expand the reason and matching rule. Reject is focused by default. Question cards accept
+numbered choices and show question progress;
 `Esc` skips that question.
 
 The TUI uses Atom One Dark by default and also includes Noah Ocean, Graphite, and High Contrast.
@@ -135,6 +138,8 @@ Approval and `ask.question` modals keep the composer. Queueing resumes after the
 
 These slash commands still run while a turn is in progress: `/status`, `/tokens`, `/todos`,
 `/health`, `/help`, `/trace`, `/work`, `/diff`, and `/terminals`. `/attach PATH` remembers the file for the next queued follow-up.
+`/team WORKFLOW OBJECTIVE` queues a team request as a normal follow-up, including pending
+attachments. A paused queue stays paused; use F5 to review and resume it.
 `/exit` stops the turn and leaves with queued input preserved. Mutating commands wait until the turn
 finishes, including `/undo`, `/redo`, `/mode`, `/model`, `/new`, `/sessions`, `/worktree`,
 `/pr`, `/plan`, `/memory`, and `/compact`.
@@ -189,6 +194,7 @@ compound shell expressions are not treated as individual passing test commands.
 | `/todos` | Show the agent's current task list |
 | `/health` | Show durable run, job, inbox, interaction, event, database, and artifact health |
 | `/agents` | List built-in and markdown subagents |
+| `/team [WORKFLOW] [OBJECTIVE]` | Choose a team in the TUI, or list workflows in the console. `/team build OBJECTIVE` analyzes, implements, and reviews; `review` and `investigate` stay read-only |
 | `/work` | Show live and recent subagent, terminal, and background-job work |
 | `/terminals` | List named persistent terminal sessions |
 | `/attach PATH` | Attach a workspace file or image to the next turn |
@@ -318,7 +324,27 @@ lane so parallel delegation cannot corrupt the checkout.
 For coordinated work, `self.task.collaborate(objective, assignments, lead="general")` fans out
 bounded assignments and then hands all reports to one lead agent for conflict resolution and a
 single synthesis. Agent lifecycle records and terminal/job state appear in the context rail and
-the live `F4` work ledger; `/work` provides the same information in console-friendly text.
+the live `F4` work ledger. `/work` opens that panel in the TUI and provides text in the console.
+The panel prioritizes work needing input or reporting a failure. Use All, Active, or Needs
+attention to filter, and `/` to search assignments, agents, and result previews. Selection and
+reading position are preserved during live refreshes. On narrow terminals the detail pane
+appears below the work list so results stay readable.
+
+Use `F9`, `/team`, or `N` in the `F4` work ledger to choose a ready-made team workflow. Selecting
+one prepares `/team WORKFLOW` in the composer so you can edit the objective before sending.
+The workflows are:
+
+| Workflow | Phases | Workspace access |
+| --- | --- | --- |
+| `build` | Analyze → implement → review | Requires build mode; writes use the shared mutation lane |
+| `review` | Inspect → synthesize | Read-only; available in build and plan modes |
+| `investigate` | Analyze → synthesize | Read-only; available in build and plan modes |
+
+For example, `/team review Check the authentication changes for regressions` sends the objective
+through the normal agent turn and asks the parent to run `await self.task.team(objective,
+workflow="review")`. Teams use the session's shared budget, permissions, cancellation, and
+checkpoint lifecycle. Their reports include blockers and observed validation; a team finishing
+does not itself mean tests passed. `/team build` never switches out of plan mode automatically.
 
 `self.web.fetch(url)` and `self.web.search(query)` are read-only and allowed by default. Fetch
 follows a bounded number of redirects and accepts only public HTTP(S) destinations; private,

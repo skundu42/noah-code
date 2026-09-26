@@ -27,6 +27,25 @@ def test_builtin_explore_is_readonly_without_todos() -> None:
     assert "parallel" in general.description.lower() or "multi-step" in general.description.lower()
 
 
+def test_team_specialists_are_readonly_without_todos() -> None:
+    agents = {spec.name: spec for spec in builtin_agents()}
+    for name in ("planner", "reviewer", "investigator"):
+        assert agents[name].readonly
+        assert agents[name].mode == "plan"
+        assert not agents[name].todos
+
+
+def test_project_specialists_preserve_existing_overrides(tmp_path: Path) -> None:
+    agents_dir = tmp_path / ".noah-code" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "reviewer.md").write_text(
+        "---\ndescription: project review specialist\nmode: plan\n---\nUse our review policy.\n"
+    )
+    found = {spec.name: spec for spec in discover_agents(tmp_path, home=tmp_path / "home")}
+    assert found["reviewer"].source == "project:reviewer.md"
+    assert found["reviewer"].description == "project review specialist"
+
+
 def test_discover_project_markdown_agents(tmp_path: Path, monkeypatch) -> None:
     home = tmp_path / "home"
     user_dir = home / ".config" / "noah-code" / "agents"

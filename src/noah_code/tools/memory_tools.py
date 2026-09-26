@@ -20,10 +20,12 @@ class MemoryTools(Skill):
         *,
         store: MemoryStore | None = None,
         on_change: Callable[[], None] | None = None,
+        readonly: bool = False,
     ) -> None:
         super().__init__()
         self._store = store or MemoryStore(root)
         self._on_change = on_change
+        self._readonly = readonly
 
     async def list(self) -> str:
         """Return remembered project conventions."""
@@ -36,6 +38,8 @@ class MemoryTools(Skill):
     ) -> str:
         """Pin a durable project preference for future sessions."""
 
+        if self._readonly:
+            raise PermissionError("read-only subagents cannot save project memory")
         facts = parse_memory_facts(fact if "\n" in fact else f"- {fact.strip()}")
         if not facts:
             raise ValueError("that fact looks empty or secret")
@@ -52,6 +56,8 @@ class MemoryTools(Skill):
     ) -> str:
         """Remove a remembered convention."""
 
+        if self._readonly:
+            raise PermissionError("read-only subagents cannot forget project memory")
         if not fact.strip():
             raise ValueError("forget requires a fact")
         forgotten = self._store.forget(fact)

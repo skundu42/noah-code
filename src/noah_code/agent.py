@@ -154,6 +154,7 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("task", "run"),
             ("task", "run_many"),
             ("task", "collaborate"),
+            ("task", "team"),
             ("processes", "input"),
             ("processes", "open_terminal"),
             ("processes", "terminal_run"),
@@ -189,6 +190,12 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
         }
     )
     _VALUE_PATHS = frozenset({("mode",), ("workspace_root",)})
+    _READONLY_BLOCKED_PATHS = frozenset({
+        ("plan", "write"),
+        ("plan", "exit_to_build"),
+        ("memory", "save"),
+        ("memory", "forget"),
+    })
 
     @classmethod
     def _path_allowed(cls, path: tuple[str, ...]) -> bool:
@@ -202,6 +209,8 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
 
     def _approved_path(self, path: tuple[str, ...]) -> bool:
         if not path or any(not part or part.startswith("_") for part in path):
+            return False
+        if getattr(self._agent, "_readonly", False) and path in self._READONLY_BLOCKED_PATHS:
             return False
         approved_roots: set[str] = getattr(self._agent, "_sandbox_approved_roots", set())
         return self._path_allowed(path) or path[0] in approved_roots
@@ -496,6 +505,10 @@ call is async: always `await` it before iterating or accessing the result.
   `set_mode`. Save standing conventions with `self.memory.save`.
 - Delegate bounded units with `self.task.run`, independent units with
   `run_many`, and lead synthesis with `collaborate`.
+- For coordinated workflows, await `self.task.team(objective, workflow="build")`.
+  Build analyzes, implements, and reviews; `review` and `investigate` are
+  read-only and available in plan mode. Inspect the returned reports, resolve
+  blockers, and report observed validation; delegation alone is not completion.
 - If `self.media` has pending images, `show()` each consumed image first.
 
 ### Workflow and safety
@@ -771,6 +784,9 @@ class CodingAgent(InteractiveAgent):
         self.mode = config.mode
         self._config = config
         self._nested = nested
+        # A delegated read-only role cannot opt into build mode or mutate the
+        # shared notes that remain writable for the top-level planning agent.
+        self._readonly = nested and config.mode == "plan"
 
         self._engine = engine or PermissionEngine(
             config.permission_rules,
@@ -859,10 +875,13 @@ class CodingAgent(InteractiveAgent):
             runtime=runtime,
             timeout_seconds=config.reliability.interaction_timeout_seconds,
         )
-        self.plan = PlanTools(workspace.root, self, self.ask, self._engine)
+        self.plan = PlanTools(
+            workspace.root, self, self.ask, self._engine, readonly=self._readonly,
+        )
         self.memory = MemoryTools(
             workspace.root,
             on_change=self.refresh_context_sources,
+            readonly=self._readonly,
         )
         self.media = MediaTools()
         self._sandbox_approved_roots: set[str] = set()
@@ -1141,6 +1160,8 @@ class CodingAgent(InteractiveAgent):
 
     @hidden
     def set_mode(self, mode: Literal["build", "plan"]) -> None:
+        if self._readonly and mode != "plan":
+            raise PermissionError("read-only subagents cannot switch to build mode")
         self.mode = mode
         self._engine.mode = mode
         self.v.mode = mode

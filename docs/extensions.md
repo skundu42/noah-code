@@ -34,12 +34,25 @@ on mode), and the same approval broker. Read-only agents can fan out concurrentl
 mutate the checkout share one mutation lane and cannot write over each other. Results are bounded:
 oversized transcripts are condensed by the lightweight model (fallback: truncation with a recall
 pointer) before they enter the parent's context. Tune with `subagent_result_max_chars` and
-`max_concurrent_subagents` under `[efficiency]`. Add project or user markdown agents:
+`max_concurrent_subagents` under `[efficiency]`.
 
 Use `self.task.collaborate(objective, assignments, lead="general")` when parallel findings need a
 deliberate handoff. Contributors run under the same concurrency and mutation-lane rules, then the
 lead receives their bounded reports and returns one synthesized result. Live queued, running,
 completed, failed, and cancelled states are visible in the TUI work ledger (`F4`) and `/work`.
+
+`await self.task.team(objective, workflow="build")` runs a built-in phased workflow with
+bounded reports passed between phases. `build` analyzes, implements, and reviews;
+`review` inspects and synthesizes findings; `investigate` analyzes and synthesizes a diagnosis.
+The last two workflows are read-only and supported in plan mode. Build requires build mode.
+Teams retain the same concurrency limit, mutation lane, permissions, and shared session budget
+as individual subagents. The parent must inspect reports and report actual verification results.
+
+Users can launch these workflows with `/team <build|review|investigate> OBJECTIVE`, or choose
+one with `F9` in the TUI. A bare `/team` lists choices in the console. Requests during an active
+turn join the follow-up queue; requests made while the queue is paused remain paused.
+
+Add project or user markdown agents at:
 
 - `~/.config/noah-code/agents/*.md`
 - `.noah-code/agents/*.md`
@@ -55,7 +68,8 @@ Review the assigned change. Cite files. Do not edit.
 
 `/agents` lists discovered names. Project files override user files with the same stem, except that
 the built-in `explore` and `general` agents are reserved and cannot be replaced by repository
-content.
+content. Built-in `planner`, `reviewer`, and `investigator` roles are also available; markdown
+definitions can customize them. Team workflows validate read-only roles before starting.
 
 Repository command and agent files are limited to 64 KiB and must be ordinary, singly linked files
 inside their expected `.noah-code` directory. Symlinks, hardlinks, linked directories, special

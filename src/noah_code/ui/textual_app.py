@@ -52,6 +52,8 @@ from noah_code.sessions import SessionEventRecord
 from noah_code.steer import SAFE_SLASH_WHILE_BUSY
 from noah_code.themes import THEMES, ThemePalette, get_theme
 from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt
+from noah_code.ui.command_menu import CommandSuggestions, command_menu_renderable
+from noah_code.ui.team_screen import TeamLauncherScreen
 from noah_code.updates import UpdateStatus, maybe_check_for_update
 from noah_code.verification import CheckLedger
 
@@ -689,12 +691,26 @@ def _coalesce_activity_text(previous: str, current: str) -> str | None:
 
 
 def _welcome_renderable(theme: ThemePalette) -> Group:
-    """Render the terminal-scale Noah mark shown before the first prompt."""
+    """Pair Noah's mark with useful, directly accessible first actions."""
+
+    shortcuts = Text(justify="center")
+    for label, action in (
+        ("F9  Start a team", "team_setup"),
+        ("Ctrl+D  Review changes", "review_changes"),
+        ("Ctrl+O  Resume work", "sessions"),
+    ):
+        if shortcuts:
+            shortcuts.append("\n")
+        shortcuts.append(label, style=Style(color=theme.accent, meta={"@click": f"app.{action}"}))
 
     return Group(
         *(Text(line, style=f"bold {theme.text}", justify="center") for line in NOAH_WORDMARK),
         Text("NOAH  /  C  O  D  E", style=f"bold {theme.accent}", justify="center"),
         Text("───  agent at work  ───", style=theme.muted, justify="center"),
+        Text(""),
+        Text("Describe a task below, or choose where to start.", style=theme.text, justify="center"),
+        Text(""),
+        shortcuts,
     )
 
 
@@ -908,40 +924,93 @@ class ApprovalModal(ModalScreen[ApprovalChoice]):
         Binding("2", "session", "Allow session", show=True),
         Binding("3", "reject", "Reject", show=True),
         Binding("escape", "reject", "Reject", show=False),
+        Binding("d", "toggle_details", "Details", show=True),
     ]
 
     def __init__(self, request: ApprovalRequest) -> None:
         super().__init__()
         self.request = request
+        self._details_expanded = False
 
     def compose(self) -> ComposeResult:
         palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
         decision = self.request.decision
+        category = decision.category.replace("_", " ")
+        title = {
+            "bash": "Allow shell command?",
+            "edit": "Allow file changes?",
+            "read": "Allow file access?",
+            "task": "Allow agent delegation?",
+            "external_directory": "Allow access outside the workspace?",
+        }.get(decision.category, f"Allow {category} request?")
         with Vertical(id="approval-dialog"):
-            yield Label("PERMISSION REQUIRED", id="approval-title")
+            yield Label(title, id="approval-title")
+            if decision.elevated_floor:
+                yield Static("Elevated-risk action", id="approval-risk")
             with VerticalScroll(id="approval-scroll"):
+                yield Static(Text(decision.target, style=palette.text), id="approval-body")
+            with VerticalScroll(id="approval-scope-scroll"):
                 yield Static(
                     Text.assemble(
-                        (f"{decision.category.upper()}\n", f"bold {palette.warning}"),
-                        (f"{decision.target}\n\n", palette.text),
-                        (f"{decision.reason}\n\n", palette.muted),
-                        ("Allow once permits only this request.\n", palette.text),
-                        (
-                            f"This session also permits future {decision.category} requests "
-                            "whose targets match the pattern below, without asking again.\n",
-                            palette.text,
-                        ),
-                        (f"Session pattern: {decision.remember_pattern}", palette.muted),
+                        (f"Session pattern · {category}\n", palette.muted),
+                        (decision.remember_pattern, palette.text),
                     ),
-                    id="approval-body",
+                    id="approval-scope",
                 )
+            with VerticalScroll(id="approval-details-scroll"):
+                details = Text(decision.reason, style=palette.text)
+                details.append(
+                    "\nAllow once permits this request. Session allows future matches "
+                    "of the pattern without asking again.", style=palette.muted,
+                )
+                if decision.tool:
+                    details.append(f"\nTool: {decision.tool}", style=palette.muted)
+                if decision.matching_rule is not None:
+                    rule = decision.matching_rule
+                    details.append(
+                        f"\nRule: {rule.category} / {rule.pattern} → {rule.action}",
+                        style=palette.muted,
+                    )
+                yield Static(details, id="approval-details")
+            yield Button("D Show details", id="approval-toggle")
             with Horizontal(id="approval-buttons"):
-                yield Button("Allow once  [1]", id="once", variant="primary")
-                yield Button("This session  [2]", id="session", variant="success")
-                yield Button("Reject  [3]", id="reject", variant="error")
+                yield Button("1 Allow once", id="once", variant="primary")
+                yield Button("2 Session", id="session")
+                yield Button("3/Esc Reject", id="reject", variant="error")
 
     def on_mount(self) -> None:
+        self._size_content()
         self.query_one("#reject", Button).focus()
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._size_content(event.size.height)
+
+    def _size_content(self, height: int | None = None) -> None:
+        """Reserve room for the choices even when targets or reasons are long."""
+
+        rows = height if height is not None else self.size.height
+        # Border, heading, scope margin, disclosure, buttons, and risk label.
+        fixed = 8 + int(self.request.decision.elevated_floor)
+        available = max(3, int(rows * 0.9) - fixed)
+        scope_rows = min(3, max(1, available // 3))
+        details_rows = min(5, max(1, available // 3)) if self._details_expanded else 0
+        target_rows = min(
+            10 if self._details_expanded else 3,
+            max(1, available - scope_rows - details_rows),
+        )
+        self.query_one("#approval-scroll").styles.max_height = target_rows
+        self.query_one("#approval-scope-scroll").styles.max_height = scope_rows
+        details = self.query_one("#approval-details-scroll")
+        details.display = self._details_expanded
+        details.styles.max_height = max(1, details_rows)
+
+    @on(Button.Pressed, "#approval-toggle")
+    def action_toggle_details(self) -> None:
+        self._details_expanded = not self._details_expanded
+        self.query_one("#approval-toggle", Button).label = (
+            "D Hide details" if self._details_expanded else "D Show details"
+        )
+        self._size_content()
 
     def action_once(self) -> None:
         self.dismiss(ApprovalChoice.ONCE)
@@ -1620,8 +1689,10 @@ class WorkLedgerScreen(ModalScreen[None]):
     """Live operator view of delegated agents, terminals, and background jobs."""
 
     BINDINGS = [
-        Binding("escape", "close", "Close", show=True),
+        Binding("escape,f4", "close", "Close", show=True),
         Binding("r", "refresh", "Refresh", show=True),
+        Binding("slash", "search", "Search", show=True),
+        Binding("n", "new_team", "New team", show=True),
     ]
 
     def __init__(self, host: AgentHost) -> None:
@@ -1629,11 +1700,18 @@ class WorkLedgerScreen(ModalScreen[None]):
         self.host = host
         self._records: dict[str, dict[str, Any]] = {}
         self._selected_id: str | None = None
+        self._filter = "all"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="work-dialog"):
-            yield Label("LIVE WORK LEDGER", id="work-title")
+            yield Label("Team & work", id="work-title")
             yield Static("", id="work-summary")
+            with Horizontal(id="work-filters"):
+                yield Button("All", id="work-all", variant="primary")
+                yield Button("Active", id="work-active")
+                yield Button("Needs attention", id="work-attention")
+                yield Button("New team", id="work-new")
+            yield Input(placeholder="Search assignments, agents, results…", id="work-filter")
             with Horizontal(id="work-body"):
                 yield OptionList(id="work-list", compact=True)
                 yield SelectableRichLog(
@@ -1645,14 +1723,47 @@ class WorkLedgerScreen(ModalScreen[None]):
                     max_lines=500,
                 )
             yield Static(
-                "R refresh · /work console view · /terminals terminal list · Esc close",
+                "/ search · N new team · R refresh · Tab switch pane · Esc close",
                 id="work-hint",
             )
 
     def on_mount(self) -> None:
+        self.set_class(self.size.width < 100, "narrow")
         self._refresh()
         self.query_one("#work-list", OptionList).focus()
         self.set_interval(1.0, self._refresh)
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.set_class(event.size.width < 100, "narrow")
+
+    @on(Input.Changed, "#work-filter")
+    def _search_changed(self) -> None:
+        self._refresh()
+
+    @on(Input.Submitted, "#work-filter")
+    def _search_submitted(self) -> None:
+        self.query_one("#work-list", OptionList).focus()
+
+    @on(Button.Pressed, "#work-filters Button")
+    def _choose_filter(self, event: Button.Pressed) -> None:
+        if event.button.id == "work-new":
+            self.action_new_team()
+            return
+        self._filter = str(event.button.id).removeprefix("work-")
+        for name in ("all", "active", "attention"):
+            self.query_one(f"#work-{name}", Button).variant = (
+                "primary" if self._filter == name else "default"
+            )
+        self._refresh()
+
+    def action_search(self) -> None:
+        self.query_one("#work-filter", Input).focus()
+
+    def action_new_team(self) -> None:
+        launch = getattr(self.app, "action_team_setup", None)
+        self.dismiss(None)
+        if callable(launch):
+            self.app.call_later(launch)
 
     def _refresh(self) -> None:
         palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
@@ -1666,13 +1777,13 @@ class WorkLedgerScreen(ModalScreen[None]):
             item.get("state") in {"queued", "running", "stopping"}
             for _key, item in records
         )
+        attention = sum(item.get("state") in {"needs_input", "failed"} for _key, item in records)
         terminals = sum(item.get("kind") == "terminal" for _key, item in records)
         self.query_one("#work-summary", Static).update(
             Text.assemble(
                 (f"{active} active", f"bold {palette.warning}" if active else palette.muted),
-                (f"   {len(snapshot['agents'])} agent records", palette.text),
+                (f"   {attention} need attention", palette.error if attention else palette.muted),
                 (f"   {terminals} terminals", palette.accent),
-                ("   newest work appears last", palette.muted),
             ),
             layout=False,
         )
@@ -1681,6 +1792,23 @@ class WorkLedgerScreen(ModalScreen[None]):
         if option_list.highlighted is not None and option_list.highlighted < len(option_list.options):
             selected_id = option_list.get_option_at_index(option_list.highlighted).id
         option_list.clear_options()
+        query = self.query_one("#work-filter", Input).value.strip().casefold()
+        has_records = bool(records)
+        records.reverse()
+        records.sort(key=lambda row: (
+            0 if row[1].get("state") in {"needs_input", "failed"}
+            else 1 if row[1].get("state") in {"queued", "running", "stopping"} else 2
+        ))
+        records = [
+            (key, item) for key, item in records
+            if (
+                self._filter == "all"
+                or self._filter == "active" and item.get("state") in {"queued", "running", "stopping"}
+                or self._filter == "attention" and item.get("state") in {"needs_input", "failed"}
+            )
+            and all(word in " ".join(str(value) for value in item.values()).casefold()
+                    for word in query.split())
+        ]
         self._records = dict(records)
         options: list[Option] = []
         for key, item in records:
@@ -1696,21 +1824,30 @@ class WorkLedgerScreen(ModalScreen[None]):
                 else palette.error
             )
             if item["unit"] == "agent":
-                title = f"agent · {item.get('agent', 'unknown')}"
+                title = str(item.get("agent", "unknown"))
                 elapsed = float(item.get("duration", 0.0))
+                assignment = str(item.get("prompt", ""))
             else:
                 kind = "terminal" if item.get("kind") == "terminal" else "job"
                 title = f"{kind} · {item.get('name', 'unknown')}"
                 elapsed = float(item.get("elapsed", 0.0))
+                assignment = str(item.get("command") or "Persistent shell")
             prompt = Text()
-            prompt.append(f"{state.upper():<10}", style=f"bold {state_style}")
-            prompt.append(f"{title}\n", style=palette.text)
-            prompt.append(f"   {elapsed:.1f}s  {str(item.get('id', ''))}", style=palette.muted)
+            label = "Input needed" if state == "needs_input" else state.capitalize()
+            prompt.append(f"{label}  ", style=f"bold {state_style}")
+            prompt.append(title, style=palette.text)
+            prompt.append(f"  {elapsed:.0f}s\n", style=palette.muted)
+            prompt.append(_truncate_middle(assignment, 76), style=palette.text)
+            if item.get("workflow"):
+                prompt.append(
+                    f"\n{item['workflow']} / {item.get('phase', '')} / {item.get('team_id', '')}",
+                    style=palette.muted,
+                )
             options.append(Option(prompt, id=key))
         if not options:
             option_list.add_option(
                 Option(
-                    Text("No delegated work or terminal sessions", style=palette.muted),
+                    Text("No matches" if has_records else "No work yet", style=palette.muted),
                     disabled=True,
                 )
             )
@@ -1718,16 +1855,20 @@ class WorkLedgerScreen(ModalScreen[None]):
             detail.clear()
             detail.write(
                 Text(
-                    "Noah opens named terminals with processes.open_terminal() and coordinates "
-                    "teams with task.collaborate(). Work will appear here as it starts.",
+                    "No work matches these filters. Try All or clear the search."
+                    if has_records else
+                    "Give a team a clear outcome. Press N to choose Build, Review, or Investigate. "
+                    "Assignments, handoffs, and results will appear here as the team works.\n\n"
+                    "For example: /team review Check the authentication changes for regressions",
                     style=palette.text,
                 )
             )
+            self._selected_id = None
             return
         option_list.add_options(options)
         index = next(
             (index for index, option in enumerate(options) if option.id == selected_id),
-            len(options) - 1,
+            0,
         )
         option_list.highlighted = index
         self._show(records[index][1])
@@ -1753,10 +1894,21 @@ class WorkLedgerScreen(ModalScreen[None]):
                 f"{float(item.get('duration', 0.0)):.1f}s\n\n",
                 style=palette.muted,
             )
-            text.append("ASSIGNMENT\n", style=f"bold {palette.accent}")
+            if item.get("workflow"):
+                text.append(
+                    f"Team {item.get('team_id', '')} · {item['workflow']} · "
+                    f"{item.get('phase', '')}\n\n", style=palette.accent,
+                )
+            if item.get("state") == "needs_input":
+                text.append(
+                    "Input needed. Read the result below, then close this panel and reply "
+                    "in the main conversation.\n\n", style=palette.warning,
+                )
+            text.append("Assignment\n", style=f"bold {palette.accent}")
             text.append(str(item.get("prompt") or "No assignment text"), style=palette.text)
             if item.get("result_preview"):
-                text.append("\n\nRESULT\n", style=f"bold {palette.success}")
+                result_style = palette.error if item.get("state") == "failed" else palette.accent
+                text.append("\n\nResult preview\n", style=f"bold {result_style}")
                 text.append(str(item["result_preview"]), style=palette.text)
         else:
             kind = "terminal" if item.get("kind") == "terminal" else "background job"
@@ -2528,6 +2680,7 @@ class NoahCodeApp(App[None]):
         Binding("f6", "notice_details", "Details", show=True),
         Binding("f7", "context_visibility", "Context", show=True),
         Binding("f8", "toggle_context_rail", "Sidebar", show=True),
+        Binding("f9", "team_setup", "Team", show=True),
         Binding("shift+f7", "focus_context_rail", "Context rail", show=False),
         Binding("ctrl+]", "scroll_live", "Latest", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
@@ -2654,7 +2807,7 @@ class NoahCodeApp(App[None]):
                     )
             with VerticalScroll(id="context-rail"):
                 yield Static("", id="context-rail-content")
-        yield Static("", id="command-suggestions")
+        yield CommandSuggestions("", id="command-suggestions")
         yield Static("", id="input-context")
         yield ComposerTextArea(
             id="composer",
@@ -2863,6 +3016,8 @@ class NoahCodeApp(App[None]):
         )
         if self._app_mounted:
             self.update_chrome(force=True)
+            if self._suggestion_matches:
+                self.call_after_refresh(self._render_suggestions)
 
     def action_toggle_context_rail(self) -> None:
         self._sidebar_visible = not self.screen.has_class("wide")
@@ -3228,6 +3383,8 @@ class NoahCodeApp(App[None]):
             hint = "Queue paused · Enter queue · F5 manage · Ctrl+P commands · F1 help"
         else:
             hint = "Enter send · / commands · Ctrl+D review · F1 help"
+            if self.size.width >= 120:
+                hint += " · F9 team"
             if self.size.width >= 150:
                 hint += " · Alt+Enter expand · Tab next pane"
         self._update_context_hint(hint)
@@ -3268,6 +3425,7 @@ class NoahCodeApp(App[None]):
             "F8 hide": "toggle_context_rail", "F2 history": "activity_history",
             "Ctrl+T resize": "toggle_activity_output", "Tab next pane": "focus_next",
             "Alt+Enter expand": "expand_composer",
+            "F9 team": "team_setup",
         }
         content = Text(style=palette.muted)
         for label in hint.split(" · "):
@@ -3403,14 +3561,25 @@ class NoahCodeApp(App[None]):
                     text.append(f"\n+{remaining} more · /todos", style=palette.muted)
 
         work = self.host.work_snapshot()
-        agents = [item for item in work["agents"] if item.get("state") in {"queued", "running"}]
+        agents = [
+            item for item in reversed(work["agents"])
+            if item.get("state") in {"queued", "running", "needs_input", "failed"}
+        ]
+        agents.sort(key=lambda item: item.get("state") not in {"needs_input", "failed"})
         jobs = [item for item in work["jobs"] if item.get("state") in {"running", "stopping"}]
         if agents or jobs:
             text.append("\n\nWork\n", style=f"bold {palette.accent}")
-            for item in agents[:2]:
+            for item in agents[:3]:
+                attention = item.get("state") in {"needs_input", "failed"}
+                state = "Input needed" if item.get("state") == "needs_input" else str(item.get("state"))
                 text.append(
-                    f"{item.get('state')} · {item.get('agent', 'agent')}\n", style=palette.text
+                    f"{state} · {item.get('agent', 'agent')}\n",
+                    style=palette.warning if attention else palette.text,
                 )
+                if item.get("workflow"):
+                    text.append(f"{item['workflow']} / {item.get('phase', '')}\n", style=palette.muted)
+                if item.get("prompt"):
+                    text.append(f"{_truncate_middle(str(item['prompt']), 29)}\n", style=palette.muted)
             for item in jobs[:2]:
                 text.append(
                     f"{item.get('state')} · {item.get('name', 'job')}\n", style=palette.text
@@ -3950,6 +4119,11 @@ class NoahCodeApp(App[None]):
         self._suggestion_index = 0
         self._render_suggestions()
 
+    @on(CommandSuggestions.WidthChanged)
+    def _suggestions_resized(self) -> None:
+        if self._app_mounted and self._suggestion_matches:
+            self._render_suggestions()
+
     def _render_suggestions(self) -> None:
         widget = self.query_one("#command-suggestions", Static)
         if not self._suggestion_matches:
@@ -3957,42 +4131,17 @@ class NoahCodeApp(App[None]):
             widget.styles.display = "none"
             self.update_chrome()
             return
-        total = len(self._suggestion_matches)
         # The panel's border and vertical padding leave room for a heading plus
         # five rows (three in compact mode). Keep the paging window within that
         # visible area so the active row can never move into clipped content.
         window_size = 3 if self.screen.has_class("compact") else 5
-        start = min(
-            max(self._suggestion_index - window_size + 1, 0),
-            max(total - window_size, 0),
-        )
-        visible = self._suggestion_matches[start : start + window_size]
-        end = start + len(visible)
-        count = f"{start + 1}–{end} of {total}" if total > window_size else f"{total} matches"
-        palette = self.theme_palette
-        lines = [
-            Text.assemble(
-                ("COMMANDS", f"bold {palette.accent}"),
-                (f"  {count}", palette.muted),
-            )
-        ]
-        for offset, item in enumerate(visible):
-            index = start + offset
-            active = index == self._suggestion_index
-            active_style = f"bold {palette.canvas} on {palette.accent}"
-            line = Text.assemble(
-                ("› " if active else "  ", active_style if active else palette.accent),
-                (item.invocation, active_style if active else palette.text),
-                (
-                    f"  {item.description}",
-                    f"{palette.canvas} on {palette.accent}" if active else palette.muted,
-                ),
-                no_wrap=True,
-                overflow="ellipsis",
-            )
-            line.stylize(Style(meta={"@click": f"app.select_suggestion({index})"}))
-            lines.append(line)
-        widget.update(Group(*lines))
+        widget.update(command_menu_renderable(
+            self._suggestion_matches,
+            self._suggestion_index,
+            width=widget.content_size.width or max(8, min(106, self.size.width - 8)),
+            window_size=window_size,
+            palette=self.theme_palette,
+        ))
         widget.styles.display = "block"
         self._update_context_hint(
             "↑/↓ choose · Enter/click run · Tab edit · Esc close"
@@ -4231,6 +4380,7 @@ class NoahCodeApp(App[None]):
             ("F6", "Expand the latest notice or error", "Global"),
             ("F7", "Inspect active context sources", "Global"),
             ("F8", "Show or hide the context sidebar", "Global"),
+            ("F9", "Choose a team workflow", "Global"),
             ("Ctrl+D", "Review current file changes", "Global"),
             ("Shift+F7", "Focus or leave the scrollable context rail", "Global"),
             ("? / F1", "Search this keyboard reference", "Global"),
@@ -4988,7 +5138,23 @@ class NoahCodeApp(App[None]):
             rail.focus()
 
     def action_work_ledger(self) -> None:
+        if isinstance(self.screen, WorkLedgerScreen):
+            return
         self.push_screen(WorkLedgerScreen(self.host))
+
+    @work(exclusive=True, group="team-setup")
+    async def action_team_setup(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        composer = self.query_one("#composer", ComposerTextArea)
+        draft = composer.text.strip()
+        mode = self.host.agent.mode if self._agent_ready else self.host.config.mode
+        selected = await self.push_screen_wait(TeamLauncherScreen(mode=mode))
+        if selected:
+            objective = draft if not draft.startswith("/") else ""
+            self._replace_composer_draft(f"/team {selected} {objective}")
+            self.close_suggestions()
+        composer.focus()
 
     def action_queue_manager(self) -> None:
         self.push_screen(QueueManagerScreen(self.host))
@@ -5342,6 +5508,16 @@ class NoahCodeApp(App[None]):
         slash = parse_slash(text)
         if slash:
             name = slash[0]
+            if name == "work" and not slash[1].strip():
+                composer.text = ""
+                self.close_suggestions()
+                self.action_work_ledger()
+                return
+            if name == "team" and not slash[1].strip():
+                composer.text = ""
+                self.close_suggestions()
+                self.action_team_setup()
+                return
             if name == "queue" and not slash[1].strip():
                 composer.text = ""
                 self.close_suggestions()
@@ -5357,7 +5533,7 @@ class NoahCodeApp(App[None]):
                 self.close_suggestions()
                 self.action_context_visibility()
                 return
-            if name in SAFE_SLASH_WHILE_BUSY or name == "attach":
+            if name in SAFE_SLASH_WHILE_BUSY or name in {"attach", "team"}:
                 composer.text = ""
                 self.close_suggestions()
                 self._append_entry(TranscriptEntry("YOU", text))
@@ -5420,6 +5596,14 @@ class NoahCodeApp(App[None]):
             self._recent_commands.append(insertion)
         if self.ui.busy and self._agent_ready:
             self._submit_while_busy(composer, text)
+            return
+        if text in {"/team", "/work"}:
+            composer.text = ""
+            self.close_suggestions()
+            if text == "/team":
+                self.action_team_setup()
+            else:
+                self.action_work_ledger()
             return
         if self._agent_ready and text == "/skills":
             composer.text = ""
@@ -5524,10 +5708,12 @@ class NoahCodeApp(App[None]):
     @work(exclusive=True, group="turn")
     async def _run_turn(self, text: str) -> None:
         self._turn_task = asyncio.current_task()
-        is_agent_turn = parse_slash(text) is None
+        slash = parse_slash(text)
+        team_request = slash is not None and slash[0] == "team" and bool(slash[1].strip())
+        is_agent_turn = slash is None or team_request
         started_at = time.monotonic()
         turn_timeline = self._timeline_begin(
-            "Turn started",
+            "Team request" if team_request else "Turn started",
             "turn",
             detail=" ".join(text.split())[:500],
         )
@@ -5548,6 +5734,11 @@ class NoahCodeApp(App[None]):
                 with contextlib.suppress(Exception):
                     before_files = await self.host.agent.git.change_fingerprints()
             action = await self.host.handle_line(text)
+            if team_request and action == "handled":
+                # Validation and paused-queue requests do not execute a turn.
+                # In particular, last_result may still describe an older run.
+                is_agent_turn = False
+                outcome = "handled"
             if is_agent_turn:
                 status = str(getattr(getattr(self.host, "last_result", None), "status", ""))
                 outcome = {
@@ -5640,7 +5831,7 @@ class NoahCodeApp(App[None]):
                         self._checkpoint_pending = False
                     self._append_entry(TranscriptEntry("RECEIPT", receipt))
             finally:
-                if is_agent_turn:
+                if is_agent_turn or team_request:
                     if self.host._active_turn is self._turn_task:
                         self.host._active_turn = None
                     self.ui.set_busy(False)

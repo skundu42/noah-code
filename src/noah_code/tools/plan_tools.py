@@ -21,12 +21,15 @@ class PlanTools(Skill):
         mode_owner: Any,
         ask: QuestionTools | None,
         engine: PermissionEngine,
+        *,
+        readonly: bool = False,
     ) -> None:
         super().__init__()
         self._store = PlanStore(root)
         self._owner = mode_owner
         self._ask = ask
         self._engine = engine
+        self._readonly = readonly
 
     async def read(self) -> str:
         """Return the active plan, or empty if none is pinned."""
@@ -39,6 +42,8 @@ class PlanTools(Skill):
     ) -> str:
         """Write `.noah-code/plan.md`. Allowed in plan mode."""
 
+        if self._readonly:
+            raise PermissionError("read-only subagents cannot write the shared plan")
         text = markdown.strip()
         if not text:
             raise ValueError("plan text is required")
@@ -66,6 +71,8 @@ class PlanTools(Skill):
     async def exit_to_build(self) -> str:
         """Ask to leave plan mode after a plan file exists. Build must follow it."""
 
+        if self._readonly:
+            raise PermissionError("read-only subagents cannot switch to build mode")
         if not self._store.read().strip():
             raise RuntimeError("write a plan with self.plan.write(...) before switching to build")
         if getattr(self._owner, "mode", None) == "build":
