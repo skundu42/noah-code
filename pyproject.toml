@@ -24,7 +24,7 @@ dependencies = [
     # LiteLLM 1.92.0-1.95.x intermittently shipped without macOS wheels,
     # forcing a Rust source build. Wheels are back for every release since
     # 1.96.0 (abi3 since 1.96.2), so the installer stays binary-only.
-    "litellm>=1.96.0,<1.99.0",
+    "litellm>=1.96.0,<1.101.0",
     # Upper bounds guard fresh end-user installs (uv tool install / pip),
     # which ignore uv.lock; caps always admit the currently locked versions.
     "click>=8.1.0,<9.0.0",
