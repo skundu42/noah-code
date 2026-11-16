@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any
@@ -10,7 +12,13 @@ from typing import Annotated, Any
 from nooa import Skill, spec
 
 from noah_code.approvals import ApprovalBroker
-from noah_code.github import GithubError, GithubManager, PullRequestInfo
+from noah_code.github import (
+    GithubError,
+    GithubManager,
+    PullRequestInfo,
+    _validate_pr_number,
+    _validate_pr_target,
+)
 from noah_code.permissions import PermissionCategory, PermissionEngine
 
 _AUTH_MARKERS = (
@@ -58,12 +66,20 @@ class GithubTools(Skill):
         *,
         manager: GithubManager | None = None,
         runtime: Any = None,
+        coordinator: Any = None,
+        workspace_tools: Any = None,
+        checkpoints: Any = None,
     ) -> None:
         super().__init__()
+        self._checkout = checkout.resolve()
         self._manager = manager or GithubManager(checkout)
         self._engine = engine
         self._approvals = approvals
         self._runtime = runtime
+        self._coordinator = coordinator
+        self._ws = workspace_tools
+        self._checkpoints = checkpoints
+        self._checkout_lock = asyncio.Lock()
 
     async def list(self) -> str:
         """List open pull requests for this repository."""
@@ -74,12 +90,16 @@ class GithubTools(Skill):
 
     async def view(
         self,
-        number: Annotated[int | None, spec(description="PR number; omit for the current branch")] = None,
+        number: Annotated[
+            int | str | None,
+            spec(description="PR number or PR URL; omit for the current branch"),
+        ] = None,
     ) -> str:
         """Show one pull request."""
 
+        target = _validate_pr_target(number)
         await self._approve("view")
-        return await self._call(lambda: self._manager.view(number))
+        return await self._call(lambda: self._manager.view(target))
 
     async def create(
         self,
@@ -90,10 +110,11 @@ class GithubTools(Skill):
         """Push the current branch and open a pull request."""
 
         await self._approve("create")
+        head_meta = await asyncio.to_thread(self._git_head_identity)
         return await self._durable_effect(
             "create",
             "pull-request",
-            {"title": title, "body": body, "base": base},
+            {"title": title, "body": body, "base": base, **head_meta},
             lambda recovering: _format_created(
                 self._manager.create(title, body, base, recover=recovering)
             ),
@@ -103,8 +124,9 @@ class GithubTools(Skill):
         """Push the current branch to origin (updates an existing PR)."""
 
         await self._approve("push")
+        head_meta = await asyncio.to_thread(self._git_head_identity)
         return await self._durable_effect(
-            "push", "HEAD", {}, lambda _recovering: self._manager.push()
+            "push", "HEAD", dict(head_meta), lambda _recovering: self._manager.push()
         )
 
     async def checkout(
@@ -113,15 +135,30 @@ class GithubTools(Skill):
     ) -> str:
         """Fetch and check out a pull request as ``pr/<number>``."""
 
+        pr_num = _validate_pr_number(number)
         await self._approve("checkout")
-        return await self._durable_effect(
-            "checkout",
-            str(int(number)),
-            {"number": int(number)},
-            lambda _recovering: (
-                f"checked out #{int(number)} as {self._manager.checkout(number)}"
-            ),
-        )
+        lock = self._coordinator.lock if self._coordinator is not None else self._checkout_lock
+        async with lock:
+            if self._checkpoints is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        self._checkpoints.capture, f"before github checkout #{pr_num}"
+                    )
+            elif self._ws is not None:
+                with contextlib.suppress(Exception):
+                    await self._ws.checkpoint_before_shell(f"github checkout #{pr_num}")
+            try:
+                return await self._durable_effect(
+                    "checkout",
+                    str(pr_num),
+                    {"number": pr_num},
+                    lambda _recovering: (
+                        f"checked out #{pr_num} as {self._manager.checkout(pr_num)}"
+                    ),
+                )
+            finally:
+                if self._ws is not None:
+                    self._ws._read_fingerprints.clear()
 
     async def comment(
         self,
@@ -130,13 +167,35 @@ class GithubTools(Skill):
     ) -> str:
         """Comment on a pull request."""
 
+        pr_num = _validate_pr_number(number)
         await self._approve("comment")
         return await self._durable_effect(
             "comment",
-            str(int(number)),
-            {"number": int(number), "body": body},
-            lambda recovering: self._manager.comment(number, body, recover=recovering),
+            str(pr_num),
+            {"number": pr_num, "body": body},
+            lambda recovering: self._manager.comment(pr_num, body, recover=recovering),
         )
+
+    def _git_head_identity(self) -> dict[str, str]:
+        def _git(*args: str) -> str:
+            try:
+                proc = subprocess.run(
+                    ["git", *args],
+                    cwd=self._checkout,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return ""
+            return proc.stdout.strip() if proc.returncode == 0 else ""
+
+        return {
+            "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+            "head_sha": _git("rev-parse", "HEAD"),
+        }
 
     async def _durable_effect(
         self,

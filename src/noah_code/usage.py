@@ -122,12 +122,24 @@ class UsageTracker:
                 self._failed += 1
 
     def llm_complete(self, event: Any) -> None:
+        usage = getattr(event, "usage", None)
+
+        def _pick(*names: str, default: Any = 0) -> Any:
+            for source in (usage, event):
+                if source is None:
+                    continue
+                for name in names:
+                    value = source.get(name) if isinstance(source, dict) else getattr(source, name, None)
+                    if value is not None:
+                        return value
+            return default
+
         with self._lock:
-            self._prompt += int(getattr(event, "prompt_tokens", 0) or 0)
-            self._cached += int(getattr(event, "cached_tokens", 0) or 0)
-            self._completion += int(getattr(event, "completion_tokens", 0) or 0)
-            self._reasoning += int(getattr(event, "reasoning_tokens", 0) or 0)
-            self._cost += float(getattr(event, "cost_usd", 0.0) or 0.0)
+            self._prompt += int(_pick("input_tokens", "prompt_tokens") or 0)
+            self._cached += int(_pick("cached_input_tokens", "cached_tokens") or 0)
+            self._completion += int(_pick("output_tokens", "completion_tokens") or 0)
+            self._reasoning += int(_pick("reasoning_tokens") or 0)
+            self._cost += float(_pick("cost_usd", "cost", default=0.0) or 0.0)
 
     def tool_output(self, event: Any) -> None:
         fields = ("stdout", "stderr", "error", "value")

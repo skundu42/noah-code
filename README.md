@@ -151,8 +151,7 @@ noah config show .
 noah update --check
 ```
 
-The package also installs `noah-code` and `nc` as equivalent entry points. Because `nc` commonly
-means netcat, `noah` or `noah-code` is recommended.
+The package also installs `noah-code` alongside `noah` as an equivalent entry point.
 
 ## Inside the TUI
 

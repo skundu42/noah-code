@@ -46,8 +46,8 @@ _TODO_CALL = re.compile(r"self\.todos\.\w+", re.IGNORECASE)
 _LSP_CALL = re.compile(r"self\.lsp\.\w+", re.IGNORECASE)
 _PROCESS_CALL = re.compile(r"self\.processes\.\w+", re.IGNORECASE)
 _MCP_CALL = re.compile(
-    r"self\.(?!(?:ws|git|lsp|web|ask|media|task|todos|processes|skills|message|"
-    r"context|engine|v|approvals|journal)\.)(?P<server>[A-Za-z_][\w]*)\."
+    r"self\.(?!(?:ws|git|git_tools|github|lsp|web|ask|media|task|todos|processes|skills|"
+    r"plan|memory|tools|message|context|engine|v|approvals|journal)\.)(?P<server>[A-Za-z_][\w]*)\."
     r"(?P<tool>[A-Za-z_]\w*)\s*\(",
 )
 _FILE_VERBS = {
@@ -67,6 +67,8 @@ _KNOWN_ROOTS = frozenset(
     {
         "ws",
         "git",
+        "git_tools",
+        "github",
         "lsp",
         "web",
         "ask",
@@ -75,6 +77,9 @@ _KNOWN_ROOTS = frozenset(
         "todos",
         "processes",
         "skills",
+        "plan",
+        "memory",
+        "tools",
         "message",
         "context",
         "engine",
@@ -225,10 +230,39 @@ def install_event_bridge(
             getattr(telemetry, method)(*args)
 
     def on_tool_call(event: Any) -> None:
-        # Fresh ToolCallEvent has result=None; updates do not re-emit.
-        if getattr(event, "result", None) is not None:
+        # Fresh ToolCallEvent has result=None; paired completion arrives later
+        # with result populated. Direct non-Python tools (e.g. return_result)
+        # do not emit PythonOutput, so close their activity on that update.
+        result = getattr(event, "result", None)
+        name = str(getattr(event, "name", "tool") or "tool")
+        activity_id = str(getattr(event, "tool_call_id", "") or getattr(event, "id", ""))
+        if result is not None:
+            if name != "execute_python":
+                status_raw = (
+                    result.get("result_status") or result.get("status")
+                    if isinstance(result, dict)
+                    else getattr(result, "status", None)
+                )
+                error = (
+                    result.get("error")
+                    if isinstance(result, dict)
+                    else getattr(result, "error", None)
+                )
+                status = str(status_raw or ("failed" if error else "success")).lower()
+                observe("tool_finish", name, activity_id, status)
+                emit(
+                    HostEvent(
+                        HostEventKind.TOOL_FINISH,
+                        status,
+                        meta={
+                            "activity_id": activity_id,
+                            "tool": name,
+                            "state": "finished",
+                            "result_status": status,
+                        },
+                    )
+                )
             return
-        name = getattr(event, "name", "tool")
         args = getattr(event, "arguments", {}) or {}
         if name == "execute_python":
             code = str(args.get("code", ""))
@@ -236,8 +270,7 @@ def install_event_bridge(
         else:
             cleaned = name.replace("_", " ").strip().capitalize() or "Working"
             text = f"{cleaned}{(' · ' + _brief_args(args)) if args else ''}"
-        activity_id = str(getattr(event, "tool_call_id", "") or getattr(event, "id", ""))
-        observe("tool_start", str(name), activity_id)
+        observe("tool_start", name, activity_id)
         emit(
             HostEvent(
                 HostEventKind.TOOL_START,
@@ -368,7 +401,7 @@ def install_event_bridge(
         ("Error", on_error),
         ("LLMCallStart", on_llm_start),
         ("LLMCallEnd", on_llm_end),
-        ("LLMComplete", on_llm_complete),
+        ("LLMResponse", on_llm_complete),
         ("Reasoning", on_reasoning),
         ("Summary", on_summary),
     ):

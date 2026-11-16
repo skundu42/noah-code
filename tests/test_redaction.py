@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from noah_code.redaction import safe_error_message
+from noah_code.redaction import redact_secrets, safe_error_message
 
 
 def test_safe_error_message_redacts_common_secret_forms() -> None:
@@ -58,3 +58,12 @@ def test_safe_error_message_does_not_redact_non_secret_key_suffixes() -> None:
     assert safe_error_message("tokenizer=enabled secretary=available") == (
         "tokenizer=enabled secretary=available"
     )
+
+
+def test_redact_secrets_preserves_multiline_structure() -> None:
+    raw = "\x1b[31mline1\x1b[0m\ntoken=SECRETVALUE1234\nAuthorization: Bearer SECRETBEARER123"
+    cleaned = redact_secrets(raw)
+    assert cleaned.splitlines()[0] == "line1"
+    assert "SECRETVALUE1234" not in cleaned
+    assert "SECRETBEARER123" not in cleaned
+    assert cleaned.count("\n") == 2

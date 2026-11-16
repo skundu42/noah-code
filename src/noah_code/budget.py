@@ -19,6 +19,9 @@ import threading
 import time
 from typing import Any
 
+from nooa.unifiedllm.unifiedllm import UnifiedLLM
+
+from noah_code import nooa_compat
 from noah_code.config import BudgetConfig
 
 
@@ -60,6 +63,8 @@ class BudgetGuard:
         self._async_provider_lock = asyncio.Lock()
         self._started = time.monotonic()
         self._started_wall = time.time()
+        self._active_elapsed = 0.0
+        self._active_since: float | None = self._started
         self._prompt_tokens = 0
         self._completion_tokens = 0
         self._cost_usd = 0.0
@@ -78,10 +83,25 @@ class BudgetGuard:
         with self._lock:
             return self._prompt_tokens + self._completion_tokens
 
+    def pause(self) -> None:
+        """Stop accumulating active wall time while waiting between user turns."""
+        with self._lock:
+            if self._active_since is not None:
+                self._active_elapsed += max(time.monotonic() - self._active_since, 0.0)
+                self._active_since = None
+
+    def resume(self) -> None:
+        """Resume active wall-clock accounting for an executing turn."""
+        with self._lock:
+            if self._active_since is None:
+                self._active_since = time.monotonic()
+
     def elapsed_seconds(self) -> float:
-        monotonic_elapsed = max(time.monotonic() - self._started, 0.0)
-        wall_elapsed = max(time.time() - self._started_wall, 0.0)
-        return max(monotonic_elapsed, wall_elapsed)
+        with self._lock:
+            elapsed = self._active_elapsed
+            if self._active_since is not None:
+                elapsed += max(time.monotonic() - self._active_since, 0.0)
+            return max(elapsed, 0.0)
 
     def remaining_seconds(self) -> float | None:
         if self._config.max_seconds is None:
@@ -178,24 +198,33 @@ class BudgetGuard:
             self._cost_usd = _sanitize_cost(data.get("cost_usd", 0.0))
             started_at = float(data.get("started_at", time.time()))
             self._started_wall = min(started_at, time.time())
-            elapsed = max(time.time() - self._started_wall, 0.0)
+            if "elapsed_seconds" in data:
+                elapsed = _sanitize_cost(data.get("elapsed_seconds", 0.0))
+            else:
+                elapsed = max(time.time() - self._started_wall, 0.0)
+            self._active_elapsed = elapsed
+            self._active_since = None if self._active_since is None else time.monotonic()
             self._started = time.monotonic() - elapsed
-            exceeded = data.get("exceeded")
-            self.exceeded = str(exceeded) if exceeded else None
+            self.exceeded = self._breach()
 
 
-def _cost_from_response(response: Any, usage: dict[str, Any]) -> float:
+def _cost_from_response(response: Any, usage: Any) -> float:
     """Best-effort per-call USD cost; 0.0 whenever pricing is unavailable.
 
-    NOOA's ``LLMResponse.usage`` carries token counts only. LiteLLM's price
-    lives on the raw response — kept as ``LLMResponse.raw_response`` — either
-    precomputed in ``_hidden_params["response_cost"]`` or derivable from the
-    model and token counts via ``litellm.completion_cost``.
+    LiteLLM's price lives on ``LLMUsage.cost_usd`` (when already populated) or on
+    the raw response kept as ``LLMResponse.raw_response`` — either precomputed
+    in ``_hidden_params["response_cost"]`` or derivable via
+    ``litellm.completion_cost``.
     """
 
     try:
-        # Usage-dict keys first: our own stamp, or provider-reported cost.
-        cost = usage.get("cost_usd") or usage.get("cost")
+        # Usage fields first: our own stamp, or provider-reported cost.
+        if isinstance(usage, dict):
+            cost = usage.get("cost_usd") or usage.get("cost")
+        elif usage is not None:
+            cost = getattr(usage, "cost_usd", None) or getattr(usage, "cost", None)
+        else:
+            cost = None
         raw = getattr(response, "raw_response", None)
         if not cost:
             cost = (getattr(raw, "_hidden_params", None) or {}).get("response_cost")
@@ -214,19 +243,27 @@ def _cost_from_response(response: Any, usage: dict[str, Any]) -> float:
 def _usage_from_response(response: Any) -> tuple[int, int, float]:
     """Token usage and best-effort USD cost for one model call.
 
-    The extracted cost is stamped back onto the response's usage dict as
-    ``cost_usd``: NOOA's runtime builds ``LLMComplete`` telemetry from
-    ``response.usage`` after the wrapper returns, so this is how per-call
-    cost reaches the usage tracker even where no budget cap applies.
+    The extracted cost is stamped back onto ``response.usage`` as ``cost_usd``:
+    NOOA's runtime records ``LLMResponse.usage`` directly onto the telemetry
+    event after the wrapper returns, so this is how per-call cost reaches the
+    usage tracker even where no budget cap applies.
     """
 
     usage = getattr(response, "usage", None)
-    usage_dict = usage if isinstance(usage, dict) else {}
-    prompt = _sanitize_tokens(usage_dict.get("prompt_tokens") or usage_dict.get("input_tokens"))
-    completion = _sanitize_tokens(
-        usage_dict.get("completion_tokens") or usage_dict.get("output_tokens")
-    )
-    cost = _cost_from_response(response, usage_dict)
+    if isinstance(usage, dict):
+        prompt = _sanitize_tokens(usage.get("prompt_tokens") or usage.get("input_tokens"))
+        completion = _sanitize_tokens(usage.get("completion_tokens") or usage.get("output_tokens"))
+    elif usage is not None:
+        prompt = _sanitize_tokens(
+            getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None)
+        )
+        completion = _sanitize_tokens(
+            getattr(usage, "output_tokens", None) or getattr(usage, "completion_tokens", None)
+        )
+    else:
+        prompt = 0
+        completion = 0
+    cost = _cost_from_response(response, usage)
     try:
         if isinstance(usage, dict):
             existing = usage.get("cost_usd")
@@ -235,20 +272,31 @@ def _usage_from_response(response: Any) -> tuple[int, int, float]:
                 usage["cost_usd"] = cost
             else:
                 usage.setdefault("cost_usd", cost)
+        elif usage is not None and hasattr(usage, "cost_usd"):
+            existing = getattr(usage, "cost_usd", None)
+            if existing is None or not math.isfinite(float(existing)) or (existing == 0.0 and cost > 0.0):
+                usage.cost_usd = cost
         elif cost > 0.0:
-            response.usage = {"cost_usd": cost}
+            from nooa.llm_types import LLMUsage
+
+            response.usage = LLMUsage(
+                input_tokens=prompt,
+                output_tokens=completion,
+                cost_usd=cost,
+            )
     except Exception:  # noqa: BLE001 - telemetry must never break a turn
         pass
     return prompt, completion, cost
 
 
-class BudgetedLLM:
+class BudgetedLLM(UnifiedLLM):
     """Transparent UnifiedLLM wrapper enforcing caps around every model call."""
 
     def __init__(self, inner: Any, guard: BudgetGuard, *, prefix_observer: Any = None) -> None:
         self._inner = inner
         self._guard = guard
         self._prefix_observer = prefix_observer
+        nooa_compat.init_llm_wrapper(self, inner)
 
     @property
     def model(self) -> Any:
@@ -352,12 +400,13 @@ def wrap_with_budget(
     return SharedBudgetLLM(client, guard, prefix_observer=prefix_observer), guard
 
 
-class _PrefixObserverOnly:
+class _PrefixObserverOnly(UnifiedLLM):
     """No budget caps; observe request prefixes and stamp per-call cost."""
 
     def __init__(self, inner: Any, observer: Any) -> None:
         self._inner = inner
         self._observer = observer
+        nooa_compat.init_llm_wrapper(self, inner)
 
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
         self._observer.observe_prefix(messages, route=kwargs.get("prompt_cache_key"))

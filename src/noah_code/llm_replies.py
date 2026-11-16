@@ -6,7 +6,10 @@ import json
 from typing import Any
 from uuid import uuid4
 
-from nooa.unifiedllm import LLMResponse, ToolCall
+from nooa.llm_types import AssistantReasoning, AssistantText, LLMResponse, ToolCall
+from nooa.unifiedllm.unifiedllm import UnifiedLLM
+
+from noah_code import nooa_compat
 
 
 def _codeact_session(tools: Any) -> bool:
@@ -18,6 +21,18 @@ def _reply_text(response: Any) -> str:
     if content is None or hasattr(content, "model_dump"):
         return ""
     return str(content).strip()
+
+
+def _reasoning_parts(response: Any) -> tuple[AssistantReasoning, ...]:
+    parts = getattr(response, "parts", None)
+    if isinstance(parts, tuple | list):
+        kept = tuple(part for part in parts if isinstance(part, AssistantReasoning))
+        if kept:
+            return kept
+    reasoning = getattr(response, "reasoning", None)
+    if isinstance(reasoning, str) and reasoning:
+        return (AssistantReasoning(text=reasoning),)
+    return ()
 
 
 def recover_empty_truncated_response(response: Any) -> Any:
@@ -45,14 +60,15 @@ def recover_empty_truncated_response(response: Any) -> Any:
         "action within the unchanged output limit. The task is not complete.\n"
         f"Original response: finish_reason=length; content={json.dumps(content)}; tool_calls=[]"
     )
+    reasoning_parts = _reasoning_parts(response)
     return LLMResponse(
         raw_response=getattr(response, "raw_response", None),
-        content=notice,
-        tool_calls=getattr(response, "tool_calls", []),
+        parts=(*reasoning_parts, AssistantText(text=notice)),
+        replay_scope=getattr(response, "replay_scope", None),
         finish_reason="length",
-        assistant_message=getattr(response, "assistant_message", {}),
-        reasoning=getattr(response, "reasoning", None),
         usage=getattr(response, "usage", None),
+        model_name=getattr(response, "model_name", "") or "",
+        generation_id=getattr(response, "generation_id", "") or "",
     )
 
 
@@ -69,35 +85,48 @@ def coerce_text_only_response(response: Any) -> Any:
     explanation = " ".join(text.split())[:80] or "answered"
     code = (
         f"self.message({text!r})\n"
-        f"return_result(RespondReason.DONE, explanation={explanation!r})"
+        f"return_result(Done(explanation={explanation!r}))"
     )
+    reasoning_parts = _reasoning_parts(response)
     return LLMResponse(
         raw_response=getattr(response, "raw_response", None),
-        content="",
-        tool_calls=[
+        parts=(
+            *reasoning_parts,
             ToolCall(
                 id=f"reply-{uuid4().hex[:8]}",
                 name="execute_python",
                 arguments=json.dumps({"code": code}),
-            )
-        ],
+            ),
+        ),
+        replay_scope=getattr(response, "replay_scope", None),
         finish_reason="tool_calls",
-        assistant_message={"role": "assistant", "content": "", "tool_calls": []},
-        reasoning=getattr(response, "reasoning", None),
         usage=getattr(response, "usage", None),
+        model_name=getattr(response, "model_name", "") or "",
+        generation_id=getattr(response, "generation_id", "") or "",
     )
 
 
-class ConversationalReplyLLM:
+class ConversationalReplyLLM(UnifiedLLM):
     """Wrap a UnifiedLLM so text-only CodeAct turns still answer the user."""
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
+        nooa_compat.init_llm_wrapper(self, inner)
 
     def _coerce(self, response: Any, tools: Any) -> Any:
-        if not _codeact_session(tools):
+        if not _codeact_session(tools) or nooa_compat.in_summary_fork():
             return response
+        truncated_without_tools = (
+            getattr(response, "finish_reason", None) == "length"
+            and not getattr(response, "tool_calls", None)
+        )
         response = recover_empty_truncated_response(response)
+        if truncated_without_tools:
+            return (
+                response.model_copy(update={"finish_reason": "stop"})
+                if hasattr(response, "model_copy")
+                else response
+            )
         return coerce_text_only_response(response)
 
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:

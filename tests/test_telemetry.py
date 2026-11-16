@@ -215,3 +215,36 @@ def test_llm_metrics_use_standard_names_and_low_cardinality_attributes() -> None
         assert "gen_ai.conversation.id" not in attributes
         assert "noah.run.id" not in attributes
         assert attributes["gen_ai.provider.name"] == "openai"
+
+
+def test_telemetry_fifo_duration_pairing_and_secret_redaction() -> None:
+    telemetry = AgentTelemetry()
+    telemetry.enabled = True
+    telemetry.model = "openai/gpt-test"
+    telemetry._llm_duration = FakeInstrument()
+    event = SimpleNamespace(generation_id="gen-shared", turn_number=1)
+
+    telemetry.llm_start(event)
+    telemetry.llm_start(event)
+    telemetry.llm_end(SimpleNamespace(**vars(event), success=True, exception_type=None))
+    telemetry.llm_end(SimpleNamespace(**vars(event), success=True, exception_type=None))
+    completion = SimpleNamespace(
+        **vars(event),
+        model_name="openai/gpt-test",
+        prompt_tokens=10,
+        completion_tokens=5,
+        cost_usd=0.0,
+    )
+    telemetry.llm_complete(completion)
+    telemetry.llm_complete(completion)
+
+    assert len(telemetry._llm_duration.measurements) == 2
+
+    scrubbed = filtered_span_attributes(
+        {"input.value": "token=MYSECRETVALUE1234"},
+        capture_content=True,
+        max_attributes=16,
+        max_attribute_length=256,
+    )
+    assert "MYSECRETVALUE1234" not in str(scrubbed["input.value"])
+    assert "***" in str(scrubbed["input.value"])

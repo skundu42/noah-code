@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import math
@@ -17,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -175,7 +177,11 @@ async def run_process(
     try:
         async with asyncio.timeout(seconds):
             await process.wait()
-            await asyncio.gather(*readers)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*readers),
+                    timeout=min(2.0, max(0.05, seconds * 0.25)),
+                )
     except TimeoutError:
         timed_out = True
     finally:
@@ -403,15 +409,19 @@ async def score_worktree(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
     bootstrap = """
-import unittest, json, sys, importlib.util
+import io, json, pathlib, sys, unittest
 root, expected = sys.argv[1], int(sys.argv[2])
+started_path, report_path, pattern = pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4]), sys.argv[5]
+started_path.write_text("1")
 sys.path.insert(0, root)
 report = {"passed": False, "tests_discovered": 0, "tests_run": 0, "expected_tests": expected}
+real_stdout = sys.stdout
+captured = io.StringIO()
 try:
-    spec = importlib.util.spec_from_file_location("frozen_acceptance", root + "/tests/acceptance.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+    sys.stdout = captured
+    suite = unittest.defaultTestLoader.discover(
+        start_dir=root + "/tests", pattern=pattern, top_level_dir=root + "/tests"
+    )
     count = suite.countTestCases()
     result = unittest.TestResult()
     suite.run(result)
@@ -420,16 +430,51 @@ try:
                   failures=result.failures, errors=result.errors, skipped=result.skipped)
 except BaseException as error:
     report["load_error"] = type(error).__name__ + ": " + str(error)
-print(json.dumps(report, default=str))
+finally:
+    sys.stdout = real_stdout
+payload = json.dumps(report, default=str)
+report_path.write_text(payload)
+print(payload)
 sys.exit(0 if report["passed"] else 1)
 """
-    return await run_process(
-        [python, "-I", "-c", bootstrap, str(scoring), str(task.expected_tests)],
+    pattern = "acceptance.py"
+    if "-p" in task.acceptance:
+        idx = task.acceptance.index("-p")
+        if idx + 1 < len(task.acceptance):
+            pattern = task.acceptance[idx + 1]
+    started_path = state / "acceptance.started"
+    report_path = state / "acceptance-report.json"
+    result = await run_process(
+        [
+            python,
+            "-I",
+            "-c",
+            bootstrap,
+            str(scoring),
+            str(task.expected_tests),
+            str(started_path),
+            str(report_path),
+            pattern,
+        ],
         cwd=scoring,
         env=env,
         seconds=30,
         secrets=secrets,
     )
+    if report_path.is_file():
+        result.stdout = report_path.read_text()
+    elif started_path.is_file():
+        result.exit_code = result.exit_code or 1
+        result.stdout = json.dumps(
+            {
+                "passed": False,
+                "tests_discovered": 0,
+                "tests_run": 0,
+                "expected_tests": task.expected_tests,
+                "load_error": "acceptance runner terminated before writing report",
+            }
+        )
+    return result
 
 
 def acceptance_passed(result: ProcessResult, expected: int) -> bool:
@@ -450,7 +495,8 @@ async def evaluate(
     tasks: list[Task], args: argparse.Namespace, proxy: Any, secrets: tuple[str, ...]
 ) -> dict[str, Any]:
     output = Path(args.output).resolve()
-    output.mkdir(parents=True, exist_ok=False)
+    output.mkdir(parents=True, exist_ok=False, mode=0o700)
+    os.chmod(output, 0o700)
     result: dict[str, Any] = {
         "schema_version": 1,
         "model": args.model,
@@ -616,7 +662,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--opencode", default="opencode")
-    parser.add_argument("--output", default=f"/tmp/noah-comparison-{time.time_ns()}")
+    parser.add_argument(
+        "--output",
+        default=str(Path(tempfile.gettempdir()) / f"noah-comparison-{time.time_ns()}"),
+    )
     parser.add_argument("--seconds", type=float, default=150)
     parser.add_argument("--output-tokens", type=int, default=4096)
     parser.add_argument("--budget-usd", type=float, default=4.0)
@@ -661,9 +710,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
-    version = subprocess.run(
-        [args.opencode, "--version"], capture_output=True, text=True, timeout=10, check=True
-    ).stdout.strip()
+    try:
+        version = subprocess.run(
+            [args.opencode, "--version"], capture_output=True, text=True, timeout=10, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        parser.error(f"Could not run OpenCode CLI ({args.opencode}): {exc}")
     if version.removeprefix("opencode v").removeprefix("v") != OPENCODE_VERSION:
         parser.error(
             f"Use the separately installed OpenCode {OPENCODE_VERSION} executable; found {version}"

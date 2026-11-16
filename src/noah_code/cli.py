@@ -32,6 +32,8 @@ from noah_code.sessions import SessionError, SessionStore
 from noah_code.ui.console import ConsoleUI
 from noah_code.updates import (
     UpdateError,
+    _acquire_auto_update_lock,
+    _release_auto_update_lock,
     check_for_update,
     maybe_auto_update,
     maybe_check_for_update,
@@ -110,6 +112,37 @@ def _permission_override(auto: bool, yolo: bool, permissions: str | None) -> str
     return next(iter(choices), None)
 
 
+def _cli_overrides(
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    auto: bool = False,
+    yolo: bool = False,
+    permissions: str | None = None,
+    mode: str | None = None,
+    max_iterations: int | None = None,
+    frontend: Literal["tui", "console"] | None = None,
+    unsafe_inprocess_code_execution: bool = False,
+) -> dict[str, Any]:
+    permission_choice = _permission_override(auto, yolo, permissions)
+    overrides: dict[str, Any] = {}
+    if model:
+        overrides["model"] = model
+    if reasoning_effort:
+        overrides["reasoning_effort"] = reasoning_effort
+    if permission_choice is not None:
+        overrides.update(permission_mode_flags(permission_choice))
+    if max_iterations is not None:
+        overrides["max_iterations"] = max_iterations
+    if mode:
+        overrides["mode"] = mode
+    if frontend is not None:
+        overrides["ui"] = {"frontend": frontend}
+    if unsafe_inprocess_code_execution:
+        overrides["unsafe_inprocess_code_execution"] = True
+    return overrides
+
+
 def _configure_first_run_permissions() -> str:
     """Choose and save a permission default separately from the model provider."""
     click.secho("Noah Code · permission mode", fg="bright_blue", bold=True, err=True)
@@ -178,7 +211,30 @@ async def _configure_first_run_model_async(model_override: str | None) -> str | 
         return selected
 
 
-@click.command("noah-code", context_settings={"help_option_names": ["-h", "--help"]})
+_SUBCOMMAND_HELP_EPILOG = (
+    "\b\n"
+    "Subcommands:\n"
+    "  run          Run one coding task without opening the interactive interface\n"
+    "  serve        Serve persistent agent sessions over authenticated loopback HTTP/SSE\n"
+    "  acp          Run an Agent Client Protocol adapter on stdin/stdout\n"
+    "  sessions     Manage persisted sessions\n"
+    "  checkpoints  Inspect or restore git worktree checkpoints\n"
+    "  worktree     Create, list, or remove isolated git worktrees\n"
+    "  pr           List, view, create, push, checkout, or comment on pull requests\n"
+    "  providers    Inspect providers, connect an account, or configure API credentials\n"
+    "  browser      Configure browser tools for coding sessions\n"
+    "  config       Show resolved configuration\n"
+    "  doctor       Diagnostics for workspace, config, and model resolution\n"
+    "  update       Check for and install the latest noah-code release\n\n"
+    "Run `noah <command> --help` for subcommand details."
+)
+
+
+@click.command(
+    "noah-code",
+    context_settings={"help_option_names": ["-h", "--help"]},
+    epilog=_SUBCOMMAND_HELP_EPILOG,
+)
 @click.version_option(__version__, prog_name="noah-code")
 @click.argument("path", required=False, type=click.Path())
 @click.option("--continue", "continue_session", is_flag=True, help="Resume latest session")
@@ -307,6 +363,9 @@ def browser_setup_cmd(browser: str, headed: bool, name: str) -> None:
 
     try:
         path = configure_browser(name=name, browser=browser, headless=not headed)
+    except ConfigError as exc:
+        click.echo(f"error: {safe_error_message(exc)}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
     except (OSError, ValueError) as exc:
         raise click.ClickException(safe_error_message(exc)) from exc
     click.echo(f"Browser tools configured in {path}. Start a new session to connect.")
@@ -361,29 +420,41 @@ def checkpoints_group() -> None:
 @checkpoints_group.command("list")
 @click.argument("session_id", required=False)
 @click.argument("path", required=False, type=click.Path())
-def checkpoints_list(session_id: str | None, path: str | None) -> None:
+@click.option("-C", "--path", "opt_path", type=click.Path(), default=None, help="Workspace path")
+def checkpoints_list(session_id: str | None, path: str | None, opt_path: str | None) -> None:
+    """List git worktree checkpoints for a session."""
 
-    from noah_code.checkpoints import CheckpointManager
+    from noah_code.checkpoints import CheckpointError, CheckpointManager
     from noah_code.sessions import SessionStore
 
+    effective_path = opt_path or path
+    if effective_path is None and session_id is not None and (
+        session_id in {".", ".."}
+        or "/" in session_id
+        or "\\" in session_id
+        or Path(session_id).expanduser().is_dir()
+    ):
+        effective_path = session_id
+        session_id = None
+
     try:
-        workspace = open_workspace(path)
+        workspace = open_workspace(effective_path)
         config = load_config(workspace.root)
-    except (WorkspaceError, ConfigError) as exc:
+        target_session = session_id
+        if target_session is None:
+            store = SessionStore(config.session_dir)
+            latest = store.latest_for_workspace(workspace)
+            if latest is None:
+                click.echo("no sessions for this workspace", err=True)
+                raise SystemExit(EXIT_CONFIG)
+            target_session = latest.session_id
+        manager = CheckpointManager(
+            workspace.root, target_session, max_per_session=config.checkpoints.max_per_session
+        )
+        entries = manager.list()
+    except (WorkspaceError, ConfigError, SessionError, CheckpointError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
-    target_session = session_id
-    if target_session is None:
-        store = SessionStore(config.session_dir)
-        latest = store.latest_for_workspace(workspace)
-        if latest is None:
-            click.echo("no sessions for this workspace", err=True)
-            raise SystemExit(EXIT_CONFIG)
-        target_session = latest.session_id
-    manager = CheckpointManager(
-        workspace.root, target_session, max_per_session=config.checkpoints.max_per_session
-    )
-    entries = manager.list()
     if not entries:
         click.echo(f"no checkpoints under {manager.ref_namespace}")
         return
@@ -407,23 +478,19 @@ def checkpoints_restore(ref: str, path: str | None) -> None:
     try:
         workspace = open_workspace(path)
         config = load_config(workspace.root)
-    except (WorkspaceError, ConfigError) as exc:
-        click.echo(f"error: {exc}", err=True)
-        raise SystemExit(EXIT_CONFIG) from exc
-    target_session = session_id_from_checkpoint_ref(ref)
-    if target_session is None:
-        store = SessionStore(config.session_dir)
-        latest = store.latest_for_workspace(workspace)
-        if latest is None:
-            click.echo("error: provide a full checkpoint ref or a session to restore", err=True)
-            raise SystemExit(EXIT_CONFIG)
-        target_session = latest.session_id
-    manager = CheckpointManager(
-        workspace.root, target_session, max_per_session=config.checkpoints.max_per_session
-    )
-    try:
+        target_session = session_id_from_checkpoint_ref(ref)
+        if target_session is None:
+            store = SessionStore(config.session_dir)
+            latest = store.latest_for_workspace(workspace)
+            if latest is None:
+                click.echo("error: provide a full checkpoint ref or a session to restore", err=True)
+                raise SystemExit(EXIT_CONFIG)
+            target_session = latest.session_id
+        manager = CheckpointManager(
+            workspace.root, target_session, max_per_session=config.checkpoints.max_per_session
+        )
         click.echo(manager.restore(ref))
-    except CheckpointError as exc:
+    except (WorkspaceError, ConfigError, SessionError, CheckpointError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
 
@@ -452,9 +519,11 @@ def sessions_list(path: str | None) -> None:
 
 @sessions_group.command("show")
 @click.argument("session_id")
-def sessions_show(session_id: str) -> None:
+@click.argument("path", required=False, type=click.Path())
+@click.option("-C", "--path", "opt_path", type=click.Path(), default=None, help="Workspace path")
+def sessions_show(session_id: str, path: str | None, opt_path: str | None) -> None:
     try:
-        workspace = open_workspace(".")
+        workspace = open_workspace(opt_path or path)
         config = load_config(workspace.root)
         store = SessionStore(config.session_dir)
         meta = store.load_meta(session_id)
@@ -466,9 +535,11 @@ def sessions_show(session_id: str) -> None:
 
 @sessions_group.command("delete")
 @click.argument("session_id")
-def sessions_delete(session_id: str) -> None:
+@click.argument("path", required=False, type=click.Path())
+@click.option("-C", "--path", "opt_path", type=click.Path(), default=None, help="Workspace path")
+def sessions_delete(session_id: str, path: str | None, opt_path: str | None) -> None:
     try:
-        workspace = open_workspace(".")
+        workspace = open_workspace(opt_path or path)
         config = load_config(workspace.root)
         store = SessionStore(config.session_dir)
         store.delete(session_id)
@@ -707,25 +778,36 @@ def doctor(path: str | None) -> None:
 @cli_group.command("config")
 @click.argument("action", type=click.Choice(["show"]))
 @click.argument("path", required=False, type=click.Path())
-@click.option("--model", default=None)
-@click.option("--auto", is_flag=True)
-def config_cmd(action: str, path: str | None, model: str | None, auto: bool) -> None:
+@_common_options
+def config_cmd(
+    action: str,
+    path: str | None,
+    model: str | None,
+    reasoning_effort: str | None,
+    auto: bool,
+    yolo: bool,
+    permissions: str | None,
+    mode: str | None,
+    max_iterations: int | None,
+    unsafe_inprocess_code_execution: bool,
+) -> None:
     """Show resolved configuration."""
     from noah_code.commands import config_json
 
+    overrides = _cli_overrides(
+        model=model,
+        reasoning_effort=reasoning_effort,
+        auto=auto,
+        yolo=yolo,
+        permissions=permissions,
+        mode=mode,
+        max_iterations=max_iterations,
+        unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
+    )
     try:
         workspace = open_workspace(path)
-    except WorkspaceError as exc:
-        click.echo(f"error: {exc}", err=True)
-        raise SystemExit(EXIT_CONFIG) from exc
-    overrides: dict[str, Any] = {}
-    if model:
-        overrides["model"] = model
-    if auto:
-        overrides["auto_approve"] = True
-    try:
         config = load_config(workspace.root, cli_overrides=overrides)
-    except ConfigError as exc:
+    except (WorkspaceError, ConfigError) as exc:
         click.echo(f"error: {exc}", err=True)
         raise SystemExit(EXIT_CONFIG) from exc
     click.echo(config_json(config))
@@ -803,7 +885,10 @@ def providers_login(provider: str, device_code: bool, model: str | None) -> None
     try:
         selected = asyncio.run(_select_codex_model(model, device_code=device_code))
         path = save_user_default_model(selected)
-    except (ConfigError, OSError, ValueError, RuntimeError) as exc:
+    except ConfigError as exc:
+        click.echo(f"error: {safe_error_message(exc)}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    except (OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(safe_error_message(exc)) from exc
     click.echo(f"Default model {selected} saved in {path}.")
 
@@ -923,7 +1008,10 @@ def providers_add(
                 f" --reasoning-effort {reasoning_effort}" if reasoning_effort is not None else ""
             )
             click.echo(f"use once with: noah --model {selected_model}{suffix} .")
-    except (ConfigError, OSError, ValueError, RuntimeError) as exc:
+    except ConfigError as exc:
+        click.echo(f"error: {safe_error_message(exc)}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    except (OSError, ValueError, RuntimeError) as exc:
         raise click.ClickException(safe_error_message(exc)) from exc
 
 
@@ -943,7 +1031,13 @@ def update_cmd(check_only: bool, force: bool) -> None:
             else:
                 click.echo(f"noah-code {status.current} is up to date")
             return
-        click.echo(upgrade())
+        lock = _acquire_auto_update_lock()
+        if lock is None:
+            raise UpdateError("another noah-code update is already in progress")
+        try:
+            click.echo(upgrade())
+        finally:
+            _release_auto_update_lock(lock)
         click.echo(f"noah-code update complete; latest release is {status.latest}")
     except UpdateError as exc:
         click.echo(f"update failed: {exc}", err=True)
@@ -1005,28 +1099,23 @@ async def _prepare(
     allow_auto_install: bool = True,
     permissions: str | None = None,
 ):
-    permission_choice = _permission_override(auto, yolo, permissions)
+    overrides = _cli_overrides(
+        model=model,
+        reasoning_effort=reasoning_effort,
+        auto=auto,
+        yolo=yolo,
+        permissions=permissions,
+        mode=mode,
+        max_iterations=max_iterations,
+        frontend=frontend,
+        unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
+    )
     try:
         workspace = open_workspace(path)
     except WorkspaceError as exc:
         click.echo(f"error: {exc}", err=True)
         return None, EXIT_CONFIG
 
-    overrides: dict[str, Any] = {}
-    if model:
-        overrides["model"] = model
-    if reasoning_effort:
-        overrides["reasoning_effort"] = reasoning_effort
-    if permission_choice is not None:
-        overrides.update(permission_mode_flags(permission_choice))
-    if max_iterations is not None:
-        overrides["max_iterations"] = max_iterations
-    if mode:
-        overrides["mode"] = mode
-    if frontend is not None:
-        overrides["ui"] = {"frontend": frontend}
-    if unsafe_inprocess_code_execution:
-        overrides["unsafe_inprocess_code_execution"] = True
     config = load_config(workspace.root, cli_overrides=overrides)
     if allow_auto_install:
         if await _maybe_auto_update(config):
@@ -1086,16 +1175,6 @@ async def _interactive(
 ) -> int:
     permission_choice = _permission_override(auto, yolo, permissions)
     first_run = user_default_model() is None
-    if first_run and (model is not None or (use_console and not (continue_session or session_id))):
-        try:
-            model = await _configure_first_run_model_async(model)
-        except (ConfigError, OSError, ValueError, RuntimeError) as exc:
-            click.echo(f"error: first-run model setup failed: {safe_error_message(exc)}", err=True)
-            return EXIT_CONFIG
-        except click.Abort:
-            click.echo("error: first-run model setup was cancelled", err=True)
-            return EXIT_CONFIG
-
     frontend: Literal["tui", "console"] | None = "console" if use_console else None
     prepared, code = await _prepare(
         path=path,
@@ -1115,32 +1194,40 @@ async def _interactive(
         return code
     workspace, config, store, meta = prepared
     use_tui = config.ui.frontend == "tui" and not use_console
-    if first_run and model is None and not use_tui and meta is None:
+    should_setup_model = first_run and meta is None and (
+        model is not None
+        or (
+            not use_tui
+            and not os.environ.get("NOAH_CODE_MODEL")
+            and config.model == NoahCodeConfig().model
+        )
+    )
+    if should_setup_model:
         try:
-            model = await _configure_first_run_model_async(model)
+            selected_model = await _configure_first_run_model_async(model)
         except (ConfigError, OSError, ValueError, RuntimeError) as exc:
             click.echo(f"error: first-run model setup failed: {safe_error_message(exc)}", err=True)
             return EXIT_CONFIG
         except click.Abort:
             click.echo("error: first-run model setup was cancelled", err=True)
             return EXIT_CONFIG
-        prepared, code = await _prepare(
-            path=path,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            auto=auto,
-            yolo=yolo,
-            permissions=permissions,
-            mode=mode,
-            max_iterations=max_iterations,
-            continue_session=continue_session,
-            session_id=session_id,
-            frontend=frontend,
-            unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
-        )
-        if prepared is None:
-            return code
-        workspace, config, store, meta = prepared
+        if selected_model is not None and selected_model != config.model:
+            model = selected_model
+            overrides = _cli_overrides(
+                model=model,
+                reasoning_effort=reasoning_effort,
+                auto=auto,
+                yolo=yolo,
+                permissions=permissions,
+                mode=mode,
+                max_iterations=max_iterations,
+                frontend=frontend,
+                unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
+            )
+            config = load_config(
+                workspace.root,
+                cli_overrides={**overrides, "session_dir": store.session_dir},
+            )
     permission_setup_required = (
         meta is None and not (continue_session or session_id)
         and permission_choice is None
@@ -1279,7 +1366,7 @@ def main(argv: list[str] | None = None) -> None:
     """Dispatch: subcommands via group; otherwise interactive with optional PATH."""
     args = list(sys.argv[1:] if argv is None else argv)
     base = os.path.basename(sys.argv[0]) if sys.argv else "noah-code"
-    prog = base if base in {"nc", "noah", "noah-code"} else "noah-code"
+    prog = base if base in {"noah", "noah-code"} else "noah-code"
     if args and args[0] in cli_group.commands:
         cli_group.main(args=args, prog_name=prog)
     else:

@@ -9,7 +9,8 @@ import pytest
 from nooa.context_blocks import ToolCallEvent
 from nooa.errors import GenerationError
 from nooa.events import TextOnlyReply
-from nooa.interactive import RespondReason
+from nooa.interactive import Done
+from nooa.llm_types import AssistantReasoning, AssistantText, LLMUsage
 from nooa.unifiedllm import FakeLLMClient, LLMResponse, ToolCall
 
 from noah_code.agent import CodingAgent
@@ -24,14 +25,29 @@ from noah_code.workspace import Workspace
 
 
 def _empty(content=""):
+    reasoning = AssistantReasoning(
+        text="Provider reasoning preserved for audit.",
+        native={"type": "reasoning", "id": "rs_audit"},
+    )
+    usage = {"prompt_tokens": 100, "completion_tokens": 4096, "reasoning_tokens": 4096}
+    raw = SimpleNamespace(_hidden_params={"response_cost": 0.002})
+    if content is None:
+        return SimpleNamespace(
+            raw_response=raw,
+            content=None,
+            parts=(reasoning,),
+            replay_scope="responses:openai:sha256:audit",
+            tool_calls=[],
+            finish_reason="length",
+            reasoning="Provider reasoning preserved for audit.",
+            usage=usage,
+        )
     return LLMResponse(
-        raw_response=SimpleNamespace(_hidden_params={"response_cost": 0.002}),
-        content=content,
-        tool_calls=[],
+        raw_response=raw,
+        parts=(reasoning, AssistantText(text=content)),
+        replay_scope="responses:openai:sha256:audit",
         finish_reason="length",
-        assistant_message={"role": "assistant", "content": content},
-        reasoning="Provider reasoning preserved for audit.",
-        usage={"prompt_tokens": 100, "completion_tokens": 4096, "reasoning_tokens": 4096},
+        usage=usage,
     )
 
 
@@ -41,7 +57,6 @@ def _code(source, key):
         content="",
         tool_calls=[ToolCall(id=key, name="execute_python", arguments=json.dumps({"code": source}))],
         finish_reason="tool_calls",
-        assistant_message={"role": "assistant", "content": ""},
         usage={"prompt_tokens": 10, "completion_tokens": 10},
     )
 
@@ -66,10 +81,11 @@ def test_empty_length_notice_preserves_original_response_and_accounting(content)
     assert recovered is not original
     assert recovered.finish_reason == "length"
     assert recovered.raw_response is original.raw_response
-    assert recovered.assistant_message is original.assistant_message
-    assert recovered.usage is original.usage
+    assert recovered.replay_scope == original.replay_scope
+    assert recovered.parts[0] == original.parts[0]
+    assert recovered.usage == LLMUsage.from_provider(original.usage)
     assert recovered.reasoning == original.reasoning
-    assert recovered.tool_calls is original.tool_calls
+    assert recovered.tool_calls == original.tool_calls
     assert "[Noah host recovery notice; not model output]" in recovered.content
     assert f"content={json.dumps(content)}" in recovered.content
     assert original.content == content
@@ -78,13 +94,20 @@ def test_empty_length_notice_preserves_original_response_and_accounting(content)
 
 @pytest.mark.parametrize("case", ["partial", "tools", "stop", "content_filter", "error"])
 def test_recovery_does_not_rewrite_other_response_shapes(case):
-    response = _empty()
     if case == "partial":
-        response.content = "An unfinished answer"
+        response = LLMResponse(
+            parts=(AssistantText(text="An unfinished answer"),),
+            finish_reason="length",
+        )
     elif case == "tools":
-        response.tool_calls = [ToolCall("partial", "execute_python", '{"code":')]
+        response = LLMResponse(
+            parts=(ToolCall(id="partial", name="execute_python", arguments='{"code":'),),
+            finish_reason="length",
+        )
+    elif case == "content_filter":
+        response = SimpleNamespace(content="", tool_calls=[], finish_reason="content_filter")
     else:
-        response.finish_reason = case
+        response = LLMResponse(parts=(AssistantText(text=""),), finish_reason=case)
     assert recover_empty_truncated_response(response) is response
 
 
@@ -114,7 +137,7 @@ async def test_real_codeact_continues_with_locals_usage_and_original_finish_reas
             _empty(),
             _code(
                 "assert remembered_value == 73\n"
-                "return_result(kind='DONE', explanation='Continued same session')",
+                "return_result(Done(explanation='Continued same session'))",
                 "after",
             ),
         ]
@@ -124,24 +147,24 @@ async def test_real_codeact_continues_with_locals_usage_and_original_finish_reas
     )
     agent = _agent(tmp_path, client)
     completions = []
-    agent.event_manager.on("LLMComplete", completions.append)
+    agent.event_manager.on("LLMResponse", completions.append)
     try:
         result = await agent.handle({"user_messages": ["Remember a value, then finish."]})
         events = agent.event_manager.values()
     finally:
         await agent.close_tools()
-    assert result.kind == RespondReason.DONE
+    assert isinstance(result, Done)
     assert model.call_count == 3
     assert guard.total_tokens == 4236
     assert guard.status()["cost_usd"] == 0.002
     assert len(completions) == 3
-    assert completions[1].completion_tokens == 4096
-    assert completions[1].reasoning_tokens == 4096
+    assert completions[1].usage.output_tokens == 4096
+    assert completions[1].usage.reasoning_tokens == 4096
     drifts = [event for event in events if isinstance(event, TextOnlyReply)]
     assert len(drifts) == 1
-    assert drifts[0].finish_reason == "length"
-    assert drifts[0].route == "synthetic_comment"
-    assert drifts[0].recovered is True
+    assert drifts[0].finish_reason == "stop"
+    assert drifts[0].action == "retry"
+    assert drifts[0].consecutive_text_only == 1
     assert "not model output" in drifts[0].content
     assert 'content=""' in drifts[0].content
     assert "unchanged output limit" in json.dumps(model.last_messages)

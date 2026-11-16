@@ -123,6 +123,7 @@ class TaskTools(Skill):
         self._start_lock = asyncio.Lock()
         self._closed = False
         self._slots = asyncio.Semaphore(self._max_concurrent())
+        self._bg_slots = asyncio.Semaphore(self._max_concurrent())
         self._runtime = getattr(parent, "_runtime", None)
         self._records: dict[str, dict[str, Any]] = (
             self._runtime.get_state("child_sessions", {}) if self._runtime is not None else {}
@@ -163,6 +164,7 @@ class TaskTools(Skill):
             raise RuntimeError("concurrent child session limit reached")
         task_id = uuid.uuid4().hex[:12]
         directory = self._workspace.root
+        rel_subdir = _git_workdir_offset(directory) if isolate else None
         manager = None
         info = None
         warnings: list[str] = []
@@ -186,6 +188,10 @@ class TaskTools(Skill):
                     await asyncio.to_thread(manager.remove, info.name)
                 raise
             directory = info.directory
+            if rel_subdir is not None:
+                candidate = (info.directory / rel_subdir).resolve()
+                if candidate.is_dir():
+                    directory = candidate
         try:
             if isolate:
                 from noah_code.hooks import HookRunner
@@ -219,7 +225,14 @@ class TaskTools(Skill):
         if runner is None:
             raise RuntimeError("subagent runner is not configured")
         job = asyncio.create_task(
-            self._execute(spec, prompt, runner, task_id=task_id), name=f"noah-child-{task_id}"
+            self._execute(
+                spec,
+                prompt,
+                runner,
+                semaphore=self._bg_slots,
+                task_id=task_id,
+            ),
+            name=f"noah-child-{task_id}",
         )
         self._jobs[task_id] = job
         # Retrieve errors even when the caller chooses status instead of wait.
@@ -545,20 +558,21 @@ class TaskTools(Skill):
             phase=phase,
         )
         self._activities[activity.task_id] = activity
+        created_ephemeral = activity.task_id not in self._records
         record = self._records.setdefault(activity.task_id, {
             "id": activity.task_id, "agent": spec.name, "directory": str(self._workspace.root),
             "isolated": False, "state": "queued", "result": "",
         })
+        if created_ephemeral:
+            record["ephemeral"] = True
         record["prompt"] = prompt[:24_000]
         record["state"] = "queued"
         self._save_records()
         self._emit(activity)
+        effective_semaphore = semaphore if semaphore is not None else self._slots
         try:
-            if semaphore is None:
+            async with effective_semaphore:
                 result = await self._run_activity(activity, spec, prompt, runner)
-            else:
-                async with semaphore:
-                    result = await self._run_activity(activity, spec, prompt, runner)
             activity.state = result.status if isinstance(result, TaskResult) else "completed"
             text = result.text if isinstance(result, TaskResult) else result
             activity.result_preview = " ".join(text.split())[:500]
@@ -580,6 +594,14 @@ class TaskTools(Skill):
             record["updated_at"] = time.time()
             if activity.state in {"failed", "cancelled"}:
                 record["result"] = activity.result_preview
+            ephemeral_done = [
+                key
+                for key, item in self._records.items()
+                if item.get("ephemeral")
+                and item.get("state") in {"completed", "needs_input", "failed", "cancelled"}
+            ]
+            for stale_key in ephemeral_done[:-50]:
+                self._records.pop(stale_key, None)
             self._save_records()
             self._emit(activity)
 
@@ -592,7 +614,7 @@ class TaskTools(Skill):
     ) -> str | TaskResult:
         record = self._records[activity.task_id]
         lane = contextlib.nullcontext() if record["isolated"] else self._agent_lane(spec)
-        async with self._slots, lane:
+        async with lane:
             activity.state = "running"
             record["state"] = "running"
             self._save_records()
@@ -691,6 +713,30 @@ def _default_runner(parent: Any | None) -> TaskRunner | None:
     return _run
 
 
+def _git_workdir_offset(root: Path) -> Path | None:
+    import subprocess
+
+    try:
+        top_res = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if top_res.returncode != 0:
+        return None
+    top = Path(top_res.stdout.strip()).resolve()
+    resolved_root = root.resolve()
+    if resolved_root == top or not resolved_root.is_relative_to(top):
+        return None
+    return resolved_root.relative_to(top)
+
+
 def _child_engine(parent_engine: PermissionEngine, mode: str) -> PermissionEngine:
     """Clone the engine so concurrent subagents never race on shared mode."""
 
@@ -698,6 +744,7 @@ def _child_engine(parent_engine: PermissionEngine, mode: str) -> PermissionEngin
         list(parent_engine.rules),
         mode=mode,  # type: ignore[arg-type]
         auto_approve=parent_engine.auto_approve,
+        yolo=parent_engine.yolo if mode == "build" else False,
     )
     clone.load_session_rules(parent_engine.snapshot_session_rules())
     return clone
@@ -714,7 +761,7 @@ async def _run_subagent(
 ) -> TaskResult:
     """Start a nested CodingAgent with isolated storage and a per-run permission engine."""
 
-    from nooa.interactive import RespondReason
+    from nooa.interactive import Done, NeedInput, Waiting
     from nooa.storage.in_memory import InMemoryStorageManager
 
     from noah_code.agent import CodingAgent
@@ -748,16 +795,21 @@ async def _run_subagent(
             child_llm = SharedBudgetLLM(child_llm, guard, prefix_observer=usage)
         elif usage is not None:
             child_llm = _PrefixObserverOnly(child_llm, usage)
-    from noah_code.runtime_state import WorkspaceLease
+    from noah_code.runtime_state import RuntimeStateStore, WorkspaceLease
     from noah_code.snapshots import SnapshotJournal
 
     runtime = getattr(parent, "_runtime", None)
+    child_runtime = runtime
     storage: Any = InMemoryStorageManager()
     lease = None
     child_workspace = Workspace(directory) if directory is not None else parent.ws._workspace
     if not child_workspace.root.is_dir():
         raise ValueError(f"child workspace missing: {child_workspace.root}")
-    journal = SnapshotJournal(blob_limit=config.undo_blob_limit) if isolated else parent.journal
+    journal = (
+        SnapshotJournal(blob_limit=config.undo_blob_limit, root=child_workspace.root)
+        if isolated
+        else parent.journal
+    )
     if task_id is not None and runtime is not None:
         from nooa.storage import SQLiteStorageManager
 
@@ -772,6 +824,7 @@ async def _run_subagent(
                 journal.load_dict(runtime.get_state(f"child:{task_id}:journal", {}))
             storage = SQLiteStorageManager(child_path / "session.db")
             (child_path / "session.db").chmod(0o600)
+            child_runtime = RuntimeStateStore(child_path)
         except BaseException:
             close_storage = getattr(storage, "close", None)
             if callable(close_storage):
@@ -782,6 +835,10 @@ async def _run_subagent(
             raise
     messages: list[str] = []
     child = None
+    child_engine = _child_engine(parent.engine, spec.mode)
+    child_approvals = ApprovalBroker(
+        child_engine, handler=getattr(parent.approvals, "_handler", None)
+    )
     try:
         child = CodingAgent(
             child_workspace,
@@ -793,10 +850,10 @@ async def _run_subagent(
                 else getattr(parent, "_lightweight_llm", parent._llm)  # noqa: SLF001
             ),
             storage=storage,
-            engine=_child_engine(parent.engine, spec.mode),
-            approvals=parent.approvals,
+            engine=child_engine,
+            approvals=child_approvals,
             journal=journal,
-            runtime=runtime,
+            runtime=child_runtime,
             coordinator=None if isolated else getattr(parent, "_coordinator", None),
             budget_guard=getattr(parent, "_budget_guard", None),
             usage_tracker=getattr(parent, "_usage_tracker", None),
@@ -845,11 +902,9 @@ async def _run_subagent(
                 result = await child.handle(notification)
             if task_id is not None and runtime is not None:
                 storage.save_snapshot(child)
-            if getattr(result, "kind", None) != RespondReason.WAIT:
-                if getattr(result, "kind", None) not in {
-                    RespondReason.DONE, RespondReason.NEED_INPUT, RespondReason.GET_USER_INPUT,
-                }:
-                    raise RuntimeError(f"Subagent returned an invalid stop reason: {getattr(result, 'kind', None)!r}")
+            if not isinstance(result, Waiting):
+                if not isinstance(result, (Done, NeedInput)):
+                    raise RuntimeError(f"Subagent returned an invalid stop reason: {result!r}")
                 break
             if not child.processes.has_running() and not wake.is_set():
                 raise RuntimeError("subagent returned WAIT without a running background job")
@@ -868,12 +923,22 @@ async def _run_subagent(
                 "A background process changed state. Inspect its status and logs, "
                 "then continue the assigned task.",
             )
-        explanation = str(getattr(result, "explanation", "") or "").strip()
-        needs_input = getattr(result, "kind", None) in {
-            RespondReason.NEED_INPUT, RespondReason.GET_USER_INPUT
-        }
+        explanation = str(
+            (result.reason or result.question) if isinstance(result, NeedInput) else getattr(result, "explanation", "") or ""
+        ).strip()
+        needs_input = isinstance(result, NeedInput)
+        reply_text = (
+            str(result.question or "").strip()
+            if isinstance(result, NeedInput)
+            else str(getattr(result, "message", "") or "").strip()
+        )
+        if reply_text and (not messages or messages[-1].strip() != reply_text):
+            messages.append(reply_text)
         prefix = "[NEED_INPUT] " if needs_input else ""
-        body = "\n\n".join(part for part in [*messages, explanation] if part)
+        parts = [part for part in [*messages, explanation] if part]
+        if len(parts) >= 2 and parts[-1] == parts[-2]:
+            parts.pop()
+        body = "\n\n".join(parts)
         raw = body or f"{spec.name} finished with no message."
         text = prefix + await bound_result(
             child, spec.name, raw, max_chars=_result_budget(parent) - len(prefix)

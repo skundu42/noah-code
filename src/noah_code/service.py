@@ -60,7 +60,7 @@ def _history_event(record: SessionEventRecord) -> dict[str, Any] | None:
     payload: dict[str, Any]
     if record.event_type == "Task":
         payload = {"prompt": str(source.get("prompt", ""))}
-    elif record.event_type in {"Message", "AssistantEvent", "Reasoning"}:
+    elif record.event_type in {"Message", "AgentMessage", "AssistantEvent", "Reasoning"}:
         payload = {"content": str(source.get("content", ""))}
     elif record.event_type == "Summary":
         payload = {"content": str(source.get("content", source.get("summary", "")))}
@@ -102,13 +102,22 @@ class ServiceUI:
         self.approval_handler: Callable[[ApprovalRequest], Awaitable[ApprovalChoice]] | None = None
         self.question_handler: Callable[[list[Any]], Awaitable[Any]] | None = None
         self._loop = asyncio.get_running_loop()
+        self._wakeup: asyncio.Future[None] = self._loop.create_future()
+
+    def _signal(self) -> None:
+        wakeup = self._wakeup
+        if not self.closed:
+            self._wakeup = self._loop.create_future()
+        if not wakeup.done():
+            wakeup.set_result(None)
+        self.changed.set()
 
     def publish(self, kind: str, **data: Any) -> None:
         if self.closed:
             return
         self.sequence += 1
         self.events.append({"sequence": self.sequence, "kind": kind, **data})
-        self.changed.set()
+        self._signal()
 
     def render(self, event: HostEvent) -> None:
         # Event callbacks may originate in a tool's worker thread. Only the
@@ -229,7 +238,7 @@ class ServiceUI:
         if after < 0 or after > self.sequence:
             raise ServiceError("event cursor is outside this session's stream")
         while True:
-            self.changed.clear()
+            waiter = self._wakeup
             if self.events and after < self.events[0]["sequence"] - 1:
                 after = self.events[0]["sequence"] - 1
                 yield {"sequence": after, "kind": "replay_gap", "oldest_sequence": after + 1}
@@ -239,8 +248,10 @@ class ServiceUI:
                     yield item
             if self.closed:
                 return
+            if waiter.done():
+                continue
             try:
-                await asyncio.wait_for(self.changed.wait(), timeout=15)
+                await asyncio.wait_for(asyncio.shield(waiter), timeout=15)
             except TimeoutError:
                 yield {"sequence": after, "kind": "heartbeat"}
 
@@ -250,7 +261,7 @@ class ServiceUI:
         for _detail, future in self.pending.values():
             if not future.done():
                 future.cancel()
-        self.changed.set()
+        self._signal()
 
 
 @dataclass
@@ -332,19 +343,34 @@ class AgentService:
             if meta is not None:
                 self.store.verify_workspace(meta, workspace)
             config = self.config.model_copy(deep=True)
-            if mcp_servers:
-                # The authenticated client supplied these commands, as it would
-                # in trusted user configuration. Never save their credentials.
-                from noah_code.mcp_setup import load_mcp_servers
-
-                configured, _sources = load_mcp_servers(workspace.root, config)
-                config.mcp = {**configured, **mcp_servers}
-                config.efficiency.lazy_mcp = False
+            clean_mcp_servers: dict[str, Any] = {}
+            if mcp_servers is not None:
+                if not isinstance(mcp_servers, dict):
+                    raise ServiceError("mcpServers must be an object")
+                clean_mcp_servers = {
+                    str(key): dict(value)
+                    for key, value in mcp_servers.items()
+                    if isinstance(value, dict)
+                }
+                if clean_mcp_servers:
+                    config.efficiency.lazy_mcp = False
             ui = ServiceUI(history_limit=self._history_limit)
-            host = self._host_factory(workspace, config, ui=ui, session_meta=meta, store=self.store)
+            try:
+                host = self._host_factory(
+                    workspace,
+                    config,
+                    ui=ui,
+                    session_meta=meta,
+                    store=self.store,
+                    client_mcp_servers=clean_mcp_servers or None,
+                )
+            except TypeError:
+                host = self._host_factory(workspace, config, ui=ui, session_meta=meta, store=self.store)
+                if clean_mcp_servers and hasattr(host, "_client_mcp_servers"):
+                    host._client_mcp_servers = clean_mcp_servers
             try:
                 meta = await host.start()
-                if mcp_servers and not set(mcp_servers).issubset(host._mcp_attached):
+                if clean_mcp_servers and not set(clean_mcp_servers).issubset(host._mcp_attached):
                     raise ServiceError("one or more requested MCP servers could not connect", 409)
             except BaseException:
                 ui.close()
@@ -380,21 +406,68 @@ class AgentService:
             session.host.enqueue_steer(prompt)
             session.ui.publish("prompt_queued")
             return {"status": "queued", "request_id": session.request_id}
+        if not queue:
+            resume = getattr(session.host, "resume_queued_input", None)
+            if callable(resume):
+                resume()
+            elif hasattr(session.host, "queue_paused"):
+                session.host.queue_paused = False
         session.request_id = uuid.uuid4().hex
         session.result = None
         session.task = asyncio.create_task(self._run(session, prompt))
         return {"status": "running", "request_id": session.request_id}
 
+    def resume_queue(self, session_id: str) -> dict[str, Any]:
+        session = self.get(session_id)
+        resume = getattr(session.host, "resume_queued_input", None)
+        if callable(resume):
+            resume()
+        elif hasattr(session.host, "queue_paused"):
+            session.host.queue_paused = False
+        if session.active:
+            session.ui.publish("queue_resumed")
+            return {"status": "resumed", "request_id": session.request_id}
+        queued = session.host.steer_queue.pop()
+        if queued is None:
+            return {"status": "idle"}
+        self._acknowledge_queued(session.host, queued)
+        if queued.attach_paths and hasattr(session.host, "_pending_attach_paths"):
+            session.host._pending_attach_paths.extend(queued.attach_paths)
+        session.request_id = uuid.uuid4().hex
+        session.result = None
+        session.task = asyncio.create_task(self._run(session, queued.text))
+        return {"status": "running", "request_id": session.request_id}
+
+    @staticmethod
+    def _acknowledge_queued(host: Any, item: Any) -> None:
+        runtime = getattr(host, "_runtime", None)
+        sequence = getattr(item, "sequence", None)
+        if runtime is not None and sequence is not None:
+            with contextlib.suppress(Exception):
+                runtime.acknowledge_inbox(sequence)
+
     async def _run(self, session: ServiceSession, prompt: str | None) -> HostResult:
         try:
-            result = (
-                await session.host.resume_interrupted_run()
-                if prompt is None
-                else await session.host.submit_prompt(prompt)
-            )
-            session.result = result or HostResult(0, session_id=session.meta.session_id)
-            if session.result.status == "failed":
-                session.result.explanation = safe_error_message(session.result.explanation)
+            current_prompt = prompt
+            while True:
+                result = (
+                    await session.host.resume_interrupted_run()
+                    if current_prompt is None
+                    else await session.host.submit_prompt(current_prompt)
+                )
+                session.result = result or HostResult(0, session_id=session.meta.session_id)
+                if session.result.status == "failed":
+                    session.result.explanation = safe_error_message(session.result.explanation)
+                    break
+                if getattr(session.host, "queue_paused", False) or session.closed:
+                    break
+                queued = session.host.steer_queue.pop()
+                if queued is None:
+                    break
+                self._acknowledge_queued(session.host, queued)
+                if queued.attach_paths and hasattr(session.host, "_pending_attach_paths"):
+                    session.host._pending_attach_paths.extend(queued.attach_paths)
+                current_prompt = queued.text
         except asyncio.CancelledError:
             session.result = HostResult(130, "cancelled", session.meta.session_id, "cancelled")
         except Exception as exc:
@@ -405,6 +478,7 @@ class AgentService:
         session.ui.publish(
             "turn_complete", request_id=session.request_id, result=asdict(session.result)
         )
+        assert session.result is not None
         return session.result
 
     def recover(self, session_id: str) -> dict[str, Any]:
@@ -416,20 +490,29 @@ class AgentService:
         session.task = asyncio.create_task(self._run(session, None))
         return {"status": "running", "request_id": session.request_id}
 
-    async def cancel(self, session_id: str) -> None:
+    async def cancel(self, session_id: str, *, request_id: str | None = None) -> bool:
         session = self.get(session_id)
-        if session.active:
-            session.host.cancel_active_turn()
-            assert session.task is not None
-            session.task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await session.task
-            if session.result is None:
-                # A just-created task can be cancelled before _run starts.
-                session.result = HostResult(130, "cancelled", session_id, "cancelled")
-                session.ui.publish(
-                    "turn_complete", request_id=session.request_id, result=asdict(session.result)
-                )
+        async with session.lock:
+            if session.closed:
+                return False
+            if request_id is not None and session.request_id != request_id:
+                return False
+            if session.active:
+                session.host.cancel_active_turn()
+                assert session.task is not None
+                session.task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await session.task
+                if session.result is None:
+                    # A just-created task can be cancelled before _run starts.
+                    session.result = HostResult(130, "cancelled", session_id, "cancelled")
+                    session.ui.publish(
+                        "turn_complete",
+                        request_id=session.request_id,
+                        result=asdict(session.result),
+                    )
+                return True
+            return False
 
     async def close_session(self, session_id: str) -> None:
         session = self.get(session_id)
@@ -447,17 +530,19 @@ class AgentService:
                 await session.host.close()
             finally:
                 session.ui.close()
-                self.sessions.pop(session_id, None)
+                async with self._lock:
+                    self.sessions.pop(session_id, None)
 
     async def close(self) -> None:
         async with self._lock:
             self._closed = True
-            results = await asyncio.gather(
-                *(self.close_session(key) for key in list(self.sessions)),
-                return_exceptions=True,
-            )
-            if any(isinstance(result, BaseException) for result in results):
-                raise ServiceError("one or more sessions failed to close cleanly", 500)
+            session_ids = list(self.sessions)
+        results = await asyncio.gather(
+            *(self.close_session(key) for key in session_ids),
+            return_exceptions=True,
+        )
+        if any(isinstance(result, BaseException) for result in results):
+            raise ServiceError("one or more sessions failed to close cleanly", 500)
 
 
 class HTTPService:
@@ -647,8 +732,11 @@ class HTTPService:
                         session_id, data.get("prompt", ""), queue=data.get("queue", False)
                     )
                 if method == "POST" and action == "cancel":
-                    await self.service.cancel(session_id)
-                    return 200, {"status": "cancelled"}
+                    req_id = data.get("request_id")
+                    if req_id is not None and not isinstance(req_id, str):
+                        raise ServiceError("request_id must be a string")
+                    cancelled = await self.service.cancel(session_id, request_id=req_id)
+                    return 200, {"status": "cancelled" if cancelled else "ignored"}
                 if method == "POST" and action == "recover":
                     return 202, self.service.recover(session_id)
                 if method == "GET" and action == "history":
@@ -661,6 +749,9 @@ class HTTPService:
                         ],
                         "before": rows[0].insertion_order if rows else None,
                     }
+            if len(path) == 6 and path[4] == "queue" and path[5] == "resume" and method == "POST":
+                resumed = self.service.resume_queue(session_id)
+                return (202 if resumed["status"] == "running" else 200), resumed
             if len(path) == 6 and path[4] == "interactions" and method == "POST":
                 session.ui.answer(path[5], data)
                 return 200, {"status": "answered"}

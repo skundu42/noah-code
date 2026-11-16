@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import itertools
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -19,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from rich.console import Group
 from rich.markdown import Markdown
+from rich.markup import escape as escape_markup
 from rich.measure import measure_renderables
 from rich.padding import Padding
 from rich.segment import Segment
@@ -57,6 +60,7 @@ from noah_code.ui.command_menu import CommandSuggestions, command_menu_renderabl
 from noah_code.ui.team_screen import TeamLauncherScreen
 from noah_code.updates import UpdateStatus, maybe_check_for_update
 from noah_code.verification import CheckLedger
+from noah_code.workspace import parse_porcelain_z
 
 if TYPE_CHECKING:
     from noah_code.host import AgentHost
@@ -385,10 +389,17 @@ class SelectableRichLog(RichLog):
             return Offset(max(point.x, 0), min(max(point.y, 0), last_row))
 
         selection = Selection(clamped(selection.start), clamped(selection.end))
-        text = "\n".join(line.text for line in self.lines)
+        text = "\n".join(re.sub(r"[\r\v\f]", " ", line.text) for line in self.lines)
         extracted = selection.extract(text)
         cleaned = "\n".join(part.rstrip() for part in extracted.split("\n"))
         return cleaned, "\n"
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        super().watch_scroll_y(old_value, new_value)
+        if self.is_attached and self.is_vertical_scroll_end:
+            handler = getattr(self.app, "_on_log_scrolled", None)
+            if callable(handler):
+                handler(self)
 
     def render_line(self, y: int) -> Strip:
         strip = super().render_line(y)
@@ -440,11 +451,9 @@ class RepositorySnapshot:
 def _parse_git_status(output: str) -> RepositorySnapshot | None:
     """Parse porcelain v1 branch output without depending on GitPython."""
 
-    nul_delimited = "\0" in output
-    records = output.split("\0") if nul_delimited else output.splitlines()
-    if not records or not records[0].startswith("## "):
+    branch_header, entries = parse_porcelain_z(output)
+    if branch_header is None:
         return None
-    branch_header = records[0][3:].strip()
     if branch_header.startswith("No commits yet on "):
         branch = branch_header.removeprefix("No commits yet on ")
     elif branch_header.startswith("HEAD (no branch)"):
@@ -454,25 +463,16 @@ def _parse_git_status(output: str) -> RepositorySnapshot | None:
     branch = branch or "detached"
     staged = modified = untracked = 0
     paths: list[str] = []
-    skip_rename_source = False
-    for record in records[1:]:
-        if skip_rename_source:
-            skip_rename_source = False
-            continue
-        if len(record) < 3 or record[2] != " ":
-            continue
-        index_state, worktree_state = record[0], record[1]
-        paths.append(record[3:])
-        if index_state == "?" and worktree_state == "?":
+    for entry in entries:
+        paths.append(entry.path)
+        x, y = entry.index_status, entry.worktree_status
+        if x == "?" and y == "?":
             untracked += 1
             continue
-        if index_state not in {" ", "?"}:
+        if x not in {" ", "?"}:
             staged += 1
-        if worktree_state not in {" ", "?"}:
+        if y not in {" ", "?"}:
             modified += 1
-        skip_rename_source = nul_delimited and (
-            "R" in {index_state, worktree_state} or "C" in {index_state, worktree_state}
-        )
     return RepositorySnapshot(branch, staged, modified, untracked, tuple(dict.fromkeys(paths)))
 
 
@@ -727,16 +727,45 @@ def _command_insertion(invocation: str) -> str:
     return invocation
 
 
-def _active_mention(text: str) -> str | None:
-    match = re.search(r'(?<![\w/])@(?:"[^"\r\n]*"?|[A-Za-z0-9_./-]*)$', text.rstrip())
+def _cursor_index(text: str, cursor_location: tuple[int, int] | None = None) -> int:
+    if cursor_location is None:
+        return len(text)
+    row, col = cursor_location
+    if (row, col) == (0, 0) and text:
+        return len(text)
+    lines = text.split("\n")
+    if row >= len(lines):
+        return len(text)
+    offset = sum(len(line) + 1 for line in lines[: max(row, 0)])
+    return min(offset + max(col, 0), len(text))
+
+
+def _location_for_offset(text: str, offset: int) -> tuple[int, int]:
+    prefix = text[: max(0, min(offset, len(text)))]
+    lines = prefix.split("\n")
+    return (len(lines) - 1, len(lines[-1]))
+
+
+def _active_mention(text: str, cursor_location: tuple[int, int] | None = None) -> str | None:
+    head = text[: _cursor_index(text, cursor_location)]
+    match = re.search(r'(?<![\w/])@(?:"[^"\r\n]*"?|[A-Za-z0-9_./-]*)$', head)
     return match.group(0) if match else None
 
 
-def _replace_active_mention(text: str, insertion: str) -> str:
-    match = re.search(r'(?<![\w/])@(?:"[^"\r\n]*"?|[A-Za-z0-9_./-]*)$', text.rstrip())
+def _replace_active_mention(
+    text: str, insertion: str, cursor_location: tuple[int, int] | None = None
+) -> tuple[str, tuple[int, int]]:
+    pos = _cursor_index(text, cursor_location)
+    head = text[:pos]
+    tail = text[pos:]
+    match = re.search(r'(?<![\w/])@(?:"[^"\r\n]*"?|[A-Za-z0-9_./-]*)$', head)
     if match is None:
-        return f"{text.rstrip()} {insertion}".strip()
-    return text[: match.start()] + insertion
+        prefix = f"{head.rstrip()} " if head.rstrip() else ""
+        updated = f"{prefix}{insertion}{tail}"
+        return updated, _location_for_offset(updated, len(prefix) + len(insertion))
+    prefix = head[: match.start()]
+    updated = f"{prefix}{insertion}{tail}"
+    return updated, _location_for_offset(updated, len(prefix) + len(insertion))
 
 
 def _truncate_middle(value: str, limit: int) -> str:
@@ -770,9 +799,21 @@ def _diff_renderable(patch: str, palette: ThemePalette | None = None) -> Group:
     lines: list[Text] = []
     for raw in (patch or "(no textual diff)").splitlines():
         if raw.startswith("@@"):
-            style = f"bold {palette.accent}"
-        elif raw.startswith("+++") or raw.startswith("---") or raw.startswith("diff "):
+            closing = raw.find("@@", 2)
+            if closing != -1:
+                header = raw[: closing + 2]
+                context = raw[closing + 2 :]
+                line = Text(no_wrap=False)
+                line.append(header, style=Style(color=palette.accent, bgcolor=palette.raised, bold=True))
+                if context:
+                    line.append(context, style=palette.muted)
+                lines.append(line)
+                continue
+            style: str | Style = f"bold {palette.accent}"
+        elif raw.startswith(("diff ", "--- ", "+++ ")):
             style = f"bold {palette.text}"
+        elif raw.startswith(("index ", "new file", "deleted file", "similarity ", "rename ")):
+            style = palette.muted
         elif raw.startswith("+"):
             style = palette.success
         elif raw.startswith("-"):
@@ -789,7 +830,7 @@ def _record_to_entries(record: SessionEventRecord) -> list[TranscriptEntry]:
     if event_type == "Task":
         text = str(payload.get("prompt", "") or "")
         return [TranscriptEntry("YOU", text, event_id=record.event_id)] if text else []
-    if event_type in {"Message", "AssistantEvent"}:
+    if event_type in {"Message", "AgentMessage", "AssistantEvent"}:
         text = str(payload.get("content", "") or "")
         return [TranscriptEntry("NOAH", text, True, record.event_id)] if text else []
     if event_type == "Summary":
@@ -1053,7 +1094,7 @@ class QuestionModal(ModalScreen[QuestionAnswer | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="approval-dialog"):
-            yield Label(self.prompt.header.upper(), id="approval-title")
+            yield Label(self.prompt.header.upper(), id="approval-title", markup=False)
             yield Static(f"Question {self.number} of {self.total}", id="question-progress")
             yield Static(Text(self.prompt.prompt), id="approval-body")
             yield OptionList(id="question-list", compact=True)
@@ -1120,7 +1161,7 @@ class OnboardingScreen(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
-        with Vertical(id="onboarding-dialog"):
+        with VerticalScroll(id="onboarding-dialog"):
             yield Label("WELCOME TO NOAH CODE", id="onboarding-title")
             yield Static(
                 "Connect one model provider before starting your first coding task.",
@@ -1129,9 +1170,9 @@ class OnboardingScreen(ModalScreen[bool]):
             yield Static(
                 Text.assemble(
                     ("1  PROVIDER\n", f"bold {palette.accent}"),
-                    ("   Connect a Codex / ChatGPT account, an API provider, or a local model.\n\n", palette.text),
+                    ("   Connect a Codex / ChatGPT account, an API provider, or a local model.\n", palette.text),
                     ("2  CREDENTIALS\n", f"bold {palette.accent}"),
-                    ("   Sign in through Codex, or enter a masked API key stored in Noah's private auth file.\n\n", palette.text),
+                    ("   Sign in through Codex, or enter a masked API key stored in Noah's private auth file.\n", palette.text),
                     ("3  MODEL + REASONING\n", f"bold {palette.warning}"),
                     ("   Pick the exact model ID and reasoning level. You can change both later with /model.", palette.text),
                 ),
@@ -1141,6 +1182,7 @@ class OnboardingScreen(ModalScreen[bool]):
                 f"Current model: {self.model}"
                 + (f"\nSetup needed: {self.reason}" if self.reason else ""),
                 id="onboarding-current",
+                markup=False,
             )
             with Horizontal(id="onboarding-buttons"):
                 yield Button("Set up model", id="onboarding-start", variant="primary")
@@ -1189,7 +1231,7 @@ class CodexLoginScreen(ModalScreen[bool]):
             )
             with Horizontal(id="codex-login-buttons"):
                 yield Button("Open browser", id="codex-login-open", variant="primary", disabled=True)
-                yield Button("Cancel [Esc]", id="codex-login-cancel")
+                yield Button(r"Cancel \[Esc]", id="codex-login-cancel")
 
     def on_mount(self) -> None:
         self.query_one("#codex-login-cancel", Button).focus()
@@ -1277,17 +1319,43 @@ class FilteredPicker(ModalScreen[str | None]):
         else:
             option_list.add_option(Option(Text("No matches", style=palette.muted), disabled=True))
 
+    @staticmethod
+    def _token_score(token: str, label: str, haystack: str) -> int | None:
+        if label.startswith(token):
+            return 0
+        if any(part.startswith(token) for part in re.split(r"[\s/_.:-]+", label) if part):
+            return 1
+        if token in haystack:
+            return 2
+        pos = 0
+        for ch in token:
+            pos = label.find(ch, pos)
+            if pos == -1:
+                return None
+            pos += 1
+        return 3
+
     @on(Input.Changed, "#picker-filter")
     def _filter(self, event: Input.Changed) -> None:
-        query = event.value.strip().lower().lstrip("/$")
-        if query:
-            starts = [row for row in self._rows if row[1].lower().lstrip("/$").startswith(query)]
-            contains = [
-                row
-                for row in self._rows
-                if row not in starts and query in f"{row[0]} {row[1]} {row[2]}".lower()
-            ]
-            self._filtered = starts + contains
+        raw = event.value.strip().lower()
+        tokens = [part.lstrip("/$") for part in raw.split() if part.lstrip("/$")]
+        if tokens:
+            scored: list[tuple[tuple[int, int], tuple[str, str, str]]] = []
+            for index, row in enumerate(self._rows):
+                label = row[1].lower().lstrip("/$")
+                haystack = f"{row[0]} {row[1]} {row[2]}".lower()
+                total = 0
+                matched = True
+                for token in tokens:
+                    score = self._token_score(token, label, haystack)
+                    if score is None:
+                        matched = False
+                        break
+                    total += score
+                if matched:
+                    scored.append(((total, index), row))
+            scored.sort(key=lambda item: item[0])
+            self._filtered = [row for _, row in scored]
         else:
             self._filtered = list(self._rows)
         self._refresh_options()
@@ -1357,7 +1425,7 @@ class TextPromptModal(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="prompt-dialog"):
-            yield Label(self.prompt_title.upper(), id="prompt-title")
+            yield Label(self.prompt_title.upper(), id="prompt-title", markup=False)
             yield Input(placeholder=self.placeholder, password=self.password, id="prompt-input")
             yield Static(self.hint, id="prompt-hint")
 
@@ -1391,10 +1459,14 @@ class ConfirmationModal(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="confirmation-dialog"):
             yield Label(self.confirmation_title.upper(), id="confirmation-title")
-            yield Static(self.body, id="confirmation-body")
+            yield Static(self.body, id="confirmation-body", markup=False)
             with Horizontal(id="confirmation-buttons"):
-                yield Button("Cancel  [Esc]", id="confirmation-cancel")
-                yield Button(f"{self.confirm_label}  [Y]", id="confirmation-accept", variant="error")
+                yield Button(r"Cancel  \[Esc]", id="confirmation-cancel")
+                yield Button(
+                    f"{escape_markup(self.confirm_label)}  \\[Y]",
+                    id="confirmation-accept",
+                    variant="error",
+                )
 
     def on_mount(self) -> None:
         self.query_one("#confirmation-cancel", Button).focus()
@@ -2254,15 +2326,24 @@ class ConversationHistoryScreen(ModalScreen[None]):
             return
         self._loading = True
         try:
-            records = await self.host.load_history_page(
-                before=self._before, limit=HISTORY_PAGE_SIZE
-            )
-            self._has_more = len(records) == HISTORY_PAGE_SIZE
-            if records:
-                self._before = min(record.insertion_order for record in records)
-            entries = [entry for record in records for entry in _record_to_entries(record)]
+            loaded_entries: list[TranscriptEntry] = []
+            for _ in range(4):
+                records = await self.host.load_history_page(
+                    before=self._before, limit=HISTORY_PAGE_SIZE
+                )
+                self._has_more = len(records) == HISTORY_PAGE_SIZE
+                if not records:
+                    break
+                next_before = min(record.insertion_order for record in records)
+                if next_before == self._before:
+                    break
+                self._before = next_before
+                batch_entries = [entry for record in records for entry in _record_to_entries(record)]
+                loaded_entries = batch_entries + loaded_entries
+                if loaded_entries or not self._has_more:
+                    break
             had_entries = bool(self._entries)
-            self._entries = entries + self._entries
+            self._entries = loaded_entries + self._entries
             self._render_entries(preserve_anchor=had_entries, latest=not had_entries)
         except Exception as exc:  # noqa: BLE001
             self.query_one("#history-log", RichLog).write(
@@ -2354,6 +2435,7 @@ class DiffReviewScreen(ModalScreen[None]):
         Binding("p,[", "previous_hunk", "Previous hunk", show=True),
         Binding("slash", "filter", "Find file", show=True),
         Binding("ctrl+r", "refresh_review", "Refresh", show=True),
+        Binding("c", "copy_patch", "Copy patch", show=True),
         Binding("o", "open_editor", "Open editor", show=True),
         Binding("v", "toggle_diagnostics", "Diagnostics", show=True),
         Binding("r", "revert", "Revert file", show=True),
@@ -2385,9 +2467,9 @@ class DiffReviewScreen(ModalScreen[None]):
                         min_width=0, max_lines=None,
                     )
                     yield Static("", id="diff-validation")
-            yield Static("", id="diff-status")
+            yield Static("", id="diff-status", markup=False)
             yield Static(
-                "J/K file · N/P hunk · / find · O editor · V diagnostics · Ctrl+R refresh · R revert · U undo · Esc close",
+                "J/K file · N/P hunk · / find · C copy · O editor · V diagnostics · Ctrl+R refresh · R revert · U undo · Esc close",
                 id="diff-hint",
             )
 
@@ -2562,10 +2644,18 @@ class DiffReviewScreen(ModalScreen[None]):
         self._render_review()
         self.query_one("#diff-status", Static).update("Refreshed; select a file to capture its current patch")
 
+    def action_copy_patch(self) -> None:
+        item = self._selected_item()
+        if item is None:
+            return
+        if not getattr(item, "loaded", bool(item.patch)) or not item.patch:
+            self.query_one("#diff-status", Static).update("No patch text loaded to copy")
+            return
+        self.app.copy_to_clipboard(item.patch)
+        self.query_one("#diff-status", Static).update(f"Copied patch for {item.path}")
+
     @work(exclusive=True, group="diff-editor")
     async def action_open_editor(self) -> None:
-        import shlex
-
         item = self._selected_item()
         if item is None:
             return
@@ -2576,9 +2666,14 @@ class DiffReviewScreen(ModalScreen[None]):
             path = self.host.workspace.resolve(item.path)
             if not path.is_file():
                 raise ValueError("The selected file no longer exists in the worktree")
-            editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
+            raw_editor = (
+                (os.environ.get("VISUAL") or "").strip()
+                or (os.environ.get("EDITOR") or "").strip()
+                or "vi"
+            )
+            editor = shlex.split(raw_editor) or ["vi"]
             with self.app.suspend():
-                result = await asyncio.to_thread(subprocess.run, [*editor, str(path)], check=False)
+                result = subprocess.run([*editor, str(path)], check=False)
             self.query_one("#diff-status", Static).update(
                 f"Editor exited {result.returncode}; Ctrl+R refreshes the captured review"
             )
@@ -2816,6 +2911,7 @@ class NoahCodeApp(App[None]):
         self._model_preview = ""
         self._model_call_id = ""
         self._activities: dict[str, ActivityRecord] = {}
+        self._activity_seq = itertools.count(1)
         self._activity_history: deque[ActivityRecord] = deque(maxlen=MAX_ACTIVITY_HISTORY)
         self._timeline_history: deque[ActivityRecord] = deque(maxlen=MAX_TIMELINE_HISTORY)
         self._thinking_timeline: ActivityRecord | None = None
@@ -2826,6 +2922,8 @@ class NoahCodeApp(App[None]):
         # Visual row counts parallel to _transcript_entries; together they map
         # a mouse selection's line range back to pristine entry text.
         self._transcript_line_counts: list[int] = []
+        self._conversation_width = 0
+        self._recent_mouse_selection: tuple[float, str] | None = None
         self._unread_count = 0
         self._activity_unread_lines = 0
         self._activity_expanded = False
@@ -2859,7 +2957,7 @@ class NoahCodeApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Static("", id="header")
-        yield Static("", id="notice-banner")
+        yield Static("", id="notice-banner", markup=False)
         with Horizontal(id="workspace-layout"):
             with Vertical(id="primary-pane"):
                 yield Static(
@@ -2893,7 +2991,7 @@ class NoahCodeApp(App[None]):
             with VerticalScroll(id="context-rail"):
                 yield Static("", id="context-rail-content")
         yield CommandSuggestions("", id="command-suggestions")
-        yield Static("", id="input-context")
+        yield Static("", id="input-context", markup=False)
         yield ComposerTextArea(
             id="composer",
             language=None,
@@ -3051,6 +3149,7 @@ class NoahCodeApp(App[None]):
         try:
             await self.host.start()
         except Exception as exc:  # noqa: BLE001
+            self._pending_submit = None
             self._set_agent_state(AgentDisplayState.ERROR, "Startup failed")
             self._pre_prompt_status = "Startup failed · open /model to retry"
             self._show_notice(
@@ -3068,11 +3167,6 @@ class NoahCodeApp(App[None]):
                     )
                 )
         else:
-            resume = getattr(self.host, "resume_interrupted_run", None)
-            if callable(resume):
-                pending_resume = resume()
-                if inspect.isawaitable(pending_resume):
-                    await pending_resume
             self._agent_ready = True
             self._onboarding_required = False
             self._set_agent_state(AgentDisplayState.READY)
@@ -3082,6 +3176,24 @@ class NoahCodeApp(App[None]):
                 _welcome_renderable(self.theme_palette),
                 layout=False,
             )
+            resume = getattr(self.host, "resume_interrupted_run", None)
+            if callable(resume):
+                self._turn_task = asyncio.current_task()
+                if hasattr(self.host, "_active_turn"):
+                    self.host._active_turn = self._turn_task
+                self.ui.set_busy(True)
+                try:
+                    pending_resume = resume()
+                    if inspect.isawaitable(pending_resume):
+                        await pending_resume
+                except asyncio.CancelledError:
+                    self._reset_transient_turn_widgets(state="error")
+                finally:
+                    if getattr(self.host, "_active_turn", None) is self._turn_task:
+                        self.host._active_turn = None
+                    self._turn_task = None
+                    self.ui.set_busy(False)
+                    self._set_agent_state(AgentDisplayState.READY)
             if self._pending_submit:
                 pending = self._pending_submit
                 self._pending_submit = None
@@ -3108,8 +3220,18 @@ class NoahCodeApp(App[None]):
         )
         if self._app_mounted:
             self.update_chrome(force=True)
+            self.call_after_refresh(self._sync_conversation_width)
             if self._suggestion_matches:
                 self.call_after_refresh(self._render_suggestions)
+
+    def _sync_conversation_width(self) -> None:
+        with contextlib.suppress(Exception):
+            log = self.query_one("#conversation", SelectableRichLog)
+            width = log.scrollable_content_region.width
+            if width > 0 and width != self._conversation_width:
+                self._conversation_width = width
+                if self._transcript_entries:
+                    self._rerender_transcript()
 
     def action_toggle_context_rail(self) -> None:
         self._sidebar_visible = not self.screen.has_class("wide")
@@ -3248,7 +3370,7 @@ class NoahCodeApp(App[None]):
         thought: str = "",
     ) -> ActivityRecord:
         record = ActivityRecord(
-            activity_id=f"timeline-{time.monotonic_ns()}",
+            activity_id=f"timeline-{next(self._activity_seq)}",
             label=label,
             tool=kind,
             detail=detail,
@@ -3567,11 +3689,6 @@ class NoahCodeApp(App[None]):
             widget.update(value, layout=False)
             widget.styles.display = "block" if value else "none"
 
-    def update_status_bar(self) -> None:
-        """Compatibility shim for callers of the original TUI API."""
-
-        self.update_chrome(force=True)
-
     def _build_rail_text(self) -> Text:
         palette = self.theme_palette
         text = Text()
@@ -3721,19 +3838,33 @@ class NoahCodeApp(App[None]):
         self._transcript_entries.append(entry)
         if len(self._transcript_entries) > 500:
             self._transcript_entries = self._transcript_entries[-500:]
-            del self._transcript_line_counts[: max(len(self._transcript_line_counts) - 500, 0)]
+            self._rerender_transcript()
+            if not at_end:
+                self._unread_count += 1
+                self.update_chrome()
+            return
         log = self.query_one("#conversation", SelectableRichLog)
-        rows_before = len(log.lines)
+        total_before = len(log.lines) + getattr(log, "_start_line", 0)
         log.write(
             _role_renderable(entry, self.theme_palette),
             scroll_end=at_end,
         )
         # Deferred pre-mount renders report no new rows; the entry simply stays
         # unselectable until the next full rerender rebuilds the table.
-        self._transcript_line_counts.append(max(len(log.lines) - rows_before, 0))
+        total_after = len(log.lines) + getattr(log, "_start_line", 0)
+        self._transcript_line_counts.append(max(total_after - total_before, 0))
         if not at_end:
             self._unread_count += 1
             self.update_chrome()
+
+    def _on_log_scrolled(self, widget: SelectableRichLog) -> None:
+        if widget.id == "conversation" and self._unread_count:
+            self._unread_count = 0
+            self.update_chrome()
+        elif widget.id == "activity-output" and self._activity_unread_lines:
+            self._activity_unread_lines = 0
+            self._activity_title_signature = None
+            self._update_activity_title()
 
     def _reveal_transcript(self) -> None:
         """Swap the centered launch state for the conversation exactly once."""
@@ -3744,14 +3875,18 @@ class NoahCodeApp(App[None]):
 
     def _rerender_transcript(self) -> None:
         log = self.query_one("#conversation", SelectableRichLog)
+        width = log.scrollable_content_region.width
+        if width > 0:
+            self._conversation_width = width
         at_end = self._follow_batch if self._follow_batch is not None else self._at_transcript_end()
         scroll_y = log.scroll_y
         log.clear()
         counts: list[int] = []
         for entry in self._transcript_entries:
-            rows_before = len(log.lines)
+            total_before = len(log.lines) + getattr(log, "_start_line", 0)
             log.write(_role_renderable(entry, self.theme_palette), scroll_end=False)
-            counts.append(max(len(log.lines) - rows_before, 0))
+            total_after = len(log.lines) + getattr(log, "_start_line", 0)
+            counts.append(max(total_after - total_before, 0))
         self._transcript_line_counts = counts
         if at_end:
             log.scroll_end(animate=False)
@@ -3763,16 +3898,37 @@ class NoahCodeApp(App[None]):
         loader = getattr(self.host, "load_history_page", None)
         if loader is None:
             return
-        try:
-            records = await loader(limit=RECENT_HISTORY_SIZE)
-        except Exception:  # noqa: BLE001 - history is an optional enhancement
-            return
+        expected_session = self.host.meta.session_id if self.host.meta else None
+        records: list[SessionEventRecord] = []
+        before: int | None = None
+        seen_before: set[int] = set()
+        for page in range(4):
+            try:
+                batch = await (
+                    loader(limit=RECENT_HISTORY_SIZE)
+                    if page == 0
+                    else loader(before=before, limit=RECENT_HISTORY_SIZE)
+                )
+            except Exception:  # noqa: BLE001 - history is an optional enhancement
+                return
+            current_session = self.host.meta.session_id if self.host.meta else None
+            if current_session != expected_session:
+                return
+            if not batch:
+                break
+            records = list(batch) + records
+            batch_entries = [entry for record in batch for entry in _record_to_entries(record)]
+            if any(entry.role == "YOU" for entry in batch_entries):
+                break
+            if len(batch) < RECENT_HISTORY_SIZE:
+                break
+            next_before = min(record.insertion_order for record in batch)
+            if next_before in seen_before:
+                break
+            seen_before.add(next_before)
+            before = next_before
         entries = [entry for record in records for entry in _record_to_entries(record)]
         if not entries:
-            return
-        if not any(entry.role == "YOU" for entry in entries):
-            self._pre_prompt_status = "Ready for your first prompt"
-            self.update_chrome(force=True)
             return
         self._session_has_prompt = True
         self._pre_prompt_status = ""
@@ -3983,16 +4139,16 @@ class NoahCodeApp(App[None]):
             record.thought = text if not record.thought else f"{record.thought}\n{text}"
         self._update_working_banner()
 
-    def _activity_id(self, event: HostEvent) -> str:
+    def _activity_id(self, event: HostEvent, *, allow_active: bool = True) -> str:
         activity_id = str(event.meta.get("activity_id", "") or "")
         if activity_id:
             return activity_id
-        if self._active_activity_id:
+        if allow_active and self._active_activity_id:
             return self._active_activity_id
-        return f"activity-{time.monotonic_ns()}"
+        return f"activity-{next(self._activity_seq)}"
 
     def _start_activity(self, event: HostEvent) -> None:
-        activity_id = self._activity_id(event)
+        activity_id = self._activity_id(event, allow_active=False)
         detail = str(event.meta.get("detail", "") or "")
         tool = str(event.meta.get("tool", "tool"))
         if re.search(
@@ -4117,32 +4273,56 @@ class NoahCodeApp(App[None]):
         if not activity_id:
             return
         record = self._activities.get(activity_id)
-        if record is None or record.tool != "shell":
+        if record is None:
             return
         self._flush_stream()
+        suffix = "complete" if state == "complete" else "interrupted"
         self._finish_activity(
             HostEvent(
                 HostEventKind.TOOL_FINISH,
-                "shell output complete",
+                f"{record.label} {suffix}",
                 meta={
                     "activity_id": activity_id,
-                    "tool": "shell",
+                    "tool": record.tool,
                     "result_status": state,
                 },
             )
         )
 
-    def _matching_command_suggestions(self, text: str) -> list[CommandSuggestion]:
+    def _reset_transient_turn_widgets(self, *, state: str = "complete") -> None:
+        if self._stream_timer is not None:
+            self._stream_timer.stop()
+            self._stream_timer = None
+        if self._active_activity_id:
+            self._finish_orphan_activity(state=state)
+        self._stream_fragments.clear()
+        self._activities.clear()
+        self._active_activity_id = None
+        self._activity_unread_lines = 0
+        self._activity_title_signature = None
+        self._model_preview = ""
+        self._model_call_id = ""
+        with contextlib.suppress(Exception):
+            self.query_one("#live-activity", Vertical).styles.display = "none"
+            preview = self.query_one("#model-stream-preview", Static)
+            preview.update("", layout=False)
+            preview.display = False
+
+    def _matching_command_suggestions(
+        self,
+        text: str,
+        cursor_location: tuple[int, int] | None = None,
+    ) -> list[CommandSuggestion]:
         query = text.strip()
-        if "\n" in text:
-            return []
-        mention = _active_mention(text)
+        mention = _active_mention(text, cursor_location)
         if mention is not None:
             matches = mention_suggestions(Path(self.host.workspace.root), mention)
             return [
                 CommandSuggestion(mention_text(path), "Attach workspace file", "Project")
                 for path in matches
             ]
+        if "\n" in text:
+            return []
         if not query.startswith("/"):
             return []
         raw_lowered = text.lstrip().lower()
@@ -4221,8 +4401,10 @@ class NoahCodeApp(App[None]):
             item for item in commands if token in f"{item.invocation} {item.description}".lower()
         ]
 
-    def _update_command_suggestions(self, text: str) -> None:
-        self._suggestion_matches = self._matching_command_suggestions(text)
+    def _update_command_suggestions(
+        self, text: str, cursor_location: tuple[int, int] | None = None
+    ) -> None:
+        self._suggestion_matches = self._matching_command_suggestions(text, cursor_location)
         self._suggestion_index = 0
         self._render_suggestions()
 
@@ -4284,10 +4466,12 @@ class NoahCodeApp(App[None]):
             composer.text = insertion
             composer.cursor_location = (0, len(insertion))
         else:
-            replaced = _replace_active_mention(current, insertion)
+            replaced, location = _replace_active_mention(
+                current, insertion, composer.cursor_location
+            )
             self._skip_suggestion_text = replaced
             composer.text = replaced
-            composer.cursor_location = (0, len(replaced))
+            composer.cursor_location = location
         self.close_suggestions()
         composer.focus()
         if submit:
@@ -4355,7 +4539,7 @@ class NoahCodeApp(App[None]):
             self._skip_suggestion_text = None
         else:
             self._skip_suggestion_text = None
-            self._update_command_suggestions(text)
+            self._update_command_suggestions(text, event.text_area.cursor_location)
         self._resize_composer(text)
 
     @on(ComposerTextArea.Submitted, "#composer")
@@ -4387,7 +4571,9 @@ class NoahCodeApp(App[None]):
             )
             if self._agent_state == AgentDisplayState.WAITING_APPROVAL:
                 self._set_agent_state(
-                    previous if previous in _ANIMATED_STATES else AgentDisplayState.THINKING
+                    previous
+                    if previous in _ANIMATED_STATES
+                    else (AgentDisplayState.THINKING if self.ui.busy else AgentDisplayState.READY)
                 )
                 self.update_chrome(force=True)
         return result if result is not None else ApprovalChoice.REJECT
@@ -4422,7 +4608,11 @@ class NoahCodeApp(App[None]):
                 )
                 if self._agent_state == AgentDisplayState.WAITING_INPUT:
                     self._set_agent_state(
-                        previous if previous in _ANIMATED_STATES else AgentDisplayState.THINKING
+                        previous
+                        if previous in _ANIMATED_STATES
+                        else (
+                            AgentDisplayState.THINKING if self.ui.busy else AgentDisplayState.READY
+                        )
                     )
                     self.update_chrome(force=True)
             if result is None:
@@ -4436,12 +4626,20 @@ class NoahCodeApp(App[None]):
         """Dismiss modals left on screen by a cancelled push_screen_wait await.
 
         QuestionModal can stack a TextPromptModal for its Other free-text
-        answer, so every known modal on top of the stack is released.
+        answer, and Ctrl+D can stack a DiffReviewScreen over a modal, so every
+        blocking overlay above the base screen is released cleanly.
         """
 
         with contextlib.suppress(Exception):
-            while isinstance(self.screen, (ApprovalModal, QuestionModal, TextPromptModal)):
-                self.screen.dismiss(None)
+            dismissable = (ApprovalModal, QuestionModal, TextPromptModal)
+            if any(isinstance(screen, dismissable) for screen in self.screen_stack):
+                while len(self.screen_stack) > 1 and isinstance(
+                    self.screen, (*dismissable, DiffReviewScreen, ConfirmationModal)
+                ):
+                    self.screen.dismiss(None)
+                for screen in reversed(list(self.screen_stack[1:])):
+                    if isinstance(screen, dismissable):
+                        screen.dismiss(None)
 
     @work(exclusive=True, group="keyboard-help")
     async def action_show_help(self) -> None:
@@ -4981,11 +5179,13 @@ class NoahCodeApp(App[None]):
                 )
             )
             if not choice:
+                self._pending_submit = None
                 self._pre_prompt_status = "Permission setup needed · open /model to continue"
                 self.update_chrome(force=True)
                 return False
             status = await self.host.configure_permission_mode(choice)
         except Exception as exc:  # noqa: BLE001
+            self._pending_submit = None
             self._pre_prompt_status = "Permission setup failed · open /model to retry"
             self._show_notice(f"Permission setup failed: {exc}", kind="error")
             self.update_chrome(force=True)
@@ -5018,6 +5218,7 @@ class NoahCodeApp(App[None]):
         if proceed:
             self.action_model_setup()
             return
+        self._pending_submit = None
         self._set_agent_state(AgentDisplayState.SETUP_REQUIRED)
         self._pre_prompt_status = "Setup needed · press ? for help or open /model"
         self.update_chrome(force=True)
@@ -5260,36 +5461,38 @@ class NoahCodeApp(App[None]):
 
     def _session_changed(self) -> None:
         current_session_id = self.host.meta.session_id if self.host.meta else None
+        was_uninitialized = self._session_id is None
+        active_startup_turn = was_uninitialized and (
+            self._turn_task is not None
+            or self._pending_submit is not None
+            or self._session_has_prompt
+        )
         changed_session = self._session_id is not None and current_session_id != self._session_id
         self._session_id = current_session_id
         self._agent_ready = True
+        self._base_commands = all_command_suggestions(self.host._custom_commands)
+        self._rail_dirty = True
+        if active_startup_turn:
+            self._refresh_repository_snapshot()
+            self.update_chrome(force=True)
+            return
         self._session_has_prompt = False
         self._pre_prompt_status = "Ready for your first prompt"
         self._config_commands = None
-        self._base_commands = all_command_suggestions(self.host._custom_commands)
         self._timeline_history.clear()
         self._thinking_timeline = None
-        self._rail_dirty = True
         self._refresh_repository_snapshot()
         if not changed_session:
             self._load_recent_history()
             self.update_chrome(force=True)
             return
-        if self._stream_timer is not None:
-            self._stream_timer.stop()
-            self._stream_timer = None
-        self._stream_fragments.clear()
-        self._activities.clear()
+        self._reset_transient_turn_widgets()
         self._activity_history.clear()
-        self._active_activity_id = None
         self._last_thought = ""
         self._unread_count = 0
-        self._activity_unread_lines = 0
         self._activity_expanded = False
         self._checkpoint_pending = False
-        self._activity_title_signature = None
         self.query_one("#activity-output", RichLog).clear()
-        self.query_one("#live-activity", Vertical).styles.display = "none"
         self._set_agent_state(AgentDisplayState.READY)
         self._transcript_entries.clear()
         self._transcript_event_ids.clear()
@@ -5549,11 +5752,25 @@ class NoahCodeApp(App[None]):
             return None
         return "\n".join(parts)
 
+    def on_mouse_down(self, _event: events.MouseDown) -> None:
+        self._recent_mouse_selection = None
+
+    def _consume_recent_mouse_selection(self) -> str | None:
+        recent = self._recent_mouse_selection
+        self._recent_mouse_selection = None
+        if recent is None:
+            return None
+        captured_at, text = recent
+        if not text.strip() or time.monotonic() - captured_at > 5.0:
+            return None
+        return text
+
     def on_text_selected(self, _event: events.TextSelected) -> None:
         """Copy completed Textual selections and clear them without a notice redraw."""
 
         selected = self._mouse_selection_text() or self.screen.get_selected_text() or ""
         if selected.strip():
+            self._recent_mouse_selection = (time.monotonic(), selected)
             self.copy_to_clipboard(selected)
         self.screen.clear_selection()
 
@@ -5571,14 +5788,20 @@ class NoahCodeApp(App[None]):
             # screen.get_selected_text(), which only sees mouse drags.
             field_selection = focused.selected_text
             if field_selection:
+                self._recent_mouse_selection = None
                 self.copy_to_clipboard(field_selection)
                 return
         selected = self._mouse_selection_text()
         if not selected:
             selected = self.screen.get_selected_text() or ""
         if selected.strip():
+            self._recent_mouse_selection = None
             self.copy_to_clipboard(selected)
             self._show_notice(self._copied_notice(selected), temporary=True)
+            return
+        if recent := self._consume_recent_mouse_selection():
+            self.copy_to_clipboard(recent)
+            self._show_notice(self._copied_notice(recent), temporary=True)
             return
         latest_reply = next(
             (entry.text for entry in reversed(self._transcript_entries) if entry.role == "NOAH"),
@@ -5633,8 +5856,13 @@ class NoahCodeApp(App[None]):
         # otherwise retain Noah's cancel / double-press-to-quit behavior.
         focused = self.focused
         has_field_selection = isinstance(focused, (Input, TextArea)) and bool(focused.selected_text)
-        if has_field_selection or self.screen.get_selected_text():
+        active_mouse = self._mouse_selection_text() or self.screen.get_selected_text() or ""
+        if has_field_selection or active_mouse.strip():
             self.action_copy_selection()
+            return
+        if recent := self._consume_recent_mouse_selection():
+            self.copy_to_clipboard(recent)
+            self._show_notice(self._copied_notice(recent), temporary=True)
             return
         if self.ui.busy and self._turn_task and not self._turn_task.done():
             # The host renders the "turn cancelled" status entry itself when
@@ -5642,6 +5870,10 @@ class NoahCodeApp(App[None]):
             self._set_agent_state(AgentDisplayState.CANCELLING)
             self.update_chrome(force=True)
             self.host.cancel_active_turn()
+            self._interrupt_count = 0
+            return
+        if isinstance(self.screen, (ApprovalModal, QuestionModal)):
+            self.screen.dismiss(None)
             self._interrupt_count = 0
             return
         self._interrupt_count += 1
@@ -5689,6 +5921,7 @@ class NoahCodeApp(App[None]):
             self.ui.set_busy(False)
             self.update_chrome(force=True)
             self.query_one("#composer", ComposerTextArea).focus()
+            self.call_after_refresh(self._resume_waiting_queue)
 
     def _steer_queued_label(self) -> str:
         queue = getattr(self.host, "steer_queue", None)
@@ -5859,6 +6092,11 @@ class NoahCodeApp(App[None]):
             self.close_suggestions()
             self.action_confirm_undo()
             return
+        if text in {"/exit", "/quit"}:
+            composer.text = ""
+            self.close_suggestions()
+            self.action_quit_app()
+            return
         if self._pending_submit is not None:
             return
         if slash is None and getattr(self.host, "queue_paused", False) is True:
@@ -5875,6 +6113,15 @@ class NoahCodeApp(App[None]):
             self.update_chrome(force=True)
             if self._permission_setup_required:
                 self.action_permission_setup()
+            elif self._onboarding_required:
+                self._show_notice(
+                    "Queued until a model is configured · run /model or Ctrl+L",
+                    temporary=True,
+                )
+            elif not any(
+                worker.group == "startup" and worker.is_running for worker in self.workers
+            ):
+                self._retry_startup_after_setup()
             return
         if slash is None:
             self._set_agent_state(AgentDisplayState.THINKING)
@@ -5882,12 +6129,18 @@ class NoahCodeApp(App[None]):
 
     @work(exclusive=True, group="review-open")
     async def action_review_changes(self) -> None:
-        if isinstance(self.screen, DiffReviewScreen):
+        if not self._agent_ready:
+            self._show_notice("Noah is still starting…", temporary=True)
+            return
+        if any(
+            isinstance(screen, (DiffReviewScreen, ApprovalModal, QuestionModal))
+            for screen in self.screen_stack
+        ):
             return
         try:
             review = await self.host.diff_review()
         except Exception as exc:  # noqa: BLE001
-            self.notify(f"Review unavailable: {exc}", severity="error")
+            self.notify(f"Review unavailable: {exc}", severity="error", markup=False)
             return
         self.push_screen(DiffReviewScreen(self.host, review))
 
@@ -5906,7 +6159,15 @@ class NoahCodeApp(App[None]):
         self._turn_task = asyncio.current_task()
         slash = parse_slash(text)
         team_request = slash is not None and slash[0] == "team" and bool(slash[1].strip())
-        is_agent_turn = slash is None or team_request
+        queue_resume = slash is not None and slash[0] == "queue" and slash[1].strip() == "resume"
+        attach_turn = slash is not None and slash[0] == "attach" and bool(slash[1].strip())
+        custom_turn = (
+            slash is not None
+            and slash[0] in getattr(self.host, "_custom_commands", {})
+        )
+        is_agent_turn = (
+            slash is None or team_request or queue_resume or attach_turn or custom_turn
+        )
         started_at = time.monotonic()
         turn_timeline = self._timeline_begin(
             "Team request" if team_request else "Turn started",
@@ -5930,7 +6191,7 @@ class NoahCodeApp(App[None]):
                 with contextlib.suppress(Exception):
                     before_files = await self.host.agent.git.change_fingerprints()
             action = await self.host.handle_line(text)
-            if team_request and action == "handled":
+            if (team_request or queue_resume or attach_turn) and action == "handled":
                 # Validation and paused-queue requests do not execute a turn.
                 # In particular, last_result may still describe an older run.
                 is_agent_turn = False
@@ -6027,6 +6288,9 @@ class NoahCodeApp(App[None]):
                         self._checkpoint_pending = False
                     self._append_entry(TranscriptEntry("RECEIPT", receipt))
             finally:
+                self._reset_transient_turn_widgets(
+                    state="error" if outcome in {"failed", "cancelled"} else "complete"
+                )
                 if is_agent_turn or team_request:
                     if self.host._active_turn is self._turn_task:
                         self.host._active_turn = None

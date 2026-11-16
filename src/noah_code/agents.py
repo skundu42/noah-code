@@ -155,8 +155,10 @@ def _load_markdown_agents(
         if raw is None:
             continue
         meta, body = parse_frontmatter(raw)
-        mode_raw = str(meta.get("mode") or "build").strip().lower()
-        mode: AgentMode = "plan" if mode_raw in {"plan", "readonly", "read-only"} else "build"
+        raw_mode = meta.get("mode")
+        mode_text = str(raw_mode).strip().lower() if raw_mode is not None else ""
+        # Fail closed when mode is missing or unrecognized instead of granting build mode.
+        mode: AgentMode = "build" if mode_text == "build" else "plan"
         readonly = _truthy(meta.get("readonly")) or mode == "plan"
         out[name] = AgentSpec(
             name=name,

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 from nooa import Skill, spec
 
 from noah_code.project_notes import MEMORY_RELATIVE, MemoryStore, parse_memory_facts
+
+if TYPE_CHECKING:
+    from noah_code.permissions import PermissionEngine
 
 
 class MemoryTools(Skill):
@@ -21,11 +24,13 @@ class MemoryTools(Skill):
         store: MemoryStore | None = None,
         on_change: Callable[[], None] | None = None,
         readonly: bool = False,
+        engine: PermissionEngine | None = None,
     ) -> None:
         super().__init__()
         self._store = store or MemoryStore(root)
         self._on_change = on_change
         self._readonly = readonly
+        self._engine = engine
 
     async def list(self) -> str:
         """Return remembered project conventions."""
@@ -40,6 +45,8 @@ class MemoryTools(Skill):
 
         if self._readonly:
             raise PermissionError("read-only subagents cannot save project memory")
+        if self._engine is not None and self._engine.mode == "plan":
+            raise PermissionError("plan mode forbids mutating project memory")
         facts = parse_memory_facts(fact if "\n" in fact else f"- {fact.strip()}")
         if not facts:
             raise ValueError("that fact looks empty or secret")
@@ -58,6 +65,8 @@ class MemoryTools(Skill):
 
         if self._readonly:
             raise PermissionError("read-only subagents cannot forget project memory")
+        if self._engine is not None and self._engine.mode == "plan":
+            raise PermissionError("plan mode forbids mutating project memory")
         if not fact.strip():
             raise ValueError("forget requires a fact")
         forgotten = self._store.forget(fact)

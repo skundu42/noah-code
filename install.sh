@@ -25,7 +25,13 @@ case "$(uname -m 2>/dev/null || true)" in
 esac
 
 temporary_dir="$(mktemp -d 2>/dev/null || mktemp -d -t noah-code)"
-trap 'rm -rf "$temporary_dir"' EXIT HUP INT TERM
+cleanup() {
+    rm -rf "$temporary_dir"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 download() {
     source_url="$1"
@@ -33,7 +39,7 @@ download() {
     if command -v curl >/dev/null 2>&1; then
         curl --proto '=https' --tlsv1.2 -LsSf "$source_url" -o "$destination"
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$destination" "$source_url"
+        wget --https-only --secure-protocol=TLSv1_2 -O "$destination" "$source_url"
     else
         fail "curl or wget is required to download the installer"
     fi
@@ -58,7 +64,7 @@ if uv_path="$(find_uv)"; then
 else
     say "Installing the self-contained uv package manager..."
     download "$UV_INSTALL_URL" "$temporary_dir/uv-installer.sh"
-    sh "$temporary_dir/uv-installer.sh"
+    sh "$temporary_dir/uv-installer.sh" < /dev/null
     uv_path="$(find_uv)" || fail "uv installed but could not be located"
 fi
 
@@ -68,12 +74,12 @@ if [ -n "${NOAH_CODE_VERSION:-}" ]; then
 fi
 
 say "Installing $package with a managed Python 3.12 runtime..."
-"$uv_path" tool install --managed-python --python 3.12 --no-build --force "$package"
-"$uv_path" tool update-shell >/dev/null 2>&1 || true
+"$uv_path" tool install --managed-python --python 3.12 --no-build --force "$package" < /dev/null
+"$uv_path" tool update-shell >/dev/null 2>&1 < /dev/null || true
 
 say ""
 say "Noah Code is installed. Open a new terminal, then run:"
 say ""
 say "  noah ."
 say ""
-say "Updates are installed automatically. Run 'noah update' to update immediately."
+say "Run 'noah update' to check for and install updates."

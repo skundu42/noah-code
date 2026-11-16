@@ -85,3 +85,28 @@ def test_equal_run_limits_do_not_share_or_reset_total_budget():
     proxy.reserve(payload())
     assert proxy.summary()["reserved_usd"] == pytest.approx(before * 2)
     assert [row["run"] for row in proxy.summary()["requests"]] == ["noah", "opencode"]
+
+
+def test_accepts_null_tools_and_preserves_tail_usage_over_2mb():
+    proxy = EvalProxy("selected/model", "test-secret", 1e-6, 2e-6)
+    request, _ = proxy.reserve({**payload(), "tools": None})
+    assert request["tools"] is None
+
+    proxy_two = EvalProxy("selected/model", "test-secret", 1e-6, 2e-6, max_output_tokens=16)
+    with pytest.raises(ValueError, match="output cap"):
+        EvalProxy("selected/model", "test-secret", 1e-6, 2e-6, max_output_tokens=True)  # type: ignore[arg-type]
+
+    chunks = [b"data: " + b"x" * 600_000 + b"\n\n" for _ in range(4)]
+    tail = b'data: {"usage": {"cost": 0.0042, "completion_tokens": 9}}\n\n'
+    buf = bytearray()
+    for chunk in [*chunks, tail]:
+        if len(chunk) >= 2_000_000:
+            buf = bytearray(chunk[-2_000_000:])
+        else:
+            excess = len(buf) + len(chunk) - 2_000_000
+            if excess > 0:
+                del buf[:excess]
+            buf.extend(chunk)
+    record: dict[str, object] = {}
+    proxy_two._capture_usage(bytes(buf), record)
+    assert record["usage"] == {"cost": 0.0042, "completion_tokens": 9}

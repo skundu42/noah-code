@@ -47,7 +47,6 @@ def _model(*codes):
                         arguments=json.dumps({"code": code}),
                     )
                 ],
-                assistant_message={"role": "assistant", "content": "", "tool_calls": []},
             )
             for index, code in enumerate(codes)
         ]
@@ -204,7 +203,7 @@ async def test_real_child_context_survives_reopen_and_sqlite_is_closed(tmp_path:
         tmp_path / "data",
         _model(
             'self.v.memo = "kept across restart"\n'
-            'return_result(RespondReason.DONE, explanation="memo saved")',
+            'return_result(Done(explanation="memo saved"))',
         ),
     )
     tasks = TaskTools(
@@ -228,7 +227,7 @@ async def test_real_child_context_survives_reopen_and_sqlite_is_closed(tmp_path:
         tmp_path,
         tmp_path / "data",
         _model(
-            'self.message(self.v.memo)\nreturn_result(RespondReason.DONE, explanation="continued")',
+            'self.message(self.v.memo)\nreturn_result(Done(explanation="continued"))',
         ),
     )
     resumed = TaskTools(
@@ -257,7 +256,7 @@ async def test_isolated_child_edits_only_its_worktree_and_releases_lease(tmp_pat
         _model(
             'self.message(await self.ws.read("source.txt"))\n'
             'await self.ws.write_file("source.txt", "child edit\\n")\n'
-            'return_result(RespondReason.DONE, explanation="isolated edit")',
+            'return_result(Done(explanation="isolated edit"))',
         ),
     )
     tasks = TaskTools(parent.ws._workspace, parent.engine, parent.approvals, parent=parent)
@@ -395,7 +394,7 @@ async def test_storage_close_failure_still_releases_child_worktree_lease(
         root,
         tmp_path / "data",
         _model(
-            'return_result(RespondReason.DONE, explanation="done")',
+            'return_result(Done(explanation="done"))',
         ),
     )
     original_close = SQLiteStorageManager.close
@@ -447,9 +446,9 @@ async def test_missing_retained_worktree_fails_follow_up_without_parent_fallback
         root,
         tmp_path / "data",
         _model(
-            'return_result(RespondReason.DONE, explanation="done")',
+            'return_result(Done(explanation="done"))',
             'await self.ws.write("source.txt", "unsafe fallback")\n'
-            'return_result(RespondReason.DONE, explanation="edited")',
+            'return_result(Done(explanation="edited"))',
         ),
     )
     tasks = TaskTools(parent.ws._workspace, parent.engine, parent.approvals, parent=parent)

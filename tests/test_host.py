@@ -1272,9 +1272,7 @@ async def test_steer_drain_runs_second_handle_in_same_journal_turn(
 
 @pytest.mark.asyncio
 async def test_need_input_with_queued_steer_continues(tmp_path: Path, monkeypatch) -> None:
-    from types import SimpleNamespace
-
-    from nooa.interactive import RespondReason
+    from nooa.interactive import Done, NeedInput
 
     host, queued, races = await _host_for_steer(tmp_path, monkeypatch)
     handles = {"n": 0}
@@ -1283,8 +1281,8 @@ async def test_need_input_with_queued_steer_continues(tmp_path: Path, monkeypatc
         handles["n"] += 1
         if handles["n"] == 1:
             host.steer_queue.push("use option two")
-            return SimpleNamespace(kind=RespondReason.NEED_INPUT, explanation="choose")
-        return SimpleNamespace(kind="DONE", explanation="ok")
+            return NeedInput(question="choose", reason="choose")
+        return Done(explanation="ok")
 
     monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
     result = await host._run_user_turn("ask me")
@@ -1300,16 +1298,14 @@ async def test_need_input_with_queued_steer_continues(tmp_path: Path, monkeypatc
 async def test_empty_need_input_stops_without_another_handle(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from types import SimpleNamespace
-
-    from nooa.interactive import RespondReason
+    from nooa.interactive import NeedInput
 
     host, _queued, races = await _host_for_steer(tmp_path, monkeypatch)
     handles = {"n": 0}
 
     async def handle(_agent, _notification, render=None):  # noqa: ANN001
         handles["n"] += 1
-        return SimpleNamespace(kind=RespondReason.NEED_INPUT, explanation="choose")
+        return NeedInput(question="choose", reason="choose")
 
     monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
     result = await host._run_user_turn("ask me")
@@ -1552,9 +1548,7 @@ async def test_background_wait_obeys_session_deadline(tmp_path: Path) -> None:
 async def test_waiting_run_resumes_when_background_job_finishes(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from types import SimpleNamespace
-
-    from nooa.interactive import RespondReason
+    from nooa.interactive import Done, Waiting
 
     host, _queued, races = await _host_for_steer(tmp_path, monkeypatch)
     host.agent.processes.has_running = MagicMock(return_value=True)
@@ -1563,8 +1557,8 @@ async def test_waiting_run_resumes_when_background_job_finishes(
     async def handle(_agent, _notification, render=None):  # noqa: ANN001
         handles["n"] += 1
         if handles["n"] == 1:
-            return SimpleNamespace(kind=RespondReason.WAIT, explanation="waiting for tests")
-        return SimpleNamespace(kind=RespondReason.DONE, explanation="tests passed")
+            return Waiting(explanation="waiting for tests", on=["job-1"])
+        return Done(explanation="tests passed")
 
     monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
     turn = asyncio.create_task(host._run_user_turn("run the full suite"))
@@ -1593,9 +1587,7 @@ async def test_wait_with_latched_terminal_emit_does_not_fail(
 ) -> None:
     """A terminal emit racing the WAIT clear() is a normal wake, not a failure."""
 
-    from types import SimpleNamespace
-
-    from nooa.interactive import RespondReason
+    from nooa.interactive import Done, Waiting
 
     host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
     host.agent.processes.has_running = MagicMock(return_value=False)
@@ -1605,8 +1597,8 @@ async def test_wait_with_latched_terminal_emit_does_not_fail(
         handles["n"] += 1
         if handles["n"] == 1:
             host._wake_event.set()  # terminal emit fires before the clear()
-            return SimpleNamespace(kind=RespondReason.WAIT, explanation="waiting for tests")
-        return SimpleNamespace(kind=RespondReason.DONE, explanation="tests passed")
+            return Waiting(explanation="waiting for tests", on=["job-1"])
+        return Done(explanation="tests passed")
 
     monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
     result = await asyncio.wait_for(host._run_user_turn("run the full suite"), timeout=3)
@@ -1623,9 +1615,7 @@ async def test_wait_terminal_emit_between_clear_and_persist_does_not_fail(
 ) -> None:
     """A terminal emit while persisting WAIT must survive until the waiter sees it."""
 
-    from types import SimpleNamespace
-
-    from nooa.interactive import RespondReason
+    from nooa.interactive import Done, Waiting
 
     host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
     running = {"value": True}
@@ -1635,8 +1625,8 @@ async def test_wait_terminal_emit_between_clear_and_persist_does_not_fail(
     async def handle(_agent, _notification, render=None):  # noqa: ANN001
         handles["n"] += 1
         if handles["n"] == 1:
-            return SimpleNamespace(kind=RespondReason.WAIT, explanation="waiting for tests")
-        return SimpleNamespace(kind=RespondReason.DONE, explanation="tests passed")
+            return Waiting(explanation="waiting for tests", on=["job-1"])
+        return Done(explanation="tests passed")
 
     assert host._runtime is not None  # noqa: SLF001
     original_transition = host._runtime.transition_run  # noqa: SLF001
@@ -1661,9 +1651,7 @@ async def test_wait_terminal_emit_between_clear_and_persist_does_not_fail(
 async def test_wait_without_terminal_emit_exits_cleanly(tmp_path: Path, monkeypatch) -> None:
     """A missing terminal emit must not hang the turn forever."""
 
-    from types import SimpleNamespace
-
-    from nooa.interactive import RespondReason
+    from nooa.interactive import Waiting
 
     host, _queued, _races = await _host_for_steer(tmp_path, monkeypatch)
     host._wake_timeout_seconds = 0.01
@@ -1678,7 +1666,7 @@ async def test_wait_without_terminal_emit_exits_cleanly(tmp_path: Path, monkeypa
 
     async def handle(_agent, _notification, render=None):  # noqa: ANN001
         handles["n"] += 1
-        return SimpleNamespace(kind=RespondReason.WAIT, explanation="waiting")
+        return Waiting(explanation="waiting", on=["job-1"])
 
     monkeypatch.setattr("noah_code.host._handle_with_overflow_recovery", handle)
     result = await asyncio.wait_for(host._run_user_turn("run the full suite"), timeout=5)

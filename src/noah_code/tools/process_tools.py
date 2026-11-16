@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import tempfile
 import time
 import uuid
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from nooa import Skill, hidden, spec
 
+from noah_code.permissions import PermissionCategory
 from noah_code.tools.workspace_tools import WorkspaceTools
 from noah_code.verification import CheckRecord
 
@@ -47,6 +49,7 @@ class BackgroundJob:
     process: asyncio.subprocess.Process
     log_path: Path | None = None
     kind: str = "process"
+    cwd: Path | None = None
     started_at: float = field(default_factory=time.monotonic)
     finished_at: float | None = None
     returncode: int | None = None
@@ -163,7 +166,7 @@ class ProcessTools(Skill):
         runtime = min(self._max_runtime if timeout is None else timeout, self._max_runtime)
         if not runtime > 0:
             raise ValueError("timeout must be positive")
-        argv = (executable,) if os.name == "nt" else (executable, "-l")
+        argv = (executable, "/Q") if os.name == "nt" else (executable, "-l")
         job = await self._launch(
             argv,
             command=f"[terminal] {executable}",
@@ -202,19 +205,28 @@ class ProcessTools(Skill):
             if os.name == "nt":
                 payload = f"{command}\r\necho {marker}:%errorlevel%\r\n"
             else:
-                payload = f"{command}\nprintf '\\n{marker}:%s\\n' \"$?\"\n"
+                payload = (
+                    f"{command}\n"
+                    f"__noah_rc=$?; {{ set +x; }} 2>/dev/null; printf '\\n{marker}:%s\\n' \"$__noah_rc\"\n"
+                )
             check = await self._ws._verification.begin(
-                command, source=f"{self._ws._verification_source}:terminal:{job.name}"
+                command,
+                source=f"{self._ws._verification_source}:terminal:{job.name}",
+                cwd=job.cwd or self._ws._workspace.root,
             )
             returncode = None
             try:
                 await self._write_input(job, payload)
-                output, returncode = await self._wait_for_terminal_marker(
-                    job,
-                    cursor=cursor,
-                    marker=marker,
-                    timeout=wait_timeout,
-                )
+                try:
+                    output, returncode = await self._wait_for_terminal_marker(
+                        job,
+                        cursor=cursor,
+                        marker=marker,
+                        timeout=wait_timeout,
+                    )
+                except TimeoutError:
+                    await self._interrupt_terminal(job)
+                    raise
             finally:
                 await self._ws._verification.finish(check, returncode)
         bounded = output.strip()
@@ -289,6 +301,7 @@ class ProcessTools(Skill):
                 process=process,
                 log_path=log_path,
                 kind=kind,
+                cwd=self._ws._workspace.root,
                 check=check,
             )
             self._jobs[job_id] = job
@@ -343,7 +356,7 @@ class ProcessTools(Skill):
         if selected not in self._jobs and self._runtime is not None:
             return self._durable_logs(selected, cursor=cursor, max_chars=max_chars)
         job = self._job(selected)
-        limit = min(max(max_chars, 1000), 32_000)
+        limit = min(max(max_chars, 1000), 65_536)
         events = [event for event in job.events if event.sequence > cursor]
         retained_from = job.events[0].sequence if job.events else job.next_sequence
         rows: list[str] = []
@@ -386,7 +399,7 @@ class ProcessTools(Skill):
             active_ids = set(self._jobs)
             rows.extend(
                 self._durable_status_line(record)
-                for record in self._runtime.jobs()
+                for record in self._runtime.jobs(limit=500)
                 if str(record["job_id"]) not in active_ids
             )
         return "\n".join(rows) or "(no background jobs)"
@@ -403,6 +416,14 @@ class ProcessTools(Skill):
             raise RuntimeError(
                 f"job {job.id} is a managed terminal; use terminal_run so commands are approved"
             )
+        if self._ws._engine.mode == "plan":
+            raise PermissionError("plan mode forbids sending interactive process input")
+        await self._ws._approvals.require(
+            self._ws._engine.decide(
+                PermissionCategory.BASH, f"input:{job.command}", tool="process_input"
+            )
+        )
+        self._ws._journal.mark_shell_bypass()
         payload = text + ("\n" if newline else "")
         await self._write_input(job, payload)
         return f"sent {len(payload.encode())} bytes to job {job.id}"
@@ -425,18 +446,48 @@ class ProcessTools(Skill):
     ) -> str:
         """Stop one owned process group, escalating to kill after a grace period."""
         job = self._job(job_id)
-        if job.state != "running":
+        if job.state in {"completed", "failed", "stopped"}:
             return self._status_line(job)
-        job.state = "stopping"
-        if self._runtime is not None:
-            with contextlib.suppress(Exception):
-                self._runtime.update_job(job.id, "stopping")
+        if job.state == "running":
+            job.state = "stopping"
+            if self._runtime is not None:
+                with contextlib.suppress(Exception):
+                    self._runtime.update_job(job.id, "stopping")
         await self._terminate(job)
         await asyncio.gather(
             *(task for task in job.tasks if task.get_name().endswith("-wait")),
             return_exceptions=True,
         )
         return self._status_line(job)
+
+    async def _interrupt_terminal(self, job: BackgroundJob) -> None:
+        process = getattr(job, "process", None)
+        if process is None or process.returncode is not None:
+            return
+        if os.name == "nt":
+            with contextlib.suppress(OSError):
+                process.terminate()
+            return
+        child_pids: list[int] = []
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            probe = await asyncio.to_thread(
+                subprocess.run,
+                ["pgrep", "-P", str(process.pid)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if probe.returncode == 0:
+                child_pids = [int(tok) for tok in probe.stdout.split() if tok.isdigit()]
+        if child_pids:
+            for cpid in child_pids:
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.kill(cpid, signal.SIGINT)
+        else:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                process.send_signal(signal.SIGINT)
 
     def summary(self) -> str:
         """Bounded live context for the agent; never includes process output."""
@@ -682,29 +733,31 @@ class ProcessTools(Skill):
         job: BackgroundJob,
         readers: tuple[asyncio.Task[Any], asyncio.Task[Any]],
     ) -> None:
-        returncode = await job.process.wait()
-        await self._close_stdin(job)
-        await asyncio.gather(*readers, return_exceptions=True)
-        if job.state == "running":
-            job.state = "completed" if returncode == 0 else "failed"
-        elif job.state == "stopping":
-            job.state = "stopped"
-        job.returncode = returncode
-        await self._ws._verification.finish(
-            job.check, returncode if job.state in {"completed", "failed"} else None
-        )
-        job.finished_at = time.monotonic()
-        job.output_event.set()
-        if self._runtime is not None:
-            try:
-                self._runtime.update_job(job.id, job.state, returncode=returncode)
-            except Exception as exc:
-                # Durable bookkeeping must never suppress the terminal
-                # lifecycle event; the host is waiting on it to wake up.
-                with contextlib.suppress(Exception):
-                    self._append(job, "stderr", f"[noah] runtime state update failed: {exc!r}")
-        self._emit(job, f"{job.state} exit={returncode}", terminal=True)
-        self._close_transport(job.process)
+        try:
+            returncode = await job.process.wait()
+            await self._close_stdin(job)
+            await asyncio.gather(*readers, return_exceptions=True)
+            if job.state == "running":
+                job.state = "completed" if returncode == 0 else "failed"
+            elif job.state == "stopping":
+                job.state = "stopped"
+            job.returncode = returncode
+            await self._ws._verification.finish(
+                job.check, returncode if job.state in {"completed", "failed"} else None
+            )
+            job.finished_at = time.monotonic()
+            job.output_event.set()
+            if self._runtime is not None:
+                try:
+                    self._runtime.update_job(job.id, job.state, returncode=returncode)
+                except Exception as exc:
+                    # Durable bookkeeping must never suppress the terminal
+                    # lifecycle event; the host is waiting on it to wake up.
+                    with contextlib.suppress(Exception):
+                        self._append(job, "stderr", f"[noah] runtime state update failed: {exc!r}")
+            self._emit(job, f"{job.state} exit={returncode}", terminal=True)
+        finally:
+            self._close_transport(job.process)
         await asyncio.sleep(0)
 
     async def _expire(self, job: BackgroundJob, timeout: float) -> None:
@@ -806,7 +859,7 @@ class ProcessTools(Skill):
         rows: list[str] = []
         used = 0
         next_cursor = cursor
-        limit = min(max(max_chars, 1000), 32_000)
+        limit = min(max(max_chars, 1000), 65_536)
         if path.is_file():
             for raw in self._tail_lines(path, limit):
                 try:

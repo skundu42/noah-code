@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from nooa.llm_types import LLMUsage
 from pydantic import BaseModel
 
 from noah_code import codex_client, codex_rpc
@@ -93,13 +94,13 @@ async def test_text_stream_usage_and_isolation(monkeypatch):
             [{"role": "system", "content": "Noah system"}, {"role": "user", "content": "Hi"}]
         )
     assert result.content == "Hello"
-    assert result.usage == {
-        "prompt_tokens": 20,
-        "completion_tokens": 5,
-        "total_tokens": 25,
-        "cached_tokens": 10,
-        "reasoning_tokens": 2,
-    }
+    assert result.usage == LLMUsage(
+        input_tokens=20,
+        output_tokens=5,
+        total_tokens=25,
+        cached_input_tokens=10,
+        reasoning_tokens=2,
+    )
     assert client.context_window == 100_000
     assert server.closed
     assert [value.kind for value in events] == ["start", "text", "finish"]
@@ -134,7 +135,7 @@ async def test_tool_call_returns_to_noah_without_executing_and_history_round_tri
     _, history, continuation = _prepare_messages(
         [
             {"role": "user", "content": "Do it"},
-            result.assistant_message,
+            dict(result),
             {"role": "tool", "tool_call_id": "call-1", "content": "1"},
         ]
     )
@@ -210,7 +211,8 @@ async def test_structured_output_and_cancellation(monkeypatch):
     )
     monkeypatch.setattr(codex_client, "CodexAppServer", lambda: server)
     result = await CodexClient("codex/test").acall([], output_model=Answer)
-    assert result.content == Answer(answer=42)
+    assert result.parsed == Answer(answer=42)
+    assert json.loads(result.content) == {"answer": 42}
     assert dict(server.requests)["turn/start"]["outputSchema"] == Answer.model_json_schema()
     server = Server([])
     events = []
@@ -242,7 +244,7 @@ async def test_nooa_codeact_executes_returned_dynamic_tool_through_noah(tmp_path
     from noah_code.sessions import SessionStore
     from noah_code.workspace import Workspace
 
-    code = 'self.message("Codex bridge answer")\nreturn_result(RespondReason.DONE, explanation="complete")'
+    code = 'self.message("Codex bridge answer")\nreturn_result(Done(explanation="complete"))'
     first = Server(
         [
             event(
@@ -299,10 +301,14 @@ async def test_nooa_codeact_executes_returned_dynamic_tool_through_noah(tmp_path
     assert any("Codex bridge answer" in value.text for value in events)
     assert first.closed and second.closed
     history = dict(second.requests)["thread/inject_items"]["items"]
+    turn_input = dict(second.requests)["turn/start"]["input"]
     assert any(
-        item.get("type") == "function_call_output" and "tool output" in item["output"]
+        item.get("type") == "function_call_output"
+        and item.get("call_id") == "call-1"
+        and item.get("output")
         for item in history
     )
+    assert "tool output" in json.dumps([*history, *turn_input])
 
 
 def test_model_constructor_routes_without_litellm_account_auth(monkeypatch):

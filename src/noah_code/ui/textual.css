@@ -394,7 +394,7 @@ DiffReviewScreen {
 #onboarding-dialog {
     width: 78;
     max-width: 94%;
-    padding: 2 3;
+    padding: 1 2;
     border: round $nc-accent;
 }
 
@@ -406,13 +406,13 @@ DiffReviewScreen {
 
 #onboarding-lead {
     height: auto;
-    margin: 1 0 2 0;
+    margin: 0 0 1 0;
     color: $nc-text;
 }
 
 #onboarding-steps {
     height: auto;
-    padding: 1 2;
+    padding: 0 2;
     background: $nc-canvas;
     border-left: thick $nc-accent;
 }
@@ -544,7 +544,8 @@ DiffReviewScreen {
 
 #confirmation-body {
     height: auto;
-    max-height: 14;
+    max-height: 8;
+    overflow-y: auto;
     margin-bottom: 1;
 }
 
@@ -599,7 +600,19 @@ DiffReviewScreen {
 
 #approval-body {
     height: auto;
+    max-height: 5;
+    overflow-y: auto;
     margin-bottom: 1;
+}
+
+#question-list {
+    height: auto;
+    max-height: 8;
+    min-height: 3;
+    background: $nc-canvas;
+    border: none;
+    scrollbar-color: $nc-border;
+    scrollbar-background: $nc-canvas;
 }
 
 ApprovalModal #approval-dialog {

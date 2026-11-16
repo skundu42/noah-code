@@ -115,10 +115,19 @@ def _acquire_auto_update_lock(
 def _release_auto_update_lock(handle: typing.IO[str] | None) -> None:
     if handle is None:
         return
+    held_identity: tuple[int, int] | None = None
+    with contextlib.suppress(OSError, ValueError):
+        stat = os.fstat(handle.fileno())
+        held_identity = (stat.st_dev, stat.st_ino)
     with contextlib.suppress(OSError):
         handle.close()
+    lock_path = _lock_path()
     with contextlib.suppress(OSError):
-        _lock_path().unlink()
+        if held_identity is not None:
+            current = lock_path.stat()
+            if (current.st_dev, current.st_ino) != held_identity:
+                return
+        lock_path.unlink()
 
 
 def find_uv() -> Path | None:
@@ -127,6 +136,7 @@ def find_uv() -> Path | None:
         Path(configured).expanduser() if configured else None,
         Path(found) if (found := shutil.which("uv")) else None,
         Path.home() / ".local" / "bin" / "uv",
+        Path.home() / ".cargo" / "bin" / "uv",
     ]
     for candidate in candidates:
         if candidate and candidate.is_file() and os.access(candidate, os.X_OK):
@@ -209,15 +219,19 @@ def maybe_auto_update(*, interval_hours: int, timeout: float) -> str | None:
         return None
     state = _read_state()
     now = time.time()
-    checked_at = state.get("checked_at", 0)
-    if isinstance(checked_at, int | float) and now - checked_at < interval_hours * 3600:
+    auto_checked_at = state.get("auto_checked_at", 0)
+    if isinstance(auto_checked_at, int | float) and now - auto_checked_at < interval_hours * 3600:
         return None
 
     lock = _acquire_auto_update_lock()
     if lock is None:
         return None  # another process is already updating
     try:
-        next_state: dict[str, object] = {"checked_at": now, "current": __version__}
+        next_state: dict[str, object] = {
+            "auto_checked_at": now,
+            "checked_at": now,
+            "current": __version__,
+        }
         try:
             status = check_for_update(timeout=timeout)
             next_state["latest"] = status.latest
@@ -256,6 +270,8 @@ def maybe_check_for_update(*, interval_hours: int, timeout: float) -> UpdateStat
         return None
 
     next_state: dict[str, object] = {"checked_at": now, "current": __version__}
+    if "auto_checked_at" in state:
+        next_state["auto_checked_at"] = state["auto_checked_at"]
     try:
         status = check_for_update(timeout=timeout)
         next_state["latest"] = status.latest

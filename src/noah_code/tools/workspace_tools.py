@@ -40,7 +40,7 @@ from noah_code.permissions import (
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tool_output import ToolOutputStore
 from noah_code.verification import CheckLedger
-from noah_code.workspace import Workspace, WorkspaceError
+from noah_code.workspace import Workspace
 
 if TYPE_CHECKING:
     from noah_code.runtime_state import RuntimeStateStore
@@ -204,8 +204,7 @@ class WorkspaceTools(Skill):
     All mutating operations go through the permission engine. Prefer
     Match-based ``replace`` over rewriting whole files. Familiar ``list``,
     ``edit``, and ``write`` aliases are available for model compatibility.
-    Paths are canonicalized and must remain inside the workspace unless
-    ``external_directory`` is approved.
+    Paths are canonicalized and must remain inside the active workspace.
     """
 
     def __init__(
@@ -584,7 +583,10 @@ class WorkspaceTools(Skill):
                         f"stale edit anchor: {self._workspace.relpath(resolved)} changed "
                         "since read(); call read() again to refresh the Match"
                     )
-            return self._native_replace_match(resolved, match, new_text)
+            result = self._native_replace_match(resolved, match, new_text)
+            if self._lsp is not None:
+                await self._lsp.sync_paths([resolved])
+            return result
         if isinstance(match, str):
             if new is None:
                 raise ValueError(
@@ -592,7 +594,10 @@ class WorkspaceTools(Skill):
                     "Did you mean replace(match, new_text)?"
                 )
             resolved = await self._authorize_path(match, PermissionCategory.EDIT, tool="ws_edit")
-            return self._native_replace_string(resolved, match, new_text, new)
+            result = self._native_replace_string(resolved, match, new_text, new)
+            if self._lsp is not None:
+                await self._lsp.sync_paths([resolved])
+            return result
         raise TypeError("replace expects a Match or path string")
 
     async def edit(
@@ -618,7 +623,10 @@ class WorkspaceTools(Skill):
         if not isinstance(content, str):
             raise TypeError("write_file(path, content) requires the full file content as a string")
         resolved = await self._authorize_path(path, PermissionCategory.EDIT, tool="write_file")
-        return self._commit_file_write(resolved, content.encode("utf-8"), content)
+        result = self._commit_file_write(resolved, content.encode("utf-8"), content)
+        if self._lsp is not None:
+            await self._lsp.sync_paths([resolved])
+        return result
 
     def _commit_file_write(
         self, resolved: Path, data: bytes, content: str, *, mode: int | None = None,
@@ -637,6 +645,7 @@ class WorkspaceTools(Skill):
             self._journal.discard_mutation(mut)
             self._rollback_durable_file_operation(durable)
             raise
+        self._refresh_read_fingerprint(resolved)
         result = result or written
         if oversized:
             result.message += self._durable_skip_note()
@@ -673,7 +682,12 @@ class WorkspaceTools(Skill):
         async with self._coordinator.lock:
             return await self._apply_patch_locked(changes)
 
-    async def _apply_patch_locked(self, changes: PatchChanges) -> str:
+    async def _apply_patch_locked(
+        self,
+        changes: PatchChanges,
+        *,
+        preauthorized: set[Path] | None = None,
+    ) -> str:
         example = 'apply_patch([{"path": "file.py", "old": "exact old text", "new": "new text"}])'
         if not isinstance(changes, list):
             raise TypeError(f"patch changes must be a list of dictionaries; use {example}")
@@ -700,9 +714,16 @@ class WorkspaceTools(Skill):
             for key in ("old", "new"):
                 if raw[key] is not None and not isinstance(raw[key], str):
                     raise TypeError(f"patch {key} must be a string or None for {path}; use {example}")
-            resolved = await self._authorize_path(
-                path, PermissionCategory.EDIT, tool="apply_patch"
-            )
+            if preauthorized is not None:
+                resolved = self._workspace.resolve(path)
+                if resolved not in preauthorized:
+                    resolved = await self._authorize_path(
+                        path, PermissionCategory.EDIT, tool="apply_patch"
+                    )
+            else:
+                resolved = await self._authorize_path(
+                    path, PermissionCategory.EDIT, tool="apply_patch"
+                )
             if resolved in seen:
                 raise ValueError(f"patch target repeated: {path}")
             seen.add(resolved)
@@ -751,19 +772,22 @@ class WorkspaceTools(Skill):
                 after = None
                 operation = "delete"
             else:
-                if old == "":
+                if old == "" and (before or "") != "":
                     raise ValueError(
                         f"update requires nonempty old text in {item['path']}; "
                         "use write(path, content) to replace an empty file"
                     )
                 current_text = before or ""
-                occurrences = current_text.count(old)
-                if occurrences != 1:
-                    raise ValueError(
-                        f"update preimage must match exactly once in {item['path']} "
-                        f"(found {occurrences})"
-                    )
-                after = current_text.replace(old, new, 1)
+                if old == "":
+                    after = new
+                else:
+                    occurrences = current_text.count(old)
+                    if occurrences != 1:
+                        raise ValueError(
+                            f"update preimage must match exactly once in {item['path']} "
+                            f"(found {occurrences})"
+                        )
+                    after = current_text.replace(old, new, 1)
                 operation = "update"
             candidate_bytes = after.encode("utf-8") if after is not None else None
             if candidate_bytes is not None:
@@ -844,6 +868,12 @@ class WorkspaceTools(Skill):
                 self._journal.record_postimage(mutation, item["resolved"])
             if durable_operations and self._runtime is not None:
                 self._runtime.complete_file_operations(durable_operations)
+            for item in prepared:
+                target = cast(Path, item["resolved"])
+                if item["after_bytes"] is None:
+                    self._read_fingerprints.pop(str(target), None)
+                else:
+                    self._refresh_read_fingerprint(target)
         except Exception as exc:
             rollback_error: Exception | None = None
             try:
@@ -872,6 +902,7 @@ class WorkspaceTools(Skill):
 
         rows = ["Applied atomic patch:"]
         changed_paths: list[str] = []
+        deleted_paths: list[str] = []
         for item in prepared:
             before_lines = (item["before"] or "").splitlines()
             after_lines = (item["after"] or "").splitlines()
@@ -882,6 +913,10 @@ class WorkspaceTools(Skill):
             rows.append(f"  {marker} {item['path']}  +{additions} -{deletions}")
             if item["after"] is not None:
                 changed_paths.append(item["path"])
+            else:
+                deleted_paths.append(item["path"])
+        if self._lsp is not None and deleted_paths:
+            await self._lsp.sync_paths(deleted_paths)
         if self._lsp is not None and changed_paths:
             diagnostics = await self._lsp.diagnostics_for_paths(changed_paths)
             rows.append("Diagnostics:")
@@ -916,36 +951,46 @@ class WorkspaceTools(Skill):
         if not diff_text or not diff_text.strip():
             raise ValueError("diff text is required")
         parsed = parse_unified_diff(diff_text)
-        changes: list[dict[str, str | None]] = []
-        for file_diff in parsed:
-            resolved = await self._authorize_path(
-                file_diff.path, PermissionCategory.EDIT, tool="apply_patch"
-            )
-            current: str | None = None
-            if not file_diff.is_create:
-                try:
-                    data = resolved.read_bytes()
-                except OSError as exc:
-                    raise ValueError(f"cannot read patch target {file_diff.path}: {exc}") from exc
-                if b"\0" in data or len(data) > self._journal.blob_limit:
-                    raise ValueError(
-                        f"binary or oversized patch targets are not supported: {file_diff.path}"
+        async with self._coordinator.lock:
+            changes: list[dict[str, str | None]] = []
+            preauthorized: set[Path] = set()
+            for file_diff in parsed:
+                resolved = await self._authorize_path(
+                    file_diff.path, PermissionCategory.EDIT, tool="apply_patch"
+                )
+                preauthorized.add(resolved)
+                current: str | None = None
+                if not file_diff.is_create:
+                    rel = self._workspace.relpath(resolved)
+                    read_decision = self._engine.decide(
+                        PermissionCategory.READ, rel, tool="apply_patch"
                     )
-                try:
-                    current = data.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise ValueError(
-                        f"non-UTF-8 patch targets are not supported: {file_diff.path}"
-                    ) from exc
-            materialized = materialize_change(file_diff, current)
-            changes.append(
-                {
-                    "path": str(resolved),
-                    "old": materialized.old,
-                    "new": materialized.new,
-                }
-            )
-        report = await self.apply_patch(changes)
+                    await self._approvals.require(read_decision)
+                    if is_secret_path(rel):
+                        raise PermissionError(f"cannot read protected path: {rel}")
+                    try:
+                        data = resolved.read_bytes()
+                    except OSError as exc:
+                        raise ValueError(f"cannot read patch target {file_diff.path}: {exc}") from exc
+                    if b"\0" in data or len(data) > self._journal.blob_limit:
+                        raise ValueError(
+                            f"binary or oversized patch targets are not supported: {file_diff.path}"
+                        )
+                    try:
+                        current = data.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise ValueError(
+                            f"non-UTF-8 patch targets are not supported: {file_diff.path}"
+                        ) from exc
+                materialized = materialize_change(file_diff, current)
+                changes.append(
+                    {
+                        "path": str(resolved),
+                        "old": materialized.old,
+                        "new": materialized.new,
+                    }
+                )
+            report = await self._apply_patch_locked(changes, preauthorized=preauthorized)
         return f"Applied unified diff ({len(parsed)} file(s)):\n{report}"
 
     async def run(
@@ -1001,7 +1046,9 @@ class WorkspaceTools(Skill):
                 await self._verification.finish(
                     check, result.returncode if result is not None else None
                 )
-        self._absolutize_harvested_matches(result)
+            self._absolutize_harvested_matches(result)
+            if mutating:
+                self._read_fingerprints.clear()
         if self._on_shell_chunk is not None:
             with contextlib.suppress(Exception):
                 if result.stdout:
@@ -1049,6 +1096,8 @@ class WorkspaceTools(Skill):
                 # NOOA updates BashSession.cwd after a streamed command but
                 # currently leaves ShellTools.cwd stale.
                 self._shell.cwd = self._shell.session.cwd.resolve()
+                if mutating:
+                    self._read_fingerprints.clear()
 
     def _shell_decision(self, command: str, *, tool: str = "ws_run") -> PermissionDecision:
         decision = self._engine.decide(PermissionCategory.BASH, command, tool=tool)
@@ -1212,6 +1261,17 @@ class WorkspaceTools(Skill):
             del self._read_fingerprints[oldest]
         self._read_fingerprints[str(resolved)] = digest
 
+    def _refresh_read_fingerprint(self, resolved: Path) -> None:
+        try:
+            size = resolved.stat().st_size
+        except OSError:
+            self._read_fingerprints.pop(str(resolved), None)
+            return
+        if size <= self._journal.blob_limit:
+            self._record_read_fingerprint(resolved)
+        else:
+            self._read_fingerprints.pop(str(resolved), None)
+
     @staticmethod
     def _hash_path(path: Path) -> str | None:
         try:
@@ -1232,14 +1292,25 @@ class WorkspaceTools(Skill):
         temp+fsync+rename.
         """
 
-        if not old:
-            raise ValueError(
-                "replace(path, old_text, new_text) requires nonempty old_text; "
-                "use write(path, content) to replace an empty file"
-            )
         data = resolved.read_bytes()
         if b"\0" in data:
             raise ValueError("binary files are not editable via replace()")
+        if not old:
+            if not (data == b"" and str(resolved) in self._read_fingerprints):
+                raise ValueError(
+                    "replace(path, old_text, new_text) requires nonempty old_text; "
+                    "use write(path, content) to replace an empty file"
+                )
+            mode = resolved.stat().st_mode & 0o7777
+            result = FileWrite(
+                path=path_display,
+                message=f"Edited {path_display}",
+                diff=f"--- a/{path_display}\n+++ b/{path_display}",
+                new_text=new,
+            )
+            return self._commit_file_write(
+                resolved, new.encode("utf-8"), new, mode=mode, result=result
+            )
         codec = "utf-8"
         try:
             text = data.decode(codec)
@@ -1292,6 +1363,18 @@ class WorkspaceTools(Skill):
         total = len(all_lines)
         start = int(match.start)
         end = int(match.end)
+        if total == 0 and start == 1 and end == 0 and match.text == "":
+            mode = resolved.stat().st_mode & 0o7777
+            diff = f"--- a/{match.path}\n+++ b/{match.path}\n@@ -0,0 +1 @@\n"
+            result = FileWrite(
+                path=match.path,
+                message=f"Edited {match.path} (populated empty file)",
+                diff=diff,
+                new_text=new_text,
+            )
+            return self._commit_file_write(
+                resolved, new_text.encode(codec), new_text, mode=mode, result=result
+            )
         if not 1 <= start <= end <= total:
             raise ValueError(
                 f"stale edit anchor: {self._workspace.relpath(resolved)} has {total} lines "
@@ -1501,23 +1584,9 @@ class WorkspaceTools(Skill):
         )
 
     async def _authorize_path(self, path: str, category: str, *, tool: str = "") -> Path:
-        try:
-            resolved = self._workspace.resolve(path)
-            rel = str(resolved.relative_to(self._workspace.root))
-            decision = self._engine.decide(category, rel, tool=tool)
-        except WorkspaceError as exc:
-            abs_path = Path(path).expanduser()
-            if not abs_path.is_absolute():
-                abs_path = (self._workspace.root / path).resolve()
-            else:
-                abs_path = abs_path.resolve()
-            decision = self._engine.decide(
-                PermissionCategory.EXTERNAL_DIRECTORY, str(abs_path), tool=tool
-            )
-            await self._approvals.require(decision)
-            raise WorkspaceError(
-                f"path outside workspace requires dedicated external handling: {path}"
-            ) from exc
+        resolved = self._workspace.resolve(path)
+        rel = str(resolved.relative_to(self._workspace.root))
+        decision = self._engine.decide(category, rel, tool=tool)
         await self._approvals.require(decision)
         return resolved
 

@@ -282,6 +282,30 @@ DEFAULT_PERMISSION_RULES: list[PermissionRule] = [
     ),
     PermissionRule(
         category="read",
+        pattern="**/.mcp.json",
+        action="deny",
+        reason="MCP secret config denied",
+    ),
+    PermissionRule(
+        category="read",
+        pattern="**/auth.json",
+        action="deny",
+        reason="auth credential store denied",
+    ),
+    PermissionRule(
+        category="read",
+        pattern="**/.noah-code/mcp.json",
+        action="deny",
+        reason="MCP secret config denied",
+    ),
+    PermissionRule(
+        category="read",
+        pattern="**/noah-code/mcp.json",
+        action="deny",
+        reason="MCP secret config denied",
+    ),
+    PermissionRule(
+        category="read",
         pattern="**/.env.*",
         action="deny",
         reason="secret env files denied",

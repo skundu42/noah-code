@@ -31,12 +31,16 @@ _METADATA_PREFIXES = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass
 class Hunk:
     """One ``@@`` hunk; line bodies carry no trailing newlines."""
 
     old_start: int  # 1-indexed
     entries: list[str] = field(default_factory=list)
+    old_count: int | None = None
+    new_count: int | None = None
+    old_no_eol: bool = False
+    new_no_eol: bool = False
 
     @property
     def before(self) -> list[str]:
@@ -117,13 +121,33 @@ def parse_unified_diff(diff_text: str) -> list[FileDiff]:
             raise ValueError("diff header lacks a usable file path")
 
         hunks: list[Hunk] = []
-        old_no_eol = False
-        new_no_eol = False
+        seen_old = 0
+        seen_new = 0
         while index < total:
             entry = lines[index]
             header = _HUNK_HEADER.match(entry)
             if header is not None:
-                hunks.append(Hunk(old_start=int(header.group(1))))
+                old_start = int(header.group(1))
+                old_count = (
+                    int(header.group(2))
+                    if header.group(2) is not None
+                    else (1 if old_start > 0 else 0)
+                )
+                new_start = int(header.group(3))
+                new_count = (
+                    int(header.group(4))
+                    if header.group(4) is not None
+                    else (1 if new_start > 0 else 0)
+                )
+                hunks.append(
+                    Hunk(
+                        old_start=old_start,
+                        old_count=old_count,
+                        new_count=new_count,
+                    )
+                )
+                seen_old = 0
+                seen_new = 0
                 index += 1
                 continue
             if entry.startswith("@@"):
@@ -132,12 +156,32 @@ def parse_unified_diff(diff_text: str) -> list[FileDiff]:
                 if hunks and hunks[-1].entries:
                     previous = hunks[-1].entries[-1][0]
                     if previous in {" ", "-"}:
-                        old_no_eol = True
+                        hunks[-1].old_no_eol = True
                     if previous in {" ", "+"}:
-                        new_no_eol = True
+                        hunks[-1].new_no_eol = True
                 index += 1
                 continue
             if entry == "":
+                current_hunk = hunks[-1] if hunks else None
+                next_line = lines[index + 1] if index + 1 < total else ""
+                separator_ahead = next_line.startswith("diff --git ") or (
+                    next_line.startswith("--- ")
+                    and index + 2 < total
+                    and lines[index + 2].startswith("+++ ")
+                )
+                if _HUNK_HEADER.match(next_line):
+                    index += 1
+                    continue
+                needs_context = (
+                    current_hunk is not None
+                    and current_hunk.old_count is not None
+                    and current_hunk.new_count is not None
+                    and seen_old < current_hunk.old_count
+                    and seen_new < current_hunk.new_count
+                    and not separator_ahead
+                )
+                if not needs_context:
+                    break
                 entry = " "
             # A '-x' line that is immediately followed by '+++' is the next
             # file's header, not a removal (standard unified-diff heuristic).
@@ -149,6 +193,10 @@ def parse_unified_diff(diff_text: str) -> list[FileDiff]:
                 break
             if hunks and entry[0] in {" ", "+", "-"}:
                 hunks[-1].entries.append(entry)
+                if entry[0] in {" ", "-"}:
+                    seen_old += 1
+                if entry[0] in {" ", "+"}:
+                    seen_new += 1
                 index += 1
                 continue
             break
@@ -161,8 +209,8 @@ def parse_unified_diff(diff_text: str) -> list[FileDiff]:
                 is_create=is_create,
                 is_delete=is_delete,
                 hunks=hunks,
-                old_no_eol=old_no_eol,
-                new_no_eol=new_no_eol,
+                old_no_eol=hunks[-1].old_no_eol if hunks else False,
+                new_no_eol=hunks[-1].new_no_eol if hunks else False,
             )
         )
     if not files:
@@ -186,15 +234,21 @@ def _locate(body: list[str], block: list[str], hint: int) -> int:
     span = len(block)
     if span == 0:
         return min(max(hint, 0), len(body))
-    center = min(max(hint, 0), max(len(body) - span, 0))
-    for offset in range(0, len(body) + span):
+    max_start = len(body) - span
+    if max_start < 0:
+        preview = " ".join(block[:2])[:60]
+        raise ValueError(
+            f"diff context does not match file content near line {hint + 1}: {preview!r}"
+        )
+    center = min(max(hint, 0), max_start)
+    first_line = block[0]
+    max_offset = min(max(center, max_start - center) + 1, 8192)
+    for offset in range(0, max_offset):
         for probe in (center + offset, center - offset):
-            if probe < 0 or probe + span > len(body):
+            if probe < 0 or probe > max_start:
                 continue
-            if body[probe : probe + span] == block:
+            if body[probe] == first_line and body[probe : probe + span] == block:
                 return probe
-        if offset > len(body) + span:
-            break
     preview = " ".join(block[:2])[:60]
     raise ValueError(
         f"diff context does not match file content near line {hint + 1}: {preview!r}"
@@ -211,11 +265,13 @@ def materialize_change(file_diff: FileDiff, current: str | None) -> DiffChange:
             )
         added: list[str] = []
         for hunk in file_diff.hunks:
+            if hunk.before:
+                raise ValueError(f"create diff must not expect existing lines: {file_diff.path}")
             added.extend(hunk.after)
         if not added:
-            raise ValueError(f"create diff has no content: {file_diff.path}")
+            return DiffChange(path=file_diff.path, old=None, new="", operation="add")
         text = "\n".join(added)
-        if not file_diff.new_no_eol:
+        if not file_diff.hunks[-1].new_no_eol:
             text += "\n"
         return DiffChange(path=file_diff.path, old=None, new=text, operation="add")
 
@@ -225,30 +281,39 @@ def materialize_change(file_diff: FileDiff, current: str | None) -> DiffChange:
             "create semantics require '--- /dev/null'"
         )
 
+    line_sep = "\r\n" if "\r\n" in current else "\n"
+    current_norm = current.replace("\r\n", "\n")
+
     if file_diff.is_delete:
+        if file_diff.hunks:
+            remaining, _ = _split_body(current_norm)
+            for hunk in sorted(file_diff.hunks, key=lambda item: item.old_start, reverse=True):
+                if hunk.after:
+                    raise ValueError(f"delete diff cannot add lines: {file_diff.path}")
+                before_block = hunk.before
+                start = _locate(remaining, before_block, hunk.old_start - 1)
+                del remaining[start : start + len(before_block)]
+            if remaining:
+                raise ValueError(
+                    f"delete diff does not cover full file content: {file_diff.path}"
+                )
         return DiffChange(path=file_diff.path, old=current, new=None, operation="delete")
 
-    body, had_trailing_newline = _split_body(current)
-    applied: list[tuple[int, int, list[str]]] = []
+    body, had_trailing_newline = _split_body(current_norm)
+    ends_with_newline = had_trailing_newline
     for hunk in sorted(file_diff.hunks, key=lambda item: item.old_start, reverse=True):
         before_block = hunk.before
         after_block = hunk.after
+        pre_len = len(body)
         start = _locate(body, before_block, hunk.old_start - 1)
         end = start + len(before_block)
         body[start:end] = after_block
-        applied.append((start, start + len(after_block), after_block))
-
-    ends_with_newline = had_trailing_newline
-    for start, end, _after in applied:
-        touches_tail = end >= len(body)
-        if not touches_tail:
-            continue
-        if file_diff.new_no_eol:
-            ends_with_newline = False
-        elif file_diff.old_no_eol and not file_diff.new_no_eol:
-            ends_with_newline = True
-        del start
-    patched = "\n".join(body)
-    if patched and ends_with_newline:
-        patched += "\n"
+        if end == pre_len:
+            if hunk.new_no_eol:
+                ends_with_newline = False
+            elif hunk.old_no_eol or current_norm == "":
+                ends_with_newline = True
+    patched = line_sep.join(body)
+    if body and ends_with_newline:
+        patched += line_sep
     return DiffChange(path=file_diff.path, old=current, new=patched, operation="update")

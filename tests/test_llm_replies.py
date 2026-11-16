@@ -7,13 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from nooa.llm_types import AssistantReasoning, AssistantText
 from nooa.unifiedllm import FakeLLMClient, LLMResponse, ToolCall
 
 from noah_code.config import load_config
 from noah_code.event_bridge import install_event_bridge
 from noah_code.events import HostEvent
 from noah_code.host import AgentHost
-from noah_code.llm_replies import coerce_text_only_response
+from noah_code.llm_replies import ConversationalReplyLLM, coerce_text_only_response
 from noah_code.sessions import SessionStore
 from noah_code.workspace import Workspace
 
@@ -24,8 +25,6 @@ def _text_only(text: str) -> LLMResponse:
         content=text,
         tool_calls=[],
         finish_reason="stop",
-        assistant_message={"role": "assistant", "content": text, "tool_calls": []},
-        reasoning=None,
         usage=None,
     )
 
@@ -38,20 +37,49 @@ def test_coerce_text_only_becomes_message_and_done() -> None:
     code = json.loads(coerced.tool_calls[0].arguments)["code"]
     assert "self.message(" in code
     assert "I can edit files" in code
-    assert "return_result(RespondReason.DONE" in code
+    assert "return_result(Done(" in code
 
 
 def test_coerce_leaves_real_tool_calls_alone() -> None:
     original = LLMResponse(
         raw_response=None,
         content="",
-        tool_calls=[ToolCall(id="1", name="return_result", arguments='{"kind":"DONE","explanation":"ok"}')],
+        tool_calls=[ToolCall(id="1", name="return_result", arguments='{"explanation":"ok"}')],
         finish_reason="tool_calls",
-        assistant_message={"role": "assistant", "content": "", "tool_calls": []},
-        reasoning=None,
         usage=None,
     )
     assert coerce_text_only_response(original) is original
+
+
+def test_wrapper_skips_coercion_inside_summary_fork() -> None:
+    from nooa.agents.summarization import _in_summary_fork
+
+    class Inner(FakeLLMClient):
+        pass
+
+    original = _text_only("Summary text")
+    wrapper = ConversationalReplyLLM(Inner([original]))
+    tools = [SimpleNamespace(name="execute_python")]
+    token = _in_summary_fork.set(True)
+    try:
+        response = wrapper.call([], tools=tools)
+    finally:
+        _in_summary_fork.reset(token)
+    assert response is original
+
+
+def test_coerce_preserves_reasoning_parts() -> None:
+    with_text = LLMResponse(
+        parts=(
+            AssistantReasoning(text="brief thought", native={"id": "r1"}),
+            AssistantText(text="Final answer."),
+        ),
+        finish_reason="stop",
+    )
+    coerced = coerce_text_only_response(with_text)
+    assert coerced.reasoning == "brief thought"
+    assert isinstance(coerced.parts[0], AssistantReasoning)
+    assert dict(coerced.parts[0].native) == {"id": "r1"}
 
 
 @pytest.mark.parametrize("finish_reason", ["length", "content_filter", None])

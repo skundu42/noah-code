@@ -17,6 +17,13 @@ from noah_code.workspace import Workspace
 
 def _return_result_response(explanation: str, kind: str = "DONE") -> FakeLLMClient:
     """Script a valid CodeAct return_result tool call."""
+    args: dict[str, object]
+    if kind in {"NEED_INPUT", "GET_USER_INPUT"}:
+        args = {"question": "Choose next step?", "reason": explanation}
+    elif kind == "WAIT":
+        args = {"explanation": explanation, "on": ["job"]}
+    else:
+        args = {"explanation": explanation}
     return FakeLLMClient(
         scripted_responses=[
             LLMResponse(
@@ -26,12 +33,10 @@ def _return_result_response(explanation: str, kind: str = "DONE") -> FakeLLMClie
                     ToolCall(
                         id="1",
                         name="return_result",
-                        arguments=json.dumps({"kind": kind, "explanation": explanation}),
+                        arguments=json.dumps(args),
                     )
                 ],
                 finish_reason="tool_calls",
-                assistant_message={"role": "assistant", "content": "", "tool_calls": []},
-                reasoning=None,
                 usage=None,
             ),
         ]
@@ -41,7 +46,7 @@ def _return_result_response(explanation: str, kind: str = "DONE") -> FakeLLMClie
 def _inline_respond_reason_response(explanation: str) -> FakeLLMClient:
     """Script the inline return pattern documented by InteractiveAgent.handle."""
 
-    code = f"return_result(RespondReason.DONE, explanation={explanation!r})"
+    code = f"return_result(Done(explanation={explanation!r}))"
     return FakeLLMClient(
         scripted_responses=[
             LLMResponse(
@@ -55,8 +60,6 @@ def _inline_respond_reason_response(explanation: str) -> FakeLLMClient:
                     )
                 ],
                 finish_reason="tool_calls",
-                assistant_message={"role": "assistant", "content": "", "tool_calls": []},
-                reasoning=None,
                 usage=None,
             ),
         ]

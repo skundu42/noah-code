@@ -8,6 +8,22 @@ from noah_code.mcp_setup import MCPInstallResult
 
 
 @pytest.fixture(autouse=True)
+def isolate_user_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Keep tests isolated from the developer's ~/.config, ~/.local, and ~/.agents."""
+
+    env_root = tmp_path_factory.mktemp("user-env")
+    user_home = env_root / "home"
+    user_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("NOAH_CODE_CONFIG", str(env_root / "config" / "config.toml"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(env_root / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(env_root / "state"))
+    monkeypatch.setattr("noah_code.skills_setup._default_user_home", lambda: user_home)
+
+
+@pytest.fixture(autouse=True)
 def stub_eager_mcp_install(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep host.start() from connecting the developer's real MCP servers."""
 

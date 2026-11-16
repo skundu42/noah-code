@@ -54,9 +54,9 @@ def test_nc_entry_point_declared() -> None:
     scripts = eps.select(group="console_scripts") if hasattr(eps, "select") else []
     names = {ep.name for ep in scripts}
     assert callable(main)
-    # Editable installs expose both scripts after uv sync.
+    # Editable installs expose supported scripts after uv sync, without shadowing POSIX nc.
     assert "noah-code" in names
-    assert "nc" in names
+    assert "nc" not in names
     assert "noah" in names
 
 
@@ -643,3 +643,85 @@ def test_run_json_reports_preparation_failures(monkeypatch, tmp_path: Path, fail
     assert payload["exit_code"] == 2
     assert payload["explanation"]
     assert payload["run_id"] is None
+
+
+def test_interactive_help_mentions_subcommands() -> None:
+    result = CliRunner().invoke(interactive_cmd, ["--help"])
+    assert result.exit_code == 0
+    for name in ("run", "checkpoints", "doctor"):
+        assert name in result.output
+
+
+def test_config_show_auto_clears_saved_yolo(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "user.toml"
+    config_path.write_text("yolo = true\nauto_approve = false\n")
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: config_path)
+
+    result = CliRunner().invoke(cli_group, ["config", "show", "--auto", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["auto_approve"] is True
+    assert payload["yolo"] is False
+
+
+def test_checkpoints_list_accepts_workspace_path_directly(monkeypatch, tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))
+    from noah_code.sessions import SessionStore
+    from noah_code.workspace import Workspace
+
+    store = SessionStore(tmp_path / "sessions")
+    store.create(Workspace(root=repo), model="openai/gpt-4o-mini")
+    result = CliRunner().invoke(cli_group, ["checkpoints", "list", str(repo)])
+    assert result.exit_code == 0, result.output
+    assert "no checkpoints under" in result.output
+
+
+@pytest.mark.asyncio
+async def test_first_run_invalid_path_does_not_save_global_model(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock
+
+    saved: list[str] = []
+    monkeypatch.setattr("noah_code.cli.user_default_model", lambda: None)
+    monkeypatch.setattr("noah_code.cli._maybe_auto_update", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        "noah_code.cli.save_user_default_model",
+        lambda model: saved.append(model) or tmp_path / "config.toml",
+    )
+    kwargs = _interactive_kwargs(tmp_path)
+    kwargs["path"] = str(tmp_path / "missing-dir")
+    kwargs["model"] = "openai/gpt-4o-mini"
+    assert await _interactive(use_console=True, **kwargs) == EXIT_CONFIG  # type: ignore[arg-type]
+    assert saved == []
+
+
+def test_console_respects_noah_code_model_env_without_prompt(monkeypatch, tmp_path: Path) -> None:
+    launches: list[str] = []
+
+    class FakeHost:
+        def __init__(self, _ws, config, **_kwargs):
+            launches.append(config.model)
+
+        async def run_interactive(self):
+            return 0
+
+        async def close(self):
+            pass
+
+    monkeypatch.setenv("NOAH_CODE_MODEL", "openai/env-model")
+    monkeypatch.setenv("NOAH_CODE_AUTO_UPDATE", "false")
+    monkeypatch.setenv("NOAH_CODE_SESSION_DIR", str(tmp_path / "sessions"))
+    monkeypatch.setattr("noah_code.config._user_config_path", lambda: tmp_path / "missing.toml")
+    monkeypatch.setattr("noah_code.cli.user_default_model", lambda: None)
+    monkeypatch.setattr("noah_code.cli.user_permission_mode", lambda: "normal")
+    monkeypatch.setattr(
+        "noah_code.cli.click.prompt",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("should not prompt")),
+    )
+    monkeypatch.setattr("noah_code.cli.AgentHost", FakeHost)
+
+    result = CliRunner().invoke(interactive_cmd, ["--console", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert launches == ["openai/env-model"]

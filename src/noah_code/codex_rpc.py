@@ -62,6 +62,7 @@ _CONFIG = {
     "web_search": "disabled",
     "mcp_servers": {},
     "features.shell_tool": False,
+    "features.unified_exec": False,
     "features.multi_agent": False,
     "features.apps": False,
     "features.plugins": False,
@@ -103,7 +104,7 @@ class CodexAppServer:
         self._process: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task[None] | None = None
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
-        self._notifications: asyncio.Queue[dict[str, Any] | CodexError] = asyncio.Queue(512)
+        self._notifications: asyncio.Queue[dict[str, Any] | CodexError] = asyncio.Queue()
         self._write_lock = asyncio.Lock()
         self._counter = 0
         self._failure: CodexError | None = None

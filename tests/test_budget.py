@@ -215,7 +215,7 @@ async def test_llm_cost_event_blocks_next_call_before_provider() -> None:
     )
 
     await client.acall([])
-    manager.handlers["LLMComplete"](
+    manager.handlers["LLMResponse"](
         type("CostEvent", (), {"cost_usd": 0.25})()
     )
     with pytest.raises(BudgetExceeded, match="cost limit exceeded"):

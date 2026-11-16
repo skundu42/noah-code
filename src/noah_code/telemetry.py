@@ -8,14 +8,18 @@ OTLP events, and a final exporter-side privacy/size guard.
 from __future__ import annotations
 
 import contextlib
+import io
 import os
+import threading
 import time
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
 from noah_code import __version__
+from noah_code.redaction import redact_secrets
 
 if TYPE_CHECKING:
     from noah_code.config import TracingConfig
@@ -93,7 +97,8 @@ def _is_content_attribute(name: str) -> bool:
 
 def _bounded_value(value: Any, limit: int) -> Any:
     if isinstance(value, str):
-        return value if len(value) <= limit else value[: max(limit - 1, 0)] + "…"
+        cleaned = redact_secrets(value)
+        return cleaned if len(cleaned) <= limit else cleaned[: max(limit - 1, 0)] + "…"
     if isinstance(value, tuple):
         return tuple(_bounded_value(item, limit) for item in value)
     if isinstance(value, list):
@@ -352,8 +357,11 @@ class AgentTelemetry:
         self._logger: Any = None
         self._logger_provider: Any = None
         self._meter_provider: Any = None
-        self._llm_started: dict[tuple[str, int], float] = {}
-        self._llm_finished: dict[tuple[str, int], tuple[float, bool, str]] = {}
+        self._registered_exporters: list[Any] = []
+        self._capture_max_attributes = 128
+        self._capture_max_attribute_length = 4096
+        self._llm_started: dict[tuple[str, int], deque[float]] = {}
+        self._llm_finished: dict[tuple[str, int], deque[tuple[float, bool, str]]] = {}
         self._tool_started: dict[str, tuple[float, str]] = {}
         self._turn_duration: Any = None
         self._llm_duration: Any = None
@@ -443,7 +451,7 @@ class AgentTelemetry:
 
     def llm_start(self, event: Any) -> None:
         key = self._event_key(event)
-        self._llm_started[key] = time.perf_counter()
+        self._llm_started.setdefault(key, deque()).append(time.perf_counter())
         self.event(
             "gen_ai.client.inference.started",
             {
@@ -455,25 +463,42 @@ class AgentTelemetry:
 
     def llm_end(self, event: Any) -> None:
         key = self._event_key(event)
-        started = self._llm_started.pop(key, None)
-        if started is None:
+        starts = self._llm_started.get(key)
+        if not starts:
             return
+        started = starts.popleft()
+        if not starts:
+            self._llm_started.pop(key, None)
         success = bool(getattr(event, "success", True))
         error_type = str(getattr(event, "exception_type", "") or "")
-        self._llm_finished[key] = (max(time.perf_counter() - started, 0.0), success, error_type)
+        self._llm_finished.setdefault(key, deque()).append(
+            (max(time.perf_counter() - started, 0.0), success, error_type)
+        )
         if not success:
             self._record_llm_completion(key, self.model, 0, 0, 0, 0, 0.0)
 
     def llm_complete(self, event: Any) -> None:
         key = self._event_key(event)
+        usage = getattr(event, "usage", None)
+
+        def _pick(*names: str, default: Any = 0) -> Any:
+            for source in (usage, event):
+                if source is None:
+                    continue
+                for name in names:
+                    value = source.get(name) if isinstance(source, dict) else getattr(source, name, None)
+                    if value is not None:
+                        return value
+            return default
+
         self._record_llm_completion(
             key,
             str(getattr(event, "model_name", "") or self.model),
-            int(getattr(event, "prompt_tokens", 0) or 0),
-            int(getattr(event, "completion_tokens", 0) or 0),
-            int(getattr(event, "cached_tokens", 0) or 0),
-            int(getattr(event, "reasoning_tokens", 0) or 0),
-            float(getattr(event, "cost_usd", 0.0) or 0.0),
+            int(_pick("input_tokens", "prompt_tokens") or 0),
+            int(_pick("output_tokens", "completion_tokens") or 0),
+            int(_pick("cached_input_tokens", "cached_tokens") or 0),
+            int(_pick("reasoning_tokens") or 0),
+            float(_pick("cost_usd", "cost", default=0.0) or 0.0),
         )
 
     def retry(self, payload: Mapping[str, Any]) -> None:
@@ -535,9 +560,15 @@ class AgentTelemetry:
 
         if not self.enabled:
             return
-        attrs = dict(attributes or {})
-        attrs.setdefault("gen_ai.agent.name", _AGENT_NAME)
-        attrs.setdefault("gen_ai.conversation.id", self.session_id)
+        raw_attrs = dict(attributes or {})
+        raw_attrs.setdefault("gen_ai.agent.name", _AGENT_NAME)
+        raw_attrs.setdefault("gen_ai.conversation.id", self.session_id)
+        attrs = filtered_span_attributes(
+            raw_attrs,
+            capture_content=self.capture_content,
+            max_attributes=self._capture_max_attributes,
+            max_attribute_length=self._capture_max_attribute_length,
+        )
         try:
             from opentelemetry import trace
 
@@ -569,6 +600,8 @@ class AgentTelemetry:
             pass
 
     def shutdown(self, timeout_millis: int = 5_000) -> None:
+        if self.session_id:
+            _unregister_session_exporters(self.session_id, self._registered_exporters, timeout_millis)
         for provider in (self._logger_provider, self._meter_provider):
             if provider is None:
                 continue
@@ -594,7 +627,13 @@ class AgentTelemetry:
         reasoning_tokens: int,
         cost_usd: float,
     ) -> None:
-        duration, success, error_type = self._llm_finished.pop(key, (0.0, True, ""))
+        finished = self._llm_finished.get(key)
+        if finished:
+            duration, success, error_type = finished.popleft()
+            if not finished:
+                self._llm_finished.pop(key, None)
+        else:
+            duration, success, error_type = (0.0, True, "")
         attrs: dict[str, Any] = {
             "gen_ai.operation.name": "chat",
             "gen_ai.provider.name": _provider_name(model),
@@ -630,6 +669,81 @@ class AgentTelemetry:
             pass
 
 
+_ROUTER_LOCK = threading.Lock()
+_SESSION_EXPORTERS: dict[str, list[Any]] = {}
+_ROUTER_EXPORTER: Any = None
+
+
+class _SessionRoutingSpanExporter:
+    """Route spans by session.id so concurrent sessions keep separate JSONL sinks."""
+
+    synchronous = False
+
+    def export(self, spans: Sequence[Any]) -> Any:
+        from opentelemetry.sdk.trace.export import SpanExportResult
+
+        buckets: dict[str, list[Any]] = {}
+        with _ROUTER_LOCK:
+            snapshot = {sid: list(items) for sid, items in _SESSION_EXPORTERS.items()}
+        if not snapshot:
+            return SpanExportResult.SUCCESS
+        fallback_sid = next(iter(snapshot)) if len(snapshot) == 1 else ""
+        for span in spans:
+            attrs = getattr(span, "attributes", None) or {}
+            sid = str(attrs.get("session.id") or attrs.get("gen_ai.conversation.id") or "")
+            if sid not in snapshot:
+                sid = fallback_sid
+            if sid:
+                buckets.setdefault(sid, []).append(span)
+        result = SpanExportResult.SUCCESS
+        for sid, group in buckets.items():
+            for exporter in snapshot.get(sid, ()):
+                try:
+                    exported = exporter.export(group)
+                    if exported is not None and exported != SpanExportResult.SUCCESS:
+                        result = exported
+                except Exception:  # noqa: BLE001
+                    result = SpanExportResult.FAILURE
+        return result
+
+    def shutdown(self) -> None:
+        with _ROUTER_LOCK:
+            all_exporters = [exp for items in _SESSION_EXPORTERS.values() for exp in items]
+            _SESSION_EXPORTERS.clear()
+        for exporter in all_exporters:
+            with contextlib.suppress(Exception):
+                exporter.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        with _ROUTER_LOCK:
+            all_exporters = [exp for items in _SESSION_EXPORTERS.values() for exp in items]
+        ok = True
+        for exporter in all_exporters:
+            flush = getattr(exporter, "force_flush", None)
+            if callable(flush):
+                with contextlib.suppress(Exception):
+                    ok = bool(flush(timeout_millis)) and ok
+        return ok
+
+
+def _unregister_session_exporters(
+    session_id: str, expected: list[Any], timeout_millis: int
+) -> None:
+    with _ROUTER_LOCK:
+        registered = _SESSION_EXPORTERS.get(session_id)
+        if registered is not None and (not expected or registered == expected):
+            exporters = _SESSION_EXPORTERS.pop(session_id)
+        else:
+            exporters = []
+    for exporter in exporters:
+        flush = getattr(exporter, "force_flush", None)
+        if callable(flush):
+            with contextlib.suppress(Exception):
+                flush(timeout_millis)
+        with contextlib.suppress(Exception):
+            exporter.shutdown()
+
+
 def setup_agent_telemetry(
     config: TracingConfig,
     *,
@@ -639,10 +753,13 @@ def setup_agent_telemetry(
 ) -> AgentTelemetry:
     """Configure NOOA traces plus Noah logs/metrics. Never raises."""
 
+    global _ROUTER_EXPORTER
     telemetry = AgentTelemetry()
     telemetry.session_id = session_id
     telemetry.model = model
     telemetry.capture_content = config.capture_content
+    telemetry._capture_max_attributes = config.max_span_attributes
+    telemetry._capture_max_attribute_length = config.max_attribute_length
     if not config.enabled:
         return telemetry
 
@@ -658,11 +775,15 @@ def setup_agent_telemetry(
             destinations.append(f"jsonl={jsonl_dir}/{session_id}.jsonl")
 
         otlp_enabled = _otlp_configured(config)
-        resource = {
-            "service.name": _AGENT_NAME,
-            "service.version": __version__,
-            "gen_ai.agent.name": _AGENT_NAME,
-        }
+        resource = filtered_resource_attributes(
+            {
+                "service.name": _AGENT_NAME,
+                "service.version": __version__,
+                "gen_ai.agent.name": _AGENT_NAME,
+            },
+            max_attributes=config.max_span_attributes,
+            max_attribute_length=config.max_attribute_length,
+        )
         if _signal_otlp_configured(config, "traces"):
             try:
                 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -679,7 +800,20 @@ def setup_agent_telemetry(
                 destinations.append(f"otlp-traces=unavailable({type(exc).__name__})")
 
         if span_exporters:
-            enable_tracing(exporters=span_exporters, extra_resource_attrs=resource)
+            with _ROUTER_LOCK:
+                previous = _SESSION_EXPORTERS.pop(session_id, [])
+                _SESSION_EXPORTERS[session_id] = span_exporters
+                install_router = _ROUTER_EXPORTER is None
+                if install_router:
+                    _ROUTER_EXPORTER = _SessionRoutingSpanExporter()
+                router = _ROUTER_EXPORTER
+            for old in previous:
+                with contextlib.suppress(Exception):
+                    old.shutdown()
+            telemetry._registered_exporters = span_exporters
+            if install_router:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    enable_tracing(exporters=[router], extra_resource_attrs=resource)
             # First-time NOOA setup installs a generated default session after
             # exporters are configured. Restore Noah's durable session route.
             set_session(session_id)

@@ -10,7 +10,7 @@ import sys
 import pytest
 from nooa.context_blocks import ResultStatus, ToolCallEvent
 from nooa.events import Feedback
-from nooa.interactive import RespondReason
+from nooa.interactive import Done, NeedInput, Waiting
 from nooa.unifiedllm import FakeLLMClient, LLMResponse, ToolCall
 
 from noah_code.agent import CodingAgent
@@ -24,8 +24,6 @@ def _tool(name, arguments, key):
         content="",
         tool_calls=[ToolCall(id=key, name=name, arguments=json.dumps(arguments))],
         finish_reason="tool_calls",
-        assistant_message={"role": "assistant", "content": "", "tool_calls": []},
-        reasoning=None,
         usage=None,
     )
 
@@ -35,7 +33,11 @@ def _code(source, key):
 
 
 def _finish(kind="DONE", key="done"):
-    return _tool("return_result", {"kind": kind, "explanation": "Observed result"}, key)
+    if kind == "NEED_INPUT":
+        return _tool("return_result", {"result": {"question": "Which option?"}}, key)
+    if kind == "WAIT":
+        return _tool("return_result", {"result": {"explanation": "Observed result", "on": ["job"]}}, key)
+    return _tool("return_result", {"result": {"explanation": "Observed result"}}, key)
 
 
 def _setup(tmp_path, responses):
@@ -69,9 +71,9 @@ async def test_failed_check_defers_completion_then_same_session_recovers(tmp_pat
     if finish_path == "direct":
         candidate = _finish(key="candidate")
     elif finish_path == "inline":
-        candidate = _code("return_result(kind='DONE', explanation='premature')", "candidate")
+        candidate = _code("return_result(Done(explanation='premature'))", "candidate")
     else:
-        candidate = _code("return {'kind': 'DONE', 'explanation': 'premature'}", "candidate")
+        candidate = _code("return Done(explanation='premature')", "candidate")
     correction = _code(
         f"await self.ws.write('note.txt', 'good')\nprint(await self.ws.run({command!r}))",
         "repair-pass",
@@ -83,7 +85,7 @@ async def test_failed_check_defers_completion_then_same_session_recovers(tmp_pat
         ledger = await agent.ws._verification.snapshot()
     finally:
         await agent.close_tools()
-    assert result.kind == RespondReason.DONE
+    assert isinstance(result, Done)
     assert (tmp_path / "note.txt").read_text() == "good"
     assert [row["returncode"] for row in ledger] == [1, 0]
     returns = [
@@ -116,7 +118,8 @@ async def test_completion_gate_allows_honest_non_success_or_unverified_simple_ed
         events = agent.event_manager.values()
     finally:
         await agent.close_tools()
-    assert result.kind == RespondReason(kind)
+    expected = {"DONE": Done, "NEED_INPUT": NeedInput, "WAIT": Waiting}[kind]
+    assert isinstance(result, expected)
     assert not any(
         isinstance(event, Feedback) and "Completion deferred" in event.content for event in events
     )
@@ -147,7 +150,7 @@ async def test_readonly_session_can_finish_while_shared_parent_edits_and_fails_c
         parent_finished.set()
         result = await asyncio.wait_for(task, 5)
         assert child.ws._verification is parent.ws._verification
-        assert result.kind == RespondReason.DONE
+        assert isinstance(result, Done)
         assert (await child.ws._verification.completion_blockers())[0]["state"] == "failed"
         assert not any(
             isinstance(event, Feedback) and "Completion deferred" in event.content
@@ -169,14 +172,14 @@ async def test_build_session_cannot_bypass_failed_check_by_switching_to_plan(tmp
         "failed-work",
     )
     transition = _code(
-        "await self.plan.enter()\nreturn_result(kind='DONE', explanation='premature')",
+        "await self.plan.enter()\nreturn_result(Done(explanation='premature'))",
         "plan-transition",
     )
     agent, _ = _setup(tmp_path, [work, transition, _finish("NEED_INPUT")])
     try:
         result = await agent.handle({"user_messages": ["Repair and verify."]})
         assert agent.engine.mode == "plan"
-        assert result.kind == RespondReason.NEED_INPUT
+        assert isinstance(result, NeedInput)
         assert any(
             isinstance(event, Feedback) and "Completion deferred" in event.content
             for event in agent.event_manager.values()

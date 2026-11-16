@@ -14,13 +14,14 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from nooa import Skill, hidden, spec
 
 from noah_code.approvals import ApprovalBroker
 from noah_code.permissions import PermissionCategory, PermissionEngine, is_secret_path
-from noah_code.workspace import Workspace
+from noah_code.workspace import Workspace, parse_porcelain_z
 
 _LANGUAGES: dict[str, str] = {
     ".py": "python",
@@ -101,7 +102,36 @@ def _uri_path(uri: str) -> Path:
     parsed = urlparse(uri)
     if parsed.scheme != "file":
         raise ValueError(f"unsupported LSP URI: {uri}")
-    return Path(unquote(parsed.path))
+    path_part = url2pathname(parsed.path)
+    if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+        path_part = f"//{parsed.netloc}{path_part}"
+    return Path(path_part)
+
+
+def _is_secret_uri(uri: str, root: Path) -> bool:
+    try:
+        path = _uri_path(uri)
+    except ValueError:
+        return False
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+        return is_secret_path(rel)
+    except (OSError, ValueError):
+        return is_secret_path(path.name)
+
+
+def _position_for_file(resolved: Path, line: int, column: int) -> dict[str, int]:
+    if line < 1 or column < 1:
+        raise ValueError("line and column are 1-indexed and must be positive")
+    try:
+        lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {"line": line - 1, "character": column - 1}
+    if 1 <= line <= len(lines):
+        prefix = lines[line - 1][: column - 1]
+        utf16_col = len(prefix.encode("utf-16-le")) // 2
+        return {"line": line - 1, "character": utf16_col}
+    return {"line": line - 1, "character": column - 1}
 
 
 def _location_text(item: dict[str, Any], root: Path) -> str:
@@ -132,7 +162,7 @@ class _LSPClient:
         self._write_lock = asyncio.Lock()
         self._diagnostics: dict[str, list[dict[str, Any]]] = {}
         self._diagnostic_events: dict[str, asyncio.Event] = {}
-        self._open_documents: dict[str, tuple[int, int]] = {}
+        self._open_documents: dict[str, tuple[tuple[int, int], int, Path, str]] = {}
         self._closed = False
 
     def _healthy(self) -> bool:
@@ -160,7 +190,10 @@ class _LSPClient:
     async def _cancel_pump_tasks(self) -> None:
         reader, self._reader_task = self._reader_task, None
         stderr, self._stderr_task = self._stderr_task, None
-        for task in (reader, stderr):
+        bg = list(getattr(self, "_background_tasks", ()))
+        if hasattr(self, "_background_tasks"):
+            self._background_tasks.clear()
+        for task in (reader, stderr, *bg):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -176,6 +209,10 @@ class _LSPClient:
                 return
             stale, self.process = self.process, None
             await self._cancel_pump_tasks()
+            reopen: list[tuple[Path, str]] = [
+                (doc_path, doc_lang)
+                for _stamp, _version, doc_path, doc_lang in self._open_documents.values()
+            ]
             self._open_documents.clear()
             self._diagnostics.clear()
             self._diagnostic_events.clear()
@@ -225,6 +262,10 @@ class _LSPClient:
                     await self._terminate(process)
                 await self._cancel_pump_tasks()
                 raise
+            for doc_path, doc_lang in reopen:
+                if doc_path.is_file():
+                    with contextlib.suppress(Exception):
+                        await self.open_document(doc_path, doc_lang)
 
     async def request(
         self, method: str, params: dict[str, Any], *, timeout: float | None = None
@@ -260,13 +301,23 @@ class _LSPClient:
 
     async def open_document(self, path: Path, language: str) -> str:
         uri = _path_uri(path)
-        stat = path.stat()
-        stamp = stat.st_mtime_ns
         previous = self._open_documents.get(uri)
+        if not path.is_file():
+            if previous is not None:
+                self._open_documents.pop(uri, None)
+                self._diagnostics.pop(uri, None)
+                self._diagnostic_events.pop(uri, None)
+                with contextlib.suppress(Exception):
+                    await self.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+            raise FileNotFoundError(f"document does not exist: {path}")
+        stat = path.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size)
         if previous and previous[0] == stamp:
             return uri
         text = path.read_text(errors="replace")
         version = (previous[1] + 1) if previous else 1
+        # Clear before sending so synchronous/fast diagnostics are never missed.
+        self._diagnostic_events.setdefault(uri, asyncio.Event()).clear()
         if previous:
             await self.notify(
                 "textDocument/didChange",
@@ -287,9 +338,24 @@ class _LSPClient:
                     }
                 },
             )
-        self._open_documents[uri] = (stamp, version)
-        self._diagnostic_events.setdefault(uri, asyncio.Event()).clear()
+        self._open_documents[uri] = (stamp, version, path, language)
         return uri
+
+    async def sync_document(self, path: Path) -> None:
+        uri = _path_uri(path)
+        previous = self._open_documents.get(uri)
+        if previous is None:
+            return
+        if not path.is_file():
+            self._open_documents.pop(uri, None)
+            self._diagnostics.pop(uri, None)
+            self._diagnostic_events.pop(uri, None)
+            with contextlib.suppress(Exception):
+                await self.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+            return
+        language = previous[3] if len(previous) >= 4 else "plaintext"
+        with contextlib.suppress(Exception):
+            await self.open_document(path, language)
 
     async def wait_diagnostics(self, uri: str, timeout: float = 0.35) -> list[dict[str, Any]]:
         event = self._diagnostic_events.setdefault(uri, asyncio.Event())
@@ -340,7 +406,51 @@ class _LSPClient:
                 if not future.done():
                     future.set_exception(RuntimeError("LSP server closed"))
 
+    def _schedule_send(self, message: dict[str, Any]) -> None:
+        if not self._healthy():
+            return
+        with contextlib.suppress(RuntimeError):
+            loop = asyncio.get_running_loop()
+            if not hasattr(self, "_background_tasks"):
+                self._background_tasks: set[asyncio.Task[Any]] = set()
+            task = loop.create_task(self._send_response_safe(message))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+    async def _send_response_safe(self, message: dict[str, Any]) -> None:
+        with contextlib.suppress(Exception):
+            await self._send(message)
+
     def _handle_message(self, message: dict[str, Any]) -> None:
+        method = message.get("method")
+        if isinstance(method, str) and "id" in message and message["id"] is not None:
+            params = message.get("params") or {}
+            msg_id = message["id"]
+            if method == "workspace/configuration":
+                items = params.get("items") or []
+                reply: dict[str, Any] = {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": [None] * len(items),
+                }
+            elif method in {
+                "client/registerCapability",
+                "client/unregisterCapability",
+                "window/workDoneProgress/create",
+                "workspace/semanticTokens/refresh",
+                "workspace/diagnostic/refresh",
+                "workspace/codeLens/refresh",
+                "workspace/inlayHint/refresh",
+            }:
+                reply = {"jsonrpc": "2.0", "id": msg_id, "result": None}
+            else:
+                reply = {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32601, "message": f"Method not found: {method}"},
+                }
+            self._schedule_send(reply)
+            return
         try:
             request_id = int(message["id"])
         except (KeyError, TypeError, ValueError):
@@ -356,7 +466,7 @@ class _LSPClient:
             else:
                 future.set_result(message.get("result"))
             return
-        if message.get("method") == "textDocument/publishDiagnostics":
+        if method == "textDocument/publishDiagnostics":
             params = message.get("params", {})
             uri = str(params.get("uri", ""))
             self._diagnostics[uri] = list(params.get("diagnostics") or [])
@@ -454,12 +564,15 @@ class RepositoryMap:
                 ]
                 files: list[Path] = []
                 for name in names:
+                    if is_secret_path(name):
+                        continue
                     candidate = self.root / name
                     with contextlib.suppress(OSError):
                         resolved = candidate.resolve()
+                        rel = resolved.relative_to(self.root)
                         if (
                             not candidate.is_symlink()
-                            and resolved.is_relative_to(self.root)
+                            and not is_secret_path(rel)
                             and resolved.is_file()
                         ):
                             files.append(resolved)
@@ -473,7 +586,8 @@ class RepositoryMap:
         for path in self.root.rglob("*"):
             if path.is_symlink() or not path.is_file():
                 continue
-            if ignored.intersection(path.relative_to(self.root).parts):
+            rel = path.relative_to(self.root)
+            if ignored.intersection(rel.parts) or is_secret_path(rel):
                 continue
             files.append(path)
             if len(files) >= self.max_files:
@@ -533,7 +647,7 @@ class LSPTools(Skill):
         self._overrides = server_overrides or {}
         self._max_symbols = max_symbols
         self._clients: dict[tuple[str, ...], _LSPClient] = {}
-        self._request_cache: dict[tuple[str, str, int, str], Any] = {}
+        self._request_cache: dict[tuple[str, str, tuple[int, int], str], Any] = {}
         self._map = RepositoryMap(workspace.root, max_file_bytes=max_file_bytes)
 
     async def definition(
@@ -569,7 +683,7 @@ class LSPTools(Skill):
             resolved,
             {
                 "textDocument": {"uri": uri},
-                "position": self._position(line, column),
+                "position": _position_for_file(resolved, line, column),
                 "context": {"includeDeclaration": include_declaration},
             },
         )
@@ -588,7 +702,7 @@ class LSPTools(Skill):
             client,
             "textDocument/hover",
             resolved,
-            {"textDocument": {"uri": uri}, "position": self._position(line, column)},
+            {"textDocument": {"uri": uri}, "position": _position_for_file(resolved, line, column)},
         )
         if not result:
             return "(no hover information)"
@@ -641,6 +755,9 @@ class LSPTools(Skill):
                 result = await client.request("workspace/symbol", {"query": query})
                 for item in list(result or []):
                     location = item.get("location", item)
+                    loc_uri = str(location.get("targetUri") or location.get("uri") or "")
+                    if loc_uri and _is_secret_uri(loc_uri, self._workspace.root):
+                        continue
                     prefix = f"{_SYMBOL_KINDS.get(int(item.get('kind', 0)), 'symbol')} "
                     lsp_rows.append(
                         f"{_location_text(location, self._workspace.root)}  {prefix}{item.get('name', '?')}"
@@ -698,7 +815,7 @@ class LSPTools(Skill):
     ) -> str:
         """Preview, but never apply, a workspace symbol rename."""
         resolved, _language, client, uri = await self._document(path)
-        position = self._position(line, column)
+        position = _position_for_file(resolved, line, column)
         with contextlib.suppress(RuntimeError):
             await client.request(
                 "textDocument/prepareRename",
@@ -717,13 +834,16 @@ class LSPTools(Skill):
         document_changes = result.get("documentChanges") or []
         rows: list[str] = []
         for target_uri, edits in changes.items():
+            if _is_secret_uri(target_uri, self._workspace.root):
+                continue
             rows.extend(self._render_text_edits(target_uri, edits))
         for change in document_changes:
             if "edits" in change:
+                doc_uri = str(change.get("textDocument", {}).get("uri", ""))
+                if doc_uri and _is_secret_uri(doc_uri, self._workspace.root):
+                    continue
                 rows.extend(
-                    self._render_text_edits(
-                        change.get("textDocument", {}).get("uri", ""), change["edits"]
-                    )
+                    self._render_text_edits(doc_uri, change["edits"])
                 )
         return "Rename preview (not applied):\n" + ("\n".join(rows) or "(no edits)")
 
@@ -738,12 +858,29 @@ class LSPTools(Skill):
             if path.suffix.lower() not in _LANGUAGES or not path.is_file():
                 continue
             rel = self._workspace.relpath(path)
+            if is_secret_path(rel):
+                continue
             try:
                 symbols = await self.document_symbols(rel)
             except Exception as exc:  # noqa: BLE001
                 symbols = f"unavailable — {exc}"
             sections.append(f"## {rel}\n{symbols}")
         return "\n\n".join(sections) or "(no changed source symbols)"
+
+    @hidden
+    async def sync_paths(self, paths: list[str | Path]) -> None:
+        """Notify active LSP clients when tracked workspace files change or vanish."""
+        if not self._clients:
+            return
+        for raw in paths[:50]:
+            try:
+                resolved = self._workspace.resolve(raw)
+            except ValueError:
+                continue
+            uri = _path_uri(resolved)
+            for client in list(self._clients.values()):
+                if client._healthy() and uri in client._open_documents:
+                    await client.sync_document(resolved)
 
     @hidden
     async def diagnostics_for_paths(self, paths: list[str]) -> dict[str, str]:
@@ -763,7 +900,7 @@ class LSPTools(Skill):
             client,
             method,
             resolved,
-            {"textDocument": {"uri": uri}, "position": self._position(line, column)},
+            {"textDocument": {"uri": uri}, "position": _position_for_file(resolved, line, column)},
         )
         return self._render_locations(result)
 
@@ -812,7 +949,8 @@ class LSPTools(Skill):
         *,
         extra: str = "",
     ) -> Any:
-        stamp = path.stat().st_mtime_ns
+        stat = path.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size)
         key = (" ".join(client.command), method, stamp, json.dumps(params, sort_keys=True) + extra)
         if key not in self._request_cache:
             self._request_cache[key] = await client.request(method, params)
@@ -844,7 +982,15 @@ class LSPTools(Skill):
         if not result:
             return "(no locations)"
         items = result if isinstance(result, list) else [result]
-        return "\n".join(_location_text(item, self._workspace.root) for item in items[:100])
+        visible: list[str] = []
+        for item in items:
+            uri = str(item.get("targetUri") or item.get("uri") or "")
+            if uri and _is_secret_uri(uri, self._workspace.root):
+                continue
+            visible.append(_location_text(item, self._workspace.root))
+            if len(visible) >= 100:
+                break
+        return "\n".join(visible) or "(no locations)"
 
     def _flatten_symbols(self, symbols: list[dict[str, Any]], path: Path) -> list[str]:
         rel = self._workspace.relpath(path)
@@ -890,30 +1036,38 @@ class LSPTools(Skill):
 
     def _changed_paths(self) -> list[Path]:
         try:
-            result = subprocess.run(
-                ["git", "status", "--porcelain=v1", "-z"],
+            prefix_res = subprocess.run(
+                ["git", "rev-parse", "--show-prefix"],
                 cwd=self._workspace.root,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            prefix = prefix_res.stdout.decode(errors="replace").strip() if prefix_res.returncode == 0 else ""
+            result = subprocess.run(
+                ["git", "status", "--porcelain=v1", "-z", "--", "."],
+                cwd=self._workspace.root,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=5,
                 check=False,
             )
             if result.returncode != 0:
                 return []
-            entries = [
-                entry for entry in result.stdout.decode(errors="replace").split("\0") if entry
-            ]
+            _, entries = parse_porcelain_z(result.stdout.decode(errors="replace"))
             paths: list[Path] = []
-            index = 0
-            while index < len(entries):
-                entry = entries[index]
-                name = entry[3:] if len(entry) >= 4 else ""
-                if entry[:2].strip() in {"R", "C"} and index + 1 < len(entries):
-                    index += 1
-                    name = entries[index]
+            for entry in entries:
+                name = entry.path
+                if prefix:
+                    if not name.startswith(prefix):
+                        continue
+                    name = name[len(prefix) :]
+                if not name:
+                    continue
                 path = (self._workspace.root / name).resolve()
                 if path.is_relative_to(self._workspace.root):
                     paths.append(path)
-                index += 1
             return list(dict.fromkeys(paths))
         except (OSError, subprocess.SubprocessError):
             return []

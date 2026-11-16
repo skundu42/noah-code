@@ -45,10 +45,23 @@ async def test_exit_to_build_requires_plan_and_switches(tmp_path: Path) -> None:
         engine.mode = mode
 
     owner.set_mode = set_mode
-    tools = PlanTools(tmp_path, owner, ask=None, engine=engine)
+
+    async def approve_build(_prompts: list[QuestionPrompt]) -> QuestionAnswer:
+        return QuestionAnswer(selections=["switch to build"], custom="")
+
+    from noah_code.tools.question_tools import QuestionTools
+
+    ask = QuestionTools(engine, ApprovalBroker(engine, handler=_always_once), handler=approve_build)
+    # Without explicit confirmation, auto_approve=True alone cannot exit plan mode.
+    tools_without_ask = PlanTools(tmp_path, owner, ask=None, engine=engine)
     with pytest.raises(RuntimeError, match="write a plan"):
-        await tools.exit_to_build()
-    await tools.write("- do the work\n")
+        await tools_without_ask.exit_to_build()
+    await tools_without_ask.write("- do the work\n")
+    with pytest.raises(PermissionError, match="no UI handler"):
+        await tools_without_ask.exit_to_build()
+    assert owner.mode == "plan"
+
+    tools = PlanTools(tmp_path, owner, ask=ask, engine=engine)
     text = await tools.exit_to_build()
     assert owner.mode == "build"
     assert "build" in text

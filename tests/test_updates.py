@@ -397,3 +397,34 @@ def test_maybe_check_for_update_handles_cache_and_failures(
     payload = json.loads(state_file.read_text())
     assert payload["error"] == "offline"
     assert payload["checked_at"] >= now
+
+
+def test_notice_check_does_not_suppress_auto_update_and_finds_cargo_uv(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cargo_uv = tmp_path / "home" / ".cargo" / "bin" / "uv"
+    cargo_uv.parent.mkdir(parents=True)
+    cargo_uv.write_text("#!/bin/sh\n")
+    cargo_uv.chmod(0o700)
+    monkeypatch.delenv("NOAH_CODE_UV", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(updates.shutil, "which", lambda _name: None)
+    assert updates.find_uv() == cargo_uv.resolve()
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(updates, "__version__", "0.1.0")
+    monkeypatch.setattr(updates, "is_uv_tool_install", lambda _uv: True)
+    monkeypatch.setattr(
+        updates,
+        "check_for_update",
+        lambda **_kwargs: updates.UpdateStatus(current="0.1.0", latest="0.2.0"),
+    )
+    upgrades: list[Path] = []
+    monkeypatch.setattr(updates, "upgrade", lambda *, uv: upgrades.append(uv) or "ok")
+
+    notice = updates.maybe_check_for_update(interval_hours=24, timeout=1)
+    assert notice and notice.latest == "0.2.0"
+
+    installed = updates.maybe_auto_update(interval_hours=24, timeout=1)
+    assert installed and "updated to 0.2.0" in installed
+    assert upgrades == [cargo_uv.resolve()]

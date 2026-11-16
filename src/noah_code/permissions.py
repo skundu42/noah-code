@@ -216,10 +216,12 @@ _SECRET_BASENAMES = {
     ".env.production",
     ".env.development",
     ".envrc",
+    ".mcp.json",
     ".netrc",
     ".npmrc",
     ".pgpass",
     ".pypirc",
+    "auth.json",
     "credentials",
     "credentials.json",
     "service-account.json",
@@ -234,6 +236,8 @@ _SECRET_ALLOW = {".env.example", ".env.sample", ".env.template"}
 _SECRET_DIR_FILES = {
     (".docker", "config.json"),
     (".kube", "config"),
+    (".noah-code", "mcp.json"),
+    ("noah-code", "mcp.json"),
 }
 _GLOB_META = frozenset("*?[")
 _DOT_SECRET_GLOB_PROBES = (
@@ -391,21 +395,22 @@ class PermissionEngine:
             and self.is_readonly_command(normalized)
             and not _command_has_external_path(normalized)
             and not _git_unscoped_patch_output(normalized)
+            and not _unscoped_hidden_search(normalized)
         ):
             action = "allow"
             reason = "read-only workspace shell command allowed"
 
-        if action == "ask" and self.auto_approve:
+        if action == "ask" and self.auto_approve and not (
+            category == PermissionCategory.BASH and _unscoped_hidden_search(normalized)
+        ):
             # --auto never overrides explicit deny; only ask → allow.
             action = "allow"
             reason = f"{reason} (auto-approved)"
 
         elevated: PermissionDecision | None = None
         if category == PermissionCategory.BASH and action == "allow":
-            # Apply the elevated-risk floor *after* ordinary auto-approval. This
-            # keeps --auto useful for routine asks without silently approving
-            # commands that are explicitly documented as always requiring a
-            # human confirmation. An exact session allow remains authoritative.
+            # Apply the elevated-risk floor *after* ordinary auto-approval and
+            # static wildcard allows. Only an exact non-wildcard rule bypasses it.
             elevated = self._elevated_bash_ask(normalized)
             if elevated is not None:
                 action = elevated.action
@@ -432,73 +437,80 @@ class PermissionEngine:
         except ValueError:
             tokens = []
         normalized_tokens = " ".join(tokens)
-        effective_tokens = _effective_shell_tokens(tokens)
-        effective_program = _program_name(effective_tokens[0]) if effective_tokens else ""
 
-        if effective_program in {"env", "printenv"}:
-            return PermissionDecision(
-                category=PermissionCategory.BASH,
-                target=command,
-                action="deny",
-                matching_rule=None,
-                reason="credential dump denied",
-                remember_pattern=command,
-            )
+        segments = _split_shell_commands(command) or [command]
+        for segment in segments:
+            try:
+                seg_tokens = shlex.split(segment)
+            except ValueError:
+                seg_tokens = []
+            effective_tokens = _effective_shell_tokens(seg_tokens)
+            effective_program = _program_name(effective_tokens[0]) if effective_tokens else ""
 
-        for index, token in enumerate(tokens):
-            if _is_secret_shell_token(token):
+            if effective_program in {"env", "printenv"}:
                 return PermissionDecision(
                     category=PermissionCategory.BASH,
                     target=command,
                     action="deny",
                     matching_rule=None,
-                    reason="secret or credential path denied",
+                    reason="credential dump denied",
                     remember_pattern=command,
                 )
-            program = Path(token).name.lower()
-            if program != "git":
-                continue
-            remaining = tokens[index + 1 :]
-            if any(part in {"push", "clean", "filter-branch"} for part in remaining) or (
-                "reset" in remaining and "--hard" in remaining
-            ):
+
+            if self.auto_approve and _is_env_dump(seg_tokens):
                 return PermissionDecision(
                     category=PermissionCategory.BASH,
                     target=command,
                     action="deny",
                     matching_rule=None,
-                    reason="destructive git command denied",
+                    reason="environment dump denied under auto-approval",
                     remember_pattern=command,
                 )
-            if self.auto_approve and not self.is_readonly_command(command):
+
+            if self.auto_approve and _contains_executing_interpreter(seg_tokens):
                 return PermissionDecision(
                     category=PermissionCategory.BASH,
                     target=command,
                     action="deny",
                     matching_rule=None,
-                    reason="mutating or unrecognized git commands are not auto-approved",
+                    reason="interpreter, eval, and indirect execution commands cannot be auto-approved",
                     remember_pattern=command,
                 )
 
-        if self.auto_approve and _is_env_dump(tokens):
-            return PermissionDecision(
-                category=PermissionCategory.BASH,
-                target=command,
-                action="deny",
-                matching_rule=None,
-                reason="environment dump denied under auto-approval",
-                remember_pattern=command,
-            )
-
-        if self.auto_approve and _contains_executing_interpreter(tokens):
-            return PermissionDecision(
-                category=PermissionCategory.BASH,
-                target=command,
-                action="deny",
-                matching_rule=None,
-                reason="interpreter, eval, and indirect execution commands cannot be auto-approved",
-                remember_pattern=command,
-            )
+            for index, token in enumerate(seg_tokens):
+                if _is_secret_shell_token(token):
+                    return PermissionDecision(
+                        category=PermissionCategory.BASH,
+                        target=command,
+                        action="deny",
+                        matching_rule=None,
+                        reason="secret or credential path denied",
+                        remember_pattern=command,
+                    )
+                program = Path(token).name.lower()
+                if program != "git":
+                    continue
+                remaining = seg_tokens[index + 1 :]
+                if any(part in {"push", "clean", "filter-branch"} for part in remaining) or (
+                    "reset" in remaining and "--hard" in remaining
+                ):
+                    return PermissionDecision(
+                        category=PermissionCategory.BASH,
+                        target=command,
+                        action="deny",
+                        matching_rule=None,
+                        reason="destructive git command denied",
+                        remember_pattern=command,
+                    )
+                if self.auto_approve and not self.is_readonly_command(command):
+                    return PermissionDecision(
+                        category=PermissionCategory.BASH,
+                        target=command,
+                        action="deny",
+                        matching_rule=None,
+                        reason="mutating or unrecognized git commands are not auto-approved",
+                        remember_pattern=command,
+                    )
 
         if self.auto_approve and _has_ambiguous_shell_expansion(command):
             return PermissionDecision(
@@ -536,12 +548,14 @@ class PermissionEngine:
         return None
 
     def _elevated_bash_ask(self, command: str) -> PermissionDecision | None:
-        """Force ask for risky commands unless a session allow rule already matched."""
-        session_allowed = any(
-            r.action == "allow" and _match_rule(r, PermissionCategory.BASH, command)
-            for r in self._session_rules
+        """Force ask for risky commands unless an exact non-wildcard allow rule matched."""
+        exact_allowed = any(
+            r.action == "allow"
+            and not any(meta in r.pattern for meta in _GLOB_META)
+            and _match_rule(r, PermissionCategory.BASH, command)
+            for r in (*self.rules, *self._session_rules)
         )
-        if session_allowed:
+        if exact_allowed:
             return None
         try:
             tokens = shlex.split(command)
@@ -968,20 +982,72 @@ def _glob_pattern_specificity(pattern: str) -> int:
     return specificity
 
 
-def _git_unscoped_patch_output(command: str) -> bool:
-    """Detect read-only git commands that still dump full patch contents.
+def _split_shell_commands(command: str) -> list[str]:
+    """Split a shell command on unquoted command/pipeline separators."""
 
-    ``git show``/``git log``/``git diff`` print complete diffs by default (or
-    with ``-p``/``--patch``), exposing committed secrets without naming a path
-    token. Unless the output is a non-patch summary or the command is scoped
-    to an explicit path, the read-only auto-allow bump must not apply. The
-    read-only classification itself is unchanged.
-    """
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
+    segments: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and not in_single:
+            current.append(command[i : i + 2])
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            current.append(ch)
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            current.append(ch)
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if command.startswith(("&&", "||"), i):
+                seg = "".join(current).strip()
+                if seg:
+                    segments.append(seg)
+                current = []
+                i += 2
+                continue
+            if ch in {"|", ";", "\n"} or (
+                ch == "&"
+                and (i + 1 >= n or command[i + 1] not in {">", "<"})
+                and (i == 0 or command[i - 1] not in {">", "<"})
+            ):
+                seg = "".join(current).strip()
+                if seg:
+                    segments.append(seg)
+                current = []
+                i += 1
+                continue
+        current.append(ch)
+        i += 1
+    tail = "".join(current).strip()
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def _scopes_specific_path(token: str) -> bool:
+    """Return True when a pathspec narrows output below repository-wide ``.``."""
+
+    cleaned = token.strip()
+    if not cleaned:
         return False
-    if len(tokens) < 2 or tokens[0] != "git":
+    normalized = cleaned.rstrip("/")
+    if normalized in {"", ".", "./", "..", "*"}:
+        return False
+    return not (cleaned.startswith("./") and normalized[2:].lstrip("/") in {"", "*", "**"})
+
+
+def _git_segment_unscoped_patch(tokens: list[str]) -> bool:
+    if len(tokens) < 2 or _program_name(tokens[0]) != "git":
         return False
     if tokens[1].lower() not in _GIT_PATCH_SUBCOMMANDS:
         return False
@@ -990,8 +1056,7 @@ def _git_unscoped_patch_output(command: str) -> bool:
     args = tokens[2:]
     for index, token in enumerate(args):
         if token == "--":
-            # Only an explicit path limiter after ``--`` scopes the output.
-            if args[index + 1 :]:
+            if any(_scopes_specific_path(item) for item in args[index + 1 :]):
                 return False
             break
         lowered = token.lower()
@@ -1002,13 +1067,69 @@ def _git_unscoped_patch_output(command: str) -> bool:
         if lowered == "-s" or name in _GIT_NON_PATCH_OUTPUT_FLAGS:
             patch_suppressed = True
             continue
-        if not token.startswith("-") and (
-            "/" in token or ":" in token or token.startswith((".", "~"))
-        ):
-            # A path-like argument (pathspec or ``<rev>:<path>`` object)
-            # scopes the output without needing ``--``.
-            return False
+        if not token.startswith("-"):
+            if ":" in token and "://" not in token:
+                target_path = token.rsplit(":", 1)[1]
+                if _scopes_specific_path(target_path):
+                    return False
+            elif "/" in token and _scopes_specific_path(token):
+                return False
     return patch_requested or not patch_suppressed
+
+
+def _git_unscoped_patch_output(command: str) -> bool:
+    """Detect read-only git commands (including pipelines) dumping unscoped patches."""
+
+    for segment in _split_shell_commands(command) or [command]:
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            continue
+        if _git_segment_unscoped_patch(tokens):
+            return True
+    return False
+
+
+_SEARCH_HIDDEN_LONG_FLAGS = frozenset(
+    {"--hidden", "--no-ignore", "--no-ignore-dot", "--no-ignore-vcs", "--unrestricted"}
+)
+
+
+def _unscoped_hidden_search(command: str) -> bool:
+    """Detect ``rg``/``grep``/``find`` searching hidden/ignored files without path scope."""
+
+    for segment in _split_shell_commands(command) or [command]:
+        try:
+            tokens = _effective_shell_tokens(shlex.split(segment))
+        except ValueError:
+            continue
+        if not tokens:
+            continue
+        program = _program_name(tokens[0])
+        if program not in {"rg", "grep", "egrep", "fgrep", "find"}:
+            continue
+        hidden_flag = False
+        positionals: list[str] = []
+        options_done = False
+        for token in tokens[1:]:
+            if not options_done and token == "--":
+                options_done = True
+                continue
+            if not options_done and token.startswith("-") and token != "-":
+                lowered = token.lower().split("=", 1)[0]
+                if lowered in _SEARCH_HIDDEN_LONG_FLAGS or (
+                    not token.startswith("--") and ("." in token[1:] or "u" in token[1:])
+                ):
+                    hidden_flag = True
+                continue
+            positionals.append(token)
+        if not hidden_flag:
+            continue
+        # For rg/grep the first positional is the pattern; remaining positionals are paths.
+        path_args = positionals if program == "find" else positionals[1:]
+        if not any(_scopes_specific_path(p) for p in path_args):
+            return True
+    return False
 
 
 def _is_readonly_git(args: list[str]) -> bool:

@@ -22,6 +22,8 @@ ISOLATED_PREDICT_CONTEXT = ScopedContext(
         "repo_instructions": None,
         "active_plan": None,
         "project_memory": None,
+        "queues": None,
+        "producers": None,
     },
     events=EventQuery.current_call(),
 )

@@ -10,6 +10,7 @@ from typing import Any
 import litellm
 import pytest
 from nooa.unifiedllm import FakeLLMClient, LLMResponse, ToolCall
+from nooa.unifiedllm.unifiedllm import UnifiedLLM
 
 from noah_code.agent import CodingAgent
 from noah_code.config import load_config
@@ -26,12 +27,10 @@ def _done(call_id: str) -> LLMResponse:
             ToolCall(
                 id=call_id,
                 name="return_result",
-                arguments=json.dumps({"kind": "DONE", "explanation": "scorecard complete"}),
+                arguments=json.dumps({"explanation": "scorecard complete"}),
             )
         ],
         finish_reason="tool_calls",
-        assistant_message={"role": "assistant", "content": "", "tool_calls": []},
-        reasoning=None,
         usage=None,
     )
 
@@ -52,12 +51,19 @@ class _RecordingLLM(FakeLLMClient):
         return await super().acall(messages, tools=tools, output_model=output_model, **kwargs)
 
 
-class _PredictRecordingLLM:
-    model = "gpt-4o-mini"
-    context_window = 128_000
-
+class _PredictRecordingLLM(UnifiedLLM):
     def __init__(self) -> None:
+        super().__init__(model="gpt-4o-mini", context_window=128_000)
         self.requests: list[tuple[list[dict[str, Any]], Any, str]] = []
+
+    def call(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Any = None,
+        output_model: Any = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        raise NotImplementedError("async only")
 
     async def acall(
         self,
@@ -73,8 +79,6 @@ class _PredictRecordingLLM:
             content=content,
             tool_calls=[],
             finish_reason="stop",
-            assistant_message={"role": "assistant", "content": content},
-            reasoning=None,
             usage=None,
         )
 
@@ -137,7 +141,7 @@ async def test_initial_prompt_token_cache_and_accuracy_scorecard(tmp_path: Path)
         "read_only=True",
         "Never claim a command passed",
         "Do not read secrets",
-        "return_result(RespondReason.DONE",
+        "return_result(Done(",
     ):
         assert required in first_system
     assert "import noah_code" not in first_system

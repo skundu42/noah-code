@@ -13,7 +13,8 @@ from typing import Any
 from noah_code.secure_files import read_text_bounded
 from noah_code.workspace import WorkspaceError
 
-_FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n(.*)\Z", re.DOTALL)
+_FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n?---\s*\n(.*)\Z", re.DOTALL)
+_PLACEHOLDER = re.compile(r"\$(?:(ARGUMENTS)|([1-9])\b)")
 MAX_MARKDOWN_BYTES = 64 * 1024
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
@@ -33,15 +34,17 @@ class CustomCommand:
     source: str = ""
 
     def render(self, arguments: str) -> str:
-        """Expand $ARGUMENTS and $1..$9 positional placeholders."""
+        """Expand $ARGUMENTS and $1..$9 positional placeholders in a single pass."""
         parts = _split_args(arguments)
-        text = self.body
-        text = text.replace("$ARGUMENTS", arguments.strip())
-        for i, part in enumerate(parts, start=1):
-            text = text.replace(f"${i}", part)
-        # Clear unused numbered placeholders.
-        text = re.sub(r"\$[1-9]\b", "", text)
-        return text.strip()
+        full_args = arguments.strip()
+
+        def _replace(match: re.Match[str]) -> str:
+            if match.group(1) is not None:
+                return full_args
+            idx = int(match.group(2))
+            return parts[idx - 1] if 1 <= idx <= len(parts) else ""
+
+        return _PLACEHOLDER.sub(_replace, self.body).strip()
 
 
 def _split_args(arguments: str) -> list[str]:
@@ -59,15 +62,19 @@ def parse_frontmatter(raw: str) -> tuple[dict[str, Any], str]:
         return {}, raw
     meta_raw, body = match.group(1), match.group(2)
     meta: dict[str, Any] = {}
-    # Prefer YAML-like simple key: value lines; fall back to TOML table.
-    for line in meta_raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ":" in line:
-            key, _, val = line.partition(":")
-            meta[key.strip()] = val.strip().strip("\"'")
-    if not meta:
+    # Prefer YAML-like simple key: value lines unless TOML assignment syntax (`=`) is used.
+    lines = [
+        line.strip()
+        for line in meta_raw.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    is_toml = any("=" in line and ":" not in line.partition("=")[0] for line in lines)
+    if not is_toml:
+        for line in lines:
+            if ":" in line:
+                key, _, val = line.partition(":")
+                meta[key.strip()] = val.strip().strip("\"'")
+    if not meta and lines:
         try:
             parsed = tomllib.loads(meta_raw)
             if isinstance(parsed, dict):
@@ -215,7 +222,20 @@ def discover_custom_commands(workspace: Path) -> dict[str, CustomCommand]:
         secure_root=workspace,
         secure_relative_dir=Path(".noah-code") / "commands",
     )
-    reserved = {command.name for command in BUILTIN_COMMANDS} | {"checkpoints", "quit"}
+    reserved = {command.name for command in BUILTIN_COMMANDS} | {
+        "animations",
+        "attach",
+        "checkpoints",
+        "context",
+        "continue",
+        "exit",
+        "health",
+        "queue",
+        "quit",
+        "terminals",
+        "timeline",
+        "trace",
+    }
     commands.update(
         {name: command for name, command in project_commands.items() if name not in reserved}
     )

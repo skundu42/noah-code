@@ -64,6 +64,8 @@ class EvalProxy:
             not api_key
             or not model
             or not 0 < budget_usd <= 5
+            or not isinstance(max_output_tokens, int)
+            or isinstance(max_output_tokens, bool)
             or not 1 <= max_output_tokens <= 8192
         ):
             raise ValueError("invalid evaluation model, key, budget, or output cap")
@@ -122,9 +124,13 @@ class EvalProxy:
                 )
             ):
                 raise ValueError("only text content is allowed")
-        if any(
-            not isinstance(tool, dict) or tool.get("type") != "function"
-            for tool in payload.get("tools", [])
+        tools = payload.get("tools")
+        if tools is not None and (
+            not isinstance(tools, list)
+            or any(
+                not isinstance(tool, dict) or tool.get("type") != "function"
+                for tool in tools
+            )
         ):
             raise ValueError("paid server tools are not allowed")
         request = dict(payload)
@@ -152,7 +158,11 @@ class EvalProxy:
         size = len(json.dumps(request, ensure_ascii=False).encode())
         if size > _MAX_BODY:
             raise ValueError("request exceeds evaluation size limit")
-        ceiling = 2 * size + 16_384 + 1024 * (len(messages) + len(request.get("tools", [])))
+        ceiling = (
+            2 * size
+            + 16_384
+            + 1024 * (len(messages) + len(request.get("tools") or []))
+        )
         reservation = ceiling * self._input_price + self.max_output_tokens * self._output_price
         # Reserve an extra 25% for rounding/account-dependent billing overhead.
         reservation *= Decimal("1.25")
@@ -254,7 +264,8 @@ class EvalProxy:
                             json=request,
                         ) as response,
                     ):
-                        record["http_status"] = response.status_code
+                        with owner._lock:
+                            record["http_status"] = response.status_code
                         self.send_response(response.status_code)
                         self.send_header(
                             "Content-Type", response.headers.get("Content-Type", "application/json")
@@ -266,12 +277,19 @@ class EvalProxy:
                         for chunk in response.iter_bytes():
                             self.wfile.write(chunk)
                             self.wfile.flush()
-                            if len(buffer) < 2_000_000:
-                                buffer.extend(chunk[: 2_000_000 - len(buffer)])
-                        owner._capture_usage(bytes(buffer), record)
-                        record["status"] = "finished"
+                            if len(chunk) >= 2_000_000:
+                                buffer = bytearray(chunk[-2_000_000:])
+                            else:
+                                excess = len(buffer) + len(chunk) - 2_000_000
+                                if excess > 0:
+                                    del buffer[:excess]
+                                buffer.extend(chunk)
+                        with owner._lock:
+                            owner._capture_usage(bytes(buffer), record)
+                            record["status"] = "finished"
                 except (OSError, httpx.HTTPError):
-                    record["status"] = "interrupted"
+                    with owner._lock:
+                        record["status"] = "interrupted"
                     if not started:
                         self.error(502, "evaluation upstream request failed")
                 finally:

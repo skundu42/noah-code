@@ -135,9 +135,11 @@ async def test_real_deltas_arrive_before_completion_and_preserve_parsed_response
         gate.set()
         response = await task
 
-    assert response.content == Answer(result=42)
+    assert response.parsed == Answer(result=42)
+    assert response.content == '{"result":42}'
     assert response.reasoning == "Checking"
-    assert response.usage["total_tokens"] == 14
+    assert response.usage is not None
+    assert response.usage.total_tokens == 14
     assert response.raw_response.choices[0].message.content == '{"result":42}'
     assert response.finish_reason == "stop"
     assert [e.kind for e in events] == ["start", "reasoning", "text", "text", "finish"]
@@ -174,7 +176,8 @@ def test_sync_stream_keeps_tool_fragments_and_usage_intact(monkeypatch):
     assert response.tool_calls[0].id == "call_1"
     assert response.tool_calls[0].name == "lookup"
     assert response.tool_calls[0].arguments == '{"path":"x.py"}'
-    assert response.usage["prompt_tokens"] == 10
+    assert response.usage is not None
+    assert response.usage.input_tokens == 10
     assert [e.kind for e in events] == ["start", "reasoning", "finish"]
 
 
@@ -470,8 +473,9 @@ async def test_traced_real_litellm_sse_preserves_deltas_tools_and_usage():
     assert response.tool_calls[0].id == "call_real"
     assert response.tool_calls[0].name == "lookup"
     assert response.tool_calls[0].arguments == '{"path":"source.py"}'
-    assert response.usage["prompt_tokens"] == 10
-    assert response.usage["completion_tokens"] == 4
+    assert response.usage is not None
+    assert response.usage.input_tokens == 10
+    assert response.usage.output_tokens == 4
     assert [e.kind for e in events] == ["start", "reasoning", "finish"]
     assert len(requests) == 1
     assert requests[0]["stream"] is True
@@ -488,7 +492,8 @@ def test_plain_sync_generator_is_collected_with_tracing_shape(monkeypatch):
     with model_stream(events.append):
         response = _client().call([])
     assert response.content == "traced"
-    assert response.usage["total_tokens"] == 14
+    assert response.usage is not None
+    assert response.usage.total_tokens == 14
     assert [e.kind for e in events] == ["start", "text", "finish"]
 
 
@@ -514,5 +519,6 @@ async def test_traced_response_still_parses_if_observer_scope_ends_before_http_r
     release.set()
     response = await task
     assert response.content == "late response"
-    assert response.usage["total_tokens"] == 14
+    assert response.usage is not None
+    assert response.usage.total_tokens == 14
     assert events == []

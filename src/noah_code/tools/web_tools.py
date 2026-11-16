@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import http.client
+import inspect
 import ipaddress
 import re
 import socket
 import ssl
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Protocol
-from urllib.parse import quote_plus, urljoin, urlsplit
+from urllib.parse import parse_qs, quote_plus, urljoin, urlsplit
 
 from nooa import Skill
 
@@ -130,7 +131,14 @@ def _request_pinned(
 class _PublicWebTransport:
     """Bounded public-web transport with redirect and DNS-rebinding defenses."""
 
-    def fetch(self, url: str, *, timeout: float, max_bytes: int) -> tuple[str, str]:
+    def fetch(
+        self,
+        url: str,
+        *,
+        timeout: float,
+        max_bytes: int,
+        check_redirect: Callable[[str], None] | None = None,
+    ) -> tuple[str, str]:
         current_url = _require_http_url(url)
         redirects = 0
         rate_limit_retries = 0
@@ -166,7 +174,10 @@ class _PublicWebTransport:
                 if redirects >= _MAX_REDIRECTS:
                     raise ValueError(f"web redirect limit exceeded ({_MAX_REDIRECTS})")
                 redirects += 1
-                current_url = _require_http_url(urljoin(current_url, location))
+                next_url = _require_http_url(urljoin(current_url, location))
+                if check_redirect is not None:
+                    check_redirect(next_url)
+                current_url = next_url
                 continue
 
             if len(body) > max_bytes:
@@ -212,6 +223,23 @@ class _HTMLText(HTMLParser):
         return re.sub(r"\n{3,}", "\n\n", collapsed).strip()
 
 
+def _normalize_search_href(raw: str) -> str | None:
+    href = raw.strip()
+    if href.startswith("//"):
+        href = f"https:{href}"
+    elif href.startswith("/l/"):
+        href = f"https://duckduckgo.com{href}"
+    if not href.startswith(("http://", "https://")):
+        return None
+    parsed = urlsplit(href)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path == "/l/":
+        target = parse_qs(parsed.query).get("uddg", [None])[0]
+        if not target or not target.startswith(("http://", "https://")):
+            return None
+        return target
+    return href
+
+
 class _SearchLinks(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -223,9 +251,9 @@ class _SearchLinks(HTMLParser):
         if tag != "a":
             return
         attrs_map = dict(attrs)
-        href = attrs_map.get("href") or ""
-        if href.startswith("http"):
-            self._href = href
+        normalized = _normalize_search_href(attrs_map.get("href") or "")
+        if normalized is not None:
+            self._href = normalized
             self._label = []
 
     def handle_data(self, data: str) -> None:
@@ -270,12 +298,28 @@ class WebTools(Skill):
         await self._approvals.require(
             self._engine.decide(PermissionCategory.WEBFETCH, normalized, tool="web_fetch")
         )
+        loop = asyncio.get_running_loop()
+
+        def _check_redirect(next_url: str) -> None:
+            decision = self._engine.decide(
+                PermissionCategory.WEBFETCH, next_url, tool="web_fetch"
+            )
+            asyncio.run_coroutine_threadsafe(
+                self._approvals.require(decision), loop
+            ).result()
+
+        kwargs: dict[str, object] = {
+            "timeout": self._timeout,
+            "max_bytes": self._max_bytes,
+        }
+        if "check_redirect" in inspect.signature(self._transport.fetch).parameters:
+            kwargs["check_redirect"] = _check_redirect
+
         # Blocking network I/O must not freeze the agent event loop.
         content_type, body = await asyncio.to_thread(
             self._transport.fetch,
             normalized,
-            timeout=self._timeout,
-            max_bytes=self._max_bytes,
+            **kwargs,  # type: ignore[arg-type]
         )
         text = _to_text(content_type, body)
         if len(text) > _MAX_CHARS:
@@ -400,23 +444,35 @@ def _validated_public_target(url: str) -> _HttpTarget:
 
 
 def _is_public_unicast(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    if (
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return _is_public_unicast(address.ipv4_mapped)
+        if address.sixtofour is not None and not _is_public_unicast(address.sixtofour):
+            return False
+        if address.teredo is not None:
+            client_ip, server_ip = address.teredo
+            if not (_is_public_unicast(client_ip) and _is_public_unicast(server_ip)):
+                return False
+        if address in _NAT64_WELL_KNOWN_PREFIX:
+            embedded = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+            return _is_public_unicast(embedded)
+        if address.is_site_local:
+            return False
+    return not (
         not address.is_global
+        or address.is_private
+        or address.is_loopback
+        or address.is_link_local
         or address.is_multicast
         or address.is_unspecified
         or address.is_reserved
-    ):
-        return False
-    if isinstance(address, ipaddress.IPv6Address) and address in _NAT64_WELL_KNOWN_PREFIX:
-        embedded = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
-        return _is_public_unicast(embedded)
-    return True
+    )
 
 
 def _to_text(content_type: str, body: str) -> str:
     mime = content_type.split(";", 1)[0].strip().lower()
     if mime in {"text/html", "application/xhtml+xml"}:
         parser = _HTMLText()
-        parser.feed(html.unescape(body))
+        parser.feed(body)
         return parser.text()
     return body.strip()

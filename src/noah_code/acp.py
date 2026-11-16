@@ -208,7 +208,7 @@ class ACPConnection:
                         str(payload.get("prompt", "")),
                         kind="user_message_chunk",
                     )
-                elif row.event_type in {"Message", "AssistantEvent"}:
+                elif row.event_type in {"Message", "AgentMessage", "AssistantEvent"}:
                     await self._message(session.meta.session_id, str(payload.get("content", "")))
                 elif row.event_type == "Summary":
                     await self._message(
@@ -237,6 +237,8 @@ class ACPConnection:
             await self._message(session_id, text)
         elif kind == "reasoning":
             await self._message(session_id, text, kind="agent_thought_chunk")
+        elif kind == "error" and text.strip():
+            await self._message(session_id, f"Error: {text}")
         elif kind in {"tool_start", "tool_finish"}:
             meta = event.get("meta", {})
             tool_id = meta.get("activity_id")
@@ -304,12 +306,22 @@ class ACPConnection:
         if method in {"session/new", "session/load"}:
             from pathlib import Path
 
+            from noah_code.workspace import open_workspace
+
             cwd = _string(params, "cwd")
             if not Path(cwd).is_absolute() or params.get("additionalDirectories"):
                 raise RPCError(
                     -32602, "cwd must be absolute; additional directories are unsupported"
                 )
             session_id = _string(params, "sessionId") if method == "session/load" else None
+            workspace_root = open_workspace(cwd).root
+            for existing in list(self.service.sessions.values()):
+                same_session = session_id is not None and existing.meta.session_id == session_id
+                same_workspace = existing.host.workspace.root == workspace_root
+                if same_session or same_workspace:
+                    if existing.active or existing.meta.session_id in self._loading:
+                        raise RPCError(-32000, "session is busy")
+                    await self.service.close_session(existing.meta.session_id)
             session = await self.service.open_session(
                 cwd=cwd, session_id=session_id, mcp_servers=_mcp_servers(params)
             )

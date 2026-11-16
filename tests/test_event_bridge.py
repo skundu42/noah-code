@@ -73,7 +73,7 @@ def test_event_bridge_forwards_safe_lifecycle_telemetry() -> None:
     manager.handlers["LLMCallEnd"](
         SimpleNamespace(**vars(llm_event), success=True, exception_type=None)
     )
-    manager.handlers["LLMComplete"](SimpleNamespace(**vars(llm_event), model_name="openai/test"))
+    manager.handlers["LLMResponse"](SimpleNamespace(**vars(llm_event), model_name="openai/test"))
     manager.handlers["ToolCallEvent"](
         SimpleNamespace(
             id="event-1",

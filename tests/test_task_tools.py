@@ -454,12 +454,12 @@ async def test_subagent_handles_wait_and_input_outcomes(
             if job_state in {"running", "completed"} else ''
         )
         + ('await asyncio.sleep(0.15)\n' if job_state == "completed" else '')
-        + 'return_result(RespondReason.WAIT, explanation="awaiting verification")',
+        + 'return_result(Waiting(explanation="awaiting verification", on=["verify"]))',
         'self.message(await self.processes.status())\n'
-        'return_result(RespondReason.DONE, explanation="verified completion")',
+        'return_result(Done(explanation="verified completion"))',
     ]
     if job_state in {"needs_input", "condensed_input"}:
-        codes[0] = 'return_result(RespondReason.NEED_INPUT, explanation="choose a target")'
+        codes[0] = 'return_result(NeedInput(question="choose a target"))'
     if job_state == "condensed_input":
         async def condense_without_control_markers(*_args, **_kwargs):
             return "choose a target"
@@ -474,7 +474,6 @@ async def test_subagent_handles_wait_and_input_outcomes(
                 content="",
                 tool_calls=[ToolCall(id=str(index), name="execute_python", arguments=json.dumps({"code": code}))],
                 finish_reason="tool_calls",
-                assistant_message={"role": "assistant", "content": "", "tool_calls": []},
             )
             for index, code in enumerate(codes)
         ]

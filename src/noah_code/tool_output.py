@@ -80,17 +80,37 @@ class ToolOutputStore:
             raise RuntimeError(f"failed to persist managed output {output_id}: {exc}") from exc
         return output_id
 
-    def read(self, output_id: str, lines: tuple[int, int] | None = None) -> str:
+    def read(
+        self,
+        output_id: str,
+        lines: tuple[int, int] | None = None,
+        *,
+        max_chars: int = 64_000,
+    ) -> str:
         path = self._path(output_id)
         if not path.is_file():
             raise FileNotFoundError(f"managed tool output not found or expired: {output_id}")
         if lines is None:
-            return path.read_text(encoding="utf-8", errors="replace")
+            text = path.read_text(encoding="utf-8", errors="replace")
+            return self._cap_slice(text, max_chars=max_chars)
         start, end = lines
         if start < 1 or end < start:
             raise ValueError("lines must be a 1-indexed inclusive (start, end) range")
+        chunks: list[str] = []
+        used = 0
         with path.open(encoding="utf-8", errors="replace") as stream:
-            return "".join(islice(stream, start - 1, end))
+            for line in islice(stream, start - 1, end):
+                chunks.append(line)
+                used += len(line)
+                if used > max_chars:
+                    break
+        return self._cap_slice("".join(chunks), max_chars=max_chars)
+
+    @staticmethod
+    def _cap_slice(text: str, *, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + f"\n...[output slice truncated at {max_chars} chars]..."
 
     def bound(self, text: str, *, max_chars: int, max_lines: int) -> BoundedOutput:
         lines = text.splitlines(keepends=True)

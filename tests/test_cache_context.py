@@ -343,7 +343,7 @@ def test_prompt_marks_message_as_synchronous() -> None:
 def test_prompt_documents_return_result_signature() -> None:
     prompt = _handle_prompt()
 
-    assert "return_result(RespondReason.DONE" in prompt
+    assert "return_result(Done(explanation=" in prompt
     assert "explanation" in prompt
     assert "never pass a bare string" in prompt.lower()
     assert "wrong type" in prompt
@@ -356,7 +356,9 @@ def test_handle_prompt_stays_compact_without_losing_contracts() -> None:
 
 
 def test_execution_context_exposes_only_supported_agent_surface() -> None:
-    assert "RespondReason" in _NOAH_EXECUTION_CONTEXT
+    assert "Done" in _NOAH_EXECUTION_CONTEXT
+    assert "NeedInput" in _NOAH_EXECUTION_CONTEXT
+    assert "Waiting" in _NOAH_EXECUTION_CONTEXT
     assert 'print(self.tools.help("ws.read"))' in _NOAH_EXECUTION_CONTEXT
     assert "nested proxies hide signatures" in _NOAH_EXECUTION_CONTEXT
     assert "import noah_code" not in _NOAH_EXECUTION_CONTEXT

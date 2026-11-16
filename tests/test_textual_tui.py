@@ -3273,3 +3273,161 @@ async def test_continue_opens_latest_ten_workspace_sessions(tmp_path: Path) -> N
         host.switch_session.assert_awaited_once_with(
             host.list_session_metas.return_value[1].session_id
         )
+
+
+@pytest.mark.asyncio
+async def test_daylight_theme_applies_cleanly(tmp_path: Path) -> None:
+    assert "daylight" in THEMES
+    assert NoahCodeConfig().ui.theme == "atom-one-dark"
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        app.apply_theme("daylight")
+        await pilot.pause()
+        assert app.theme_palette.name == "daylight"
+        assert app.query_one("#composer").theme == "daylight"
+
+
+@pytest.mark.asyncio
+async def test_markup_like_brackets_do_not_crash_banners_or_modals(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        app._show_notice("Error in routes/[id]/page.tsx [/bad] [a=b]", kind="error")
+        host.steer_queue.push("Fix regex [/bad] [a=b]")
+        app._update_input_context()
+        await pilot.pause()
+        assert "[/bad]" in str(app.query_one("#notice-banner").render())
+
+        modal = QuestionModal(QuestionPrompt("Header [/bad]", "Body [a=b]", ("opt",)))
+        await app.push_screen(modal)
+        await pilot.pause()
+        assert "HEADER [/BAD]" in str(modal.query_one("#approval-title").render())
+        modal.dismiss(None)
+        await pilot.pause()
+
+        confirm = ConfirmationModal("Title", "routes/[slug=1].tsx [/bad]", "Undo [now]")
+        await app.push_screen(confirm)
+        await pilot.pause()
+        assert "[/bad]" in str(confirm.query_one("#confirmation-body").render())
+        assert "[Esc]" in str(confirm.query_one("#confirmation-cancel").label)
+        assert "[Y]" in str(confirm.query_one("#confirmation-accept").label)
+
+
+@pytest.mark.asyncio
+async def test_rapid_timeline_and_orphan_activities_keep_unique_ids_and_clean_up(
+    tmp_path: Path,
+) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        app._timeline_begin("One", "llm")
+        app._timeline_begin("Two", "llm")
+        ui.render(HostEvent(HostEventKind.TOOL_START, "first tool", meta={"tool": "execute_python"}))
+        ui.render(HostEvent(HostEventKind.TOOL_START, "second tool", meta={"tool": "bash"}))
+        await pilot.pause()
+        ids = [record.activity_id for record in app._timeline_history]
+        assert len(ids) == len(set(ids))
+
+        await app.push_screen(ActivityHistoryScreen(list(app._timeline_history)))
+        await pilot.pause()
+        assert isinstance(app.screen, ActivityHistoryScreen)
+        app.screen.dismiss(None)
+        await pilot.pause()
+
+        app._reset_transient_turn_widgets(state="error")
+        await pilot.pause()
+        assert app.query_one("#live-activity").styles.display == "none"
+        assert app.query_one("#model-stream-preview").display is False
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_after_mouse_text_selected_copies_without_cancelling_turn(
+    tmp_path: Path,
+) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test() as pilot:
+        ui.render(HostEvent(HostEventKind.MESSAGE, "important output"))
+        await pilot.pause()
+        ui.set_busy(True)
+        app._turn_task = asyncio.current_task()
+
+        transcript = app.query_one("#conversation")
+        app.screen.selections = {transcript: SELECT_ALL}
+        app.screen.post_message(events.TextSelected())
+        await pilot.pause()
+        assert app.screen.selections == {}
+
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        host.cancel_active_turn.assert_not_called()
+        assert "important output" in app.clipboard
+
+
+@pytest.mark.asyncio
+async def test_80x24_onboarding_and_question_modals_keep_controls_visible(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=(80, 24)) as pilot:
+        onboarding = OnboardingScreen("openai/gpt-test", "Missing key")
+        await app.push_screen(onboarding)
+        await pilot.pause()
+        buttons = onboarding.query_one("#onboarding-buttons")
+        assert buttons.region.height > 0
+        assert buttons.region.bottom <= 24
+        onboarding.dismiss(False)
+        await pilot.pause()
+
+        long_prompt = "\n".join(f"Line {idx}: context detail" for idx in range(12))
+        qmodal = QuestionModal(QuestionPrompt("Pick", long_prompt, ("Alpha", "Beta", "Gamma")))
+        await app.push_screen(qmodal)
+        await pilot.pause()
+        qlist = qmodal.query_one("#question-list")
+        assert qlist.region.height >= 3
+        assert qlist.region.bottom <= 24
+
+
+@pytest.mark.asyncio
+async def test_trailing_space_closes_mention_suggestions_and_fuzzy_picker_and_copy_patch(
+    tmp_path: Path,
+) -> None:
+    from noah_code.tools.git_tools import DiffFile, DiffReview
+
+    (tmp_path / "app.py").write_text("x = 1\n")
+    host = _fake_host(tmp_path)
+    host.agent.lsp.document_symbols = AsyncMock(return_value="")
+    host.diff_diagnostics = AsyncMock()
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.text = "Explain @app "
+        await pilot.pause()
+        assert not app.suggestions_open
+        await pilot.press("enter")
+        await pilot.pause()
+        host.handle_line.assert_awaited_once_with("Explain @app")
+
+        picker = FilteredPicker(
+            "Commands",
+            [("/mcp", "MCP Servers", "Inspect configured MCP servers"), ("/help", "Help", "Show help")],
+            "Enter run · Esc close",
+        )
+        await app.push_screen(picker)
+        await pilot.pause()
+        picker.query_one("#picker-filter", Input).value = "mcp srv"
+        await pilot.pause()
+        assert [row[0] for row in picker._filtered] == ["/mcp"]
+        picker.dismiss(None)
+        await pilot.pause()
+
+        patch_text = "@@ -1 +1 @@\n-old\n+new\n"
+        item = DiffFile("app.py", "unstaged", "modified", patch=patch_text, loaded=True)
+        await app.push_screen(DiffReviewScreen(host, DiffReview([item])))
+        await pilot.pause()
+        await pilot.press("c")
+        await pilot.pause()
+        assert app.clipboard == patch_text
+        assert "Copied patch for app.py" in str(app.screen.query_one("#diff-status").render())

@@ -23,7 +23,9 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from litellm import CustomStreamWrapper
+from nooa.unifiedllm.unifiedllm import UnifiedLLM
 
+from noah_code import nooa_compat
 from noah_code.nooa_compat import install_completion_stream_observer
 
 logger = logging.getLogger(__name__)
@@ -108,6 +110,8 @@ class _Call:
     model: str
     call_id: str
     attempt: int = 0
+    raw_stream: Any = None
+    cancelled: bool = False
 
     def emit(self, kind: StreamKind, text: str = "", error_type: str = "") -> None:
         if not self.observer.active:
@@ -180,6 +184,8 @@ class _ObservedStream(CustomStreamWrapper):
         try:
             async for chunk in self._raw:
                 if self._call is not None:
+                    if self._call.cancelled:
+                        raise asyncio.CancelledError
                     self._call.chunk(chunk)
                 yield chunk
         except BaseException:
@@ -198,6 +204,7 @@ def _observe(raw: Any) -> Any:
     if not isinstance(raw, (CustomStreamWrapper, AsyncIterator, Iterator)):
         return raw
     if call is not None and call.observer.active:
+        call.raw_stream = raw
         call.attempt += 1
         call.emit("start")
     else:
@@ -207,11 +214,12 @@ def _observe(raw: Any) -> Any:
     return _ObservedStream(raw, call)
 
 
-class StreamingLLM:
+class StreamingLLM(UnifiedLLM):
     """Delegate parsing to NOOA, enabling its streaming transport only in scope."""
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
+        nooa_compat.init_llm_wrapper(self, inner)
         install_completion_stream_observer(_observe)
 
     @contextmanager
@@ -234,6 +242,7 @@ class StreamingLLM:
         try:
             yield call
         except asyncio.CancelledError:
+            call.cancelled = True
             if call.attempt:
                 call.emit("cancel")
             raise
@@ -250,10 +259,25 @@ class StreamingLLM:
     async def acall(
         self, messages: list[dict], tools: Any = None, output_model: Any = None, **kwargs: Any
     ) -> Any:
-        with self._scope(kwargs):
-            return await self._inner.acall(
-                messages, tools=tools, output_model=output_model, **kwargs
-            )
+        with self._scope(kwargs) as call:
+            try:
+                return await self._inner.acall(
+                    messages, tools=tools, output_model=output_model, **kwargs
+                )
+            except asyncio.CancelledError:
+                if call is not None:
+                    call.cancelled = True
+                    raw_stream = call.raw_stream
+                    if raw_stream is not None:
+                        aclose = getattr(raw_stream, "aclose", None)
+                        close = getattr(raw_stream, "close", None)
+                        if callable(aclose):
+                            with suppress(Exception):
+                                await aclose()
+                        elif callable(close):
+                            with suppress(Exception):
+                                close()
+                raise
 
     def call(
         self, messages: list[dict], tools: Any = None, output_model: Any = None, **kwargs: Any

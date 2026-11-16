@@ -1,6 +1,6 @@
 [project]
 name = "noah-code"
-version = "1.0.0"
+version = "2.0.0"
 description = "Noah Code terminal coding agent, built on NVIDIA OO Agents (NOOA)"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -19,12 +19,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "nooa==0.0.10",
-    "nooa-cli==0.0.10",
+    "nooa==0.0.12",
+    "nooa-cli==0.0.12",
     # LiteLLM 1.92.0-1.95.x intermittently shipped without macOS wheels,
     # forcing a Rust source build. Wheels are back for every release since
     # 1.96.0 (abi3 since 1.96.2), so the installer stays binary-only.
-    "litellm>=1.96.0,<1.99.0",
+    "litellm>=1.97.0,<1.106.0",
     # Upper bounds guard fresh end-user installs (uv tool install / pip),
     # which ignore uv.lock; caps always admit the currently locked versions.
     "click>=8.1.0,<9.0.0",
@@ -55,16 +55,15 @@ dev = [
     "types-pyyaml>=6.0.12.20260815",
 ]
 mcp = [
-    "nooa[mcp]==0.0.10",
+    "nooa[mcp]==0.0.12",
 ]
 tracing = [
-    "nooa[tracing]==0.0.10",
+    "nooa[tracing]==0.0.12",
     "opentelemetry-exporter-otlp-proto-http>=1.44.0,<2.0.0",
 ]
 
 [project.scripts]
 noah-code = "noah_code.cli:main"
-nc = "noah_code.cli:main"
 noah = "noah_code.cli:main"
 
 [build-system]

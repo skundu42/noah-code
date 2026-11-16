@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
+import stat
 import tempfile
 import time
 import uuid
@@ -42,8 +44,9 @@ class TurnJournal:
 class SnapshotJournal:
     """Journal WorkspaceTools mutations; refuse concurrent overwrites."""
 
-    def __init__(self, *, blob_limit: int = 2_000_000) -> None:
+    def __init__(self, *, blob_limit: int = 2_000_000, root: Path | None = None) -> None:
         self.blob_limit = blob_limit
+        self._root = root.resolve() if root is not None else None
         self._turns: list[TurnJournal] = []
         self._redo: list[TurnJournal] = []
         self._current: TurnJournal | None = None
@@ -65,16 +68,21 @@ class SnapshotJournal:
             self._current.shell_may_bypass = True
 
     def record_preimage(self, path: Path) -> FileMutation:
-        existed = path.exists()
+        existed = os.path.lexists(path)
         pre_bytes: bytes | None = None
         pre_hash: str | None = None
         mode: int | None = None
         if existed:
-            data = path.read_bytes()
+            info = path.lstat()
+            mode = info.st_mode
+            if stat.S_ISLNK(mode):
+                data = os.fsencode(os.readlink(path))
+                pre_hash = _sha256(b"symlink\0" + data)
+            else:
+                data = path.read_bytes()
+                pre_hash = _sha256(data)
             if len(data) <= self.blob_limit:
                 pre_bytes = data
-            pre_hash = _sha256(data)
-            mode = path.stat().st_mode
         mut = FileMutation(
             id=str(uuid.uuid4()),
             path=str(path),
@@ -91,11 +99,16 @@ class SnapshotJournal:
         return mut
 
     def record_postimage(self, mut: FileMutation, path: Path) -> None:
-        if path.exists():
-            data = path.read_bytes()
-            mut.post_hash = _sha256(data)
+        if os.path.lexists(path):
+            info = path.lstat()
+            mut.post_mode = info.st_mode
+            if stat.S_ISLNK(info.st_mode):
+                data = os.fsencode(os.readlink(path))
+                mut.post_hash = _sha256(b"symlink\0" + data)
+            else:
+                data = path.read_bytes()
+                mut.post_hash = _sha256(data)
             mut.post_bytes = data if len(data) <= self.blob_limit else None
-            mut.post_mode = path.stat().st_mode
         else:
             mut.post_hash = None
             mut.post_bytes = None
@@ -135,6 +148,7 @@ class SnapshotJournal:
         simulated: dict[str, str | None] = {}
         for mut in reversed(turn.mutations):
             path = Path(mut.path)
+            self._assert_safe_parent(path, self._root)
             actual = simulated.get(mut.path, self._path_hash(path))
             if actual != mut.post_hash:
                 raise RuntimeError(
@@ -143,32 +157,64 @@ class SnapshotJournal:
             if mut.existed_before:
                 if mut.pre_bytes is None:
                     raise RuntimeError(f"cannot undo {mut.path}: preimage not stored (too large)")
-                if mut.pre_hash and _sha256(mut.pre_bytes) != mut.pre_hash:
-                    raise RuntimeError(f"corrupt preimage for {mut.path}")
+                if mut.pre_hash:
+                    expected_pre_digest = (
+                        _sha256(b"symlink\0" + mut.pre_bytes)
+                        if mut.mode is not None and stat.S_ISLNK(mut.mode)
+                        else _sha256(mut.pre_bytes)
+                    )
+                    if expected_pre_digest != mut.pre_hash:
+                        raise RuntimeError(f"corrupt preimage for {mut.path}")
             if mut.post_hash is not None:
-                if mut.post_bytes is None:
+                if mut.existed_before and mut.post_bytes is None:
                     raise RuntimeError(f"cannot undo {mut.path}: postimage not stored (too large)")
-                if _sha256(mut.post_bytes) != mut.post_hash:
-                    raise RuntimeError(f"corrupt postimage for {mut.path}")
+                if mut.post_bytes is not None:
+                    expected_post_digest = (
+                        _sha256(b"symlink\0" + mut.post_bytes)
+                        if mut.post_mode is not None and stat.S_ISLNK(mut.post_mode)
+                        else _sha256(mut.post_bytes)
+                    )
+                    if expected_post_digest != mut.post_hash:
+                        raise RuntimeError(f"corrupt postimage for {mut.path}")
             simulated[mut.path] = mut.pre_hash if mut.existed_before else None
 
         return turn
 
     def undo(self) -> TurnJournal:
         turn = self.validate_undo()
-        applied: list[FileMutation] = []
+        applied: list[tuple[FileMutation, Path | None]] = []
         try:
             for mut in reversed(turn.mutations):
-                self._write_state(
-                    Path(mut.path),
-                    mut.pre_bytes if mut.existed_before else None,
-                    mut.mode,
-                )
-                applied.append(mut)
+                target = Path(mut.path)
+                if (
+                    not mut.existed_before
+                    and mut.post_bytes is None
+                    and os.path.lexists(target)
+                ):
+                    fd, stash_name = tempfile.mkstemp(
+                        prefix=f".{target.name}.undo-", dir=target.parent
+                    )
+                    os.close(fd)
+                    os.replace(target, stash_name)
+                    applied.append((mut, Path(stash_name)))
+                else:
+                    self._write_state(
+                        target,
+                        mut.pre_bytes if mut.existed_before else None,
+                        mut.mode,
+                    )
+                    applied.append((mut, None))
         except Exception as exc:
-            for mut in reversed(applied):
-                self._write_state(Path(mut.path), mut.post_bytes, mut.post_mode)
+            for mut, stash in reversed(applied):
+                if stash is not None and os.path.lexists(stash):
+                    os.replace(stash, Path(mut.path))
+                else:
+                    self._write_state(Path(mut.path), mut.post_bytes, mut.post_mode)
             raise RuntimeError(f"undo failed and was rolled back: {exc}") from exc
+        for _mut, stash in applied:
+            if stash is not None:
+                with contextlib.suppress(OSError):
+                    stash.unlink()
 
         self._turns.pop()
         self._redo.append(turn)
@@ -182,6 +228,7 @@ class SnapshotJournal:
         simulated: dict[str, str | None] = {}
         for mut in turn.mutations:
             path = Path(mut.path)
+            self._assert_safe_parent(path, self._root)
             expected = mut.pre_hash if mut.existed_before else None
             actual = simulated.get(mut.path, self._path_hash(path))
             if actual != expected:
@@ -189,7 +236,12 @@ class SnapshotJournal:
             if mut.post_hash is not None:
                 if mut.post_bytes is None:
                     raise RuntimeError(f"cannot redo {mut.path}: postimage not stored (too large)")
-                if _sha256(mut.post_bytes) != mut.post_hash:
+                expected_post_digest = (
+                    _sha256(b"symlink\0" + mut.post_bytes)
+                    if mut.post_mode is not None and stat.S_ISLNK(mut.post_mode)
+                    else _sha256(mut.post_bytes)
+                )
+                if expected_post_digest != mut.post_hash:
                     raise RuntimeError(f"corrupt postimage for {mut.path}")
             simulated[mut.path] = mut.post_hash
 
@@ -222,21 +274,71 @@ class SnapshotJournal:
                 continue
             seen.add(mut.path)
             path = Path(mut.path)
-            if mut.post_bytes is None and path.exists() and path.stat().st_size <= self.blob_limit:
-                mut.post_bytes = path.read_bytes()
-                mut.post_mode = path.stat().st_mode
+            if mut.post_bytes is None and os.path.lexists(path):
+                info = path.lstat()
+                if stat.S_ISLNK(info.st_mode):
+                    data = os.fsencode(os.readlink(path))
+                    if len(data) <= self.blob_limit:
+                        mut.post_bytes = data
+                        mut.post_mode = info.st_mode
+                elif info.st_size <= self.blob_limit:
+                    mut.post_bytes = path.read_bytes()
+                    mut.post_mode = info.st_mode
+
+    @staticmethod
+    def _assert_safe_parent(path: Path, root: Path | None = None) -> None:
+        if os.path.lexists(path.parent) and path.parent.is_symlink():
+            raise RuntimeError(f"refuse restore through symlinked directory: {path.parent}")
+        if root is None:
+            return
+        try:
+            rel = path.relative_to(root)
+            cur = root
+            for part in rel.parts[:-1]:
+                cur = cur / part
+                if os.path.lexists(cur) and cur.is_symlink():
+                    raise RuntimeError(f"refuse restore through symlinked directory: {cur}")
+        except ValueError:
+            resolved_root = root.resolve()
+            if os.path.lexists(path.parent):
+                try:
+                    rel_parent = path.parent.resolve().relative_to(resolved_root)
+                except ValueError as exc:
+                    raise RuntimeError(f"refuse restore outside root {root}: {path}") from exc
+                cur = resolved_root
+                for part in rel_parent.parts:
+                    cur = cur / part
+                    if os.path.lexists(cur) and cur.is_symlink():
+                        raise RuntimeError(
+                            f"refuse restore through symlinked directory: {cur}"
+                        ) from None
 
     @staticmethod
     def _path_hash(path: Path) -> str | None:
-        return _sha256(path.read_bytes()) if path.exists() else None
+        if not os.path.lexists(path):
+            return None
+        if path.is_symlink():
+            return _sha256(b"symlink\0" + os.fsencode(os.readlink(path)))
+        return _sha256(path.read_bytes())
 
     @staticmethod
     def _write_state(path: Path, data: bytes | None, mode: int | None) -> None:
+        SnapshotJournal._assert_safe_parent(path)
         if data is None:
-            if path.exists():
+            if os.path.lexists(path):
                 path.unlink()
             return
         path.parent.mkdir(parents=True, exist_ok=True)
+        if mode is not None and stat.S_ISLNK(mode):
+            temp_name = str(path.parent / f".{path.name}.lnk-{uuid.uuid4().hex[:8]}")
+            try:
+                os.symlink(os.fsdecode(data), temp_name)
+                os.replace(temp_name, path)
+            finally:
+                if os.path.lexists(temp_name):
+                    with contextlib.suppress(OSError):
+                        Path(temp_name).unlink()
+            return
         fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
             with os.fdopen(fd, "wb") as fh:
@@ -247,7 +349,7 @@ class SnapshotJournal:
                 Path(temp_name).chmod(mode)
             os.replace(temp_name, path)
         finally:
-            with __import__("contextlib").suppress(FileNotFoundError):
+            with contextlib.suppress(FileNotFoundError):
                 Path(temp_name).unlink()
 
     def to_dict(self) -> dict:

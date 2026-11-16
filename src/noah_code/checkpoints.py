@@ -69,6 +69,10 @@ class CheckpointManager:
         env = os.environ.copy()
         for name in _STRIPPED_GIT_ENV:
             env.pop(name, None)
+        env.setdefault("GIT_AUTHOR_NAME", "Noah Code")
+        env.setdefault("GIT_AUTHOR_EMAIL", "noah-code@localhost")
+        env.setdefault("GIT_COMMITTER_NAME", "Noah Code")
+        env.setdefault("GIT_COMMITTER_EMAIL", "noah-code@localhost")
         if env_index is not None:
             env["GIT_INDEX_FILE"] = env_index
         try:
@@ -76,6 +80,7 @@ class CheckpointManager:
                 ["git", *args],
                 cwd=self._root,
                 env=env,
+                stdin=subprocess.DEVNULL if input_bytes is None else None,
                 input=input_bytes,
                 capture_output=True,
                 timeout=_GIT_TIMEOUT,
@@ -107,8 +112,8 @@ class CheckpointManager:
             self.prune_to(max(self._max - 1, 0))
         head = self._head_commit()
         top = self._toplevel()
-        with tempfile.NamedTemporaryFile(prefix="noah-index-") as handle:
-            index_path = handle.name
+        with tempfile.TemporaryDirectory(prefix="noah-index-") as tmp_dir:
+            index_path = str(Path(tmp_dir) / "index")
             if head:
                 read_tree = self._git("read-tree", head, env_index=index_path)
             else:
@@ -275,12 +280,12 @@ class CheckpointManager:
             metadata, path = entry.split("\t", 1)
             source_modes[path] = metadata.split()[0]
         tracked_paths = set(_split_nul(tracked.stdout))
+        top = self._toplevel()
         protected = {path for path in tracked_paths if is_secret_path(path)}
         protected_ancestors = {parent for path in protected for parent in Path(path).parents}
         paths = {path for path in tracked_paths | set(source_modes) if not is_secret_path(path)}
         if not paths:
             return f"restored {ref}: no unprotected files (HEAD unchanged)"
-        top = self._toplevel()
 
         def check_directory(directory: Path) -> None:
             with os.scandir(directory) as entries:
@@ -307,13 +312,28 @@ class CheckpointManager:
             target = top / path
             if source_modes.get(path) != "160000" and target.is_dir() and not target.is_symlink():
                 check_directory(target)
-        result = self._git(
-            "restore", "--source", ref, "--staged", "--worktree",
-            "--pathspec-from-file=-", "--pathspec-file-nul",
-            input_bytes=b"".join(b":(top,literal)" + os.fsencode(path) + b"\0" for path in sorted(paths)),
-        )
-        if result.returncode != 0:
-            raise CheckpointError(f"restore failed: {_err(result)}")
+        present_in_ref = sorted(p for p in paths if p in source_modes)
+        added_since_ref = sorted(p for p in paths if p not in source_modes)
+        if present_in_ref:
+            result = self._git(
+                "restore", "--source", ref, "--staged", "--worktree",
+                "--pathspec-from-file=-", "--pathspec-file-nul",
+                input_bytes=b"".join(
+                    b":(top,literal)" + os.fsencode(path) + b"\0" for path in present_in_ref
+                ),
+            )
+            if result.returncode != 0:
+                raise CheckpointError(f"restore failed: {_err(result)}")
+        if added_since_ref:
+            removed = self._git(
+                "rm", "-f", "--ignore-unmatch",
+                "--pathspec-from-file=-", "--pathspec-file-nul",
+                input_bytes=b"".join(
+                    b":(top,literal)" + os.fsencode(path) + b"\0" for path in added_since_ref
+                ),
+            )
+            if removed.returncode != 0:
+                raise CheckpointError(f"restore removal failed: {_err(removed)}")
         return f"restored {ref} into index+worktree (HEAD unchanged)"
 
     def prune_to(self, keep: int) -> int:

@@ -56,7 +56,9 @@ class QuestionTools(Skill):
     async def question(self, header: str, prompt: str, options: list[str]) -> str:
         """Ask one multiple-choice question and return the user's answer."""
 
-        cleaned = [item.strip() for item in options if str(item).strip()]
+        if not isinstance(options, (list, tuple)) or any(not isinstance(item, str) for item in options):
+            raise ValueError("question options must be strings")
+        cleaned = [item.strip() for item in options if item.strip()]
         if not cleaned:
             raise ValueError("question requires at least one option")
         await self._approvals.require(

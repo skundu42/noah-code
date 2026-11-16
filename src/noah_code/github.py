@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 Runner = Callable[[Path, list[str]], subprocess.CompletedProcess[str]]
+_PR_URL_RE = re.compile(r"^https://[^/\s]+/[^/\s]+/[^/\s]+/pull/[1-9]\d*(?:[/?#].*)?$")
+_REMOTE_OWNER_RE = re.compile(r"(?:github\.com[:/]|://[^/]+/)([^/]+)/[^/]+?(?:\.git)?/?$")
 
 
 class GithubError(RuntimeError):
@@ -28,12 +32,56 @@ class PullRequestInfo:
         return f"#{self.number}  {self.title}  {self.url}"
 
 
-def _default_run(cwd: Path, argv: list[str]) -> subprocess.CompletedProcess[str]:
+def _default_run(
+    cwd: Path, argv: list[str], *, timeout: float = 60.0
+) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env.setdefault("GH_PROMPT_DISABLED", "1")
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
     try:
-        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        program = argv[0] if argv else "command"
+        return subprocess.CompletedProcess(
+            argv, 124, "", f"{program} timed out after {timeout:.0f}s"
+        )
     except FileNotFoundError:
         program = argv[0] if argv else "command"
         return subprocess.CompletedProcess(argv, 127, "", f"{program} not found")
+
+
+def _validate_pr_number(number: int) -> int:
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise ValueError("pull request number must be an integer >= 1")
+    return number
+
+
+def _validate_pr_target(target: int | str | None) -> str | None:
+    if target is None:
+        return None
+    if isinstance(target, bool):
+        raise ValueError("pull request target must be a positive integer or PR URL")
+    if isinstance(target, int):
+        return str(_validate_pr_number(target))
+    if isinstance(target, str):
+        cleaned = target.strip()
+        if cleaned.isdigit() and int(cleaned) >= 1:
+            return str(int(cleaned))
+        if _PR_URL_RE.match(cleaned):
+            return cleaned
+        raise ValueError(
+            "pull request target must be a positive integer or GitHub pull request URL"
+        )
+    raise ValueError("pull request target must be a positive integer or PR URL")
 
 
 def _message(result: subprocess.CompletedProcess[str]) -> str:
@@ -70,15 +118,22 @@ class GithubManager:
             raise GithubError(_message(listed))
         return [_parse_pr(item) for item in _parse_json_list(listed.stdout)]
 
-    def view(self, number: int | None = None) -> str:
+    def view(self, number: int | str | None = None) -> str:
+        target = _validate_pr_target(number)
         self._require_ready()
         argv = ["gh", "pr", "view"]
-        if number is not None:
-            argv.append(str(number))
+        if target is not None:
+            argv.append(target)
         viewed = self._run(self.root, argv)
-        if viewed.returncode != 0:
-            raise GithubError(_message(viewed))
-        return (viewed.stdout or viewed.stderr).strip()
+        if viewed.returncode == 0:
+            return (viewed.stdout or viewed.stderr).strip()
+        if target is None:
+            fork_ref = self._fork_head_ref()
+            if fork_ref:
+                retry = self._run(self.root, ["gh", "pr", "view", fork_ref])
+                if retry.returncode == 0:
+                    return (retry.stdout or retry.stderr).strip()
+        raise GithubError(_message(viewed))
 
     def create(
         self,
@@ -132,23 +187,26 @@ class GithubManager:
 
     def push(self) -> str:
         self._require_ready()
-        pushed = self._run(self.root, ["git", "push", "-u", "origin", "HEAD"])
+        remote = self._push_remote()
+        pushed = self._run(self.root, ["git", "push", "-u", remote, "HEAD"])
         if pushed.returncode != 0:
             raise GithubError(_message(pushed))
-        return (pushed.stdout or pushed.stderr or "pushed HEAD to origin").strip()
+        return (pushed.stdout or pushed.stderr or f"pushed HEAD to {remote}").strip()
 
     def checkout(self, number: int) -> str:
+        pr_num = _validate_pr_number(number)
         self._require_ready()
-        branch = f"pr/{int(number)}"
+        branch = f"pr/{pr_num}"
         result = self._run(
             self.root,
-            ["gh", "pr", "checkout", str(int(number)), "--branch", branch, "--force"],
+            ["gh", "pr", "checkout", str(pr_num), "--branch", branch, "--force"],
         )
         if result.returncode != 0:
             raise GithubError(_message(result))
         return branch
 
     def comment(self, number: int, body: str, *, recover: bool = False) -> str:
+        pr_num = _validate_pr_number(number)
         self._require_ready()
         text = body.strip()
         if not text:
@@ -156,7 +214,7 @@ class GithubManager:
         if recover:
             viewed = self._run(
                 self.root,
-                ["gh", "pr", "view", str(int(number)), "--json", "comments"],
+                ["gh", "pr", "view", str(pr_num), "--json", "comments"],
             )
             if viewed.returncode == 0:
                 payload = _parse_json_object(viewed.stdout)
@@ -165,14 +223,51 @@ class GithubManager:
                     isinstance(item, dict) and str(item.get("body") or "").strip() == text
                     for item in comments
                 ):
-                    return f"comment already present on #{int(number)}"
+                    return f"comment already present on #{pr_num}"
         result = self._run(
             self.root,
-            ["gh", "pr", "comment", str(int(number)), "--body", text],
+            ["gh", "pr", "comment", str(pr_num), "--body", text],
         )
         if result.returncode != 0:
             raise GithubError(_message(result))
-        return (result.stdout or f"commented on #{int(number)}").strip()
+        return (result.stdout or f"commented on #{pr_num}").strip()
+
+    def _push_remote(self) -> str:
+        upstream = self._run(
+            self.root,
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        )
+        if upstream.returncode == 0:
+            ref = upstream.stdout.strip()
+            if "/" in ref:
+                return ref.split("/", 1)[0]
+        push_default = self._run(self.root, ["git", "config", "remote.pushDefault"])
+        if push_default.returncode == 0 and push_default.stdout.strip():
+            return push_default.stdout.strip()
+        remotes = self._run(self.root, ["git", "remote"])
+        if remotes.returncode == 0:
+            names = [line.strip() for line in remotes.stdout.splitlines() if line.strip()]
+            if len(names) == 1:
+                return names[0]
+            if "origin" in names:
+                return "origin"
+        return "origin"
+
+    def _fork_head_ref(self) -> str | None:
+        branch_res = self._run(self.root, ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        if branch_res.returncode != 0:
+            return None
+        branch = branch_res.stdout.strip()
+        if not branch or branch == "HEAD":
+            return None
+        remote = self._push_remote()
+        url_res = self._run(self.root, ["git", "remote", "get-url", remote])
+        if url_res.returncode != 0:
+            return None
+        match = _REMOTE_OWNER_RE.search(url_res.stdout.strip())
+        if not match:
+            return None
+        return f"{match.group(1)}:{branch}"
 
     def _latest_subject(self) -> str:
         result = self._run(self.root, ["git", "log", "-1", "--pretty=%s"])
@@ -192,14 +287,20 @@ class GithubManager:
 def _parse_json_list(raw: str) -> list[dict]:
     if not raw.strip():
         return []
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise GithubError(f"invalid JSON from gh: {exc}") from exc
     if not isinstance(data, list):
         raise GithubError("unexpected gh list payload")
     return [item for item in data if isinstance(item, dict)]
 
 
 def _parse_json_object(raw: str) -> dict:
-    data = json.loads(raw or "{}")
+    try:
+        data = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        raise GithubError(f"invalid JSON from gh: {exc}") from exc
     if not isinstance(data, dict):
         raise GithubError("unexpected gh view payload")
     return data

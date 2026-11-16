@@ -69,8 +69,6 @@ def _tool_call(name: str, arguments: dict[str, object], call_id: str) -> LLMResp
             ToolCall(id=call_id, name=name, arguments=json.dumps(arguments)),
         ],
         finish_reason="tool_calls",
-        assistant_message={"role": "assistant", "content": "", "tool_calls": []},
-        reasoning=None,
         usage=None,
     )
 
@@ -93,12 +91,12 @@ print("wave1-complete")
             _tool_call("execute_python", {"code": code}, "1"),
             _tool_call(
                 "return_result",
-                {"kind": "DONE", "explanation": "parser lives in src/parser.py"},
+                {"explanation": "parser lives in src/parser.py"},
                 "2",
             ),
             _tool_call(
                 "return_result",
-                {"kind": "DONE", "explanation": "wave1 tools finished"},
+                {"explanation": "wave1 tools finished"},
                 "3",
             ),
         ]

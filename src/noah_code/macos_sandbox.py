@@ -8,6 +8,7 @@ import ctypes.util
 import json
 import os
 import resource
+import unicodedata
 from collections.abc import Iterable
 from multiprocessing.connection import Connection
 from typing import Any
@@ -18,8 +19,8 @@ class MacOSSandboxUnavailable(RuntimeError):
 
 
 def _profile_path(path: str) -> str:
-    """Quote an absolute path as a sandbox profile string literal."""
-    return json.dumps(os.path.abspath(os.path.expanduser(path)))
+    """Quote an absolute path as a UTF-8 SBPL string literal."""
+    return json.dumps(os.path.abspath(os.path.expanduser(path)), ensure_ascii=False)
 
 
 def build_macos_profile(read_paths: Iterable[str]) -> str:
@@ -38,9 +39,16 @@ def build_macos_profile(read_paths: Iterable[str]) -> str:
         resolved = os.path.realpath(absolute)
         if os.path.exists(resolved):
             # macOS sandbox profiles match the path used by the operation, not
-            # only its canonical target. Keep both sides of symlinks such as
-            # /tmp -> /private/tmp and uv's versioned Python aliases.
-            roots.update({absolute, resolved})
+            # only its canonical target. Keep both symlink aliases and NFC/NFD
+            # Unicode forms used on HFS+/APFS.
+            for variant in (absolute, resolved):
+                roots.update(
+                    {
+                        variant,
+                        unicodedata.normalize("NFC", variant),
+                        unicodedata.normalize("NFD", variant),
+                    }
+                )
     roots.update(
         path
         for path in (
@@ -166,7 +174,9 @@ def macos_worker_main(
         _install_native_sandbox(profile)
     except BaseException as exc:  # noqa: BLE001 - child must fail closed
         with contextlib.suppress(Exception):
-            conn.send({"type": "fatal", "error": f"{type(exc).__name__}: {exc}"})
+            from nooa.runtime.sandbox import wire
+
+            wire.send(conn, {"type": "fatal", "error": f"{type(exc).__name__}: {exc}"})
         os._exit(3)
 
     from nooa.runtime.sandbox.worker import worker_main

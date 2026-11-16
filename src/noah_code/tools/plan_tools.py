@@ -82,16 +82,25 @@ class PlanTools(Skill):
             "Switch to build and follow the pinned plan?",
             "switch to build",
             "stay in plan",
+            allow_auto_approve=False,
         ):
             return "staying in plan mode"
         self._owner.set_mode("build")
         return "switched to build · follow .noah-code/plan.md"
 
-    async def _confirm(self, header: str, prompt: str, accept: str, reject: str) -> bool:
-        if self._engine.auto_approve:
+    async def _confirm(
+        self,
+        header: str,
+        prompt: str,
+        accept: str,
+        reject: str,
+        *,
+        allow_auto_approve: bool = True,
+    ) -> bool:
+        if self._engine.yolo or (allow_auto_approve and self._engine.auto_approve):
             return True
         if self._ask is None:
             raise PermissionError("plan switch has no UI handler")
         answer = await self._ask.question(header, prompt, [accept, reject])
-        chosen = answer.lower().rsplit("a:", 1)[-1]
-        return accept in chosen
+        chosen = answer.lower().rsplit("a:", 1)[-1].strip()
+        return chosen == accept.lower()

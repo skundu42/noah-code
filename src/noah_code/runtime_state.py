@@ -87,29 +87,37 @@ class WorkspaceLease:
         descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            payload = json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "session_id": session_id,
+                    "workspace": str(canonical),
+                    "acquired_at": time.time(),
+                },
+                separators=(",", ":"),
+            ).encode()
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.ftruncate(descriptor, 0)
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+            return cls(path, descriptor)
         except OSError as exc:
             owner = _read_lease_owner(path)
-            os.close(descriptor)
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
             detail = f" ({owner})" if owner else ""
             raise WorkspaceAlreadyActiveError(
                 f"workspace is already active in another Noah process{detail}: {canonical}. "
                 "Use /worktree create for concurrent coding sessions."
             ) from exc
-
-        payload = json.dumps(
-            {
-                "pid": os.getpid(),
-                "session_id": session_id,
-                "workspace": str(canonical),
-                "acquired_at": time.time(),
-            },
-            separators=(",", ":"),
-        ).encode()
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        os.ftruncate(descriptor, 0)
-        os.write(descriptor, payload)
-        os.fsync(descriptor)
-        return cls(path, descriptor)
+        except Exception:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            raise
 
     def close(self) -> None:
         descriptor, self._descriptor = self._descriptor, -1
@@ -529,7 +537,7 @@ class RuntimeStateStore:
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM file_operations WHERE state='started' "
-                "ORDER BY created_at DESC"
+                "ORDER BY created_at DESC, rowid DESC"
             ).fetchall()
         recovered: list[str] = []
         if rows:
@@ -589,7 +597,7 @@ class RuntimeStateStore:
             if row is not None and row["state"] == "committed":
                 result = json.loads(row["result_json"]) if row["result_json"] else None
                 return key, True, result, False
-            recovering = row is not None
+            recovering = row is not None and row["state"] == "started"
             connection.execute(
                 "INSERT INTO effects(effect_key, kind, target, request_json, state, "
                 "created_at, updated_at) VALUES (?, ?, ?, ?, 'started', ?, ?) "
@@ -660,7 +668,13 @@ class RuntimeStateStore:
         timeout_seconds: float,
         log_path: Path,
     ) -> None:
-        pgid = os.getpgid(pid) if os.name != "nt" else pid
+        if os.name == "nt":
+            pgid = pid
+        else:
+            try:
+                pgid = os.getpgid(pid)
+            except ProcessLookupError:
+                pgid = pid
         token = _process_token(pid)
         now = time.time()
         with self._connect() as connection:
@@ -764,11 +778,22 @@ class RuntimeStateStore:
             events = connection.execute("SELECT COUNT(*) FROM runtime_events").fetchone()[0]
         incomplete = self.latest_incomplete_run()
         sidecars = [self.path, Path(f"{self.path}-wal"), Path(f"{self.path}-shm")]
+
+        def _safe_size(target: Path) -> int:
+            try:
+                return target.stat().st_size if target.is_file() else 0
+            except OSError:
+                return 0
+
+        artifact_bytes = 0
+        try:
+            for artifact in self.artifact_dir.rglob("*"):
+                artifact_bytes += _safe_size(artifact)
+        except OSError:
+            pass
         return {
-            "database_bytes": sum(path.stat().st_size for path in sidecars if path.exists()),
-            "artifact_bytes": sum(
-                path.stat().st_size for path in self.artifact_dir.rglob("*") if path.is_file()
-            ),
+            "database_bytes": sum(_safe_size(path) for path in sidecars),
+            "artifact_bytes": artifact_bytes,
             "pending_inbox": int(pending_inbox),
             "pending_interactions": int(pending_interactions),
             "live_jobs": int(live_jobs),
@@ -858,7 +883,12 @@ def _process_token(pid: int) -> str:
 def _process_matches(pid: int, recorded_token: str) -> bool:
     try:
         os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        current = _process_token(pid)
+        return bool(recorded_token and current and current == recorded_token) if current else True
+    except OSError:
         return False
     current = _process_token(pid)
     return bool(recorded_token and current and current == recorded_token)

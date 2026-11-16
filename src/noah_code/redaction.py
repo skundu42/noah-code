@@ -12,8 +12,8 @@ _KEYED_SECRET = re.compile(
     r"api[-_ ]?secret[-_ ]?key|secret[-_ ]?access[-_ ]?key|secret[-_ ]?key|"
     r"session[-_ ]?cookie|"
     r"set[-_ ]?cookie|credential|credentials|cookie|token|secret)"
-    r"[\"']?\s*[:=]\s*)"
-    r"(?:(?P<quote>[\"'])(?P<quoted>.*?)(?P=quote)|"
+    r"(?:\\?[\"'])?\s*[:=]\s*)"
+    r"(?:(?P<quote>\\?[\"'])(?P<quoted>(?:\\.|[^\"'])*?)(?P=quote)|"
     r"(?P<bearer>Bearer\s+[^\s,;}]+)|(?P<bare>[^\s,;}]+))",
     re.IGNORECASE,
 )
@@ -31,13 +31,15 @@ _GOOGLE_API_KEY = re.compile(r"(?P<secret>AIza[A-Za-z0-9_-]{35})")
 _PRIVATE_KEY = re.compile(
     r"(?P<secret>-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
     r".*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----)",
-    re.IGNORECASE,
+    re.IGNORECASE | re.DOTALL,
 )
 _URL_CREDENTIALS = re.compile(
     r"(?P<scheme>https?://)(?P<userinfo>[^/@\s]+)@",
     re.IGNORECASE,
 )
-_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_ANSI_ESCAPE = re.compile(
+    r"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|[PX^_][^\x1b]*\x1b\\|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])"
+)
 
 
 def _redact_keyed_secret(match: re.Match[str]) -> str:
@@ -48,6 +50,21 @@ def _redact_keyed_secret(match: re.Match[str]) -> str:
 def _redact_named_secret(match: re.Match[str]) -> str:
     prefix = match.groupdict().get("prefix", "")
     return f"{prefix}***"
+
+
+def redact_secrets(text: str) -> str:
+    """Strip ANSI escape codes and common credential forms from text."""
+
+    if not text:
+        return ""
+    message = _ANSI_ESCAPE.sub("", text)
+    message = _URL_CREDENTIALS.sub(r"\g<scheme>***@", message)
+    message = _KEYED_SECRET.sub(_redact_keyed_secret, message)
+    message = _BEARER_SECRET.sub(_redact_named_secret, message)
+    message = _PREFIXED_SECRET.sub(_redact_named_secret, message)
+    message = _AWS_ACCESS_KEY.sub(_redact_named_secret, message)
+    message = _GOOGLE_API_KEY.sub(_redact_named_secret, message)
+    return _PRIVATE_KEY.sub(_redact_named_secret, message)
 
 
 def safe_error_message(error: BaseException | str, *, limit: int = 700) -> str:
@@ -61,15 +78,7 @@ def safe_error_message(error: BaseException | str, *, limit: int = 700) -> str:
         message = error.strip()
     if not message:
         return ""
-    message = _ANSI_ESCAPE.sub("", message)
-    message = re.sub(r"\s+", " ", message)
-    message = _URL_CREDENTIALS.sub(r"\g<scheme>***@", message)
-    message = _KEYED_SECRET.sub(_redact_keyed_secret, message)
-    message = _BEARER_SECRET.sub(_redact_named_secret, message)
-    message = _PREFIXED_SECRET.sub(_redact_named_secret, message)
-    message = _AWS_ACCESS_KEY.sub(_redact_named_secret, message)
-    message = _GOOGLE_API_KEY.sub(_redact_named_secret, message)
-    message = _PRIVATE_KEY.sub(_redact_named_secret, message)
+    message = re.sub(r"\s+", " ", redact_secrets(message)).strip()
     if len(message) > limit:
         message = message[: limit - 1].rstrip() + "…"
     return message

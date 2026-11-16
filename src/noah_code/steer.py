@@ -147,11 +147,22 @@ class SteerQueue:
 
 
 def expansion_failed(item: SteerItem, expanded: Any) -> bool:
-    """True when a queued item named files but expand_turn resolved none of them."""
+    """True when a queued item named file attachments that resolved nothing."""
+
+    import re
 
     from noah_code.composer import _MENTION
 
-    expected = bool(_MENTION.search(item.text) or item.attach_paths)
+    if item.attach_paths:
+        return expanded.text == item.text and not getattr(expanded, "images", None)
+    stripped = re.sub(r"```.*?```", " ", item.text, flags=re.DOTALL)
+    stripped = re.sub(r"`[^`\n]+`", " ", stripped)
+    expected = any(
+        match.group(1) is not None
+        or "/" in (match.group(2) or "")
+        or "." in (match.group(2) or "")
+        for match in _MENTION.finditer(stripped)
+    )
     if not expected:
         return False
     return expanded.text == item.text and not getattr(expanded, "images", None)

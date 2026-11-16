@@ -80,9 +80,12 @@ def _write_auth_file(path: Path, data: dict[str, Any]) -> None:
 
     descriptor, temporary_name = tempfile.mkstemp(prefix=".auth-", suffix=".tmp", dir=parent)
     temporary_path = Path(temporary_name)
+    stream = None
     try:
         os.fchmod(descriptor, AUTH_FILE_MODE)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with stream:
             json.dump(data, stream, indent=2, sort_keys=True)
             stream.write("\n")
             stream.flush()
@@ -90,8 +93,9 @@ def _write_auth_file(path: Path, data: dict[str, Any]) -> None:
         temporary_path.replace(path)
         path.chmod(AUTH_FILE_MODE)
     except Exception:
-        with suppress(OSError):
-            os.close(descriptor)
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
         temporary_path.unlink(missing_ok=True)
         raise
 

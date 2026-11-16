@@ -19,27 +19,49 @@ from noah_code.permissions import PermissionCategory, PermissionEngine
 
 _RESERVED_AGENT_ATTRS = frozenset(
     {
+        "agent_id",
         "approvals",
+        "ask",
         "context",
         "engine",
+        "event_manager",
+        "events",
         "git",
+        "github",
         "journal",
         "lsp",
+        "media",
+        "memory",
         "message",
         "mode",
+        "plan",
         "processes",
+        "producers",
+        "queue_manager",
         "skills",
+        "task",
         "todos",
+        "tools",
+        "user_messages",
         "v",
+        "vars",
+        "web",
         "workspace_root",
         "ws",
         "_approvals",
+        "_budget_guard",
         "_config",
+        "_coordinator",
         "_engine",
         "_journal",
         "_llm",
+        "_lightweight_llm",
+        "_observability_event_manager",
+        "_observability_unsubs",
+        "_runtime",
         "_sandbox_approved_roots",
         "_shell",
+        "_usage_tracker",
     }
 )
 _MUTATING_MCP_TOOL = re.compile(
@@ -148,11 +170,16 @@ def load_mcp_servers(
     config: NoahCodeConfig,
     *,
     home: Path | None = None,
+    extra_servers: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-    """Merge Claude/Cursor-style JSON and trusted Noah configuration."""
+    """Merge Claude/Cursor-style JSON, untrusted session requests, and trusted Noah config."""
 
     servers: dict[str, dict[str, Any]] = {}
     sources: dict[str, str] = {}
+    if isinstance(extra_servers, dict):
+        for name, spec in _server_mapping(extra_servers).items():
+            servers[name] = spec
+            sources[name] = "client session"
     for path in mcp_config_paths(workspace, home=home):
         if not path.is_file():
             continue
@@ -269,13 +296,16 @@ async def attach_mcp_server(
                 reason=f"{decision.reason} (configured MCP)",
             )
     else:
-        saved = engine.auto_approve
+        saved_auto = engine.auto_approve
+        saved_yolo = engine.yolo
         engine.auto_approve = False
+        engine.yolo = False
         try:
             decision = engine.decide(PermissionCategory.MCP, name, tool="mcp")
         finally:
-            engine.auto_approve = saved
-        if decision.action == "ask" and (saved or startup):
+            engine.auto_approve = saved_auto
+            engine.yolo = saved_yolo
+        if decision.action == "ask" and (saved_auto or saved_yolo or startup):
             raise PermissionError(f"workspace MCP servers cannot be auto-approved: {name}")
     await approvals.require(decision)
     try:
@@ -289,19 +319,40 @@ async def attach_mcp_server(
         **_normalized_spec(spec),
     )
     runtime = getattr(agent, "_runtime", None)
-    if runtime is not None or callable(getattr(tool, "_call_tool", None)):
+    if callable(getattr(tool, "_call_tool", None)):
         original_call = tool._call_tool
         browser_effect_lock = asyncio.Lock()
 
-        async def _invoke(tool_name: str, clean: dict[str, Any], *, browser_mutation: bool) -> Any:
+        async def _call_underlying(
+            tool_name: str,
+            clean: dict[str, Any],
+            preserve_none: set[str] | frozenset[str],
+        ) -> Any:
+            if preserve_none:
+                return await original_call(tool_name, clean, _preserve_none=preserve_none)
+            return await original_call(tool_name, clean)
+
+        async def _invoke(
+            tool_name: str,
+            clean: dict[str, Any],
+            *,
+            browser_mutation: bool,
+            preserve_none: set[str] | frozenset[str] = frozenset(),
+        ) -> Any:
             if runtime is None or (
                 not browser_mutation and _MUTATING_MCP_TOOL.match(tool_name) is None
             ):
-                return await original_call(tool_name, clean)
+                return await _call_underlying(tool_name, clean, preserve_none)
+            active_run_id = getattr(agent, "_current_run_id", None)
+            effect_request: Any = (
+                {"arguments": clean, "run_id": active_run_id}
+                if not browser_mutation and active_run_id
+                else clean
+            )
             effect_key, cached, result, recovering = runtime.begin_effect(
                 "mcp",
                 f"{name}.{tool_name}",
-                clean,
+                effect_request,
             )
             if cached:
                 if not browser_mutation:
@@ -310,7 +361,7 @@ async def attach_mcp_server(
                 # not an idempotent operation. Reopen the completed journal
                 # record; an interruption here safely blocks the next retry.
                 runtime.fail_effect(effect_key, "starting another browser invocation")
-                runtime.begin_effect("mcp", f"{name}.{tool_name}", clean)
+                runtime.begin_effect("mcp", f"{name}.{tool_name}", effect_request)
             if recovering:
                 runtime.fail_effect(
                     effect_key,
@@ -321,7 +372,7 @@ async def attach_mcp_server(
                     "crash; inspect the remote system before retrying with changed arguments"
                 )
             try:
-                value = await original_call(tool_name, clean)
+                value = await _call_underlying(tool_name, clean, preserve_none)
             except Exception as exc:
                 runtime.fail_effect(effect_key, str(exc))
                 raise
@@ -332,23 +383,55 @@ async def attach_mcp_server(
             _self: Any,
             tool_name: str,
             arguments: dict[str, Any] | None = None,
+            *,
+            _preserve_none: set[str] | frozenset[str] = frozenset(),
         ) -> Any:
-            clean = {key: value for key, value in (arguments or {}).items() if value is not None}
+            preserve = set(_preserve_none)
+            clean = {
+                key: value
+                for key, value in (arguments or {}).items()
+                if value is not None or key in preserve
+            }
             browser_mutation = browser_tool_mutates(tool_name, clean)
-            if browser_mutation:
-                decision = engine.decide(
-                    PermissionCategory.MCP, f"{name}.{tool_name}", tool=f"mcp.{tool_name}"
+            is_mutating = browser_mutation or _MUTATING_MCP_TOOL.match(tool_name) is not None
+            decision = engine.decide(
+                PermissionCategory.MCP, f"{name}.{tool_name}", tool=f"mcp.{tool_name}"
+            )
+            if is_mutating and engine.mode == "plan":
+                reason = (
+                    f"plan mode forbids browser mutations ({name}.{tool_name})"
+                    if browser_mutation
+                    else f"plan mode forbids mutating MCP calls ({name}.{tool_name})"
                 )
-                if engine.mode == "plan":
-                    decision = replace(
-                        decision, action="deny", reason="plan mode forbids browser mutations"
-                    )
+                decision = replace(
+                    decision,
+                    action="deny",
+                    reason=reason,
+                )
                 await approvals.require(decision)
+            elif (
+                browser_mutation
+                or not trusted
+                or decision.action == "deny"
+                or (decision.matching_rule is not None and decision.matching_rule.pattern != "*")
+            ):
+                await approvals.require(decision)
+            if browser_mutation:
                 # Serialize browser effects so an identical concurrent action
                 # cannot confuse an in-flight operation with crash recovery.
                 async with browser_effect_lock:
-                    return await _invoke(tool_name, clean, browser_mutation=True)
-            return await _invoke(tool_name, clean, browser_mutation=False)
+                    return await _invoke(
+                        tool_name,
+                        clean,
+                        browser_mutation=True,
+                        preserve_none=preserve,
+                    )
+            return await _invoke(
+                tool_name,
+                clean,
+                browser_mutation=False,
+                preserve_none=preserve,
+            )
 
         tool._call_tool = types.MethodType(_durable_mcp_call, tool)
     attr = re_attr(name)
@@ -368,10 +451,13 @@ async def install_mcp(
     approvals: ApprovalBroker,
     home: Path | None = None,
     startup: bool = False,
+    extra_servers: dict[str, dict[str, Any]] | None = None,
 ) -> MCPInstallResult:
     """Attach all configured servers without failing startup on one bad server."""
 
-    servers, sources = load_mcp_servers(workspace, config, home=home)
+    servers, sources = load_mcp_servers(
+        workspace, config, home=home, extra_servers=extra_servers
+    )
     attached: list[str] = []
     errors: list[str] = []
     for name, spec in servers.items():

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from noah_code.secure_files import read_text_bounded, unlink_file, write_text_atomic
@@ -12,7 +13,12 @@ MEMORY_RELATIVE = ".noah-code/memory.md"
 MEMORY_MAX_ITEMS = 40
 MEMORY_MAX_CHARS = 4000
 _SECRET_MARKERS = ("api_key", "password", "secret", "token=", "BEGIN ")
-_NOTE_MAX_BYTES = 1024 * 1024
+_NOTE_MAX_BYTES = 64 * 1024
+_BULLET_PREFIX = re.compile(r"^\s*(?:[-*•]+)\s*")
+
+
+def _strip_bullet(line: str) -> str:
+    return _BULLET_PREFIX.sub("", line.strip()).strip()
 
 
 def parse_memory_facts(raw: str) -> list[str]:
@@ -20,7 +26,7 @@ def parse_memory_facts(raw: str) -> list[str]:
 
     facts: list[str] = []
     for line in raw.splitlines():
-        text = line.strip().lstrip("-*").strip()
+        text = _strip_bullet(line)
         if not text or text.upper() == "EMPTY":
             continue
         if len(text) > 200 or "```" in text:
@@ -39,7 +45,7 @@ def parse_distilled_memories(raw: str) -> list[str]:
 
     tagged: list[str] = []
     for line in raw.splitlines():
-        text = line.strip().lstrip("-*").strip()
+        text = _strip_bullet(line)
         if text.upper().startswith("MEMORY:"):
             tagged.append(text.split(":", 1)[1].strip())
     return parse_memory_facts("\n".join(f"- {item}" for item in tagged))
@@ -65,6 +71,8 @@ class NoteStore:
 
     def write(self, text: str) -> None:
         payload = text if text.endswith("\n") or text == "" else f"{text}\n"
+        if len(payload.encode("utf-8")) > _NOTE_MAX_BYTES:
+            raise ValueError(f"note exceeds {_NOTE_MAX_BYTES} byte limit")
         write_text_atomic(self.root, self.relative, payload)
 
     def clear(self) -> None:
@@ -84,7 +92,7 @@ class MemoryStore(NoteStore):
         super().__init__(root, MEMORY_RELATIVE)
 
     def merge(self, facts: list[str]) -> list[str]:
-        existing = [line.lstrip("- ").strip() for line in self.read().splitlines() if line.strip()]
+        existing = [_strip_bullet(line) for line in self.read().splitlines() if _strip_bullet(line)]
         seen = {item.lower() for item in existing}
         added: list[str] = []
         for fact in facts:
@@ -95,6 +103,8 @@ class MemoryStore(NoteStore):
             seen.add(cleaned.lower())
             added.append(cleaned)
         existing = existing[-MEMORY_MAX_ITEMS:]
+        while len("\n".join(f"- {item}" for item in existing)) > MEMORY_MAX_CHARS and len(existing) > 1:
+            existing.pop(0)
         text = "\n".join(f"- {item}" for item in existing)
         if len(text) > MEMORY_MAX_CHARS:
             text = text[: MEMORY_MAX_CHARS - 1].rstrip() + "…"
@@ -103,8 +113,10 @@ class MemoryStore(NoteStore):
         return added
 
     def forget(self, fact: str) -> bool:
-        needle = fact.strip().lower()
-        lines = [line.lstrip("- ").strip() for line in self.read().splitlines() if line.strip()]
+        needle = _strip_bullet(fact).lower()
+        if not needle:
+            return False
+        lines = [_strip_bullet(line) for line in self.read().splitlines() if _strip_bullet(line)]
         kept = [item for item in lines if needle not in item.lower()]
         if len(kept) == len(lines):
             return False

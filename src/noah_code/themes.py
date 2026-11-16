@@ -10,6 +10,7 @@ ThemeName = Literal[
     "noah-ocean",
     "graphite",
     "high-contrast",
+    "daylight",
 ]
 
 
@@ -104,6 +105,21 @@ THEMES: dict[ThemeName, ThemePalette] = {
         success="#00f59b",
         warning="#ffd400",
         error="#ff6685",
+    ),
+    "daylight": ThemePalette(
+        name="daylight",
+        label="Daylight",
+        description="Crisp paper daylight with deep ink and cobalt signal",
+        canvas="#f7f7f9",
+        surface="#ffffff",
+        raised="#ededf2",
+        border="#cfd2dc",
+        text="#1b1d24",
+        muted="#5f6575",
+        accent="#2b59c3",
+        success="#1b7f5a",
+        warning="#b26a00",
+        error="#c43242",
     ),
 }
 

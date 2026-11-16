@@ -11,6 +11,8 @@ import asyncio
 import json
 from typing import Any
 
+from nooa.unifiedllm.unifiedllm import UnifiedLLM
+
 from noah_code.codex_rpc import CodexAppServer, CodexError
 from noah_code.model_streaming import external_model_stream
 
@@ -149,14 +151,13 @@ def _validate_options(options: dict[str, Any]) -> None:
         )
 
 
-class CodexClient:
+class CodexClient(UnifiedLLM):
     def __init__(self, model: str, **config: Any) -> None:
         if not model.startswith("codex/") or not model.removeprefix("codex/").strip():
             raise ValueError("Codex models use codex/<model-id>.")
         _validate_options(config)
-        self.model = model
+        super().__init__(model=model, context_window=None)
         self.config = config
-        self.context_window: int | None = None
 
     def count_tokens(self, text: str) -> int:
         import litellm
@@ -255,7 +256,7 @@ class CodexClient:
                         method = event.get("method")
                         if method == "thread/tokenUsage/updated":
                             usage = _usage(event_params.get("tokenUsage"))
-                            self.context_window = event_params.get("tokenUsage", {}).get(
+                            self._context_window = event_params.get("tokenUsage", {}).get(
                                 "modelContextWindow"
                             )
                         elif method == "item/agentMessage/delta":
@@ -278,23 +279,12 @@ class CodexClient:
                                 raise CodexError("Codex returned an invalid tool call.")
                             arguments = json.dumps(event_params["arguments"])
                             tool_call = ToolCall(id=call_id, name=name, arguments=arguments)
-                            message = {
-                                "role": "assistant",
-                                "content": "\n".join(text_items.values()),
-                                "tool_calls": [
-                                    {
-                                        "id": call_id,
-                                        "type": "function",
-                                        "function": {"name": name, "arguments": arguments},
-                                    }
-                                ],
-                            }
+                            content_text = "\n".join(text_items.values())
                             return LLMResponse(
                                 raw_response={"model": self.model},
-                                content=message["content"],
+                                content=content_text,
                                 tool_calls=[tool_call],
                                 finish_reason="tool_calls",
-                                assistant_message=message,
                                 usage=usage,
                             )
                         elif method in {"item/started", "item/completed"}:
@@ -330,6 +320,5 @@ class CodexClient:
                                 content=content,
                                 tool_calls=[],
                                 finish_reason="stop",
-                                assistant_message={"role": "assistant", "content": text},
                                 usage=usage,
                             )

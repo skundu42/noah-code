@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import random
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+_STRIPPED_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY")
+_GIT_TIMEOUT = 30
 
 ADJECTIVES = (
     "brave",
@@ -59,13 +63,35 @@ class WorktreeInfo:
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    env = os.environ.copy()
+    for name in _STRIPPED_GIT_ENV:
+        env.pop(name, None)
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        program = f"git {args[0]}" if args else "git"
+        return subprocess.CompletedProcess(
+            ["git", *args],
+            returncode=124,
+            stdout="",
+            stderr=f"{program} timed out after {_GIT_TIMEOUT}s",
+        )
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(
+            ["git", *args],
+            returncode=127,
+            stdout="",
+            stderr="git is not installed or not on PATH",
+        )
 
 
 def _git_message(result: subprocess.CompletedProcess[str]) -> str:
@@ -214,7 +240,7 @@ class WorktreeManager:
             pruned = _git(self.checkout, "worktree", "prune", "--verbose")
             if pruned.returncode != 0:
                 raise WorktreeError(_git_message(pruned))
-        if info.branch:
+        if info.branch and info.branch.startswith("noah/"):
             _git(self.checkout, "branch", "-D", info.branch)
         if directory.exists():
             shutil.rmtree(directory, ignore_errors=True)
@@ -235,6 +261,12 @@ class WorktreeManager:
         raise WorktreeError("failed to generate a unique worktree name")
 
     def _owned(self, directory: Path, branch: str) -> WorktreeInfo | None:
+        repo = repo_id_for(self.checkout)
+        if not repo:
+            return None
+        owner_root = (self.storage_root / repo).resolve()
+        if not directory.resolve().is_relative_to(owner_root):
+            return None
         name = infer_worktree_name(directory, self.storage_root)
         if not name:
             return None
@@ -244,6 +276,7 @@ class WorktreeManager:
 
     def _rollback(self, info: WorktreeInfo) -> None:
         _git(self.checkout, "worktree", "remove", "--force", str(info.directory))
-        _git(self.checkout, "branch", "-D", info.branch)
+        if info.branch and info.branch.startswith("noah/"):
+            _git(self.checkout, "branch", "-D", info.branch)
         if info.directory.exists():
             shutil.rmtree(info.directory, ignore_errors=True)

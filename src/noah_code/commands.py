@@ -201,8 +201,11 @@ def _is_secret_config_path(path: tuple[str, ...]) -> bool:
             (
                 "_api_key",
                 "_access_key",
+                "_auth",
                 "_authorization",
                 "_credential",
+                "_credentials",
+                "_passphrase",
                 "_password",
                 "_private_key",
                 "_secret",
@@ -223,7 +226,21 @@ def _redact_config(value: Any, path: tuple[str, ...] = ()) -> Any:
         return [_redact_config(child, path) for child in value]
     if isinstance(value, tuple):
         return [_redact_config(child, path) for child in value]
-    return "***" if _is_secret_config_path(path) else value
+    if _is_secret_config_path(path):
+        return "***"
+    if isinstance(value, str):
+        from noah_code.redaction import (
+            _BEARER_SECRET,
+            _PREFIXED_SECRET,
+            _URL_CREDENTIALS,
+            _redact_named_secret,
+        )
+
+        scrubbed = _URL_CREDENTIALS.sub(r"\g<scheme>***@", value)
+        scrubbed = _BEARER_SECRET.sub(_redact_named_secret, scrubbed)
+        scrubbed = _PREFIXED_SECRET.sub(_redact_named_secret, scrubbed)
+        return scrubbed
+    return value
 
 
 def redacted_config(config: Any) -> dict[str, Any]:

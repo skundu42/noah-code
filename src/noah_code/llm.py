@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import random
 import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from nooa.unifiedllm.unifiedllm import UnifiedLLM
+
+from noah_code import nooa_compat
 from noah_code.config import REASONING_EFFORTS, RetryConfig
 
 
@@ -123,7 +127,24 @@ def is_transient_llm_error(exc: BaseException) -> bool:
     return any(marker in text for marker in _TRANSIENT_MARKERS)
 
 
-class ResilientLLM:
+def _disable_inner_retries(client: Any) -> None:
+    """Disable NOOA's inner retry loop when ResilientLLM owns retry/failover."""
+
+    from nooa.unifiedllm.retry_config import RetryConfig as NooaRetryConfig
+
+    seen: set[int] = set()
+    current: Any = client
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if hasattr(current, "retry_config"):
+            with contextlib.suppress(AttributeError, TypeError):
+                current.retry_config = NooaRetryConfig(
+                    max_retries=0, rate_limit_extra_retries=0
+                )
+        current = getattr(current, "_inner", None)
+
+
+class ResilientLLM(UnifiedLLM):
     """Provider-aware retries and ordered model failover.
 
     Model calls are side-effect free from Noah's perspective, so a failure
@@ -140,8 +161,11 @@ class ResilientLLM:
         on_retry: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._clients = (primary, *fallbacks)
+        for wrapped in self._clients:
+            _disable_inner_retries(wrapped)
         self._config = config
         self._on_retry = on_retry
+        nooa_compat.init_llm_wrapper(self, primary)
 
     @property
     def model(self) -> Any:
@@ -159,6 +183,8 @@ class ResilientLLM:
         **kwargs: Any,
     ) -> Any:
         last_error: BaseException | None = None
+        call_kwargs = dict(kwargs)
+        call_kwargs.setdefault("timeout", self._config.request_timeout_seconds)
         for fallback_index, client in enumerate(self._clients):
             for attempt in range(1, self._config.max_attempts + 1):
                 try:
@@ -166,7 +192,7 @@ class ResilientLLM:
                         messages,
                         tools=tools,
                         output_model=output_model,
-                        **kwargs,
+                        **call_kwargs,
                     )
                     return await asyncio.wait_for(
                         call,

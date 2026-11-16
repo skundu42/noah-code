@@ -1,7 +1,7 @@
 """Single seam for NOOA internals that have no public API yet.
 
 Every private-attribute reach-through into the framework lives here so an
-upgrade only requires auditing this one module. Pinned upstream: nooa==0.0.10.
+upgrade only requires auditing this one module. Pinned upstream: nooa==0.0.12.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def _indent_cell_preserving_literals(code: str, prefix: str) -> str:
 
 
 def install_cell_literal_preservation() -> None:
-    """Patch NOOA 0.0.10's sandbox-only textual indentation defect once.
+    """Patch NOOA 0.0.12's sandbox-only textual indentation defect once.
 
     Install in the parent before Linux forks and in the macOS spawned worker
     before OS guards. The in-process actor already uses token-aware indentation.
@@ -59,8 +59,8 @@ def install_cell_literal_preservation() -> None:
     with _stream_install_lock:
         if _cell_indent_installed:
             return
-        if version("nooa") != "0.0.10":
-            raise RuntimeError("cell literal preservation requires audited nooa==0.0.10")
+        if version("nooa") != "0.0.12":
+            raise RuntimeError("cell literal preservation requires audited nooa==0.0.12")
         from nooa.runtime.sandbox import cell_core
 
         if tuple(inspect.signature(cell_core._indent).parameters) != ("code", "prefix"):
@@ -72,7 +72,7 @@ def install_cell_literal_preservation() -> None:
 def install_completion_stream_observer(observer: Callable[[Any], Any]) -> None:
     """Observe NOOA's completion iterators without replacing its response parser.
 
-    NOOA 0.0.10 exposes no per-chunk callback. Its two collectors are the narrow
+    NOOA 0.0.12 exposes no per-chunk callback. Its two collectors are the narrow
     interception point: the observer returns the same response or a transparent
     iterator, and the original collector still assembles usage and tool calls.
     Install once; the observer itself must use call-local context, never global
@@ -83,8 +83,8 @@ def install_completion_stream_observer(observer: Callable[[Any], Any]) -> None:
     with _stream_install_lock:
         if _stream_observer_installed:
             return
-        if version("nooa") != "0.0.10":
-            raise RuntimeError("model streaming requires the audited nooa==0.0.10 collectors")
+        if version("nooa") != "0.0.12":
+            raise RuntimeError("model streaming requires the audited nooa==0.0.12 collectors")
         from nooa.unifiedllm import unifiedllm
 
         sync_collect = unifiedllm._collect_sync
@@ -154,16 +154,11 @@ async def compact_summarizers(agent: Any) -> bool:
 
 
 def rebind_summarizer_llms(agent: Any, llm: Any) -> None:
-    """Route every summarizer's model calls to the new client."""
+    """Route every summarizer's model calls to the new client when applicable."""
 
     for summarizer in summarizers(agent):
-        summarizer._llm = llm
-
-
-def truncation_event_format(agent: Any) -> str:
-    """Event format string the agent's truncation policy was built with."""
-
-    return agent._truncation.event_format
+        if hasattr(summarizer, "_llm"):
+            summarizer._llm = llm
 
 
 def evicted_output_chars(agent: Any) -> int:
@@ -173,3 +168,30 @@ def evicted_output_chars(agent: Any) -> int:
     for summarizer in summarizers(agent):
         total += int(getattr(summarizer, "evicted_output_chars", 0) or 0)
     return total
+
+
+def in_summary_fork() -> bool:
+    """Return True inside NOOA's best-effort history summarization fork."""
+
+    from nooa.agents.summarization import summary_fork_active
+
+    return bool(summary_fork_active())
+
+
+def init_llm_wrapper(wrapper: Any, delegate: Any) -> None:
+    """Populate UnifiedLLM internal attributes on delegate wrappers."""
+
+    from nooa.unifiedllm.unifiedllm import ReasoningConfig
+
+    object.__setattr__(
+        wrapper,
+        "_reasoning_config",
+        getattr(delegate, "_reasoning_config", None) or ReasoningConfig(),
+    )
+    object.__setattr__(wrapper, "reasoning_level", getattr(delegate, "reasoning_level", None))
+    object.__setattr__(wrapper, "structured_output_mode", getattr(delegate, "structured_output_mode", None))
+    object.__setattr__(wrapper, "media_inputs", getattr(delegate, "media_inputs", ()))
+    object.__setattr__(wrapper, "config", dict(getattr(delegate, "config", None) or {}))
+    object.__setattr__(wrapper, "_registry_config", getattr(delegate, "_registry_config", None))
+    object.__setattr__(wrapper, "cache_breakpoint", getattr(delegate, "cache_breakpoint", None))
+    object.__setattr__(wrapper, "_http", getattr(delegate, "_http", None))

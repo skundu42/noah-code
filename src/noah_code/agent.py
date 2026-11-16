@@ -18,16 +18,17 @@ from typing import Annotated, Any, Literal
 
 from nooa import Agent, Context, hidden, strategy
 from nooa.config import CodeActConfig, PredictConfig
-from nooa.context_blocks import RenderedMessage, ResolvedBlock, Role, ToolCallEvent
-from nooa.interactive import InteractiveAgent, RespondReason, RespondResult
+from nooa.context_blocks import ToolCallEvent
+from nooa.context_blocks.formatter import MarkdownBlockFormatter
+from nooa.interactive import Done, InteractiveAgent, NeedInput, Waiting
 from nooa.runtime.channels import Channel
 from nooa.runtime.restrictions import RESTRICTED_MODULES, RestrictionsConfig
+from nooa.runtime.sandbox import wire
 from nooa.runtime.sandbox.config import FileRule, SandboxConfig, resolve_spec
 from nooa.runtime.sandbox.executor import SandboxedExecutor
 from nooa.runtime.sandbox.serialization import effective_error_limit
 from nooa.storage.markers import nosnapshot
 from nooa.strategies import CodeActStrategy
-from nooa.strategies.codeact_lite import PlainCodeActBlockFormatter
 from nooa.tools import TodoManager
 from nooa.tools.shell_tools import ShellTools
 
@@ -406,6 +407,7 @@ class _MacOSPermissionSandboxedExecutor(_PermissionSandboxedExecutor):
         self._max_error = effective_error_limit(max_error)
         self._error_tail = error_tail
         self._spec = resolve_spec(worker_config)
+        self._codec = wire.Codec(wire.agent_types(agent))
         self._degraded: list[str] = []
         # Forking a multithreaded Textual process can deadlock in inherited
         # locks and is deprecated on macOS/Python 3.12. This custom executor's
@@ -549,26 +551,24 @@ Sandboxed cells forbid host/system imports (including os, sys, subprocess,
 shutil, nooa, and noah_code), dynamic execution, input, and attaching callables
 to `self`. Use dedicated tools and `self.tools.help` for API help.
 
-End with exactly one RespondResult: DONE, NEED_INPUT, or WAIT (WAIT requires a
-registered running job). In code call
-`return_result(RespondReason.DONE, explanation="...")`; never pass a bare string,
-which has the wrong type.
-Show user-facing text first with synchronous `self.message("...")`.
+End with Done, NeedInput, or Waiting (Waiting requires a running job and `on=[...]`).
+Call `return_result(Done(explanation="..."))`; never pass a bare string, which has
+the wrong type. Show text via synchronous `self.message("...")` (or `Done.message`).
 """
 
 _NOAH_EXECUTION_CONTEXT = """## Execution Context
 
-Inside `execute_python`, method parameters and `self` are already in scope and
-state persists across cells. Always available: `print`, `pprint`, `doc`,
-`return_result`, `RespondReason`, `asyncio`, and `typing`. Inspect the API
-with `print(self.tools.help("ws.read"))`; nested proxies hide signatures. Noah's
-internal module imports are intentionally not part of the agent-facing contract.
+Inside `execute_python`, parameters and `self` are in scope and state persists
+across cells. Available: `print`, `pprint`, `doc`, `return_result`, `Done`,
+`NeedInput`, `Waiting`, `asyncio`, and `typing`. Inspect the API with
+`print(self.tools.help("ws.read"))`; nested proxies hide signatures. Noah's
+internal imports are not part of the agent-facing contract.
 """
 
 _OBSERVABILITY_EVENT_TYPES = (
     "LLMCallStart",
     "LLMCallEnd",
-    "LLMComplete",
+    "LLMResponse",
     "Reasoning",
     "Error",
 )
@@ -658,13 +658,13 @@ class _PermissionCodeActStrategy(CodeActStrategy):
         call: Any,
         return_type: Any,
         event_id: str,
-        reasoning_items: list[dict[str, Any]] | None = None,
+        preserve_llm_response: bool = False,
     ) -> Any:
         prior_event_tags = set(runtime.event_manager.keys())
         result = await super()._process_tool_calls(
-            tool_calls, runtime, builtins, session, call, return_type, event_id, reasoning_items
+            tool_calls, runtime, builtins, session, call, return_type, event_id, preserve_llm_response
         )
-        if not result.completed or getattr(result.final_value, "kind", None) != RespondReason.DONE:
+        if not result.completed or not isinstance(result.final_value, Done):
             return result
         # Shared checkout changes/checks can belong to a concurrent parent.
         # A role forbidden to edit may finish by reporting those failures.
@@ -747,9 +747,9 @@ class _PermissionCodeActStrategy(CodeActStrategy):
 
     def _build_builtins(self, runtime: Any, call: Any) -> dict[str, Any]:
         builtins = super()._build_builtins(runtime, call)
-        # InteractiveAgent documents this exact inline return pattern. Keep the
-        # enum explicit in case module-context filtering changes upstream.
-        builtins["RespondReason"] = RespondReason
+        builtins["Done"] = Done
+        builtins["NeedInput"] = NeedInput
+        builtins["Waiting"] = Waiting
         return builtins
 
     def get_block_order(self) -> list[str]:
@@ -775,26 +775,6 @@ class _PermissionCodeActStrategy(CodeActStrategy):
         )
 
 
-class _ReasoningPlainCodeActBlockFormatter(PlainCodeActBlockFormatter):
-    """Retain opaque reasoning state omitted by NOOA 0.0.10's plain formatter."""
-
-    def format(self, blocks: list[ResolvedBlock]) -> list[RenderedMessage]:
-        messages = super().format(blocks)
-        # Plain formatting preserves event order; IDs may repeat across turns.
-        reasoning_items = iter(
-            block.event.reasoning_items
-            for block in blocks
-            if block.role not in (Role.SYSTEM, Role.RUNTIME_EVENT)
-            and isinstance(block.event, ToolCallEvent)
-        )
-        for index, message in enumerate(messages):
-            if message.tool_call is not None:
-                reasoning = next(reasoning_items)
-                if reasoning:
-                    messages[index] = message.model_copy(update={"reasoning_items": reasoning})
-        return messages
-
-
 class _LeanPermissionCodeActStrategy(_PermissionCodeActStrategy):
     """Compact NOOA event rendering while retaining cross-turn history."""
 
@@ -804,11 +784,8 @@ class _LeanPermissionCodeActStrategy(_PermissionCodeActStrategy):
 
     async def execute(self, runtime: Any, call: Any) -> Any:
         original = runtime.agent.render_config
-        event_format = nooa_compat.truncation_event_format(runtime.agent)
         runtime.agent.render_config = original.model_copy(
-            update={
-                "block_formatter": _ReasoningPlainCodeActBlockFormatter(event_format=event_format)
-            }
+            update={"block_formatter": MarkdownBlockFormatter()}
         )
         try:
             return await super().execute(runtime, call)
@@ -844,8 +821,23 @@ class CodingAgent(InteractiveAgent):
 
     workspace_root: str = "."
     mode: Literal["build", "plan"] = "build"
+    _config: Annotated[Any, hidden, nosnapshot]
+    _engine: Annotated[Any, hidden, nosnapshot]
+    _approvals: Annotated[Any, hidden, nosnapshot]
+    _journal: Annotated[Any, hidden, nosnapshot]
+    _runtime: Annotated[Any, hidden, nosnapshot]
+    _coordinator: Annotated[Any, hidden, nosnapshot]
+    _budget_guard: Annotated[Any, hidden, nosnapshot]
+    _usage_tracker: Annotated[Any, hidden, nosnapshot]
+    _lightweight_llm: Annotated[Any, hidden, nosnapshot]
     _system_messages_in: Annotated[Channel, hidden, nosnapshot]
     _summarizers: Annotated[list[Any], hidden, nosnapshot]
+    _observability_event_manager: Annotated[Any, hidden, nosnapshot]
+    _observability_unsubs: Annotated[list[Any], hidden, nosnapshot]
+    _sandbox_approved_roots: Annotated[set[str], hidden, nosnapshot]
+    _current_run_id: Annotated[str | None, hidden, nosnapshot] = None
+    producers: Annotated[Any, hidden, nosnapshot]
+    user_messages: Annotated[Any, hidden, nosnapshot]
     tools: Annotated[ToolContracts, nosnapshot]
 
     def __init__(
@@ -874,6 +866,7 @@ class CodingAgent(InteractiveAgent):
         llm = wrap_conversational_replies(llm)
         super().__init__(llm=llm, storage=storage, **kwargs)
         self._system_messages_in = self.queue_manager.queue("system_messages")
+        self.context["queues"] = None
         if cache_namespace:
             # NOOA derives prompt_cache_key from this id. A durable Noah
             # session therefore keeps provider cache affinity across restart.
@@ -903,7 +896,9 @@ class CodingAgent(InteractiveAgent):
             runtime,
             timeout_seconds=config.reliability.interaction_timeout_seconds,
         )
-        self._journal = journal or SnapshotJournal(blob_limit=config.undo_blob_limit)
+        self._journal = journal or SnapshotJournal(
+            blob_limit=config.undo_blob_limit, root=workspace.root
+        )
         self._runtime = runtime
         self._coordinator = coordinator or WorkspaceMutationCoordinator()
         self._budget_guard = budget_guard
@@ -966,6 +961,8 @@ class CodingAgent(InteractiveAgent):
             self._engine,
             self._approvals,
             runtime=runtime,
+            coordinator=self._coordinator,
+            workspace_tools=self.ws,
         )
         self.web = WebTools(self._engine, self._approvals)
         self.ask = QuestionTools(
@@ -981,6 +978,7 @@ class CodingAgent(InteractiveAgent):
             workspace.root,
             on_change=self.refresh_context_sources,
             readonly=self._readonly,
+            engine=self._engine,
         )
         self.media = MediaTools()
         self._sandbox_approved_roots: set[str] = set()
@@ -992,15 +990,17 @@ class CodingAgent(InteractiveAgent):
                 parent=self,
             )
 
+        tool_roots: dict[str, Any] = {
+            name: getattr(self, name)
+            for name in (
+                "ws", "git", "github", "lsp", "processes", "web", "ask",
+                "plan", "memory", "media", "todos", "task",
+            )
+            if hasattr(self, name)
+        }
+        tool_roots["message"] = self.message
         self.tools = ToolContracts(
-            {
-                name: getattr(self, name)
-                for name in (
-                    "ws", "git", "github", "lsp", "processes", "web", "ask",
-                    "plan", "memory", "media", "todos", "task",
-                )
-                if hasattr(self, name)
-            },
+            tool_roots,
             allowed_paths=_PermissionSandboxedExecutor._EXACT_PATHS,
         )
 
@@ -1031,7 +1031,6 @@ class CodingAgent(InteractiveAgent):
 
             summarizer = CodingSessionSummarizer.install(
                 self,
-                llm=self._lightweight_llm,
                 config=TokenBudgetConfig(
                     max_tokens=_summarization_token_limit(config, self._llm),
                     preserve_recent=config.summarization.preserve_recent,
@@ -1143,7 +1142,7 @@ class CodingAgent(InteractiveAgent):
 
         if profile not in {"fast", "balanced", "deep"}:
             raise ValueError("profile must be fast, balanced, or deep")
-        self._config.efficiency.profile = profile  # type: ignore[assignment]
+        self._config.efficiency.profile = profile
         self.ws.set_efficiency_profile(profile)
 
     @hidden
@@ -1283,12 +1282,12 @@ class CodingAgent(InteractiveAgent):
             config=CodeActConfig(max_iterations=40, cell_timeout=120.0)
         )
     )
-    async def handle(self, notification: dict[str, list]) -> RespondResult:
+    async def handle(self, notification: dict[str, list]) -> Done | NeedInput | Waiting:
         """Handle one conversational turn for a coding task.
 
         Process every notification item as one turn. Follow the Noah CodeAct
         contract and repository context, fulfill the requested end state, and
-        return a valid RespondResult with a concise, evidence-based explanation.
+        return Done, NeedInput, or Waiting with a concise explanation.
         """
         ...
 

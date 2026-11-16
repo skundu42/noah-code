@@ -241,20 +241,38 @@ class CheckLedger:
                 except FileNotFoundError:
                     entry: Any = (relative, "missing")
                 else:
-                    if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+                    if stat.S_ISDIR(metadata.st_mode) and repository:
+                        # Gitlinks (submodules) appear as directory entries in git ls-files.
+                        entry = (
+                            relative,
+                            "gitlink",
+                            metadata.st_mode,
+                            metadata.st_mtime_ns,
+                            metadata.st_ino,
+                        )
+                    elif (
+                        stat.S_ISFIFO(metadata.st_mode)
+                        or stat.S_ISSOCK(metadata.st_mode)
+                        or stat.S_ISCHR(metadata.st_mode)
+                        or stat.S_ISBLK(metadata.st_mode)
+                    ):
+                        # Special files cannot hold workspace source edits; skip them.
+                        continue
+                    elif not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
                         return None
-                    entry = (
-                        relative,
-                        metadata.st_mode,
-                        metadata.st_size,
-                        metadata.st_mtime_ns,
-                        metadata.st_ctime_ns,
-                        metadata.st_dev,
-                        metadata.st_ino,
-                        metadata.st_uid,
-                        metadata.st_gid,
-                        os.readlink(path) if stat.S_ISLNK(metadata.st_mode) else None,
-                    )
+                    else:
+                        entry = (
+                            relative,
+                            metadata.st_mode,
+                            metadata.st_size,
+                            metadata.st_mtime_ns,
+                            metadata.st_ctime_ns,
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            metadata.st_uid,
+                            metadata.st_gid,
+                            os.readlink(path) if stat.S_ISLNK(metadata.st_mode) else None,
+                        )
                 digest.update(repr(entry).encode("utf-8", errors="surrogateescape"))
                 digest.update(b"\0")
             return digest.hexdigest()

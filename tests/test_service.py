@@ -26,7 +26,7 @@ from noah_code.workspace import Workspace
 
 
 class FakeHost:
-    def __init__(self, workspace, config, *, ui, session_meta, store):  # noqa: ANN001
+    def __init__(self, workspace, config, *, ui, session_meta, store, client_mcp_servers=None):  # noqa: ANN001
         self.workspace, self.config, self.ui, self.store = workspace, config, ui, store
         self.meta = session_meta
         self.closed = False
@@ -34,7 +34,7 @@ class FakeHost:
         self.waiting = asyncio.Event()
         self.task = None
         self.steer_queue = SteerQueue()
-        self._mcp_attached = set(config.mcp)
+        self._mcp_attached = set(config.mcp) | set(client_mcp_servers or {})
 
     async def start(self):
         self.meta = self.meta or self.store.create(self.workspace, model="fake")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 from typing import TextIO
 
@@ -34,6 +35,16 @@ class ConsoleUI:
 
     def set_busy(self, busy: bool) -> None:
         self._busy = busy
+        if not busy:
+            self._stop_live()
+
+    def _stop_live(self) -> None:
+        if self._model_live is not None:
+            with contextlib.suppress(Exception):
+                self._model_live.stop()
+            self._model_live = None
+        self._model_call_id = ""
+        self._model_preview = ""
 
     def render(self, event: HostEvent) -> None:
         if event.kind == HostEventKind.MODEL_STREAM:
@@ -41,8 +52,7 @@ class ConsoleUI:
                 return
             phase = event.meta.get("phase")
             if phase == "start":
-                if self._model_live is not None:
-                    self._model_live.stop()
+                self._stop_live()
                 self._model_call_id = str(event.meta.get("call_id", ""))
                 self._model_preview = ""
                 self._model_live = Live(Text("Generating…"), console=self.console, transient=True)
@@ -52,9 +62,9 @@ class ConsoleUI:
                     self._model_preview = (self._model_preview + event.text)[-1800:]
                     self._model_live.update(Text(self._model_preview))
                 elif phase in {"finish", "error", "cancel"}:
-                    self._model_live.stop()
-                    self._model_live = None
+                    self._stop_live()
             return
+        self._stop_live()
         if event.kind == HostEventKind.MESSAGE:
             if self.markdown and event.meta.get("format", "markdown") == "markdown":
                 self.console.print(Markdown(event.text))
@@ -85,6 +95,7 @@ class ConsoleUI:
             self.console.print(event.text, markup=False, highlight=False)
 
     async def ask_approval(self, request: ApprovalRequest) -> ApprovalChoice:
+        self._stop_live()
         d = request.decision
         self.console.print(
             Panel(
@@ -103,6 +114,9 @@ class ConsoleUI:
                 choice = choice.strip().lower()
             except EOFError:
                 return ApprovalChoice.REJECT
+            except BaseException:
+                self._stop_live()
+                raise
             if choice in {"1", "once", "o", "y", "yes"}:
                 return ApprovalChoice.ONCE
             if choice in {"2", "session", "s"}:
@@ -112,13 +126,22 @@ class ConsoleUI:
             self.console.print("Enter 1/2/3")
 
     async def ask_questions(self, prompts: list[QuestionPrompt]) -> QuestionAnswer:
-        return await console_question_handler(
-            prompts,
-            printer=lambda line: self.console.print(line, markup=False, highlight=False),
-        )
+        self._stop_live()
+        try:
+            return await console_question_handler(
+                prompts,
+                printer=lambda line: self.console.print(line, markup=False, highlight=False),
+            )
+        except BaseException:
+            self._stop_live()
+            raise
 
     async def prompt(self, status: str) -> str | None:
+        self._stop_live()
         try:
             return await asyncio.to_thread(input, f"{status}> ")
         except EOFError:
             return None
+        except BaseException:
+            self._stop_live()
+            raise
