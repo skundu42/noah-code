@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import re
 import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,7 +25,7 @@ from textual import events, on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.geometry import Offset
+from textual.geometry import Offset, Size
 from textual.screen import ModalScreen
 from textual.selection import Selection
 from textual.strip import Strip
@@ -116,11 +118,54 @@ class SelectableRichLog(RichLog):
                 return None
             return Offset(max(point.x, 0), min(max(point.y, 0), last_row))
 
-        selection = Selection(clamped(selection.start), clamped(selection.end))
-        text = "\n".join(re.sub(r"[\r\v\f]", " ", line.text) for line in self.lines)
-        extracted = selection.extract(text)
+        start = clamped(selection.start)
+        end = clamped(selection.end)
+        if start is None and end is None:
+            min_y, max_y = 0, last_row
+        elif start is None:
+            assert end is not None
+            min_y, max_y = 0, end.y
+        elif end is None:
+            min_y, max_y = start.y, last_row
+        else:
+            min_y = min(start.y, end.y)
+            max_y = max(start.y, end.y)
+
+        sliced_lines = self.lines[min_y : max_y + 1]
+        shifted = Selection(
+            None if start is None else Offset(start.x, start.y - min_y),
+            None if end is None else Offset(end.x, end.y - min_y),
+        )
+        text = "\n".join(re.sub(r"[\r\v\f]", " ", line.text) for line in sliced_lines)
+        extracted = shifted.extract(text)
         cleaned = "\n".join(part.rstrip() for part in extracted.split("\n"))
         return cleaned, "\n"
+
+    def replace_tail_lines(
+        self,
+        old_row_count: int,
+        renderable: Any,
+        *,
+        scroll_end: bool = False,
+    ) -> int:
+        """Replace the last *old_row_count* rendered lines in-place in O(1)."""
+
+        if (
+            old_row_count <= 0
+            or not getattr(self, "_size_known", False)
+            or len(self.lines) < old_row_count
+        ):
+            return -1
+        del self.lines[-old_row_count:]
+        self._line_cache.clear()
+        if not self.lines:
+            self._widest_line_width = 0
+        self.virtual_size = Size(self._widest_line_width, len(self.lines))
+        before = len(self.lines) + getattr(self, "_start_line", 0)
+        self.write(renderable, scroll_end=scroll_end)
+        after = len(self.lines) + getattr(self, "_start_line", 0)
+        self.refresh()
+        return max(after - before, 0)
 
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         super().watch_scroll_y(old_value, new_value)
@@ -224,6 +269,112 @@ def _normalize_markdown(text: str) -> str:
     return cleaned
 
 
+_REGISTRY_MAX = 512
+_CODE_BLOCK_REGISTRY: OrderedDict[str, str] = OrderedDict()
+_FILE_REF_REGISTRY: OrderedDict[str, tuple[str, int | None]] = OrderedDict()
+
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+_FILE_REF_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_:/~.-])"
+    r"(?P<path>"
+    r"(?:\./)?(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z][A-Za-z0-9]{0,9}"
+    r"|(?:\./)?[A-Za-z0-9_.-]+\.[A-Za-z][A-Za-z0-9]{0,9}(?=:\d+)"
+    r")"
+    r"(?::(?P<line>\d+)(?::\d+)?)?"
+)
+
+
+def extract_fenced_code_blocks(text: str) -> list[str]:
+    """Extract fenced Markdown code block bodies cleanly without fence lines."""
+
+    blocks: list[str] = []
+    fence_char = ""
+    fence_len = 0
+    body_lines: list[str] = []
+    for line in text.splitlines():
+        if not fence_char:
+            match = _FENCE_OPEN_RE.match(line)
+            if match is None:
+                continue
+            marker, info = match.group(1), match.group(2)
+            if marker[0] == "`" and "`" in info:
+                continue
+            fence_char = marker[0]
+            fence_len = len(marker)
+            body_lines = []
+        else:
+            stripped = line.strip()
+            if (
+                len(stripped) >= fence_len
+                and stripped == fence_char * len(stripped)
+            ):
+                block = "\n".join(body_lines)
+                if block:
+                    blocks.append(block)
+                fence_char = ""
+                fence_len = 0
+                body_lines = []
+            else:
+                body_lines.append(line)
+    return blocks
+
+
+def register_code_block(code: str) -> str:
+    """Register a code snippet in the bounded @click registry and return its 12-hex ID."""
+
+    block_id = hashlib.sha256(code.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+    _CODE_BLOCK_REGISTRY[block_id] = code
+    _CODE_BLOCK_REGISTRY.move_to_end(block_id)
+    while len(_CODE_BLOCK_REGISTRY) > _REGISTRY_MAX:
+        _CODE_BLOCK_REGISTRY.popitem(last=False)
+    return block_id
+
+
+def get_registered_code_block(block_id: str) -> str | None:
+    """Look up a registered code snippet by its 12-hex ID."""
+
+    value = _CODE_BLOCK_REGISTRY.get(block_id)
+    if value is not None:
+        _CODE_BLOCK_REGISTRY.move_to_end(block_id)
+    return value
+
+
+def register_file_ref(path: str, line: int | None = None) -> str:
+    """Register a workspace file/line target and return its 12-hex ID."""
+
+    normalized_line = int(line) if line is not None and int(line) > 0 else None
+    raw_key = f"{path}:{normalized_line or ''}"
+    ref_id = hashlib.sha256(raw_key.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+    _FILE_REF_REGISTRY[ref_id] = (path, normalized_line)
+    _FILE_REF_REGISTRY.move_to_end(ref_id)
+    while len(_FILE_REF_REGISTRY) > _REGISTRY_MAX:
+        _FILE_REF_REGISTRY.popitem(last=False)
+    return ref_id
+
+
+def get_registered_file_ref(ref_id: str) -> tuple[str, int | None] | None:
+    """Look up a registered (path, line) tuple by its 12-hex ID."""
+
+    value = _FILE_REF_REGISTRY.get(ref_id)
+    if value is not None:
+        _FILE_REF_REGISTRY.move_to_end(ref_id)
+    return value
+
+
+def _stylize_file_refs(text: Text) -> None:
+    plain = text.plain
+    for match in _FILE_REF_PATTERN.finditer(plain):
+        path = match.group("path")
+        raw_line = match.group("line")
+        line_no = int(raw_line) if raw_line is not None else None
+        ref_id = register_file_ref(path, line_no)
+        text.stylize(
+            Style(underline=True, meta={"@click": f"app.open_file_id('{ref_id}')"}),
+            match.start(),
+            match.end(),
+        )
+
+
 def _role_renderable(entry: TranscriptEntry, palette: ThemePalette | None = None) -> Group:
     palette = palette or THEMES["atom-one-dark"]
     colors = {
@@ -252,20 +403,42 @@ def _role_renderable(entry: TranscriptEntry, palette: ThemePalette | None = None
             text.stylize(Style(meta={"@click": "app.activity_history"}))
         elif entry.role == "RECEIPT" and "/diff" in entry.text:
             text.stylize(Style(meta={"@click": "app.review_changes"}))
+        if entry.role in {"ACTIVITY", "STATUS"}:
+            _stylize_file_refs(text)
         return Group(Padding(text, (0, 0, 1, 2)))
     label = Text(
         labels.get(entry.role, entry.role),
         style=f"bold {colors.get(entry.role, palette.muted)}",
     )
     if entry.markdown:
+        normalized = _normalize_markdown(entry.text)
         body: Any = Markdown(
-            _normalize_markdown(entry.text),
-            code_theme="monokai",
+            normalized,
+            code_theme=palette.code_theme,
             hyperlinks=True,
             style=palette.text,
         )
+        if entry.role == "NOAH":
+            blocks = extract_fenced_code_blocks(normalized)[:4]
+            if blocks:
+                copy_bar = Text(style=palette.muted)
+                for idx, code in enumerate(blocks, start=1):
+                    if idx > 1:
+                        copy_bar.append(" · ", style=palette.muted)
+                    block_id = register_code_block(code)
+                    btn_label = "⎘ Copy code" if len(blocks) == 1 else f"⎘ Copy block {idx}"
+                    copy_bar.append(
+                        btn_label,
+                        style=Style(
+                            color=palette.muted,
+                            meta={"@click": f"app.copy_code_id('{block_id}')"},
+                        ),
+                    )
+                return Group(label, Padding(body, (0, 0, 0, 2)), Padding(copy_bar, (0, 0, 1, 2)))
     else:
         body = Text(entry.text, style=palette.text)
+        if entry.role in {"ERROR", "COMMAND"}:
+            _stylize_file_refs(body)
     return Group(label, Padding(body, (0, 0, 1, 2)))
 
 
@@ -507,11 +680,12 @@ class ApprovalModal(ModalScreen[ApprovalChoice]):
 
 
 class QuestionModal(ModalScreen[QuestionAnswer | None]):
-    """Keyboard-first multiple-choice card for the question tool."""
+    """Keyboard-first single- or multi-choice card for the question tool."""
 
     BINDINGS = [
         Binding("escape", "cancel", "Skip question", show=True),
         Binding("enter", "accept", "Choose", show=True),
+        Binding("space", "toggle_choice", "Toggle", show=False),
         Binding("0", "other", "Other", show=False),
         *[Binding(str(number), f"choose({number})", "Choose", show=False) for number in range(1, 10)],
     ]
@@ -521,6 +695,50 @@ class QuestionModal(ModalScreen[QuestionAnswer | None]):
         self.prompt = prompt
         self.number = number
         self.total = total
+        self._selected_indices: set[int] = set()
+        self._space_toggled = False
+
+    def _is_multi_mode(self) -> bool:
+        return bool(getattr(self.prompt, "multi_select", False)) or self._space_toggled
+
+    def _hint_text(self) -> str:
+        if self._is_multi_mode():
+            return "Space/1–9 toggle · Enter submit · 0 other · Esc skip question"
+        return "1–9 choose · Space multi-select · ↑/↓ Enter · 0 other · Esc skip question"
+
+    def _format_option(self, index: int, option: str, palette: ThemePalette) -> Text:
+        label_part = option
+        desc_part = ""
+        for sep in (" — ", " - "):
+            if sep in option:
+                head, tail = option.split(sep, 1)
+                label_part = head
+                desc_part = f"{sep}{tail}"
+                break
+        text = Text()
+        if self._is_multi_mode():
+            checked = (index - 1) in self._selected_indices
+            marker = "[✓] " if checked else "[ ] "
+            marker_style = f"bold {palette.success}" if checked else palette.muted
+            text.append(marker, style=marker_style)
+        text.append(f"{index}. {label_part}", style=palette.text)
+        if desc_part:
+            text.append(desc_part, style=palette.muted)
+        return text
+
+    def _refresh_question_options(self, *, highlighted: int | None = None) -> None:
+        palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
+        option_list = self.query_one("#question-list", OptionList)
+        prev = option_list.highlighted if highlighted is None else highlighted
+        option_list.clear_options()
+        options = [
+            Option(self._format_option(index, option, palette), id=f"opt-{index}")
+            for index, option in enumerate(self.prompt.options, start=1)
+        ]
+        option_list.add_options(options)
+        if options:
+            option_list.highlighted = min(max(prev or 0, 0), len(options) - 1)
+        self.query_one("#picker-hint", Static).update(self._hint_text(), layout=False)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="approval-dialog"):
@@ -528,27 +746,43 @@ class QuestionModal(ModalScreen[QuestionAnswer | None]):
             yield Static(f"Question {self.number} of {self.total}", id="question-progress")
             yield Static(Text(self.prompt.prompt), id="approval-body")
             yield OptionList(id="question-list", compact=True)
-            yield Static(
-                "1–9 choose · ↑/↓ then Enter · 0 other · Esc skip question",
-                id="picker-hint",
-            )
+            yield Static(self._hint_text(), id="picker-hint")
 
     def on_mount(self) -> None:
+        self._refresh_question_options(highlighted=0)
+        self.query_one("#question-list", OptionList).focus()
+
+    def action_toggle_choice(self) -> None:
         option_list = self.query_one("#question-list", OptionList)
-        options = [
-            Option(Text(f"{index}. {option}"), id=f"opt-{index}")
-            for index, option in enumerate(self.prompt.options, start=1)
-        ]
-        option_list.add_options(options)
-        option_list.highlighted = 0
-        option_list.focus()
+        index = option_list.highlighted
+        if index is None or not (0 <= index < len(self.prompt.options)):
+            return
+        self._space_toggled = True
+        if index in self._selected_indices:
+            self._selected_indices.discard(index)
+        else:
+            self._selected_indices.add(index)
+        self._refresh_question_options(highlighted=index)
 
     def action_choose(self, number: int) -> None:
-        if 1 <= number <= len(self.prompt.options):
-            self.dismiss(QuestionAnswer(selections=[self.prompt.options[number - 1]], custom=""))
+        if not (1 <= number <= len(self.prompt.options)):
+            return
+        idx = number - 1
+        if self._is_multi_mode():
+            if idx in self._selected_indices:
+                self._selected_indices.discard(idx)
+            else:
+                self._selected_indices.add(idx)
+            self._refresh_question_options(highlighted=idx)
+            return
+        self.dismiss(QuestionAnswer(selections=[self.prompt.options[idx]], custom=""))
 
     def action_accept(self) -> None:
         option_list = self.query_one("#question-list", OptionList)
+        if self._selected_indices:
+            chosen = [self.prompt.options[i] for i in sorted(self._selected_indices)]
+            self.dismiss(QuestionAnswer(selections=chosen, custom=""))
+            return
         index = option_list.highlighted
         if index is None or index < 0 or index >= len(self.prompt.options):
             self.dismiss(None)
@@ -560,7 +794,8 @@ class QuestionModal(ModalScreen[QuestionAnswer | None]):
 
         def _submit_custom(answer: str | None) -> None:
             if answer is not None:
-                self.dismiss(QuestionAnswer(selections=[], custom=answer))
+                chosen = [self.prompt.options[i] for i in sorted(self._selected_indices)]
+                self.dismiss(QuestionAnswer(selections=chosen, custom=answer))
 
         self.app.push_screen(
             TextPromptModal(
@@ -855,6 +1090,226 @@ class PermissionOnboardingScreen(FilteredPicker):
 
 class KeyboardHelpScreen(FilteredPicker):
     """Searchable shortcut reference ordered for the currently focused panel."""
+
+
+class _ResumeFilterInput(Input):
+    """Filter input that lets 1/2/3 immediately resume a chat when empty."""
+
+    async def _on_key(self, event: events.Key) -> None:
+        if not self.value and event.key in {"1", "2", "3"}:
+            screen = self.screen
+            if isinstance(screen, ResumeSessionPicker) and screen.quick_select_digit(
+                int(event.key)
+            ):
+                event.stop()
+                event.prevent_default()
+                return
+        await super()._on_key(event)
+
+
+class ResumeSessionPicker(FilteredPicker):
+    """Last-3-chats repo resume picker with instant 1/2/3 key selection."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close", show=True),
+        Binding("1", "quick_select(1)", "Chat 1", show=True),
+        Binding("2", "quick_select(2)", "Chat 2", show=True),
+        Binding("3", "quick_select(3)", "Chat 3", show=True),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker-dialog"):
+            yield Label(self.picker_title.upper(), id="picker-title")
+            yield _ResumeFilterInput(placeholder="Type to filter…", id="picker-filter")
+            yield OptionList(id="picker-list", compact=True)
+            yield Static(self._hint, id="picker-hint")
+
+    def quick_select_digit(self, number: int) -> bool:
+        idx = number - 1
+        if 0 <= idx < len(self._rows):
+            self.dismiss(self._rows[idx][0])
+            return True
+        return False
+
+    def action_quick_select(self, number: int) -> None:
+        with contextlib.suppress(Exception):
+            if self.query_one("#picker-filter", Input).value:
+                return
+        self.quick_select_digit(number)
+
+
+class SessionPickerScreen(FilteredPicker):
+    """Searchable session browser with inline rename, delete, fork, and worktree actions."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close", show=True),
+        Binding("ctrl+r,f2", "rename_session", "Rename", show=True, priority=True),
+        Binding("ctrl+d", "delete_session", "Delete", show=True, priority=True),
+        Binding("delete", "delete_session", "Delete", show=False),
+        Binding("ctrl+f", "fork_session", "Fork", show=True, priority=True),
+        Binding("ctrl+w", "new_worktree", "Worktree", show=True, priority=True),
+    ]
+
+    def __init__(
+        self,
+        host: Any,
+        title: str = "Sessions",
+        rows: list[PickerItem] | None = None,
+        hint: str = (
+            "Enter resume · Ctrl+R rename · Ctrl+F fork · "
+            "Ctrl+D delete · Ctrl+W worktree · Esc close"
+        ),
+    ) -> None:
+        self.host = host
+        resolved_rows = self._rows_from_host() if rows is None else list(rows)
+        super().__init__(title, resolved_rows, hint)
+
+    def _rows_from_metas(self, sessions: list[Any]) -> list[PickerItem]:
+        active_id = getattr(getattr(self.host, "meta", None), "session_id", None)
+        built: list[PickerItem] = []
+        for session in sessions:
+            sid = str(session.session_id)
+            title = (
+                str(session.title)
+                if getattr(session, "title", "") and session.title != "untitled"
+                else sid[:8]
+            )
+            wt = getattr(session, "worktree_name", "")
+            parts = []
+            if sid == active_id:
+                parts.append("current")
+            if wt:
+                parts.append(str(wt))
+            parts.append(str(getattr(session, "mode", "build")))
+            parts.append(str(getattr(session, "model", "")))
+            built.append((sid, title, " · ".join(p for p in parts if p)))
+        return built
+
+    def _rows_from_host(self) -> list[PickerItem]:
+        lister = getattr(self.host, "list_session_metas", None)
+        if not callable(lister):
+            return []
+        try:
+            metas = list(lister())
+        except Exception:  # noqa: BLE001
+            return []
+        return self._rows_from_metas(metas)
+
+    def _highlighted_row(self) -> PickerItem | None:
+        option_list = self.query_one("#picker-list", OptionList)
+        if option_list.highlighted is None or not self._filtered:
+            return None
+        if not (0 <= option_list.highlighted < len(self._filtered)):
+            return None
+        return self._filtered[option_list.highlighted]
+
+    def _reapply_filter_and_refresh(self, preferred_id: str | None = None) -> None:
+        query = self.query_one("#picker-filter", Input).value
+        self._filter(Input.Changed(self.query_one("#picker-filter", Input), query))
+        if preferred_id:
+            option_list = self.query_one("#picker-list", OptionList)
+            for idx, row in enumerate(self._filtered):
+                if row[0] == preferred_id:
+                    option_list.highlighted = idx
+                    break
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "delete":
+            filter_input = self.query_one("#picker-filter", Input)
+            if not filter_input.has_focus or not filter_input.value:
+                event.prevent_default()
+                event.stop()
+                self.action_delete_session()
+                return
+        super().on_key(event)
+
+    @work(exclusive=True, group="session-picker-action")
+    async def action_rename_session(self) -> None:
+        row = self._highlighted_row()
+        if row is None:
+            return
+        sid, current_label, desc = row
+        new_title = await self.app.push_screen_wait(
+            TextPromptModal(
+                f"Rename session {sid[:8]}",
+                current_label,
+                "Enter save · Esc cancel",
+            )
+        )
+        if not new_title:
+            return
+        try:
+            renamed = await self.host.rename_session(sid, new_title)
+            updated_label = getattr(renamed, "title", None)
+            if not isinstance(updated_label, str) or not updated_label:
+                updated_label = new_title.strip()[:60]
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#picker-hint", Static).update(f"Rename failed: {exc}")
+            return
+        self._rows = [
+            (r[0], updated_label, r[2]) if r[0] == sid else r
+            for r in self._rows
+        ]
+        metas = await asyncio.to_thread(self._rows_from_host)
+        if metas:
+            self._rows = metas
+        self._reapply_filter_and_refresh(preferred_id=sid)
+        self.query_one("#picker-hint", Static).update(f"Renamed to {updated_label}")
+
+    @work(exclusive=True, group="session-picker-action")
+    async def action_delete_session(self) -> None:
+        row = self._highlighted_row()
+        if row is None:
+            return
+        sid, label, _desc = row
+        active_id = getattr(getattr(self.host, "meta", None), "session_id", None)
+        if active_id and sid == active_id:
+            self.query_one("#picker-hint", Static).update(
+                "Switch to another session before deleting the active session"
+            )
+            return
+        confirmed = await self.app.push_screen_wait(
+            ConfirmationModal(
+                f"Delete session {label}?",
+                "This permanently deletes the session database, journal, and checkpoints.",
+                "Delete session",
+            )
+        )
+        if not confirmed:
+            return
+        try:
+            await self.host.delete_session_by_id(sid)
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#picker-hint", Static).update(f"Delete failed: {exc}")
+            return
+        self._rows = [r for r in self._rows if r[0] != sid]
+        metas = await asyncio.to_thread(self._rows_from_host)
+        if metas:
+            self._rows = metas
+        self._reapply_filter_and_refresh()
+        self.query_one("#picker-hint", Static).update(f"Deleted session {sid[:8]}")
+
+    @work(exclusive=True, group="session-picker-action")
+    async def action_fork_session(self) -> None:
+        row = self._highlighted_row()
+        if row is None:
+            return
+        sid = row[0]
+        try:
+            await self.host.fork_session(sid)
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#picker-hint", Static).update(f"Fork failed: {exc}")
+            return
+        self.dismiss(None)
+
+    @work(exclusive=True, group="session-picker-action")
+    async def action_new_worktree(self) -> None:
+        try:
+            await self.host.create_worktree_session()
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#picker-hint", Static).update(f"Worktree failed: {exc}")
+            return
+        self.dismiss(None)
 
 
 class TextPromptModal(ModalScreen[str | None]):
@@ -1153,6 +1608,9 @@ class ContextVisibilityScreen(ModalScreen[None]):
     BINDINGS = [
         Binding("escape,f7", "close", "Close", show=True),
         Binding("r", "refresh", "Refresh", show=True),
+        Binding("alt+1", "switch_timeline", "Timeline", show=False),
+        Binding("alt+2", "switch_work", "Work", show=False),
+        Binding("alt+3", "switch_context", "Context", show=False),
     ]
 
     def __init__(self, host: AgentHost) -> None:
@@ -1188,6 +1646,37 @@ class ContextVisibilityScreen(ModalScreen[None]):
 
     def _refresh(self) -> None:
         palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
+        summary = Text(
+            "Sources listed here can influence Noah's next response. Secrets are never shown.",
+            style=palette.muted,
+        )
+        with contextlib.suppress(Exception):
+            usage_fn = getattr(self.host, "usage_snapshot", None)
+            usage = usage_fn() if callable(usage_fn) else None
+            last_in = int(getattr(usage, "last_input_tokens", 0) or 0)
+            ctx_win = int(getattr(usage, "context_window", 0) or 0)
+            if last_in > 0 and ctx_win > 0:
+                ratio = min(max(last_in / ctx_win, 0.0), 1.0)
+                filled = round(ratio * 12)
+                bar = "━" * filled + "─" * (12 - filled)
+                bar_style = (
+                    palette.error
+                    if ratio >= 0.9
+                    else palette.warning
+                    if ratio >= 0.7
+                    else palette.accent
+                )
+                summary.append("\nContext window  ", style=palette.muted)
+                summary.append(bar, style=bar_style)
+                summary.append(
+                    f"  {last_in:,} / {ctx_win:,} tokens ({ratio:.0%})",
+                    style=palette.text,
+                )
+                cache_ratio = float(getattr(usage, "cache_hit_ratio", 0.0) or 0.0)
+                if cache_ratio > 0:
+                    summary.append(f" · {cache_ratio:.0%} cached", style=palette.success)
+        with contextlib.suppress(Exception):
+            self.query_one("#context-summary", Static).update(summary)
         rows = self._snapshot()
         options: list[Option] = []
         self._rows = {}
@@ -1257,6 +1746,21 @@ class ContextVisibilityScreen(ModalScreen[None]):
     def action_refresh(self) -> None:
         self._refresh()
 
+    def action_switch_timeline(self) -> None:
+        launch = getattr(self.app, "action_activity_history", None)
+        self.dismiss(None)
+        if callable(launch):
+            self.app.call_later(launch)
+
+    def action_switch_work(self) -> None:
+        launch = getattr(self.app, "action_work_ledger", None)
+        self.dismiss(None)
+        if callable(launch):
+            self.app.call_later(launch)
+
+    def action_switch_context(self) -> None:
+        return
+
     def action_close(self) -> None:
         self.dismiss(None)
 
@@ -1269,6 +1773,14 @@ class WorkLedgerScreen(ModalScreen[None]):
         Binding("r", "refresh", "Refresh", show=True),
         Binding("slash", "search", "Search", show=True),
         Binding("n", "new_team", "New team", show=True),
+        Binding("k", "stop_item", "Stop", show=True),
+        Binding("f", "follow_up_agent", "Follow up", show=True),
+        Binding("d", "diff_agent", "Diff", show=True),
+        Binding("a", "apply_agent", "Apply", show=True),
+        Binding("x", "cleanup_agent", "Clean up", show=True),
+        Binding("alt+1", "switch_timeline", "Timeline", show=False),
+        Binding("alt+2", "switch_work", "Work", show=False),
+        Binding("alt+3", "switch_context", "Context", show=False),
     ]
 
     def __init__(self, host: AgentHost) -> None:
@@ -1277,6 +1789,24 @@ class WorkLedgerScreen(ModalScreen[None]):
         self._records: dict[str, dict[str, Any]] = {}
         self._selected_id: str | None = None
         self._filter = "all"
+        self._diff_preview: tuple[str, str] | None = None
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        _ = parameters
+        return not (
+            isinstance(self.focused, Input)
+            and action
+            in {
+                "refresh",
+                "search",
+                "new_team",
+                "stop_item",
+                "follow_up_agent",
+                "diff_agent",
+                "apply_agent",
+                "cleanup_agent",
+            }
+        )
 
     def compose(self) -> ComposeResult:
         with Vertical(id="work-dialog"):
@@ -1299,7 +1829,7 @@ class WorkLedgerScreen(ModalScreen[None]):
                     max_lines=500,
                 )
             yield Static(
-                "/ search · N new team · R refresh · Tab switch pane · Esc close",
+                "/ search · N team · K stop · F follow · D diff · A apply · X clean · Esc close",
                 id="work-hint",
             )
 
@@ -1307,7 +1837,29 @@ class WorkLedgerScreen(ModalScreen[None]):
         self.set_class(self.size.width < 100, "narrow")
         self._refresh()
         self.query_one("#work-list", OptionList).focus()
-        self.set_interval(1.0, self._refresh)
+        self.set_interval(0.75, self._poll_active_work)
+
+    def _poll_active_work(self) -> None:
+        had_active = any(
+            item.get("state") in {"queued", "running", "stopping"}
+            for item in self._records.values()
+        )
+        snapshot = self.host.work_snapshot()
+        roster = getattr(self.app, "_subagent_roster", None)
+        roster_active = (
+            any(
+                item.get("state") in {"queued", "running"}
+                for item in roster.values()
+            )
+            if isinstance(roster, dict)
+            else False
+        )
+        now_active = roster_active or any(
+            item.get("state") in {"queued", "running", "stopping"}
+            for item in [*snapshot.get("agents", []), *snapshot.get("jobs", [])]
+        )
+        if had_active or now_active:
+            self._refresh(snapshot=snapshot)
 
     def on_resize(self, event: events.Resize) -> None:
         self.set_class(event.size.width < 100, "narrow")
@@ -1341,12 +1893,60 @@ class WorkLedgerScreen(ModalScreen[None]):
         if callable(launch):
             self.app.call_later(launch)
 
-    def _refresh(self) -> None:
+    def _refresh(self, *, snapshot: dict[str, list[dict[str, Any]]] | None = None) -> None:
         palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
-        snapshot = self.host.work_snapshot()
+        if snapshot is None:
+            snapshot = self.host.work_snapshot()
+        roster_raw = getattr(self.app, "_subagent_roster", None)
+        roster: dict[str, dict[str, Any]] = (
+            dict(roster_raw) if isinstance(roster_raw, dict) else {}
+        )
         records: list[tuple[str, dict[str, Any]]] = []
+        seen_agent_ids: set[str] = set()
         for item in snapshot["agents"]:
-            records.append((f"agent:{item['id']}", {"unit": "agent", **item}))
+            agent_id = str(item.get("id", ""))
+            seen_agent_ids.add(agent_id)
+            merged = {"unit": "agent", **item}
+            live = roster.get(agent_id)
+            if isinstance(live, dict):
+                if not merged.get("current_action") and live.get("current_action"):
+                    merged["current_action"] = live["current_action"]
+                if not merged.get("step_count") and live.get("step_count"):
+                    merged["step_count"] = live["step_count"]
+            records.append((f"agent:{agent_id}", merged))
+        now = time.monotonic()
+        for roster_id, live in roster.items():
+            if roster_id in seen_agent_ids:
+                continue
+            started_at = float(live.get("started_at", now) or now)
+            finished_at = live.get("finished_at")
+            raw_dur = float(live.get("duration", 0.0) or 0.0)
+            elapsed_val = (
+                max(raw_dur, (float(finished_at) if finished_at else now) - started_at)
+                if live.get("state") in {"queued", "running"}
+                else (raw_dur if raw_dur > 0 else max(0.0, (float(finished_at) if finished_at else now) - started_at))
+            )
+            records.append(
+                (
+                    f"agent:{roster_id}",
+                    {
+                        "unit": "agent",
+                        "id": roster_id,
+                        "agent": live.get("agent", "agent"),
+                        "state": live.get("state", "running"),
+                        "prompt": live.get("prompt", ""),
+                        "mode": live.get("mode", "build"),
+                        "readonly": bool(live.get("readonly", not live.get("isolated", False))),
+                        "duration": elapsed_val,
+                        "isolated": bool(live.get("isolated", False)),
+                        "workflow": live.get("workflow", ""),
+                        "phase": live.get("phase", ""),
+                        "team_id": live.get("team_id", ""),
+                        "current_action": live.get("current_action", ""),
+                        "step_count": int(live.get("step_count", 0) or 0),
+                    },
+                )
+            )
         for item in snapshot["jobs"]:
             records.append((f"job:{item['id']}", {"unit": "job", **item}))
         active = sum(
@@ -1424,8 +2024,23 @@ class WorkLedgerScreen(ModalScreen[None]):
             label = "Input needed" if state == "needs_input" else state.capitalize()
             prompt.append(f"{label}  ", style=f"bold {state_style}")
             prompt.append(title, style=palette.text)
+            if item["unit"] == "agent" and item.get("isolated"):
+                prompt.append("  [isolated]", style=palette.accent)
+                if item.get("applied"):
+                    prompt.append(" [applied]", style=palette.success)
             prompt.append(f"  {elapsed:.0f}s\n", style=palette.muted)
             prompt.append(_truncate_middle(assignment, 76), style=palette.text)
+            if item["unit"] == "agent":
+                step_count = int(item.get("step_count", 0) or 0)
+                current_action = str(item.get("current_action", "") or "").strip()
+                if current_action or step_count > 0:
+                    if step_count > 0 and current_action:
+                        live_line = f"\nLive step {step_count} · {_truncate_middle(current_action, 56)}"
+                    elif current_action:
+                        live_line = f"\nLive · {_truncate_middle(current_action, 62)}"
+                    else:
+                        live_line = f"\nStep {step_count}"
+                    prompt.append(live_line, style=palette.warning if running else palette.muted)
             if item.get("workflow"):
                 prompt.append(
                     f"\n{item['workflow']} / {item.get('phase', '')} / {item.get('team_id', '')}",
@@ -1464,7 +2079,22 @@ class WorkLedgerScreen(ModalScreen[None]):
     @on(OptionList.OptionHighlighted, "#work-list")
     def _highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option.id and event.option.id in self._records:
+            if self._diff_preview is not None and self._diff_preview[0] != event.option.id:
+                self._diff_preview = None
             self._show(self._records[event.option.id])
+
+    def _selected_item(self) -> dict[str, Any] | None:
+        option_list = self.query_one("#work-list", OptionList)
+        if (
+            option_list.highlighted is not None
+            and 0 <= option_list.highlighted < len(option_list.options)
+        ):
+            opt_id = option_list.get_option_at_index(option_list.highlighted).id
+            if opt_id and opt_id in self._records:
+                return self._records[opt_id]
+        if self._selected_id and self._selected_id in self._records:
+            return self._records[self._selected_id]
+        return None
 
     def _show(self, item: dict[str, Any]) -> None:
         palette = getattr(self.app, "theme_palette", THEMES["atom-one-dark"])
@@ -1473,9 +2103,38 @@ class WorkLedgerScreen(ModalScreen[None]):
         scroll_y = detail.scroll_y if selected_id == self._selected_id else 0
         self._selected_id = selected_id
         detail.clear()
+        if self._diff_preview is not None and self._diff_preview[0] == selected_id:
+            header = Text()
+            header.append(
+                f"{item.get('agent', 'agent')} · isolated worktree diff\n",
+                style=f"bold {palette.accent}",
+            )
+            header.append("Press R to return to assignment details · A apply · X clean up\n\n", style=palette.muted)
+            detail.write(header, scroll_end=False)
+            for raw_line in self._diff_preview[1].splitlines():
+                line_style = (
+                    palette.success
+                    if raw_line.startswith("+") and not raw_line.startswith("+++")
+                    else palette.error
+                    if raw_line.startswith("-") and not raw_line.startswith("---")
+                    else f"bold {palette.accent}"
+                    if raw_line.startswith("@@")
+                    else palette.text
+                )
+                detail.write(Text(raw_line, style=line_style), scroll_end=False)
+            self.call_after_refresh(lambda: detail.scroll_to(y=scroll_y, animate=False, force=True))
+            return
+
         text = Text()
         if item["unit"] == "agent":
-            text.append(f"{item.get('agent', 'agent')}\n", style=f"bold {palette.accent}")
+            text.append(f"{item.get('agent', 'agent')}", style=f"bold {palette.accent}")
+            if item.get("isolated"):
+                text.append("  [isolated]", style=palette.accent)
+                if item.get("applied"):
+                    text.append(" [applied]", style=palette.success)
+                if item.get("worktree_cleaned"):
+                    text.append(" [cleaned]", style=palette.muted)
+            text.append("\n")
             text.append(
                 f"{item.get('state')} · {item.get('mode')} · "
                 f"{'read-only' if item.get('readonly') else 'workspace writer'} · "
@@ -1488,10 +2147,27 @@ class WorkLedgerScreen(ModalScreen[None]):
                     f"{item.get('phase', '')}\n\n",
                     style=palette.accent,
                 )
+            step_count = int(item.get("step_count", 0) or 0)
+            current_action = str(item.get("current_action", "") or "").strip()
+            if current_action or step_count > 0:
+                if step_count > 0 and current_action:
+                    live_detail = f"Live step {step_count} · {current_action}\n\n"
+                elif current_action:
+                    live_detail = f"Live · {current_action}\n\n"
+                else:
+                    live_detail = f"Steps completed · {step_count}\n\n"
+                text.append(
+                    live_detail,
+                    style=(
+                        palette.warning
+                        if item.get("state") in {"queued", "running"}
+                        else palette.muted
+                    ),
+                )
             if item.get("state") == "needs_input":
                 text.append(
-                    "Input needed. Read the result below, then close this panel and reply "
-                    "in the main conversation.\n\n",
+                    "Input needed. Press F to reply directly to this agent, or close this "
+                    "panel and reply in the main conversation.\n\n",
                     style=palette.warning,
                 )
             text.append("Assignment\n", style=f"bold {palette.accent}")
@@ -1510,11 +2186,177 @@ class WorkLedgerScreen(ModalScreen[None]):
             )
             text.append("COMMAND\n", style=f"bold {palette.accent}")
             text.append(str(item.get("command") or "Persistent shell"), style=palette.text)
+            log_getter = getattr(self.host, "work_job_logs", None)
+            raw_logs = log_getter(str(item.get("id", ""))) if callable(log_getter) else ""
+            logs = raw_logs if isinstance(raw_logs, str) else ""
+            if logs:
+                text.append("\n\nOUTPUT\n", style=f"bold {palette.accent}")
+                for idx, log_line in enumerate(logs.splitlines()):
+                    if idx > 0:
+                        text.append("\n")
+                    is_err = log_line.startswith("! ")
+                    text.append(log_line, style=palette.error if is_err else palette.text)
         detail.write(text, scroll_end=False)
         self.call_after_refresh(lambda: detail.scroll_to(y=scroll_y, animate=False, force=True))
 
-    def action_refresh(self) -> None:
+    @work(exclusive=True, group="work-action")
+    async def action_stop_item(self) -> None:
+        item = self._selected_item()
+        if item is None:
+            return
+        if item.get("state") not in {"running", "queued", "stopping"}:
+            self.query_one("#work-hint", Static).update("Selected work item is already stopped")
+            return
+        label = str(item.get("agent") if item["unit"] == "agent" else item.get("name", item["id"]))
+        confirmed = await self.app.push_screen_wait(
+            ConfirmationModal(
+                f"Stop {label}?",
+                f"Interrupt running {item['unit']} {item['id']}?",
+                "Stop",
+            )
+        )
+        if not confirmed:
+            return
+        try:
+            await self.host.stop_work_item(item["unit"], str(item["id"]))
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#work-hint", Static).update(f"Stop failed: {exc}")
+            return
+        self._diff_preview = None
         self._refresh()
+        self.query_one("#work-hint", Static).update(f"Stopped {label}")
+
+    @work(exclusive=True, group="work-action")
+    async def action_follow_up_agent(self) -> None:
+        item = self._selected_item()
+        if item is None or item.get("unit") != "agent":
+            self.query_one("#work-hint", Static).update("Select a child agent to send a follow-up")
+            return
+        if item.get("state") in {"running", "queued"}:
+            self.query_one("#work-hint", Static).update(
+                "Wait or press K to stop before sending a follow-up"
+            )
+            return
+        reply = await self.app.push_screen_wait(
+            TextPromptModal(
+                f"Follow up · {item.get('agent', 'agent')}",
+                "Enter instructions or answer…",
+                "Enter send to child agent · Esc cancel",
+            )
+        )
+        if not reply:
+            return
+        try:
+            await self.host.follow_up_work_agent(str(item["id"]), reply)
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#work-hint", Static).update(f"Follow-up failed: {exc}")
+            return
+        self._diff_preview = None
+        self._refresh()
+        self.query_one("#work-hint", Static).update(
+            f"Sent follow-up to {item.get('agent', 'agent')}"
+        )
+
+    @work(exclusive=True, group="work-action")
+    async def action_diff_agent(self) -> None:
+        item = self._selected_item()
+        if item is None or item.get("unit") != "agent" or not item.get("isolated"):
+            self.query_one("#work-hint", Static).update(
+                "Select an isolated child agent to preview its worktree diff"
+            )
+            return
+        try:
+            diff_text = await self.host.work_agent_diff(str(item["id"]))
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#work-hint", Static).update(f"Diff unavailable: {exc}")
+            return
+        key = f"agent:{item['id']}"
+        self._diff_preview = (key, str(diff_text or "(no changes)"))
+        self._show(item)
+        self.query_one("#work-hint", Static).update(
+            f"Showing isolated worktree diff for {item.get('agent', 'agent')}"
+        )
+
+    @work(exclusive=True, group="work-action")
+    async def action_apply_agent(self) -> None:
+        item = self._selected_item()
+        if item is None or item.get("unit") != "agent" or not item.get("isolated"):
+            self.query_one("#work-hint", Static).update(
+                "Select an isolated child agent to apply its changes"
+            )
+            return
+        if item.get("state") in {"running", "queued"}:
+            self.query_one("#work-hint", Static).update(
+                "Wait for the child agent to finish before applying changes"
+            )
+            return
+        confirmed = await self.app.push_screen_wait(
+            ConfirmationModal(
+                f"Apply changes from {item.get('agent', 'agent')}?",
+                f"Apply isolated worktree edits from {item['id']} into the workspace?",
+                "Apply changes",
+            )
+        )
+        if not confirmed:
+            return
+        try:
+            report = await self.host.apply_work_agent(str(item["id"]))
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#work-hint", Static).update(f"Apply failed: {exc}")
+            return
+        self._diff_preview = None
+        self._refresh()
+        self.query_one("#work-hint", Static).update(str(report))
+
+    @work(exclusive=True, group="work-action")
+    async def action_cleanup_agent(self) -> None:
+        item = self._selected_item()
+        if item is None or item.get("unit") != "agent" or not item.get("isolated"):
+            self.query_one("#work-hint", Static).update(
+                "Select an isolated child agent to clean up its worktree"
+            )
+            return
+        if item.get("state") in {"running", "queued"}:
+            self.query_one("#work-hint", Static).update(
+                "Wait or stop the child agent before cleaning up its worktree"
+            )
+            return
+        confirmed = await self.app.push_screen_wait(
+            ConfirmationModal(
+                f"Clean up worktree for {item.get('agent', 'agent')}?",
+                f"Remove retained linked worktree for {item['id']}?",
+                "Clean up",
+            )
+        )
+        if not confirmed:
+            return
+        try:
+            report = await self.host.cleanup_work_agent(str(item["id"]))
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#work-hint", Static).update(f"Cleanup failed: {exc}")
+            return
+        self._diff_preview = None
+        self._refresh()
+        self.query_one("#work-hint", Static).update(str(report))
+
+    def action_refresh(self) -> None:
+        self._diff_preview = None
+        self._refresh()
+
+    def action_switch_timeline(self) -> None:
+        launch = getattr(self.app, "action_activity_history", None)
+        self.dismiss(None)
+        if callable(launch):
+            self.app.call_later(launch)
+
+    def action_switch_work(self) -> None:
+        return
+
+    def action_switch_context(self) -> None:
+        launch = getattr(self.app, "action_context_visibility", None)
+        self.dismiss(None)
+        if callable(launch):
+            self.app.call_later(launch)
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -1530,6 +2372,9 @@ class ActivityHistoryScreen(ModalScreen[None]):
         Binding("a", "toggle_action", "Action", show=True),
         Binding("o", "toggle_output", "Output", show=True),
         Binding("e", "toggle_all", "Expand all", show=False),
+        Binding("alt+1", "switch_timeline", "Timeline", show=False),
+        Binding("alt+2", "switch_work", "Work", show=False),
+        Binding("alt+3", "switch_context", "Context", show=False),
     ]
 
     def __init__(self, records: list[ActivityRecord]) -> None:
@@ -1746,6 +2591,21 @@ class ActivityHistoryScreen(ModalScreen[None]):
     def _highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option.id and event.option.id in self._by_id:
             self._show_record(self._by_id[event.option.id])
+
+    def action_switch_timeline(self) -> None:
+        return
+
+    def action_switch_work(self) -> None:
+        launch = getattr(self.app, "action_work_ledger", None)
+        self.dismiss(None)
+        if callable(launch):
+            self.app.call_later(launch)
+
+    def action_switch_context(self) -> None:
+        launch = getattr(self.app, "action_context_visibility", None)
+        self.dismiss(None)
+        if callable(launch):
+            self.app.call_later(launch)
 
     def action_close(self) -> None:
         self.dismiss(None)

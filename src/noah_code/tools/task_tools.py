@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextlib
+import inspect
 import json
 import os
 import re
@@ -111,6 +112,10 @@ class TaskActivity:
     team_id: str | None = None
     workflow: str | None = None
     phase: str | None = None
+    title: str = ""
+    current_action: str = ""
+    step_count: int = 0
+    isolated: bool = False
 
     @property
     def duration(self) -> float:
@@ -129,6 +134,10 @@ class TaskActivity:
             "team_id": self.team_id,
             "workflow": self.workflow,
             "phase": self.phase,
+            "title": self.title,
+            "current_action": self.current_action,
+            "step_count": self.step_count,
+            "isolated": self.isolated,
         }
 
 
@@ -283,6 +292,7 @@ class TaskTools(Skill):
             record_data: dict[str, Any] = {
                 "id": task_id,
                 "agent": spec.name,
+                "prompt": prompt.strip()[:24_000],
                 "directory": str(directory),
                 "isolated": isolate,
                 "state": "queued",
@@ -563,6 +573,328 @@ class TaskTools(Skill):
         contributors = ", ".join(spec.name for spec, _prompt in resolved)
         return f"## Team lead · {lead_spec.name}\n{result}\n\nInputs: {contributors}"
 
+    async def orchestrate(
+        self,
+        objective: str,
+        subtasks: Sequence[tuple[str, str] | dict[str, Any]],
+        isolate: bool = False,
+        lead: str | None = None,
+    ) -> str:
+        """Coordinate multiple subagents in parallel on a large multi-part task.
+
+        Each item in ``subtasks`` is either ``(agent_name, prompt)`` or a dict
+        ``{"agent": "general", "title": "API", "prompt": "...", "isolate": True}``
+        (up to 12 subtasks). Every role and permission is validated before any
+        subagent starts. Read-only subtasks run concurrently; when ``isolate=True``
+        (or per-item ``"isolate": True``) inside a Git repository, writable
+        subtasks each receive an isolated linked worktree so multiple writers run
+        in parallel without blocking one another, and non-conflicting edits are
+        applied back to the parent workspace on completion.
+        """
+
+        goal = str(objective or "").strip()
+        if not goal:
+            raise ValueError("orchestration objective is required")
+        if not subtasks:
+            raise ValueError("at least one subtask is required")
+        if len(subtasks) > 12:
+            raise ValueError("orchestrate accepts at most 12 subtasks per wave")
+
+        parsed: builtins.list[tuple[AgentSpec, str, str, bool]] = []
+        for idx, item in enumerate(subtasks, start=1):
+            if isinstance(item, dict):
+                raw_agent = str(item.get("agent") or "general")
+                raw_prompt = str(item.get("prompt") or "").strip()
+                raw_title = " ".join(str(item.get("title") or "").split())[:60]
+                want_isolate = bool(item["isolate"]) if "isolate" in item else bool(isolate)
+            elif isinstance(item, (tuple, builtins.list)) and len(item) == 2:
+                raw_agent = str(item[0])
+                raw_prompt = str(item[1] or "").strip()
+                raw_title = ""
+                want_isolate = bool(isolate)
+            else:
+                raise ValueError(
+                    f"subtask {idx} must be (agent, prompt) or {{'agent': ..., 'prompt': ...}}"
+                )
+            spec = self._resolve(raw_agent)
+            effective_isolate = bool(want_isolate and not spec.readonly)
+            if effective_isolate and self._engine.mode == "plan":
+                raise PermissionError("plan mode cannot run mutating agents")
+            await self._authorize(spec, raw_prompt)
+            parsed.append((spec, raw_title, raw_prompt, effective_isolate))
+
+        lead_spec: AgentSpec | None = None
+        if lead is not None and str(lead).strip():
+            lead_spec = self._resolve(str(lead))
+            await self._authorize(lead_spec, goal)
+
+        runner = self._runner or _default_runner(self._parent)
+        if runner is None:
+            raise RuntimeError("subagent runner is not configured")
+
+        any_isolated = any(eff_iso for _spec, _title, _prompt, eff_iso in parsed)
+        manager: Any = None
+        rel_subdir: Path | None = None
+        if any_isolated:
+            if self._engine.mode == "plan":
+                raise PermissionError("plan mode cannot run mutating agents")
+            if _git_toplevel(self._workspace.root) is None:
+                raise ValueError("isolated orchestration requires a Git repository")
+            from noah_code.worktree import WorktreeManager, worktree_storage_root
+
+            parent_cfg = getattr(self._parent, "_config", None)
+            session_dir = getattr(parent_cfg, "session_dir", None) or (
+                self._workspace.root.parent / f".{self._workspace.root.name}-noah-sessions"
+            )
+            manager = WorktreeManager(self._workspace.root, worktree_storage_root(Path(session_dir)))
+            rel_subdir = _git_workdir_offset(self._workspace.root)
+
+        team_id = uuid.uuid4().hex[:8]
+        created_worktrees: builtins.list[tuple[str, str, Path, str, dict[str, str | None]]] = []
+        subtask_slots: builtins.list[
+            tuple[int, str, AgentSpec, str, str, bool, Path, str, dict[str, str | None]]
+        ] = []
+
+        try:
+            for idx, (spec, raw_title, raw_prompt, eff_iso) in enumerate(parsed, start=1):
+                sub_id = uuid.uuid4().hex[:12]
+                child_dir = self._workspace.root
+                base_commit = ""
+                dirty_base: dict[str, str | None] = {}
+                if eff_iso and manager is not None:
+                    wt_name = f"orch-{sub_id}"
+                    creating = asyncio.create_task(
+                        asyncio.to_thread(manager.create, wt_name, include_dirty=True)
+                    )
+                    try:
+                        info = await asyncio.shield(creating)
+                    except asyncio.CancelledError:
+                        with contextlib.suppress(Exception):
+                            info = await creating
+                            await asyncio.to_thread(manager.remove, info.name)
+                        raise
+                    base_commit, dirty_base = await asyncio.to_thread(
+                        _inspect_isolated_baseline, info.directory, True
+                    )
+                    child_dir = info.directory
+                    if rel_subdir is not None:
+                        candidate = (info.directory / rel_subdir).resolve()
+                        if candidate.is_dir():
+                            child_dir = candidate
+                    created_worktrees.append((sub_id, info.name, child_dir, base_commit, dirty_base))
+                self._records[sub_id] = {
+                    "id": sub_id,
+                    "agent": spec.name,
+                    "title": raw_title,
+                    "prompt": raw_prompt[:24_000],
+                    "directory": str(child_dir),
+                    "isolated": eff_iso,
+                    "ephemeral": True,
+                    "state": "queued",
+                    "result": "",
+                }
+                subtask_slots.append(
+                    (
+                        idx,
+                        sub_id,
+                        spec,
+                        raw_title,
+                        raw_prompt,
+                        eff_iso,
+                        child_dir,
+                        base_commit,
+                        dirty_base,
+                    )
+                )
+
+            async def _run_slot(
+                slot: tuple[int, str, AgentSpec, str, str, bool, Path, str, dict[str, str | None]]
+            ) -> tuple[int, str, AgentSpec, str, bool, Path, str, dict[str, str | None], str, str]:
+                idx, sub_id, spec, raw_title, raw_prompt, eff_iso, child_dir, base_ref, d_base = slot
+                phase_label = raw_title or f"part-{idx}"
+                full_prompt = (
+                    f"Orchestrated wave objective:\n{_truncate_result(goal, 6000)}\n\n"
+                    f"Subtask {idx}/{len(subtask_slots)}"
+                    + (f" ({raw_title})" if raw_title else "")
+                    + f":\n{raw_prompt}"
+                )
+                try:
+                    res = await self._execute_result(
+                        spec,
+                        full_prompt,
+                        runner,
+                        semaphore=self._slots,
+                        team_id=team_id,
+                        workflow="orchestrate",
+                        phase=phase_label,
+                        display_prompt=raw_title or raw_prompt,
+                        task_id=sub_id,
+                        title=raw_title,
+                        isolated=eff_iso,
+                    )
+                    return (
+                        idx,
+                        sub_id,
+                        spec,
+                        raw_title,
+                        eff_iso,
+                        child_dir,
+                        base_ref,
+                        d_base,
+                        _truncate_result(res.text, _TEAM_REPORT_LIMIT),
+                        res.status,
+                    )
+                except Exception as exc:  # noqa: BLE001 - retain peer results
+                    return (
+                        idx,
+                        sub_id,
+                        spec,
+                        raw_title,
+                        eff_iso,
+                        child_dir,
+                        base_ref,
+                        d_base,
+                        _truncate_result(f"error: {type(exc).__name__}: {exc}", _TEAM_REPORT_LIMIT),
+                        "failed",
+                    )
+
+            jobs = [asyncio.create_task(_run_slot(slot)) for slot in subtask_slots]
+            try:
+                outcomes = await asyncio.gather(*jobs)
+            except asyncio.CancelledError:
+                for job in jobs:
+                    job.cancel()
+                await asyncio.gather(*jobs, return_exceptions=True)
+                raise
+
+            applied_files: builtins.list[str] = []
+            conflict_notes: dict[str, str] = {}
+            claimed_paths: dict[str, int] = {}
+            parent_ws = getattr(self._parent, "ws", None)
+
+            for (
+                idx,
+                sub_id,
+                _spec,
+                _title,
+                eff_iso,
+                child_dir,
+                base_ref,
+                d_base,
+                _text,
+                sub_status,
+            ) in outcomes:
+                if not eff_iso or sub_status == "failed" or not child_dir.is_dir():
+                    continue
+                try:
+                    changes = await asyncio.to_thread(
+                        _collect_isolated_patch_changes,
+                        child_dir,
+                        self._workspace.root,
+                        base_ref or "HEAD",
+                        d_base,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    conflict_notes[sub_id] = f"[CONFLICT - could not inspect worktree changes: {exc}]"
+                    continue
+                if not changes:
+                    continue
+                touched = [str(ch["path"]) for ch in changes if ch.get("path")]
+                overlaps = [p for p in touched if p in claimed_paths]
+                if overlaps:
+                    raw_diff = await asyncio.to_thread(
+                        _collect_isolated_diff, child_dir, base_ref or "HEAD"
+                    )
+                    conflict_notes[sub_id] = (
+                        f"[CONFLICT - not auto-applied; overlapped {', '.join(overlaps)} "
+                        f"already modified in this wave]\n{_truncate_result(raw_diff, 4000)}"
+                    )
+                    continue
+                try:
+                    if parent_ws is not None:
+                        await parent_ws.apply_patch(changes)
+                    else:
+                        await asyncio.to_thread(
+                            _apply_patch_changes_fallback, self._workspace.root, changes
+                        )
+                    for path_str in touched:
+                        claimed_paths[path_str] = idx
+                        if path_str not in applied_files:
+                            applied_files.append(path_str)
+                    if sub_id in self._records:
+                        self._records[sub_id]["applied"] = True
+                except Exception as exc:  # noqa: BLE001
+                    raw_diff = await asyncio.to_thread(
+                        _collect_isolated_diff, child_dir, base_ref or "HEAD"
+                    )
+                    conflict_notes[sub_id] = (
+                        f"[CONFLICT - patch did not apply cleanly ({exc})]\n"
+                        f"{_truncate_result(raw_diff, 4000)}"
+                    )
+        finally:
+            if manager is not None and created_worktrees:
+                from noah_code.checkpoints import CheckpointManager
+
+                for sub_id, wt_name, _cdir, _bref, _dbase in created_worktrees:
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(
+                            CheckpointManager(self._workspace.root, sub_id).delete_all
+                        )
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(manager.remove, wt_name)
+                    if sub_id in self._records:
+                        self._records[sub_id]["worktree_cleaned"] = True
+                self._save_records()
+
+        overall_status = (
+            "failed"
+            if any(row[9] == "failed" for row in outcomes)
+            else "needs_input"
+            if any(row[9] == "needs_input" for row in outcomes)
+            else "completed"
+        )
+        sections: builtins.list[str] = []
+        for idx, sub_id, spec, raw_title, eff_iso, _cdir, _bref, _dbase, text, sub_status in outcomes:
+            label = f"{raw_title} ({spec.name})" if raw_title else spec.name
+            iso_badge = " · isolated" if eff_iso else ""
+            body = text
+            if sub_id in conflict_notes:
+                body = f"{body}\n\n{conflict_notes[sub_id]}"
+            sections.append(f"### {idx}. {label}{iso_badge} · {sub_status}\n{body}")
+
+        combined_sections = "\n\n".join(sections)
+        if lead_spec is not None:
+            applied_line = ", ".join(applied_files) if applied_files else "(none)"
+            lead_prompt = (
+                "Act as the lead synthesizer for this parallel multi-subagent wave. "
+                "Verify coherence across subtasks, highlight any conflicts or follow-ups, "
+                "and summarize the completed outcome.\n\n"
+                f"Objective:\n{goal}\n\n"
+                f"Applied files: {applied_line}\n\n"
+                f"Subtask reports:\n{combined_sections}"
+            )
+            lead_res = await self._execute_result(
+                lead_spec,
+                _truncate_result(lead_prompt, _DISTILL_INPUT_LIMIT),
+                runner,
+                semaphore=self._slots,
+                team_id=team_id,
+                workflow="orchestrate",
+                phase="synthesis",
+                display_prompt=f"Synthesize: {goal}",
+                title="Lead synthesis",
+            )
+            sections.append(f"### Lead synthesis · {lead_spec.name}\n{lead_res.text}")
+            combined_sections = "\n\n".join(sections)
+
+        applied_summary = ", ".join(applied_files) if applied_files else "(none)"
+        header = (
+            f"## Orchestrated wave · {team_id} · {overall_status}\n"
+            f"Objective: {goal}\n"
+            f"Applied files: {applied_summary}"
+        )
+        return f"{header}\n\n{combined_sections}"
+
     async def team(self, objective: str, workflow: str = "build") -> str:
         """Run a build, review, or investigate team with explicit phase handoffs.
 
@@ -727,9 +1059,15 @@ class TaskTools(Skill):
         phase: str | None = None,
         display_prompt: str | None = None,
         task_id: str | None = None,
+        title: str = "",
+        isolated: bool = False,
     ) -> TaskResult:
+        resolved_id = task_id or uuid.uuid4().hex[:12]
+        existing_rec = self._records.get(resolved_id, {})
+        is_isolated = bool(isolated or existing_rec.get("isolated", False))
+        effective_title = title or str(existing_rec.get("title", "") or "")
         activity = TaskActivity(
-            task_id=task_id or uuid.uuid4().hex[:12],
+            task_id=resolved_id,
             agent=spec.name,
             prompt=" ".join((display_prompt if display_prompt is not None else prompt).split())[:500],
             mode=spec.mode,
@@ -737,15 +1075,19 @@ class TaskTools(Skill):
             team_id=team_id,
             workflow=workflow,
             phase=phase,
+            title=effective_title,
+            isolated=is_isolated,
         )
         self._activities[activity.task_id] = activity
         created_ephemeral = activity.task_id not in self._records
         record = self._records.setdefault(activity.task_id, {
             "id": activity.task_id, "agent": spec.name, "directory": str(self._workspace.root),
-            "isolated": False, "state": "queued", "result": "",
+            "isolated": is_isolated, "state": "queued", "result": "", "title": effective_title,
         })
         if created_ephemeral:
             record["ephemeral"] = True
+        if effective_title:
+            record["title"] = effective_title
         record["prompt"] = prompt[:24_000]
         record["state"] = "queued"
         self._save_records()
@@ -769,9 +1111,12 @@ class TaskTools(Skill):
             raise
         finally:
             activity.finished_at = time.monotonic()
+            activity.current_action = ""
             self._activities.pop(activity.task_id, None)
             self._history.append(activity)
             record["state"] = activity.state
+            record["current_action"] = ""
+            record["step_count"] = activity.step_count
             record["updated_at"] = time.time()
             if activity.state in {"failed", "cancelled"}:
                 record["result"] = activity.result_preview
@@ -795,25 +1140,123 @@ class TaskTools(Skill):
     ) -> str | TaskResult:
         record = self._records[activity.task_id]
         lane = contextlib.nullcontext() if record["isolated"] else self._agent_lane(spec)
+        last_step_emit = 0.0
+
+        def _on_step(action_label: str) -> None:
+            nonlocal last_step_emit
+            cleaned = " ".join(str(action_label or "").split())[:120]
+            if not cleaned:
+                return
+            activity.current_action = cleaned
+            activity.step_count += 1
+            record["current_action"] = cleaned
+            record["step_count"] = activity.step_count
+            now = time.monotonic()
+            if now - last_step_emit >= 0.15:
+                last_step_emit = now
+                self._emit(activity)
+
         async with lane:
             activity.state = "running"
             record["state"] = "running"
             self._save_records()
             self._emit(activity)
-            if self._runner is None and self._parent is not None and self._runtime is not None:
+            if self._runner is None and self._parent is not None:
                 return await _run_subagent(
-                    self._parent, spec, prompt, task_id=activity.task_id,
-                    directory=Path(record["directory"]), isolated=record["isolated"],
+                    self._parent,
+                    spec,
+                    prompt,
+                    task_id=activity.task_id if self._runtime is not None else None,
+                    directory=Path(record["directory"]),
+                    isolated=bool(record["isolated"]),
+                    on_step=_on_step,
                 )
+            extra_kwargs: dict[str, Any] = {}
+            with contextlib.suppress(TypeError, ValueError):
+                params = inspect.signature(runner).parameters
+                if "on_step" in params:
+                    extra_kwargs["on_step"] = _on_step
+                if "directory" in params:
+                    extra_kwargs["directory"] = Path(record["directory"])
+            if extra_kwargs:
+                custom_runner: Any = runner
+                return await custom_runner(spec, prompt, **extra_kwargs)
             return await runner(spec, prompt)
 
     def set_lifecycle_handler(self, handler: Any) -> None:
         self._on_lifecycle = handler
 
     def snapshot(self, *, limit: int = 20) -> builtins.list[dict[str, Any]]:
-        history = builtins.list(self._history)[-limit:] if limit > 0 else []
+        if limit <= 0:
+            return []
+        history = builtins.list(self._history)[-limit:]
         active = builtins.list(self._activities.values())
-        return [activity.to_dict() for activity in [*history, *active]]
+
+        def _enrich(entry: dict[str, Any]) -> dict[str, Any]:
+            rec = self._records.get(str(entry.get("id", "")), {})
+            enriched = dict(entry)
+            enriched["isolated"] = bool(entry.get("isolated") or rec.get("isolated", False))
+            enriched["applied"] = bool(rec.get("applied", False))
+            enriched["worktree_cleaned"] = bool(rec.get("worktree_cleaned", False))
+            enriched["directory"] = str(rec.get("directory", ""))
+            if not enriched.get("title") and rec.get("title"):
+                enriched["title"] = str(rec["title"])
+            if not enriched.get("current_action") and rec.get("current_action"):
+                enriched["current_action"] = str(rec["current_action"])
+            if not enriched.get("step_count") and rec.get("step_count"):
+                enriched["step_count"] = int(rec["step_count"])
+            if not enriched.get("result_preview") and rec.get("result"):
+                enriched["result_preview"] = " ".join(str(rec["result"]).split())[:500]
+            return enriched
+
+        active_ids = {item.task_id for item in active}
+        history_dicts: builtins.list[dict[str, Any]] = []
+        seen_ids: set[str] = set(active_ids)
+        for item in reversed(history):
+            if item.task_id in seen_ids:
+                continue
+            seen_ids.add(item.task_id)
+            history_dicts.append(_enrich(item.to_dict()))
+        history_dicts.reverse()
+
+        durable_dicts: builtins.list[dict[str, Any]] = []
+        for task_id, rec in self._records.items():
+            if task_id in seen_ids or rec.get("ephemeral"):
+                continue
+            seen_ids.add(task_id)
+            agent_name = str(rec.get("agent", "agent"))
+            spec_mode = "build" if rec.get("isolated") else "plan"
+            spec_readonly = not bool(rec.get("isolated"))
+            with contextlib.suppress(Exception):
+                spec = self._resolve(agent_name)
+                spec_mode = spec.mode
+                spec_readonly = spec.readonly
+            durable_dicts.append(
+                {
+                    "id": task_id,
+                    "agent": agent_name,
+                    "prompt": " ".join(str(rec.get("prompt", "")).split())[:500],
+                    "mode": spec_mode,
+                    "readonly": spec_readonly,
+                    "state": str(rec.get("state", "unknown")),
+                    "result_preview": " ".join(str(rec.get("result", "")).split())[:500],
+                    "duration": 0.0,
+                    "team_id": None,
+                    "workflow": None,
+                    "phase": None,
+                    "title": str(rec.get("title", "")),
+                    "current_action": str(rec.get("current_action", "")),
+                    "step_count": int(rec.get("step_count", 0) or 0),
+                    "isolated": bool(rec.get("isolated", False)),
+                    "applied": bool(rec.get("applied", False)),
+                    "worktree_cleaned": bool(rec.get("worktree_cleaned", False)),
+                    "directory": str(rec.get("directory", "")),
+                }
+            )
+
+        completed_items = [*durable_dicts, *history_dicts][-limit:]
+        active_dicts = [_enrich(item.to_dict()) for item in active]
+        return [*completed_items, *active_dicts]
 
     def _emit(self, activity: TaskActivity) -> None:
         if self._on_lifecycle is None:
@@ -1066,14 +1509,59 @@ def _child_engine(parent_engine: PermissionEngine, mode: str) -> PermissionEngin
     return clone
 
 
+def _apply_patch_changes_fallback(
+    workspace_root: Path, changes: list[dict[str, str | None]]
+) -> None:
+    """Preflight and apply collected worktree changes when standalone TaskTools lacks parent.ws."""
+
+    root = workspace_root.resolve()
+    staged: list[tuple[Path, str | None]] = []
+    for change in changes:
+        rel = str(change.get("path") or "")
+        if not rel or is_secret_path(rel):
+            raise ValueError(f"invalid patch target: {rel!r}")
+        target = (root / rel).resolve()
+        if not target.is_relative_to(root):
+            raise PermissionError(f"patch escapes workspace: {rel}")
+        old = change.get("old")
+        new = change.get("new")
+        if old is None:
+            if target.exists():
+                raise ValueError(f"file already exists in parent workspace: {rel}")
+            staged.append((target, str(new or "")))
+        elif new is None:
+            if not target.is_file() or target.read_text(encoding="utf-8") != old:
+                raise ValueError(f"delete preimage mismatch in parent workspace: {rel}")
+            staged.append((target, None))
+        else:
+            if not target.is_file():
+                raise ValueError(f"missing file in parent workspace: {rel}")
+            current = target.read_text(encoding="utf-8")
+            if current != old:
+                raise ValueError(f"parent file modified concurrently: {rel}")
+            staged.append((target, new))
+    for target, content in staged:
+        if content is None:
+            target.unlink()
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+
+
 async def run_subagent(parent: Any, spec: AgentSpec, prompt: str) -> str:
     """Return a nested agent's report as text for existing callers."""
     return (await _run_subagent(parent, spec, prompt)).text
 
 
 async def _run_subagent(
-    parent: Any, spec: AgentSpec, prompt: str, *, task_id: str | None = None,
-    directory: Path | None = None, isolated: bool = False,
+    parent: Any,
+    spec: AgentSpec,
+    prompt: str,
+    *,
+    task_id: str | None = None,
+    directory: Path | None = None,
+    isolated: bool = False,
+    on_step: Callable[[str], None] | None = None,
 ) -> TaskResult:
     """Start a nested CodingAgent with isolated storage and a per-run permission engine."""
 
@@ -1176,6 +1664,7 @@ async def _run_subagent(
     if parent_approvals is not None and hasattr(parent_approvals, "_ui_lock"):
         child_approvals._ui_lock = parent_approvals._ui_lock  # noqa: SLF001
     checkpoints = None
+    step_unsub: Callable[[], None] | None = None
     try:
         child = CodingAgent(
             child_workspace,
@@ -1203,6 +1692,25 @@ async def _run_subagent(
             nested=True,
             nested_prompt=spec.prompt,
         )
+        if on_step is not None:
+            def _on_child_tool_call(event: Any) -> None:
+                if getattr(event, "result", None) is not None:
+                    return
+                tool_name = str(getattr(event, "name", "tool") or "tool")
+                args = getattr(event, "arguments", {}) or {}
+                if tool_name == "execute_python":
+                    from noah_code.event_bridge import _describe_code_activity
+
+                    label = _describe_code_activity(str(args.get("code", "")))
+                elif tool_name == "return_result":
+                    label = "Preparing response"
+                else:
+                    label = tool_name.replace("_", " ").strip().capitalize() or "Working"
+                with contextlib.suppress(Exception):
+                    on_step(label)
+
+            with contextlib.suppress(Exception):
+                step_unsub = child.event_manager.on("ToolCallEvent", _on_child_tool_call)
         parent_ask = getattr(parent, "ask", None)
         ask_handler = getattr(parent_ask, "_handler", None)
         if ask_handler is not None:
@@ -1288,6 +1796,9 @@ async def _run_subagent(
         )
         return TaskResult(text, "needs_input" if needs_input else "completed")
     finally:
+        if step_unsub is not None:
+            with contextlib.suppress(Exception):
+                step_unsub()
         try:
             if child is not None:
                 await child.close_tools()

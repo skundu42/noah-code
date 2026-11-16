@@ -243,6 +243,7 @@ _SUBCOMMAND_HELP_EPILOG = (
     "  worktree     Create, list, or remove isolated git worktrees\n"
     "  pr           List, view, create, push, checkout, or comment on pull requests\n"
     "  providers    Inspect providers, connect an account, or configure API credentials\n"
+    "  mcp          List, add, import, or install one-click MCP server presets\n"
     "  browser      Configure browser tools for coding sessions\n"
     "  config       Show resolved configuration\n"
     "  doctor       Diagnostics for workspace, config, and model resolution\n"
@@ -258,6 +259,12 @@ _SUBCOMMAND_HELP_EPILOG = (
 )
 @click.version_option(__version__, prog_name="noah-code")
 @click.argument("path", required=False, type=click.Path())
+@click.option(
+    "--resume",
+    "resume_picker",
+    is_flag=True,
+    help="Choose from the last 3 chats in this repository",
+)
 @click.option("--continue", "continue_session", is_flag=True, help="Resume latest session")
 @click.option("--session", "session_id", default=None, help="Resume a specific session id")
 @click.option(
@@ -276,6 +283,7 @@ def interactive_cmd(
     permissions: str | None,
     mode: str | None,
     max_iterations: int | None,
+    resume_picker: bool,
     continue_session: bool,
     session_id: str | None,
     use_console: bool,
@@ -285,8 +293,10 @@ def interactive_cmd(
 
     Default UI is the Textual TUI. Pass --console for the classic line UI.
     """
-    if continue_session and session_id:
+    if continue_session and session_id and not resume_picker:
         raise click.UsageError("--continue and --session cannot be used together")
+    if resume_picker and (continue_session or session_id):
+        raise click.UsageError("--resume cannot be used together with --continue or --session")
     code = _run_async(
         _interactive(
             path=path,
@@ -301,6 +311,7 @@ def interactive_cmd(
             session_id=session_id,
             use_console=use_console,
             unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
+            resume_picker=resume_picker,
         )
     )
     raise SystemExit(code)
@@ -426,6 +437,161 @@ def browser_setup_cmd(browser: str, headed: bool, name: str) -> None:
     except (OSError, ValueError) as exc:
         raise click.ClickException(safe_error_message(exc)) from exc
     click.echo(f"Browser tools configured in {path}. Start a new session to connect.")
+
+
+@cli_group.group("mcp")
+def mcp_group() -> None:
+    """List, add, import, or install one-click MCP server presets."""
+
+
+@mcp_group.command("list")
+@click.argument("path", required=False, type=click.Path())
+def mcp_list_cmd(path: str | None) -> None:
+    """List configured MCP servers and detected external configs."""
+    from noah_code.mcp_setup import discover_external_mcp_servers, list_mcp_servers
+
+    try:
+        workspace = open_workspace(path)
+        config = load_config(workspace.root)
+        rows = list_mcp_servers(workspace.root, config)
+        external = discover_external_mcp_servers()
+    except (WorkspaceError, ConfigError) as exc:
+        click.echo(f"error: {safe_error_message(exc)}", err=True)
+        raise SystemExit(EXIT_CONFIG) from exc
+    configured_names = {row.name for row in rows}
+    if rows:
+        for row in rows:
+            click.echo(f"{row.name}\t{row.transport}\t{row.target}\t{row.source}")
+    else:
+        click.echo("(no MCP servers configured)")
+    importable = [name for name in sorted(external) if name not in configured_names]
+    if importable:
+        click.echo(
+            f"\nImportable from Claude/Cursor ({len(importable)}): {', '.join(importable)} "
+            "(run `noah mcp import`)",
+            err=True,
+        )
+
+
+@mcp_group.command("presets")
+def mcp_presets_cmd() -> None:
+    """Show built-in one-click MCP presets."""
+    from noah_code.mcp_setup import list_mcp_presets
+
+    for preset in list_mcp_presets():
+        env_note = f"\t[env: {preset.env_var}]" if preset.env_var else ""
+        click.echo(
+            f"{preset.key}\t{preset.label}\t{preset.transport}\t{preset.target}\t"
+            f"{preset.description}{env_note}"
+        )
+
+
+@mcp_group.command(
+    "add",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.argument("tokens", nargs=-1, required=True)
+def mcp_add_cmd(tokens: tuple[str, ...]) -> None:
+    """Save an MCP server (auto-detects HTTP URL vs STDIO command)."""
+    import shlex
+
+    from noah_code.mcp_setup import (
+        MCP_PRESETS,
+        get_mcp_preset,
+        parse_mcp_add_target,
+        save_user_mcp_server,
+    )
+
+    try:
+        if len(tokens) == 1 and tokens[0].strip().lower() in {p.key for p in MCP_PRESETS}:
+            preset = get_mcp_preset(tokens[0])
+            path = save_user_mcp_server(preset.key, preset.to_spec())
+            click.echo(f"Saved MCP preset {preset.key} ({preset.label}) in {path}")
+            if preset.env_var and not os.environ.get(preset.env_var):
+                click.echo(f"Note: set {preset.env_var} in your environment when needed.", err=True)
+            return
+        kind, name, target = parse_mcp_add_target(tokens)
+        if kind == "stdio":
+            cmd_parts = shlex.split(target)
+            spec: dict[str, Any] = {
+                "command": cmd_parts[0],
+                "args": cmd_parts[1:],
+                "transport": "stdio",
+            }
+        else:
+            spec = {"url": target.strip(), "transport": "streamable-http"}
+        path = save_user_mcp_server(name, spec)
+    except (OSError, ValueError, FileExistsError, KeyError) as exc:
+        raise click.ClickException(safe_error_message(exc)) from exc
+    click.echo(f"Saved MCP server {name} ({kind}) in {path}")
+
+
+@mcp_group.command("preset")
+@click.argument("key")
+def mcp_preset_cmd(key: str) -> None:
+    """Install a built-in MCP preset by key (see `noah mcp presets`)."""
+    from noah_code.mcp_setup import get_mcp_preset, save_user_mcp_server
+
+    try:
+        preset = get_mcp_preset(key)
+        try:
+            path = save_user_mcp_server(preset.key, preset.to_spec())
+            click.echo(f"Installed MCP preset {preset.key} ({preset.label}) in {path}")
+        except FileExistsError:
+            click.echo(f"MCP preset {preset.key} is already configured.")
+        if preset.env_var and not os.environ.get(preset.env_var):
+            click.echo(f"Note: set {preset.env_var} in your environment when needed.", err=True)
+    except (OSError, ValueError, KeyError) as exc:
+        raise click.ClickException(safe_error_message(exc)) from exc
+
+
+@mcp_group.command("import")
+@click.argument("names", nargs=-1, required=False)
+def mcp_import_cmd(names: tuple[str, ...]) -> None:
+    """Import MCP servers from Claude Code, Claude Desktop, and Cursor."""
+    from noah_code.mcp_setup import discover_external_mcp_servers, save_user_mcp_server
+
+    try:
+        discovered = discover_external_mcp_servers()
+        if not discovered:
+            click.echo("No external MCP servers found in Claude Code, Claude Desktop, or Cursor.")
+            return
+        if names:
+            missing = [n for n in names if n not in discovered]
+            if missing:
+                raise KeyError(f"external MCP server not found: {', '.join(missing)}")
+            targets = [(n, *discovered[n]) for n in names]
+        else:
+            targets = [(n, spec, src) for n, (spec, src) in sorted(discovered.items())]
+        imported: list[str] = []
+        skipped: list[str] = []
+        for srv_name, spec, src in targets:
+            try:
+                save_user_mcp_server(srv_name, spec)
+                imported.append(f"{srv_name} ({src.split(' (', 1)[0]})")
+            except FileExistsError:
+                skipped.append(srv_name)
+    except (OSError, ValueError, KeyError) as exc:
+        raise click.ClickException(safe_error_message(exc)) from exc
+    if imported:
+        click.echo(f"Imported {len(imported)} MCP server(s): {', '.join(imported)}")
+    if skipped:
+        click.echo(f"Already configured: {', '.join(skipped)}")
+
+
+@mcp_group.command("remove")
+@click.argument("name")
+def mcp_remove_cmd(name: str) -> None:
+    """Remove an MCP server from user configuration."""
+    from noah_code.mcp_setup import remove_user_mcp_server
+
+    try:
+        removed = remove_user_mcp_server(name)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(safe_error_message(exc)) from exc
+    if not removed:
+        raise click.ClickException(f"MCP server {name} is not in user mcp.json")
+    click.echo(f"Removed MCP server {name}")
 
 
 @cli_group.command("run")
@@ -1247,6 +1413,7 @@ async def _interactive(
     use_console: bool,
     unsafe_inprocess_code_execution: bool,
     permissions: str | None = None,
+    resume_picker: bool = False,
 ) -> int:
     permission_choice = _permission_override(auto, yolo, permissions)
     first_run = user_default_model() is None
@@ -1326,6 +1493,8 @@ async def _interactive(
         from noah_code.providers import model_setup_required
 
         host = agent_host_cls(workspace, config, session_meta=meta, store=store)
+        if resume_picker:
+            host._open_resume_on_start = True
         onboarding_required = (
             (
                 first_run
@@ -1351,6 +1520,38 @@ async def _interactive(
             # run_tui closes itself, but an import failure or a close that was
             # cut short by cancellation must not leak leases, storage, or tools.
             await host.close()
+    if resume_picker and meta is None:
+        probe_host = agent_host_cls(workspace, config, store=store)
+        recent = await asyncio.to_thread(probe_host.recent_repo_sessions, 3)
+        if recent:
+            click.secho("Recent chats in this repository:", fg="bright_blue", bold=True, err=True)
+            for idx, (cand, preview) in enumerate(recent, start=1):
+                snippet = f" — “{preview}”" if preview else ""
+                click.echo(
+                    f"  {idx}. {cand.title} ({cand.session_id[:8]} · {cand.mode} · {cand.model}){snippet}",
+                    err=True,
+                )
+            valid_choices = [*(str(i) for i in range(1, len(recent) + 1)), "n"]
+            try:
+                picked = click.prompt(
+                    "Resume chat (number, or 'n' for a new chat)",
+                    type=click.Choice(valid_choices, case_sensitive=False),
+                    default="1",
+                    show_default=True,
+                    err=True,
+                ).lower()
+            except click.Abort:
+                return EXIT_SIGINT
+            if picked != "n":
+                chosen_meta, _ = recent[int(picked) - 1]
+                try:
+                    workspace = store.workspace_for_resume(chosen_meta, workspace)
+                    meta = chosen_meta
+                except SessionError as exc:
+                    click.echo(f"error: {exc}", err=True)
+                    return EXIT_CONFIG
+        else:
+            click.echo("No previous chats in this repository; starting a new session.", err=True)
     console_ui_cls = _lazy_symbol("ConsoleUI")
     host = agent_host_cls(
         workspace,

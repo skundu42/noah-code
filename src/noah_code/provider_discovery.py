@@ -25,8 +25,22 @@ from noah_code.providers import (
 )
 
 _MAX_RESPONSE_BYTES = 1_000_000
+_OPENROUTER_MAX_RESPONSE_BYTES = 5_000_000
 _MAX_MODELS = 500
+_OPENROUTER_MAX_MODELS = 800
 _CHAT_MODES = frozenset({"chat", "responses"})
+_NOISY_MODEL_TOKENS = (
+    "-audio",
+    "-tts",
+    "whisper",
+    "moderation",
+    "prompt-guard",
+    "llama-guard",
+    "lyria-",
+    "-image",
+    "-realtime",
+    "-transcribe",
+)
 
 
 @dataclass(frozen=True)
@@ -44,16 +58,25 @@ class ModelDiscoveryResult:
 
 @lru_cache(maxsize=1)
 def _bundled_catalog() -> dict[str, Any]:
-    """Read the pinned package's fallback data without importing its network loader."""
+    """Read the pinned package's fallback data plus Noah's curated coding catalog."""
 
+    from noah_code.model_catalog import curated_catalog_overlay
+
+    payload: dict[str, Any] = {}
     try:
         path = distribution("litellm").locate_file(
             "litellm/model_prices_and_context_window_backup.json"
         )
-        payload = json.loads(path.read_text())
-        return payload if isinstance(payload, dict) else {}
+        loaded = json.loads(path.read_text())
+        if isinstance(loaded, dict):
+            payload = loaded
     except (PackageNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
-        return {}
+        payload = {}
+    merged = dict(payload)
+    for route, meta in curated_catalog_overlay().items():
+        existing = merged.get(route)
+        merged[route] = {**(existing if isinstance(existing, dict) else {}), **meta}
+    return merged
 
 
 def _valid_model_id(value: Any) -> TypeGuard[str]:
@@ -64,6 +87,16 @@ def _valid_model_id(value: Any) -> TypeGuard[str]:
     )
 
 
+def _is_noisy_non_coding_model(model_id: str) -> bool:
+    lowered = model_id.lower()
+    return (
+        model_id.startswith("ft:")
+        or model_id.endswith(":batch")
+        or model_id == "container"
+        or any(token in lowered for token in _NOISY_MODEL_TOKENS)
+    )
+
+
 def catalog_models(provider: str) -> tuple[ModelInfo, ...]:
     """Offer known chat models, clearly distinguished from live availability."""
 
@@ -71,7 +104,9 @@ def catalog_models(provider: str) -> tuple[ModelInfo, ...]:
         # Installed tags and cloud deployment identifiers are user-specific.
         return ()
     prefix = provider_preset(provider).prefix
+    limit = _OPENROUTER_MAX_MODELS if provider == "openrouter" else _MAX_MODELS
     models: dict[str, ModelInfo] = {}
+    ranks: dict[str, int] = {}
     for route, metadata in _bundled_catalog().items():
         if not isinstance(metadata, dict) or metadata.get("litellm_provider") != prefix:
             continue
@@ -80,14 +115,28 @@ def catalog_models(provider: str) -> tuple[ModelInfo, ...]:
         if metadata.get("supports_function_calling") is False:
             continue
         model_id = route.removeprefix(f"{prefix}/")
-        if not _valid_model_id(model_id):
+        if not _valid_model_id(model_id) or _is_noisy_non_coding_model(model_id):
             continue
-        description = "Bundled catalog · account access not checked"
+        raw_rank = metadata.get("_curated_rank")
+        rank = int(raw_rank) if isinstance(raw_rank, int) else 10_000
+        if model_id in ranks and ranks[model_id] < rank:
+            continue
+        curated_tag = metadata.get("_curated_tag")
         context = metadata.get("max_input_tokens")
-        if isinstance(context, int) and context > 0:
-            description += f" · {context:,} input tokens"
+        if isinstance(curated_tag, str) and curated_tag:
+            parts = [curated_tag]
+            if isinstance(context, int) and context > 0:
+                parts.append(f"{context:,} input tokens")
+            parts.append("Bundled catalog · account access not checked")
+            description = " · ".join(parts)
+        else:
+            description = "Bundled catalog · account access not checked"
+            if isinstance(context, int) and context > 0:
+                description += f" · {context:,} input tokens"
+        ranks[model_id] = rank
         models[model_id] = ModelInfo(model_id, description)
-    return tuple(models[key] for key in sorted(models)[:_MAX_MODELS])
+    ordered_keys = sorted(models, key=lambda key: (ranks[key], key))[:limit]
+    return tuple(models[key] for key in ordered_keys)
 
 
 class _DiscoveryError(Exception):
@@ -100,6 +149,7 @@ async def _fetch_inventory(
     api_key: str | None,
     timeout: float,
     transport: httpx.AsyncBaseTransport | None,
+    max_bytes: int = _MAX_RESPONSE_BYTES,
 ) -> dict[str, Any]:
     headers = {"Accept": "application/json"}
     if api_key:
@@ -133,7 +183,7 @@ async def _fetch_inventory(
                     )
                 body = bytearray()
                 async for chunk in response.aiter_bytes():
-                    if len(body) + len(chunk) > _MAX_RESPONSE_BYTES:
+                    if len(body) + len(chunk) > max_bytes:
                         raise _DiscoveryError(
                             "The model list is too large; enter a model manually."
                         )
@@ -216,6 +266,16 @@ async def discover_models(
         api_key = provider_api_key(provider)
         if api_key:
             url = "https://api.openai.com/v1/models"
+    elif provider == "openrouter":
+        if base_url or os.environ.get("OPENROUTER_API_BASE"):
+            return ModelDiscoveryResult(
+                catalog,
+                "catalog",
+                "A custom OpenRouter endpoint is configured. Showing the bundled catalog.",
+            )
+        api_key = provider_api_key(provider)
+        if api_key:
+            url = "https://openrouter.ai/api/v1/models"
     if url is None:
         message = (
             "Bundled catalog; account access has not been checked."
@@ -224,25 +284,109 @@ async def discover_models(
         )
         return ModelDiscoveryResult(catalog, "catalog", message)
 
+    max_bytes = (
+        _OPENROUTER_MAX_RESPONSE_BYTES if provider == "openrouter" else _MAX_RESPONSE_BYTES
+    )
+    max_models = _OPENROUTER_MAX_MODELS if provider == "openrouter" else _MAX_MODELS
     try:
-        payload = await _fetch_inventory(url, api_key=api_key, timeout=timeout, transport=transport)
+        payload = await _fetch_inventory(
+            url,
+            api_key=api_key,
+            timeout=timeout,
+            transport=transport,
+            max_bytes=max_bytes,
+        )
         values = payload.get("models" if ollama else "data")
         if not isinstance(values, list):
             raise _DiscoveryError("The model-list endpoint returned an unexpected response.")
+        bundled = _bundled_catalog() if provider in {"openai", "openrouter"} else {}
         models: dict[str, ModelInfo] = {}
+        ranks: dict[str, int] = {}
         for item in values:
             if not isinstance(item, dict):
                 continue
             model_id = (item.get("model") or item.get("name")) if ollama else item.get("id")
-            if _valid_model_id(model_id):
-                metadata = _bundled_catalog().get(model_id, {}) if provider == "openai" else {}
+            if not _valid_model_id(model_id):
+                continue
+            if provider == "openrouter":
+                if _is_noisy_non_coding_model(model_id):
+                    continue
+                arch = item.get("architecture")
+                if isinstance(arch, dict):
+                    modality = arch.get("modality")
+                    if (
+                        isinstance(modality, str)
+                        and "->" in modality
+                        and "text" not in modality.partition("->")[2].lower()
+                    ):
+                        continue
+                supported_params = item.get("supported_parameters")
+                if (
+                    isinstance(supported_params, list)
+                    and supported_params
+                    and not model_id.startswith("openrouter/")
+                ):
+                    lowered_params = {str(param).lower() for param in supported_params}
+                    if "tools" not in lowered_params and "tool_choice" not in lowered_params:
+                        continue
+                meta = bundled.get(f"openrouter/{model_id}")
+                meta_dict = meta if isinstance(meta, dict) else {}
+                raw_rank = meta_dict.get("_curated_rank")
+                rank = (
+                    int(raw_rank)
+                    if isinstance(raw_rank, int)
+                    else (250 if model_id.startswith(("anthropic/", "openai/")) else 5_000)
+                )
+                ctx = item.get("context_length")
+                if not isinstance(ctx, int) or ctx <= 0:
+                    ctx = meta_dict.get("max_input_tokens")
+                curated_tag = meta_dict.get("_curated_tag")
+                if isinstance(curated_tag, str) and curated_tag:
+                    parts = [curated_tag]
+                    if isinstance(ctx, int) and ctx > 0:
+                        parts.append(f"{ctx:,} input tokens")
+                    parts.append("Live on OpenRouter")
+                    desc = " · ".join(parts)
+                else:
+                    display_name = str(item.get("name") or "").strip()
+                    parts = [display_name] if display_name and display_name != model_id else []
+                    if isinstance(ctx, int) and ctx > 0:
+                        parts.append(f"{ctx:,} input tokens")
+                    parts.append("Live on OpenRouter")
+                    desc = " · ".join(parts)
+                models[model_id] = ModelInfo(model_id, desc)
+                ranks[model_id] = rank
+                continue
+            if provider == "openai":
+                if _is_noisy_non_coding_model(model_id):
+                    continue
+                metadata = bundled.get(f"openai/{model_id}") or bundled.get(model_id) or {}
                 if isinstance(metadata, dict) and metadata.get("mode", "chat") not in _CHAT_MODES:
                     continue
+                raw_rank = metadata.get("_curated_rank") if isinstance(metadata, dict) else None
+                ranks[model_id] = int(raw_rank) if isinstance(raw_rank, int) else 10_000
+                curated_tag = metadata.get("_curated_tag") if isinstance(metadata, dict) else None
+                if isinstance(curated_tag, str) and curated_tag:
+                    models[model_id] = ModelInfo(model_id, f"{curated_tag} · Reported by endpoint")
+                else:
+                    models[model_id] = ModelInfo(
+                        model_id, "Reported by endpoint · tool support not checked"
+                    )
+            else:
+                ranks[model_id] = 10_000
                 description = "Installed in Ollama" if ollama else "Reported by endpoint"
                 models[model_id] = ModelInfo(model_id, f"{description} · tool support not checked")
-            if len(models) >= _MAX_MODELS:
+            if len(models) >= max_models:
                 break
-        result = tuple(models[key] for key in sorted(models))
+        if provider == "openrouter" and models and catalog:
+            for cat_info in catalog:
+                if cat_info.id not in models:
+                    meta = bundled.get(f"openrouter/{cat_info.id}")
+                    raw_rank = meta.get("_curated_rank") if isinstance(meta, dict) else None
+                    ranks[cat_info.id] = int(raw_rank) if isinstance(raw_rank, int) else 9_000
+                    models[cat_info.id] = cat_info
+        ordered = sorted(models, key=lambda key: (ranks.get(key, 10_000), key))[:max_models]
+        result = tuple(models[key] for key in ordered)
         message = "Live model list; tool support still depends on the model."
         if not result:
             message = (

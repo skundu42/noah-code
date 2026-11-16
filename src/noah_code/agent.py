@@ -35,10 +35,10 @@ from nooa.tools.shell_tools import ShellTools
 from noah_code import nooa_compat
 from noah_code.approvals import ApprovalBroker
 from noah_code.config import NoahCodeConfig
+from noah_code.instructions import load_repo_instructions
 from noah_code.macos_sandbox import build_macos_profile, macos_worker_main
 from noah_code.permissions import PermissionEngine
 from noah_code.predict import ISOLATED_PREDICT_CONTEXT, LeanPredictStrategy
-from noah_code.secure_files import read_text_bounded
 from noah_code.snapshots import SnapshotJournal
 from noah_code.tool_contracts import ToolContracts
 from noah_code.tools.git_tools import GitTools
@@ -52,7 +52,7 @@ from noah_code.tools.question_tools import QuestionTools
 from noah_code.tools.task_tools import TaskTools
 from noah_code.tools.web_tools import WebTools
 from noah_code.tools.workspace_tools import WorkspaceMutationCoordinator, WorkspaceTools
-from noah_code.workspace import Workspace, WorkspaceError
+from noah_code.workspace import Workspace
 
 nooa_compat.install_cell_literal_preservation()
 
@@ -161,6 +161,7 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("task", "run"),
             ("task", "run_many"),
             ("task", "collaborate"),
+            ("task", "orchestrate"),
             ("task", "team"),
             ("task", "start"),
             ("task", "follow_up"),
@@ -510,6 +511,7 @@ def _cache_first_block_order(base: list[str] | None) -> list[str]:
     stable_blocks = (
         "repo_instructions",
         "agents",
+        "skills",
         "subagent",
         "workspace",
         "active_plan",
@@ -539,71 +541,65 @@ _NOAH_CODEACT_INSTRUCTIONS = """## Noah CodeAct
 
 Use `execute_python(code)` for work and `return_result(...)` to finish; plain
 prose does neither. Cell state persists; parameters and `self` are preloaded.
-Every `self.ws.*` call is async: `await` it before accessing the result.
-`self.message(text)` is synchronous—never await it.
+Every `self.ws.*` call is async (`await` it). `self.message(text)` is
+synchronous—never await it.
+
+### Project Instructions (`AGENTS.md` / `CLAUDE.md`)
+
+`# Repo Instructions` (`AGENTS.md`, `CLAUDE.md`, `.noah-code/instructions.md`)
+and any `[Scoped directory instructions]` are authoritative project rules:
+strictly follow their build/test commands, package manager, code style,
+architecture, and constraints unless overruled by the user or safety policy.
+More specific directory instructions refine broader outer instructions.
 
 ### Tools
 
-- Get signatures, return types and examples with
-  `print(self.tools.help("ws"))`; `self.tools.list()` lists groups. After a tool
-  argument error, read its help before retrying.
-- `await self.ws.list(pattern="**/*", path=".")` returns list[str], not objects.
-  `await self.ws.read(path, lines=None)` returns an anchor with raw `.text`;
-  `lines=60` reads the first 60 lines. Search returns Matches plus `.stdout`.
+- Inspect signatures and examples via `print(self.tools.help("ws"))`;
+  `self.tools.list()` lists groups. On argument errors, read help first.
+- `await self.ws.list(pattern="**/*", path=".")` -> `list[str]`.
+  `await self.ws.read(path, lines=None)` -> Match anchor with `.text`
+  (`lines=60` reads first 60 lines). `search` returns Matches plus `.stdout`.
 - Prefer `anchor = await self.ws.read(path)` then
-  `await self.ws.replace(anchor, new_text)`. Reuse read/search anchors instead
-  of retyping old whitespace. `self.ws.edit(path, old, new)` takes exactly three
-  arguments; two-argument calls are invalid.
-  Batch schema: `await self.ws.apply_patch([{"path": "a.py", "old": "return 1",
-  "new": "return 2"}])`. Keys are exactly path/old/new; old=None creates a file,
-  new=None deletes it. `self.ws.apply_unified_diff` accepts git-style hunks.
-- Run `await self.ws.run(command)` and inspect returncode/stdout/stderr.
+  `await self.ws.replace(anchor, new_text)` over retyping whitespace.
+  `self.ws.edit(path, old, new)` takes exactly three arguments; two-argument calls are invalid.
+  Batch edits: `await self.ws.apply_patch([{"path": "a.py", "old": "return 1", "new": "return 2"}])`
+  (`old=None` creates, `new=None` deletes); `self.ws.apply_unified_diff` takes git hunks.
+- Run `await self.ws.run(command)` and check returncode/stdout/stderr.
   `read_only=True` skips approval only for commands the engine recognizes as
-  read-only. It is rejected for pytest, uv, Python, builds, and mutations.
-- After edits, run the requested acceptance command and inspect its output.
-  Inspect `await self.ws.checks()`; fix failures and rerun stale checks before
-  DONE. A successful write is not validation. If blocked, explain and NEED_INPUT.
-- Use `self.processes.start/logs/status/input/stop` for long jobs and consume
-  logs by cursor. Persistent shells use `open_terminal`, `terminal_run`,
-  `terminal_status`, and `close_terminal`; raw terminal input is blocked.
-- `self.web.fetch/search` are read-only. Use `self.github` for PR operations,
-  not shell commands. Ask choices through `self.ask.question`.
-- Manage plans through `self.plan.write/enter/exit_to_build`; never call
-  `set_mode`. Save standing conventions with `self.memory.save`.
-- Delegate bounded units with `self.task.run`, independent units with
-  `run_many`, and lead synthesis with `collaborate`.
-  Use `start(name, prompt, isolate=True)` for background work in a retained
-  worktree, then `status`, `wait`, `cancel`, `follow_up`, `diff`, `apply`, or
-  `cleanup` with its task ID. Shared-checkout background tasks must be read-only.
-  Isolation starts at HEAD unless `include_dirty=True`.
-- `await self.task.team(objective, workflow="build")` analyzes, implements and
-  reviews. Workflows `review`/`investigate` are read-only. Resolve reported
-  blockers and validate; delegation alone is not completion.
+  read-only; it is rejected for pytest, uv, Python, builds, and mutations.
+- Validate edits and inspect `await self.ws.checks()`; fix failures and rerun
+  stale checks before DONE. If blocked, explain and return NeedInput.
+- Long jobs: `self.processes` (`start/logs/status/input/stop` or
+  `open_terminal/terminal_run/terminal_status/close_terminal`).
+- Use `self.web.fetch/search` (read-only), `self.github` for PRs,
+  `self.ask.question` for choices, `self.plan.write/enter/exit_to_build` for
+  plans (never `set_mode`), and `self.memory.save` for standing conventions.
+- Delegate bounded work via `self.task.run`, `run_many`, `collaborate`,
+  `orchestrate(objective, subtasks, isolate=True)` for parallel multi-agent waves,
+  `start(..., isolate=True)` (`status/wait/cancel/follow_up/diff/apply/cleanup`),
+  or `self.task.team(objective, workflow="build")` (`review`/`investigate` are
+  read-only; delegation alone is not completion).
 - If `self.media` has pending images, `show()` each consumed image first.
 
 ### Workflow and safety
 
-For a conversational answer, call `self.message(...)` and finish. For coding,
-inspect repository instructions and nearby code, use todos for multi-step work,
-preserve unrelated changes, edit narrowly and validate proportional to risk.
+For conversational replies, call `self.message(...)` and finish. For coding,
+use todos for multi-step work, preserve unrelated changes, and edit narrowly.
 Never claim a command passed unless its successful result was observed.
 In plan mode do not mutate; follow an active plan without expanding scope.
-Do not commit, push, publish, or create external resources unless explicitly
-asked. Do not read secrets or expose sensitive values. `--yolo` applies only
-when the host was explicitly launched for a throwaway workspace.
+Do not commit, push, publish, or create external resources unless asked.
+Do not read secrets or expose sensitive values. `--yolo` applies only when the
+host was explicitly launched for a throwaway workspace.
 
-Sandboxed cells forbid host/system imports (including os, sys, subprocess,
-shutil, nooa, and noah_code), dynamic execution, input, and attaching callables
-to `self`. Use dedicated tools and `self.tools.help` for API help.
+Sandboxed cells forbid host/system imports (`os`, `sys`, `subprocess`, `shutil`,
+`nooa`, `noah_code`), dynamic execution, `input`, and attaching callables to `self`.
 
-End with Done, NeedInput, or Waiting (Waiting requires a running job and `on=[...]`).
+End with Done, NeedInput, or Waiting (`Waiting` requires a running job and `on=[...]`).
 Call `return_result(Done(explanation="..."))`; never pass a bare string, which has
-the wrong type. Show text via synchronous `self.message("...")` (or `Done.message`).
+the wrong type.
 """
 
-_NOAH_EXECUTION_CONTEXT = """## Execution Context
-
-Inside `execute_python`, parameters and `self` are in scope and state persists
+_NOAH_EXECUTION_CONTEXT = """Inside `execute_python`, parameters and `self` are in scope and state persists
 across cells. Available: `print`, `pprint`, `doc`, `return_result`, `Done`,
 `NeedInput`, `Waiting`, `asyncio`, and `typing`. Inspect the API with
 `print(self.tools.help("ws.read"))`; nested proxies hide signatures. Noah's
@@ -919,6 +915,9 @@ class CodingAgent(InteractiveAgent):
         super().__init__(llm=llm, storage=storage, **kwargs)
         self._system_messages_in = self.queue_manager.queue("system_messages")
         self.context["queues"] = None
+        # CodingAgent.__doc__ is already rendered inside `# Self`; avoid sending it twice.
+        self.context["system_prompt"] = None
+        self.context["state"] = Context(expr="self._compact_state()")
         if cache_namespace:
             # NOOA derives prompt_cache_key from this id. A durable Noah
             # session therefore keeps provider cache affinity across restart.
@@ -1074,7 +1073,9 @@ class CodingAgent(InteractiveAgent):
         if nested_prompt:
             self.context["subagent"] = Context(nested_prompt, prefix=True)
         if not nested:
-            self.context["agents"] = Context(expr="self.task.list()")
+            self.context["agents"] = Context(self.task.list(), prefix=True)
+        if getattr(self, "skills", None) is not None:
+            self.context["skills"] = Context(self.skills.status(), prefix=True)
 
         if config.summarization.policy != "none":
             from nooa.config.summarizer_config import TokenBudgetConfig
@@ -1100,25 +1101,67 @@ class CodingAgent(InteractiveAgent):
             )
         self._aux_predictors: dict[str, Any] = {}
 
-        # Discover AGENTS.md / README hints without dumping trees.
-        self._repo_instructions_value = self._repo_instructions()
+        # Discover CLAUDE.md / AGENTS.md instructions without dumping trees.
+        seen_inodes: set[tuple[int, int]] = set()
+        self._repo_instructions_value = self._repo_instructions(seen_inodes=seen_inodes)
         self.context["repo_instructions"] = Context(
             self._repo_instructions_value,
             prefix=True,
+        )
+        self.ws.set_scoped_instruction_handler(
+            self._on_scoped_instructions,
+            seen_inodes=seen_inodes,
         )
         self._active_plan_value = self._active_plan()
         self.context["active_plan"] = Context(self._active_plan_value, prefix=True)
         self._project_memory_value = self._project_memory()
         self.context["project_memory"] = Context(self._project_memory_value, prefix=True)
 
+    def message(self, text: str, *, echo: bool = False) -> None:
+        """Send self-contained Markdown to the user (`echo=True` also prints to cell output)."""
+        super().message(text, echo=echo)
+
+    @hidden
+    def _compact_state(self) -> str:
+        """Render only custom agent/user cell variables, omitting static tool bindings."""
+        from nooa.agentdoc import pformat
+
+        raw_vars = getattr(self, "vars", None)
+        if not raw_vars:
+            return ""
+        custom = {
+            key: value
+            for key, value in dict(raw_vars).items()
+            if key not in {"mode", "model"}
+        }
+        if not custom:
+            return ""
+        return str(pformat(custom, max_length=30, max_string=300, max_depth=3))
+
+    @hidden
+    def _on_scoped_instructions(self, note: str) -> None:
+        """Append newly discovered subdirectory instructions without invalidating prefix cache."""
+        from nooa.events import Feedback
+
+        if note and not nooa_compat.in_summary_fork():
+            self.event_manager.add(Feedback(content=note))
+
     @hidden
     def refresh_context_sources(self) -> None:
         """Refresh cacheable instructions at a safe user-turn boundary."""
 
+        self.context["system_prompt"] = None
+        self.context["state"] = Context(expr="self._compact_state()")
         self._git_summary_value = self._git_summary()
-        current = self._repo_instructions()
+        if not self._nested and hasattr(self, "task"):
+            self.context["agents"] = Context(self.task.list(), prefix=True)
+        if getattr(self, "skills", None) is not None:
+            self.context["skills"] = Context(self.skills.status(), prefix=True)
+        seen_inodes: set[tuple[int, int]] = set()
+        current = self._repo_instructions(seen_inodes=seen_inodes)
         self._repo_instructions_value = current
         self.context["repo_instructions"] = Context(current, prefix=True)
+        self.ws._surfaced_instruction_inodes.update(seen_inodes)
         plan = self._active_plan()
         self._active_plan_value = plan
         self.context["active_plan"] = Context(plan, prefix=True)
@@ -1264,21 +1307,13 @@ class CodingAgent(InteractiveAgent):
             return unavailable
 
     @hidden
-    def _repo_instructions(self) -> str:
-        root = Path(self.workspace_root).resolve()
-        chunks: list[str] = []
-        for name in ("AGENTS.md", "CLAUDE.md", ".noah-code/instructions.md"):
-            try:
-                result = read_text_bounded(root, name, max_bytes=16 * 1024)
-            except (OSError, WorkspaceError):
-                # Repository-controlled links and parent swaps must not turn
-                # trusted context assembly into an external-file read.
-                continue
-            text = result.text
-            if result.truncated or len(text) > 4000:
-                text = text[:4000] + "\n...(truncated)..."
-            chunks.append(f"## {name}\n{text}")
-        return "\n\n".join(chunks) if chunks else "(no repository instruction files found)"
+    def _repo_instructions(
+        self, *, seen_inodes: set[tuple[int, int]] | None = None
+    ) -> str:
+        return load_repo_instructions(
+            Path(self.workspace_root).resolve(),
+            seen_inodes=seen_inodes,
+        )
 
     @hidden
     def _active_plan(self) -> str:

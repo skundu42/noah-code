@@ -388,7 +388,14 @@ def install_event_bridge(
 
     def on_llm_complete(event: Any) -> None:
         if usage is not None:
-            usage.llm_complete(event)
+            llm_client = getattr(agent, "_llm", None)
+            raw_window = getattr(llm_client, "context_window", None)
+            if raw_window is None:
+                raw_window = getattr(llm_client, "_context_window", None)
+            context_window = (
+                int(raw_window) if isinstance(raw_window, int) and raw_window > 0 else None
+            )
+            usage.llm_complete(event, context_window=context_window)
             if budget_guard is not None and budget_guard.active:
                 # EventManager treats subscribers as telemetry and swallows
                 # their exceptions. Record a sticky breach here; the outer

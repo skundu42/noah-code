@@ -51,7 +51,21 @@ _SPILL_NOTICE = re.compile(r"full output id=[0-9a-f]{20}; read with self\.ws\.re
 EVICT_FLOOR_CHARS = 2000
 
 #: Unspilled Python outputs above this threshold are spilled to disk during compaction.
-UNSPILLED_EVICT_FLOOR_CHARS = 8000
+UNSPILLED_EVICT_FLOOR_CHARS = 6000
+
+_SUPERSEDED_WORKSPACE_STATUS = "[superseded workspace status]"
+_NOOP_BLOCK_CONTENTS = frozenset(
+    {
+        "(no repository instruction files found)",
+        "(no active plan)",
+        "(no project memory yet)",
+    }
+)
+
+
+def _is_noop_system_block(block: ResolvedBlock) -> bool:
+    stripped = (block.content or "").strip()
+    return not stripped or stripped in _NOOP_BLOCK_CONTENTS
 
 
 def _stub(agent_name: str, output_id: str, original_chars: int) -> str:
@@ -103,7 +117,24 @@ def evict_spilled_outputs(
         start_index, end_index = end_index, start_index
 
     saved = 0
-    for tag in keys[start_index : end_index + 1]:
+    range_tags = keys[start_index : end_index + 1]
+    status_tags = [
+        tag
+        for tag in range_tags
+        if (evt := manager.get(tag)) is not None  # type: ignore[attr-defined]
+        and type(evt).__name__ == "Feedback"
+        and isinstance(getattr(evt, "content", None), str)
+        and evt.content.startswith("[workspace status]\n")
+    ]
+    for tag in status_tags[:-1]:
+        evt = manager.get(tag)  # type: ignore[attr-defined]
+        content = getattr(evt, "content", "")
+        if len(content) > len(_SUPERSEDED_WORKSPACE_STATUS) and manager.update(  # type: ignore[attr-defined]
+            tag, content=_SUPERSEDED_WORKSPACE_STATUS
+        ):
+            saved += len(content) - len(_SUPERSEDED_WORKSPACE_STATUS)
+
+    for tag in range_tags:
         event = manager.get(tag)  # type: ignore[attr-defined]
         if event is None:
             continue
@@ -171,7 +202,11 @@ class CachedMarkdownBlockFormatter(BlockFormatter):
         )
 
     def format(self, blocks: list[ResolvedBlock]) -> list[RenderedMessage]:
-        system_blocks = [block for block in blocks if block.role == Role.SYSTEM]
+        system_blocks = [
+            block
+            for block in blocks
+            if block.role == Role.SYSTEM and not _is_noop_system_block(block)
+        ]
         message_blocks = [block for block in blocks if block.role != Role.SYSTEM]
 
         static_blocks, dynamic_blocks = _partition_system_blocks(system_blocks)

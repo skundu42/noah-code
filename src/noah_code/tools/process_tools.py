@@ -503,6 +503,81 @@ class ProcessTools(Skill):
         lines.extend(self._status_line(job) for job in recent)
         return "\n".join(lines)
 
+    @hidden
+    def peek_logs(self, job_id: str, *, max_chars: int = 8000) -> str:
+        """Read-only tail of recent job/terminal output without advancing any cursor."""
+
+        selected = job_id.strip()
+        limit = min(max(int(max_chars), 256), 65_536)
+        marker_re = re.compile(r"^__NOAH_TERMINAL_[0-9a-f]+__:\d+$")
+
+        def _clean_chunk(stream: str, raw_text: str) -> str:
+            filtered = [
+                line
+                for line in raw_text.splitlines()
+                if not marker_re.fullmatch(line.strip())
+            ]
+            if not filtered:
+                return ""
+            joined = "\n".join(filtered)
+            if stream == "stderr":
+                return "\n".join(f"! {line}" for line in joined.splitlines())
+            return joined
+
+        if selected in self._jobs:
+            job = self._jobs[selected]
+            if job.events:
+                chunks: list[str] = []
+                used = 0
+                for event in reversed(job.events):
+                    piece = _clean_chunk(event.stream, event.text)
+                    if not piece:
+                        continue
+                    if used + len(piece) > limit:
+                        remaining = max(limit - used, 0)
+                        if remaining > 0:
+                            chunks.append(piece[-remaining:])
+                        break
+                    chunks.append(piece)
+                    used += len(piece) + 1
+                chunks.reverse()
+                return "\n".join(chunks).strip("\n")
+            if job.log_path is not None and job.log_path.is_file():
+                return self._peek_durable_path(job.log_path, limit=limit, clean_fn=_clean_chunk)
+            return ""
+
+        if self._runtime is not None:
+            record = self._runtime.job(selected)
+            if record is not None:
+                path = Path(str(record["log_path"]))
+                if path.is_file():
+                    return self._peek_durable_path(path, limit=limit, clean_fn=_clean_chunk)
+                return ""
+        raise KeyError(f"unknown background job: {selected}")
+
+    def _peek_durable_path(self, path: Path, *, limit: int, clean_fn: Any) -> str:
+        chunks: list[str] = []
+        used = 0
+        for raw in reversed(self._tail_lines(path, limit)):
+            try:
+                event = json.loads(raw)
+                stream = str(event.get("stream", "stdout"))
+                text = str(event.get("text", ""))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            piece = clean_fn(stream, text)
+            if not piece:
+                continue
+            if used + len(piece) > limit:
+                remaining = max(limit - used, 0)
+                if remaining > 0:
+                    chunks.append(piece[-remaining:])
+                break
+            chunks.append(piece)
+            used += len(piece) + 1
+        chunks.reverse()
+        return "\n".join(chunks).strip("\n")
+
     def snapshot(self, *, limit: int = 20) -> list[dict[str, Any]]:
         jobs = list(self._jobs.values())[-limit:] if limit > 0 else []
         return [

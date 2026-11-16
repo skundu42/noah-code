@@ -50,7 +50,13 @@ def command_menu_renderable(
     visible = matches[start : start + window_size]
     end = start + len(visible)
     count = f"{start + 1}–{end} of {total}" if total > window_size else f"{total} match{'es' if total != 1 else ''}"
-    title = "Files" if matches and matches[0].invocation.startswith("@") else "Commands"
+    title = (
+        "Files"
+        if matches and matches[0].invocation.startswith("@")
+        else "Skills"
+        if matches and matches[0].invocation.startswith("$")
+        else "Commands"
+    )
     width = max(8, width)
     header = Text(title, style=f"bold {palette.muted}", no_wrap=True)
     header.append(" " * max(2, width - header.cell_len - Text(count).cell_len))

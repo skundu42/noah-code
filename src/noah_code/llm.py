@@ -77,7 +77,23 @@ def get_llm_client(name: str, **overrides: Any) -> Any:
         )
     from noah_code.model_streaming import with_model_streaming
 
-    return with_model_streaming(nooa_get_llm_client(name, **overrides))
+    raw_client = nooa_get_llm_client(name, **overrides)
+    if getattr(raw_client, "context_window", None) is None:
+        from noah_code.model_catalog import known_context_window
+
+        cw = known_context_window(name)
+        if cw is not None:
+            with contextlib.suppress(AttributeError, TypeError):
+                object.__setattr__(raw_client, "_context_window", cw)
+    client = with_model_streaming(raw_client)
+    if getattr(client, "context_window", None) is None:
+        from noah_code.model_catalog import known_context_window
+
+        cw = known_context_window(name)
+        if cw is not None:
+            with contextlib.suppress(AttributeError, TypeError):
+                object.__setattr__(client, "_context_window", cw)
+    return client
 
 
 _TRANSIENT_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})

@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import re
+import shlex
 import tempfile
 import types
 from collections.abc import AsyncIterator, Callable
@@ -299,6 +300,182 @@ async def close_mcp_servers(agent: Any) -> None:
         await asyncio.gather(*(pool.aclose() for pool in pools), return_exceptions=True)
 
 
+_REAL_PATH_HOME = Path.home
+
+
+def _resolve_user_home(home: Path | None = None) -> Path:
+    if home is not None:
+        return home.expanduser()
+    if Path.home != _REAL_PATH_HOME:
+        return Path.home().expanduser()
+    from noah_code.skills_setup import _default_user_home
+
+    return _default_user_home()
+
+
+@dataclass(frozen=True)
+class MCPPreset:
+    """Built-in one-click MCP server preset."""
+
+    key: str
+    label: str
+    transport: str
+    target: str
+    description: str
+    env_var: str | None = None
+
+    def to_spec(self) -> dict[str, Any]:
+        if self.transport == "stdio":
+            parts = shlex.split(self.target)
+            return {
+                "command": parts[0],
+                "args": parts[1:],
+                "transport": "stdio",
+            }
+        return {
+            "url": self.target,
+            "transport": "streamable-http",
+        }
+
+
+MCP_PRESETS: tuple[MCPPreset, ...] = (
+    MCPPreset(
+        "context7",
+        "Context7 Docs",
+        "stdio",
+        "npx -y @upstash/context7-mcp@latest",
+        "Up-to-date library & framework docs",
+        None,
+    ),
+    MCPPreset(
+        "playwright",
+        "Playwright Browser",
+        "stdio",
+        "npx -y @playwright/mcp@latest",
+        "Browser automation & inspection",
+        None,
+    ),
+    MCPPreset(
+        "filesystem",
+        "Filesystem",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-filesystem .",
+        "Scoped local file operations",
+        None,
+    ),
+    MCPPreset(
+        "fetch",
+        "Web Fetch",
+        "stdio",
+        "uvx mcp-server-fetch",
+        "Fetch & convert web pages to Markdown",
+        None,
+    ),
+    MCPPreset(
+        "memory",
+        "Knowledge Graph Memory",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-memory",
+        "Persistent entity/relation graph memory",
+        None,
+    ),
+    MCPPreset(
+        "sequential-thinking",
+        "Sequential Thinking",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-sequential-thinking",
+        "Structured step-by-step problem decomposition",
+        None,
+    ),
+    MCPPreset(
+        "github",
+        "GitHub",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-github",
+        "Repos, issues, PRs, and code search",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+    ),
+    MCPPreset(
+        "postgres",
+        "PostgreSQL",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-postgres",
+        "Inspect schemas & run read-only SQL",
+        "POSTGRES_URL",
+    ),
+    MCPPreset(
+        "brave-search",
+        "Brave Search",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-brave-search",
+        "Web & local search via Brave API",
+        "BRAVE_API_KEY",
+    ),
+    MCPPreset(
+        "linear",
+        "Linear",
+        "http",
+        "https://mcp.linear.app/mcp",
+        "Issues, projects, and cycles",
+        None,
+    ),
+    MCPPreset(
+        "sentry",
+        "Sentry",
+        "http",
+        "https://mcp.sentry.dev/mcp",
+        "Production errors, traces, and issues",
+        None,
+    ),
+    MCPPreset(
+        "cloudflare-docs",
+        "Cloudflare Docs",
+        "http",
+        "https://docs.mcp.cloudflare.com/mcp",
+        "Search Cloudflare developer documentation",
+        None,
+    ),
+)
+
+
+def list_mcp_presets() -> tuple[MCPPreset, ...]:
+    """Return built-in one-click MCP server presets."""
+
+    return MCP_PRESETS
+
+
+def get_mcp_preset(key: str) -> MCPPreset:
+    """Look up a built-in MCP preset by key (case-insensitive)."""
+
+    normalized = key.strip().lower()
+    for preset in MCP_PRESETS:
+        if preset.key == normalized:
+            return preset
+    raise KeyError(f"unknown MCP preset: {key}")
+
+
+def parse_mcp_add_target(tokens: list[str] | tuple[str, ...]) -> tuple[str, str, str]:
+    """Parse ``[stdio|http] NAME TARGET...`` or shorthand ``NAME URL_OR_CMD...``."""
+
+    parts = [part for part in tokens if part]
+    if len(parts) < 2:
+        raise ValueError("usage: mcp add [stdio|http] NAME URL_OR_COMMAND…")
+    first = parts[0].lower()
+    if first == "stdio":
+        if len(parts) < 3:
+            raise ValueError("usage: mcp add stdio NAME COMMAND…")
+        return "stdio", parts[1], shlex.join(parts[2:])
+    if first in {"http", "streamable-http"}:
+        if len(parts) != 3:
+            raise ValueError("usage: mcp add http NAME URL")
+        return "http", parts[1], parts[2]
+    name = parts[0]
+    rest = parts[1:]
+    if len(rest) == 1 and rest[0].lower().startswith(("http://", "https://")):
+        return "http", name, rest[0]
+    return "stdio", name, shlex.join(rest)
+
+
 @dataclass(frozen=True)
 class MCPServerInfo:
     name: str
@@ -322,7 +499,7 @@ class MCPInstallResult:
 
 
 def mcp_config_paths(workspace: Path, *, home: Path | None = None) -> list[Path]:
-    user_home = (home or Path.home()).expanduser()
+    user_home = _resolve_user_home(home)
     return [
         user_home / ".config" / "noah-code" / "mcp.json",
         workspace / ".mcp.json",
@@ -335,7 +512,7 @@ def mcp_source_is_trusted(source: str, *, home: Path | None = None) -> bool:
 
     if source == "user config.toml":
         return True
-    user_home = (home or Path.home()).expanduser()
+    user_home = _resolve_user_home(home)
     trusted = user_home / ".config" / "noah-code" / "mcp.json"
     try:
         return Path(source).expanduser().resolve() == trusted.resolve()
@@ -488,7 +665,7 @@ def save_user_mcp_server(
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("MCP URL must be an absolute http:// or https:// endpoint")
 
-    user_home = (home or Path.home()).expanduser()
+    user_home = _resolve_user_home(home)
     path = user_home / ".config" / "noah-code" / "mcp.json"
     existing: dict[str, dict[str, Any]] = {}
     document: dict[str, Any] = {}
@@ -520,6 +697,101 @@ def save_user_mcp_server(
         temporary.unlink(missing_ok=True)
         raise
     return path
+
+
+def remove_user_mcp_server(name: str, *, home: Path | None = None) -> bool:
+    """Remove ``name`` from the user's ``~/.config/noah-code/mcp.json`` if present."""
+
+    clean_name = name.strip()
+    if not clean_name:
+        return False
+    user_home = _resolve_user_home(home)
+    path = user_home / ".config" / "noah-code" / "mcp.json"
+    if not path.is_file():
+        return False
+    try:
+        loaded = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read existing MCP config: {exc}") from exc
+    if not isinstance(loaded, dict):
+        return False
+    existing = _server_mapping(loaded)
+    if clean_name not in existing:
+        return False
+    existing.pop(clean_name, None)
+    document = dict(loaded)
+    document.pop("servers", None)
+    document["mcpServers"] = existing
+    payload = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    file_descriptor, temporary_name = tempfile.mkstemp(prefix=".mcp-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w") as handle:
+            handle.write(payload)
+        temporary.chmod(0o600)
+        temporary.replace(path)
+        path.chmod(0o600)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def discover_external_mcp_servers(
+    *, home: Path | None = None
+) -> dict[str, tuple[dict[str, Any], str]]:
+    """Inspect Claude Code, Claude Desktop, and Cursor user MCP configs safely."""
+
+    user_home = _resolve_user_home(home)
+    candidates: tuple[tuple[Path, str, bool], ...] = (
+        (
+            user_home
+            / "Library"
+            / "Application Support"
+            / "Claude"
+            / "claude_desktop_config.json",
+            "Claude Desktop",
+            False,
+        ),
+        (
+            user_home / ".config" / "Claude" / "claude_desktop_config.json",
+            "Claude Desktop",
+            False,
+        ),
+        (user_home / ".cursor" / "mcp.json", "Cursor", False),
+        (user_home / ".claude" / "mcp.json", "Claude Code", False),
+        (user_home / ".claude.json", "Claude Code", True),
+    )
+    discovered: dict[str, tuple[dict[str, Any], str]] = {}
+    for config_path, label, require_servers_key in candidates:
+        if not config_path.is_file():
+            continue
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if require_servers_key and "mcpServers" not in data and "servers" not in data:
+            continue
+        for raw_name, raw_spec in _server_mapping(data).items():
+            clean_name = raw_name.strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", clean_name):
+                continue
+            if raw_spec.get("disabled") is True or raw_spec.get("enabled") is False:
+                continue
+            try:
+                normalized = _normalized_spec(raw_spec)
+            except ValueError:
+                continue
+            if not normalized.get("command") and not normalized.get("url"):
+                continue
+            if normalized.get("url"):
+                parsed = urlparse(str(normalized["url"]))
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    continue
+            discovered[clean_name] = (normalized, f"{label} ({config_path})")
+    return discovered
 
 
 async def attach_mcp_server(

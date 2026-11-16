@@ -321,6 +321,7 @@ class AgentHost(HostCommandsMixin):
         self._active_context_paths: set[Path] = set()
         self._pending_worktree_name = ""
         self._last_agent_message = ""
+        self._open_resume_on_start: bool = False
         self.on_session_changed: Any = None  # optional UI callback
 
     @property
@@ -936,15 +937,21 @@ class AgentHost(HostCommandsMixin):
 
         state = str(activity.get("state", "running"))
         agent = str(activity.get("agent", "agent"))
+        title = " ".join(str(activity.get("title", "")).split())[:48]
+        current_action = " ".join(str(activity.get("current_action", "")).split())[:72]
         prompt = " ".join(str(activity.get("prompt", "")).split())[:80]
         duration = float(activity.get("duration", 0.0) or 0.0)
         terminal = state in {"completed", "needs_input", "failed", "cancelled"}
-        detail = f" · {prompt}" if prompt else ""
+        subject = f"{agent} ({title})" if title else agent
+        if state == "running" and current_action:
+            detail = f" · {current_action}"
+        else:
+            detail = f" · {prompt}" if prompt else ""
         elapsed = f" · {duration:.1f}s" if terminal else ""
         self.ui.render(
             HostEvent(
                 HostEventKind.STATUS,
-                f"agent {agent} · {state}{elapsed}{detail}",
+                f"agent {subject} · {state}{elapsed}{detail}",
                 meta={"kind": "subagent", **activity},
             )
         )
@@ -1117,7 +1124,40 @@ class AgentHost(HostCommandsMixin):
         return f"noah [{mode}|{model}|r:{effort_label}|{sid}{title}{worktree}{plan}]{suffix}"
 
     def usage_snapshot(self) -> UsageSnapshot:
-        return self._usage.snapshot()
+        snap = self._usage.snapshot()
+        context_window = getattr(snap, "context_window", 0)
+        if not context_window and self._agent is not None:
+            cw: int | None = None
+            current: Any = getattr(self._agent, "_llm", None)
+            seen: set[int] = set()
+            while current is not None and id(current) not in seen:
+                seen.add(id(current))
+                candidate = getattr(current, "context_window", None)
+                if (
+                    isinstance(candidate, (int, float))
+                    and not isinstance(candidate, bool)
+                    and candidate > 0
+                ):
+                    cw = int(candidate)
+                    break
+                current = getattr(current, "_inner", None)
+            if not cw:
+                cw = int(self.config.efficiency.context_token_budget or 0) or None
+            if hasattr(snap, "context_window") and cw:
+                replace_fn: Any = replace
+                return replace_fn(snap, context_window=int(cw))
+        return snap
+
+    def list_prompt_history(self, limit: int = 100) -> list[str]:
+        """Return persisted workspace-family prompt history (most-recent-first)."""
+
+        return self.store.list_prompt_history(self.workspace, limit=limit)
+
+    def record_prompt(self, text: str) -> None:
+        """Best-effort persistence of a non-slash prompt for cross-session recall."""
+
+        with contextlib.suppress(Exception):
+            self.store.record_prompt_history(self.workspace, text)
 
     async def diff_review(self) -> Any:
         """List Git changes without waiting for individual patches or language servers."""
@@ -1155,6 +1195,60 @@ class AgentHost(HostCommandsMixin):
             try:
                 result = await self.agent.git.revert(
                     path, scope, expected_revision=expected_revision
+                )
+            finally:
+                self.agent.journal.end_turn()
+                try:
+                    await self._persist_async()
+                finally:
+                    self._active_turn = None
+                    self.ui.set_busy(False)
+            return result
+
+    async def stage_diff_hunk(
+        self,
+        path: str,
+        scope: str,
+        hunk_patch: str,
+        *,
+        expected_revision: str | None = None,
+    ) -> str:
+        """Stage or unstage one explicitly selected diff hunk."""
+
+        self._require_review_idle()
+        async with self._session_lock:
+            self._active_turn = asyncio.current_task()
+            self.ui.set_busy(True)
+            try:
+                result = await self.agent.git.stage_hunk(
+                    path, scope, hunk_patch, expected_revision=expected_revision
+                )
+            finally:
+                try:
+                    await self._persist_async()
+                finally:
+                    self._active_turn = None
+                    self.ui.set_busy(False)
+            return result
+
+    async def revert_diff_hunk(
+        self,
+        path: str,
+        scope: str,
+        hunk_patch: str,
+        *,
+        expected_revision: str | None = None,
+    ) -> str:
+        """Revert one explicitly confirmed diff hunk as its own journal turn."""
+
+        self._require_review_idle()
+        async with self._session_lock:
+            self._active_turn = asyncio.current_task()
+            self.ui.set_busy(True)
+            self.agent.journal.begin_turn()
+            try:
+                result = await self.agent.git.revert_hunk(
+                    path, scope, hunk_patch, expected_revision=expected_revision
                 )
             finally:
                 self.agent.journal.end_turn()
@@ -1319,6 +1413,63 @@ class AgentHost(HostCommandsMixin):
     def list_session_metas(self) -> list[SessionMeta]:
         return self.store.list_sessions(self.workspace)
 
+    def recent_repo_sessions(self, limit: int = 3) -> list[tuple[SessionMeta, str]]:
+        """Return up to ``limit`` recent repo sessions paired with message previews."""
+
+        if limit <= 0:
+            return []
+        sessions = self.store.list_sessions(self.workspace)
+        if not sessions:
+            return []
+        active_id = self.meta.session_id if self.meta is not None else None
+        meaningful: list[tuple[SessionMeta, str]] = []
+        abandoned_untitled: list[tuple[SessionMeta, str]] = []
+        for item in sessions:
+            preview = self.store.last_message_preview(item.session_id)
+            has_messages = bool(preview) or self.store.session_has_messages(item.session_id)
+            if item.title == "untitled" and not has_messages:
+                if item.session_id != active_id:
+                    abandoned_untitled.append((item, preview))
+                continue
+            meaningful.append((item, preview))
+            if len(meaningful) >= limit:
+                break
+        if meaningful:
+            return meaningful[:limit]
+        return abandoned_untitled[:limit]
+
+    async def rename_session(self, session_id: str, title: str) -> SessionMeta:
+        """Rename a session and synchronize active session metadata if needed."""
+
+        renamed = await asyncio.to_thread(self.store.rename, session_id, title)
+        if self.meta is not None and self.meta.session_id == session_id:
+            self.meta.title = renamed.title
+            self.meta.updated_at = renamed.updated_at
+            if self._agent is not None:
+                with contextlib.suppress(Exception):
+                    self._agent.v.title = renamed.title
+            if not self._turn_running():
+                await self._persist_async()
+            self.ui.render(HostEvent(HostEventKind.STATUS, f"title={renamed.title}"))
+            self.ui.set_status(self.status_prompt())
+        return renamed
+
+    async def delete_session_by_id(self, session_id: str) -> None:
+        """Delete a non-active persisted session."""
+
+        if self.meta is not None and session_id == self.meta.session_id:
+            raise ValueError("Switch to another session before deleting the active session")
+        await asyncio.to_thread(self.store.delete, session_id)
+
+    async def fork_session(self, session_id: str) -> SessionMeta:
+        """Fork a persisted session and switch into the forked copy."""
+
+        self._require_idle_turn()
+        if self.meta is not None and session_id == self.meta.session_id:
+            await self._persist_async()
+        forked = await asyncio.to_thread(self.store.fork, session_id, self.workspace)
+        return await self.switch_session(forked.session_id)
+
     def list_skill_infos(self) -> list[Any]:
         """Return display metadata for all loaded and document skills."""
 
@@ -1339,6 +1490,22 @@ class AgentHost(HostCommandsMixin):
         from noah_code.mcp_setup import list_mcp_servers
 
         return list_mcp_servers(self.workspace.root, self.config)
+
+    def list_mcp_presets(self) -> list[Any]:
+        from noah_code.mcp_setup import list_mcp_presets
+
+        return list(list_mcp_presets())
+
+    def list_importable_mcp_servers(self) -> list[tuple[str, dict[str, Any], str]]:
+        from noah_code.mcp_setup import discover_external_mcp_servers, load_mcp_servers
+
+        existing, _sources = load_mcp_servers(self.workspace.root, self.config)
+        discovered = discover_external_mcp_servers()
+        return [
+            (name, spec, src)
+            for name, (spec, src) in sorted(discovered.items())
+            if name not in existing
+        ]
 
     def list_provider_infos(self) -> list[Any]:
         from noah_code.providers import list_providers
@@ -1498,6 +1665,114 @@ class AgentHost(HostCommandsMixin):
             return f"Saved MCP server {name} in {path}, but connection failed: {exc}"
         return f"Saved MCP server {name} in {path}. {status}"
 
+    async def connect_mcp_preset(
+        self, preset_key: str, *, env_value: str | None = None
+    ) -> str:
+        """Save (if needed) and connect a built-in one-click MCP preset."""
+
+        import os
+
+        from noah_code.mcp_setup import get_mcp_preset, save_user_mcp_server
+
+        preset = get_mcp_preset(preset_key)
+        if preset.env_var and env_value:
+            os.environ[preset.env_var] = env_value.strip()
+        saved_path: Path | None = None
+        with contextlib.suppress(FileExistsError):
+            saved_path = await asyncio.to_thread(
+                save_user_mcp_server, preset.key, preset.to_spec()
+            )
+        cred_note = ""
+        if preset.env_var and not os.environ.get(preset.env_var):
+            cred_note = f" (set {preset.env_var} in your environment if authentication is required)"
+        if self._agent is None:
+            loc = f" in {saved_path}" if saved_path else ""
+            return f"Configured MCP preset {preset.key} ({preset.label}){loc}{cred_note}"
+        try:
+            status = await self.connect_mcp_server(preset.key)
+        except Exception as exc:
+            loc = f" in {saved_path}" if saved_path else ""
+            return (
+                f"Configured MCP preset {preset.key} ({preset.label}){loc}, "
+                f"but connection failed: {exc}{cred_note}"
+            )
+        return f"{status}{cred_note}"
+
+    async def import_external_mcp_servers(self, names: list[str] | None = None) -> str:
+        """Import MCP servers from Claude Code, Claude Desktop, or Cursor into user config."""
+
+        from noah_code.mcp_setup import discover_external_mcp_servers, save_user_mcp_server
+
+        discovered = await asyncio.to_thread(discover_external_mcp_servers)
+        if not discovered:
+            return "No external MCP servers found in Claude Code, Claude Desktop, or Cursor configs."
+        if names:
+            requested = [item.strip() for item in names if item.strip()]
+            missing = [item for item in requested if item not in discovered]
+            if missing:
+                raise KeyError(f"external MCP server not found: {', '.join(missing)}")
+            selected = [(name, *discovered[name]) for name in requested]
+        else:
+            selected = [(name, spec, src) for name, (spec, src) in sorted(discovered.items())]
+
+        imported: list[str] = []
+        skipped: list[str] = []
+        connected: list[str] = []
+        failed: list[str] = []
+        for name, spec, _src in selected:
+            try:
+                await asyncio.to_thread(save_user_mcp_server, name, spec)
+                imported.append(name)
+            except FileExistsError:
+                skipped.append(name)
+            if self._agent is not None:
+                try:
+                    await self.connect_mcp_server(name)
+                    connected.append(name)
+                except Exception as exc:
+                    failed.append(f"{name} ({exc})")
+
+        parts: list[str] = []
+        if imported:
+            parts.append(f"Imported {len(imported)} MCP server(s): {', '.join(imported)}")
+        if skipped:
+            parts.append(f"Already configured: {', '.join(skipped)}")
+        if connected:
+            parts.append(f"Connected: {', '.join(connected)}")
+        if failed:
+            parts.append(f"Connection errors: {'; '.join(failed)}")
+        return ". ".join(parts) if parts else "Nothing to import."
+
+    async def remove_mcp_server(self, name: str) -> str:
+        """Remove an MCP server from user configuration and detach any live pool."""
+
+        from noah_code.mcp_setup import re_attr, remove_user_mcp_server
+
+        clean_name = name.strip()
+        removed = await asyncio.to_thread(remove_user_mcp_server, clean_name)
+        if not removed:
+            raise KeyError(f"MCP server {clean_name} is not in user mcp.json")
+        self._mcp_attached.discard(clean_name)
+        self._mcp_errors.pop(clean_name, None)
+        if self._agent is not None:
+            attr = re_attr(clean_name)
+            pools = getattr(self._agent, "_mcp_stdio_pools", None)
+            if isinstance(pools, dict):
+                pool = pools.pop(attr, None)
+                aclose = getattr(pool, "aclose", None)
+                if callable(aclose):
+                    with contextlib.suppress(Exception):
+                        res = aclose()
+                        if inspect.isawaitable(res):
+                            await res
+            approved = getattr(self._agent, "_sandbox_approved_roots", None)
+            if isinstance(approved, set):
+                approved.discard(attr)
+            if hasattr(self._agent, attr):
+                with contextlib.suppress(AttributeError):
+                    delattr(self._agent, attr)
+        return f"Removed MCP server {clean_name}"
+
     async def load_history_page(
         self,
         *,
@@ -1655,6 +1930,7 @@ class AgentHost(HostCommandsMixin):
             attach_paths=paths or None,
             sequence=sequence,
         )
+        self.record_prompt(text)
         if dropped_item is not None:
             self.ui.render(HostEvent(HostEventKind.STATUS, "steer dropped oldest"))
         if not self.queue_paused:
@@ -1692,8 +1968,14 @@ class AgentHost(HostCommandsMixin):
                 )
                 attach_paths = self.take_pending_attaches()
                 if run_id is None:
-                    return await self._run_user_turn(line, attach_paths=attach_paths)
-                return await self._run_user_turn(line, run_id=run_id, attach_paths=attach_paths)
+                    res = await self._run_user_turn(line, attach_paths=attach_paths)
+                else:
+                    res = await self._run_user_turn(
+                        line, run_id=run_id, attach_paths=attach_paths
+                    )
+                if line != text:
+                    await asyncio.to_thread(self.record_prompt, text)
+                return res
             finally:
                 self._active_turn = None
                 self.ui.set_busy(False)
@@ -1876,6 +2158,7 @@ class AgentHost(HostCommandsMixin):
                 self.ui.render(HostEvent(HostEventKind.STATUS, "steer dropped · could not expand"))
                 continue
             self._deliver_expanded(agent, expanded)
+            self.record_prompt(item.text)
             if self._runtime is not None and item.sequence is not None:
                 self._runtime.acknowledge_inbox(item.sequence)
             preview = " ".join(item.text.split())[:60]
@@ -1910,6 +2193,7 @@ class AgentHost(HostCommandsMixin):
                 self.ui.render(HostEvent(HostEventKind.STATUS, "steer dropped · could not expand"))
                 continue
             self._deliver_expanded(agent, expanded)
+            await asyncio.to_thread(self.record_prompt, item.text)
             if self._runtime is not None and item.sequence is not None:
                 self._runtime.acknowledge_inbox(item.sequence)
             preview = " ".join(item.text.split())[:60]
@@ -2025,6 +2309,7 @@ class AgentHost(HostCommandsMixin):
                     explanation = "No waiting prompt could be expanded"
                     return turn_result
             else:
+                await asyncio.to_thread(self.record_prompt, text)
                 expanded = await asyncio.to_thread(self._expand_user_text, text, attach_paths)
                 self._deliver_expanded(agent, expanded)
 

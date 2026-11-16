@@ -136,6 +136,17 @@ _DETAILS = {
         "Run checks again when edits make earlier evidence stale.",
         ("print(await self.ws.checks())",),
     ),
+    "task.orchestrate": _Details(
+        "str: consolidated multi-subagent wave report, applied files, and conflict diagnostics.",
+        "Pass up to 12 subtasks as (agent, prompt) or {'agent': 'general', 'title': 'API', "
+        "'prompt': '...', 'isolate': True}. With isolate=True in a Git repo, writable subtasks "
+        "edit separate linked worktrees in parallel and non-conflicting changes auto-apply.",
+        (
+            "print(await self.task.orchestrate('Refactor auth & billing', "
+            "[{'agent': 'general', 'title': 'Auth', 'prompt': '...'}, "
+            "{'agent': 'general', 'title': 'Billing', 'prompt': '...'}], isolate=True))",
+        ),
+    ),
     "task.diff": _Details(
         "str: status and unified diff of an isolated child task's worktree.",
         "Pass the 12-char task_id returned by self.task.start(..., isolate=True).",

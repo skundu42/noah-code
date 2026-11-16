@@ -290,6 +290,86 @@ class GitTools(Skill):
         self._ws._refresh_read_fingerprint(resolved)
         return f"reverted staged and worktree changes in {path}"
 
+    @hidden
+    async def stage_hunk(
+        self,
+        path: str,
+        scope: str,
+        hunk_patch: str,
+        *,
+        expected_revision: str | None = None,
+    ) -> str:
+        """Stage (when unstaged) or unstage (when staged) one unified diff hunk."""
+
+        if scope not in {"unstaged", "staged"}:
+            raise ValueError("scope must be staged or unstaged")
+        resolved = await self._ws._authorize_path(path, "edit", tool="git_stage_hunk")
+        rel = self._ws._workspace.relpath(resolved)
+        payload = hunk_patch if hunk_patch.endswith("\n") else f"{hunk_patch}\n"
+        async with self._ws._coordinator.lock:
+            if (
+                expected_revision is not None
+                and await self._review_signature(rel) != expected_revision
+            ):
+                raise RuntimeError(
+                    "File or index changed since this review; refresh before staging"
+                )
+            prefix = await self._repo_prefix()
+            args = ["apply", "--cached", "--unidiff-zero"]
+            if scope == "staged":
+                args.append("--reverse")
+            if prefix:
+                args.append(f"--directory={prefix.rstrip('/')}")
+            result = await self._git_input(*args, input_text=payload)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "git apply --cached failed")
+        action = "unstaged" if scope == "staged" else "staged"
+        return f"{action} hunk in {path}"
+
+    @hidden
+    async def revert_hunk(
+        self,
+        path: str,
+        scope: str,
+        hunk_patch: str,
+        *,
+        expected_revision: str | None = None,
+    ) -> str:
+        """Revert one unified diff hunk; journaled in SnapshotJournal for /undo."""
+
+        if scope not in {"unstaged", "staged"}:
+            raise ValueError("scope must be staged or unstaged")
+        resolved = await self._ws._authorize_path(path, "edit", tool="git_revert_hunk")
+        rel = self._ws._workspace.relpath(resolved)
+        payload = hunk_patch if hunk_patch.endswith("\n") else f"{hunk_patch}\n"
+        async with self._ws._coordinator.lock:
+            if (
+                expected_revision is not None
+                and await self._review_signature(rel) != expected_revision
+            ):
+                raise RuntimeError(
+                    "File or index changed since this review; refresh before reverting"
+                )
+            prefix = await self._repo_prefix()
+            args = ["apply", "--reverse", "--unidiff-zero"]
+            if scope == "staged":
+                args.append("--index")
+            if prefix:
+                args.append(f"--directory={prefix.rstrip('/')}")
+            mut = self._ws._journal.record_preimage(resolved)
+            try:
+                result = await self._git_input(*args, input_text=payload)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or "git apply --reverse failed")
+                if scope == "staged":
+                    self._ws._journal.mark_shell_bypass()
+                self._ws._journal.record_postimage(mut, resolved)
+            except Exception:
+                self._ws._journal.discard_mutation(mut)
+                raise
+            self._ws._refresh_read_fingerprint(resolved)
+        return f"reverted {scope} hunk in {path}"
+
     async def _patch(self, path: str, scope: str, status: str) -> str:
         blocked = self._review_path_error(path)
         if blocked is not None:
@@ -386,6 +466,39 @@ class GitTools(Skill):
             except subprocess.TimeoutExpired:
                 # Callers already branch on returncode/stderr; a synthetic
                 # result keeps every path (review/revert/patch) uniform.
+                return subprocess.CompletedProcess(
+                    args,
+                    returncode=124,
+                    stdout="",
+                    stderr=f"git {args[0]!r} timed out after 10s",
+                )
+            except FileNotFoundError:
+                return subprocess.CompletedProcess(
+                    args,
+                    returncode=127,
+                    stdout="",
+                    stderr="git is not installed or not on PATH",
+                )
+
+        return await asyncio.to_thread(run)
+
+    async def _git_input(
+        self,
+        *args: str,
+        input_text: str,
+    ) -> subprocess.CompletedProcess[str]:
+        def run() -> subprocess.CompletedProcess[str]:
+            try:
+                return subprocess.run(
+                    ["git", "--literal-pathspecs", *args],
+                    cwd=self._ws._workspace.root,
+                    input=input_text,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
                 return subprocess.CompletedProcess(
                     args,
                     returncode=124,

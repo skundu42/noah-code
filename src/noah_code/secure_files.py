@@ -40,6 +40,7 @@ _UNSAFE_PATH_ERRNOS = frozenset({errno.ELOOP, errno.ENOTDIR})
 class BoundedText:
     text: str
     truncated: bool = False
+    inode: tuple[int, int] | None = None
 
 
 def _secure_dir_fd_available() -> bool:
@@ -130,12 +131,42 @@ def _verify_parent_binding(root: Path, parent_parts: tuple[str, ...], held_fd: i
         os.close(current_fd)
 
 
-def _validate_regular_file(fd: int, relative: str | Path, *, reject_hardlinks: bool) -> None:
+def _validate_regular_file(
+    fd: int, relative: str | Path, *, reject_hardlinks: bool
+) -> tuple[int, int]:
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
         raise _unsafe_path(relative)
     if reject_hardlinks and info.st_nlink != 1:
         raise _unsafe_path(relative)
+    return (info.st_dev, info.st_ino)
+
+
+def list_dir_entries(root: Path, relative: str | Path = ".") -> tuple[str, ...]:
+    """List non-symlink entry names in a directory without following links."""
+
+    rel_text = str(relative)
+    parts = () if rel_text in {"", "."} else _validated_parts(relative)
+    dir_fd = _open_parent_fd(root, parts, create=False)
+    try:
+        _verify_parent_binding(root, parts, dir_fd)
+        dup_fd = os.dup(dir_fd)
+        try:
+            scanner = os.scandir(dup_fd)
+        except BaseException:
+            os.close(dup_fd)
+            raise
+        names: list[str] = []
+        with scanner as entries:
+            for entry in entries:
+                with suppress(OSError):
+                    if entry.is_symlink():
+                        continue
+                    names.append(entry.name)
+        _verify_parent_binding(root, parts, dir_fd)
+        return tuple(sorted(names))
+    finally:
+        os.close(dir_fd)
 
 
 def read_text_bounded(
@@ -165,7 +196,7 @@ def read_text_bounded(
                 raise _unsafe_path(relative, exc) from exc
             raise
         try:
-            _validate_regular_file(file_fd, relative, reject_hardlinks=reject_hardlinks)
+            inode = _validate_regular_file(file_fd, relative, reject_hardlinks=reject_hardlinks)
             _verify_parent_binding(root, parent_parts, parent_fd)
             remaining = max_bytes + 1
             chunks: list[bytes] = []
@@ -182,7 +213,11 @@ def read_text_bounded(
         os.close(parent_fd)
 
     truncated = len(data) > max_bytes
-    return BoundedText(data[:max_bytes].decode("utf-8", errors="replace"), truncated)
+    return BoundedText(
+        data[:max_bytes].decode("utf-8", errors="replace"),
+        truncated,
+        inode=inode,
+    )
 
 
 def _existing_leaf_is_replaceable(parent_fd: int, leaf: str, relative: str | Path) -> None:

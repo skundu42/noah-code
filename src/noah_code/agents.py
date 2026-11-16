@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -13,6 +14,9 @@ from noah_code.custom_commands import (
 )
 
 AgentMode = Literal["build", "plan"]
+_REAL_PATH_HOME = Path.home
+_CLAUDE_MODEL_SHORTHANDS = frozenset({"", "inherit", "default", "sonnet", "opus", "haiku"})
+_CLAUDE_WRITE_TOOLS = frozenset({"edit", "write", "multiedit", "multi_edit", "bash", "notebookedit"})
 
 
 @dataclass(frozen=True)
@@ -102,8 +106,18 @@ def builtin_agents() -> list[AgentSpec]:
     ]
 
 
+def _resolve_user_home(home: Path | None = None) -> Path:
+    if home is not None:
+        return home.expanduser()
+    if Path.home != _REAL_PATH_HOME:
+        return Path.home().expanduser()
+    from noah_code.skills_setup import _default_user_home
+
+    return _default_user_home()
+
+
 def discover_agents(workspace: Path, *, home: Path | None = None) -> list[AgentSpec]:
-    """Built-ins plus user and project markdown agents."""
+    """Built-ins plus user and project markdown agents (Noah + Claude .claude/agents)."""
 
     found = {spec.name: spec for spec in builtin_agents()}
     # Preserve the original protected names while allowing existing specialist
@@ -111,15 +125,30 @@ def discover_agents(workspace: Path, *, home: Path | None = None) -> list[AgentS
     # read-only role requirements before starting any work.
     reserved = frozenset({"explore", "general"})
     workspace = workspace.expanduser().resolve()
-    user_home = (home or Path.home()).expanduser()
+    user_home = _resolve_user_home(home)
+    claude_user_dir = user_home / ".claude" / "agents"
     user_dir = user_home / ".config" / "noah-code" / "agents"
+    claude_project_dir = workspace / ".claude" / "agents"
     project_dir = workspace / ".noah-code" / "agents"
+
+    found.update(
+        _load_markdown_agents(claude_user_dir, source="user", infer_mode_from_tools=True)
+    )
     found.update(_load_markdown_agents(user_dir, source="user"))
+
     project_agents = _load_markdown_agents(
-        project_dir,
+        claude_project_dir,
         source="project",
         secure_root=workspace,
-        secure_relative_dir=Path(".noah-code") / "agents",
+        secure_relative_dir=Path(".claude") / "agents",
+    )
+    project_agents.update(
+        _load_markdown_agents(
+            project_dir,
+            source="project",
+            secure_root=workspace,
+            secure_relative_dir=Path(".noah-code") / "agents",
+        )
     )
     found.update({name: spec for name, spec in project_agents.items() if name not in reserved})
     return list(found.values())
@@ -131,6 +160,7 @@ def _load_markdown_agents(
     source: str,
     secure_root: Path | None = None,
     secure_relative_dir: Path | None = None,
+    infer_mode_from_tools: bool = False,
 ) -> dict[str, AgentSpec]:
     out: dict[str, AgentSpec] = {}
     if (secure_root is None) != (secure_relative_dir is None):
@@ -141,8 +171,8 @@ def _load_markdown_agents(
         secure_relative_dir=secure_relative_dir,
     )
     for path in paths:
-        name = path.stem.strip().lower().lstrip("/")
-        if not name or name.startswith("."):
+        stem_name = path.stem.strip().lower().lstrip("/")
+        if not stem_name or stem_name.startswith("."):
             continue
         secure_relative = (
             secure_relative_dir / path.name if secure_relative_dir is not None else None
@@ -155,11 +185,33 @@ def _load_markdown_agents(
         if raw is None:
             continue
         meta, body = parse_frontmatter(raw)
+        raw_name = str(meta.get("name") or "").strip().lower().lstrip("@/")
+        name = (
+            raw_name
+            if raw_name and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", raw_name)
+            else stem_name
+        )
         raw_mode = meta.get("mode")
         mode_text = str(raw_mode).strip().lower() if raw_mode is not None else ""
-        # Fail closed when mode is missing or unrecognized instead of granting build mode.
-        mode: AgentMode = "build" if mode_text == "build" else "plan"
+        if mode_text == "build":
+            mode: AgentMode = "build"
+        elif mode_text == "plan":
+            mode = "plan"
+        elif infer_mode_from_tools and meta.get("tools"):
+            tool_tokens = {
+                tok.strip().lower()
+                for tok in re.split(r"[,;\s]+", str(meta["tools"]).strip("[]"))
+                if tok.strip()
+            }
+            mode = "build" if (tool_tokens & _CLAUDE_WRITE_TOOLS) else "plan"
+        else:
+            # Fail closed when mode is missing or unrecognized instead of granting build mode.
+            mode = "plan"
         readonly = _truthy(meta.get("readonly")) or mode == "plan"
+        raw_model = str(meta["model"]).strip() if meta.get("model") else ""
+        model_val = (
+            None if raw_model.lower() in _CLAUDE_MODEL_SHORTHANDS else raw_model
+        )
         out[name] = AgentSpec(
             name=name,
             description=str(meta.get("description") or name),
@@ -167,7 +219,7 @@ def _load_markdown_agents(
             mode="plan" if readonly else mode,
             readonly=readonly,
             todos=_truthy(meta.get("todos"), default=False),
-            model=str(meta["model"]) if meta.get("model") else None,
+            model=model_val,
             source=f"{source}:{path.name}",
         )
     return out

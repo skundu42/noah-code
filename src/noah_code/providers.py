@@ -175,6 +175,8 @@ def provider_preset(key: str) -> ProviderPreset:
 def resolve_provider_model(provider: str, model: str) -> str:
     """Return an explicit LiteLLM routing string for a provider/model pair."""
 
+    from noah_code.model_catalog import OPENROUTER_NATIVE_ROUTERS
+
     preset = provider_preset(provider)
     selected = model.strip()
     if not selected or any(character.isspace() for character in selected):
@@ -182,6 +184,8 @@ def resolve_provider_model(provider: str, model: str) -> str:
     prefix = f"{preset.prefix}/"
     if selected == prefix:
         raise ValueError("model must include a name after the provider prefix")
+    if preset.key == "openrouter" and selected in OPENROUTER_NATIVE_ROUTERS:
+        return f"{prefix}{selected}"
     return selected if selected.startswith(prefix) else f"{prefix}{selected}"
 
 

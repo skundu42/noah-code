@@ -19,6 +19,7 @@ class QuestionPrompt:
     header: str
     prompt: str
     options: tuple[str, ...]
+    multi_select: bool = False
 
 
 @dataclass(frozen=True)
@@ -53,7 +54,13 @@ class QuestionTools(Skill):
     def set_handler(self, handler: QuestionHandler | None) -> None:
         self._handler = handler
 
-    async def question(self, header: str, prompt: str, options: list[str]) -> str:
+    async def question(
+        self,
+        header: str,
+        prompt: str,
+        options: list[str],
+        multi_select: bool = False,
+    ) -> str:
         """Ask one multiple-choice question and return the user's answer."""
 
         if not isinstance(options, (list, tuple)) or any(not isinstance(item, str) for item in options):
@@ -72,6 +79,7 @@ class QuestionTools(Skill):
             header=header.strip() or "Question",
             prompt=prompt.strip(),
             options=tuple(cleaned),
+            multi_select=bool(multi_select),
         )
         if self._handler is None:
             raise PermissionError("question tool has no UI handler")
@@ -84,6 +92,7 @@ class QuestionTools(Skill):
                     "header": item.header,
                     "prompt": item.prompt,
                     "options": list(item.options),
+                    "multi_select": item.multi_select,
                 },
             )
         try:
@@ -166,6 +175,12 @@ async def console_question_handler(
         if raw.isdigit() and 1 <= int(raw) <= len(item.options):
             selections.append(item.options[int(raw) - 1])
             continue
+        if "," in raw:
+            parts = [part.strip() for part in raw.split(",") if part.strip()]
+            if parts and all(part.isdigit() and 1 <= int(part) <= len(item.options) for part in parts):
+                for part in dict.fromkeys(parts):
+                    selections.append(item.options[int(part) - 1])
+                continue
         if raw:
             custom_bits.append(raw)
     return QuestionAnswer(

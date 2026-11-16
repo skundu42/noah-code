@@ -29,6 +29,8 @@ class ThemePalette:
     success: str
     warning: str
     error: str
+    code_theme: str = "monokai"
+    is_light: bool = False
 
     def css_variables(self) -> dict[str, str]:
         return {
@@ -60,6 +62,8 @@ THEMES: dict[ThemeName, ThemePalette] = {
         success="#8bd5ca",
         warning="#e6b673",
         error="#ed8796",
+        code_theme="one-dark",
+        is_light=False,
     ),
     "noah-ocean": ThemePalette(
         name="noah-ocean",
@@ -75,6 +79,8 @@ THEMES: dict[ThemeName, ThemePalette] = {
         success="#91d6a8",
         warning="#f3c969",
         error="#ff8178",
+        code_theme="nord",
+        is_light=False,
     ),
     "graphite": ThemePalette(
         name="graphite",
@@ -90,6 +96,8 @@ THEMES: dict[ThemeName, ThemePalette] = {
         success="#8dcc8a",
         warning="#f2cb6b",
         error="#f07f82",
+        code_theme="github-dark",
+        is_light=False,
     ),
     "high-contrast": ThemePalette(
         name="high-contrast",
@@ -105,6 +113,8 @@ THEMES: dict[ThemeName, ThemePalette] = {
         success="#00f59b",
         warning="#ffd400",
         error="#ff6685",
+        code_theme="native",
+        is_light=False,
     ),
     "daylight": ThemePalette(
         name="daylight",
@@ -120,6 +130,8 @@ THEMES: dict[ThemeName, ThemePalette] = {
         success="#1b7f5a",
         warning="#b26a00",
         error="#c43242",
+        code_theme="friendly",
+        is_light=True,
     ),
 }
 

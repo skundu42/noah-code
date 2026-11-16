@@ -51,9 +51,56 @@ Screen {
 #model-stream-preview {
     display: none;
     height: auto;
-    max-height: 6;
-    padding: 0 2;
+    max-height: 18;
+    margin: 0 2;
+    padding: 0 2 1 2;
+    background: $nc-canvas;
+    color: $nc-text;
+    border-left: tall $nc-accent;
+    overflow-y: auto;
+    scrollbar-color: $nc-border;
+    scrollbar-color-hover: $nc-muted;
+    scrollbar-color-active: $nc-accent;
+    scrollbar-background: $nc-canvas;
+    scrollbar-size-vertical: 1;
+}
+
+#transcript-find-bar {
+    display: none;
+    height: 3;
+    margin: 0 2;
+    padding: 0 1;
+    background: $nc-surface;
+    color: $nc-text;
+    border: round $nc-border;
+    align: left middle;
+}
+
+#transcript-find-bar:focus-within {
+    border: round $nc-accent;
+}
+
+#transcript-find-input {
+    width: 1fr;
+    height: 1;
+    margin: 0;
+    padding: 0 1;
+    border: none;
+    background: $nc-surface;
+    color: $nc-text;
+}
+
+#transcript-find-input:focus {
+    border: none;
+}
+
+#transcript-find-count {
+    width: auto;
+    min-width: 12;
+    height: 1;
+    padding: 0 1;
     color: $nc-muted;
+    content-align: right middle;
 }
 
 #welcome {
@@ -101,6 +148,17 @@ Screen {
 #context-rail-content {
     width: 1fr;
     height: auto;
+}
+
+#subagent-strip {
+    display: none;
+    height: auto;
+    max-height: 8;
+    padding: 0 2;
+    margin: 0 0 1 0;
+    background: $nc-surface;
+    color: $nc-text;
+    border-left: tall $nc-accent;
 }
 
 #working-banner {
@@ -227,8 +285,24 @@ Screen {
     height: 5;
 }
 
+.compact #subagent-strip {
+    max-height: 6;
+    margin: 0;
+    padding: 0 1;
+}
+
 .compact #working-banner {
     height: 1;
+}
+
+.compact #model-stream-preview {
+    max-height: 10;
+    margin: 0 1;
+    padding: 0 1;
+}
+
+.compact #transcript-find-bar {
+    margin: 0 1;
 }
 
 ApprovalModal,
@@ -236,6 +310,8 @@ QuestionModal,
 OnboardingScreen,
 CodexLoginScreen,
 FilteredPicker,
+ResumeSessionPicker,
+SessionPickerScreen,
 KeyboardHelpScreen,
 TextPromptModal,
 ConfirmationModal,
@@ -378,6 +454,7 @@ DiffReviewScreen {
 #onboarding-dialog,
 #codex-login-dialog,
 #picker-dialog,
+#session-dialog,
 #prompt-dialog,
 #detail-dialog,
 #history-dialog,
@@ -590,6 +667,7 @@ DiffReviewScreen {
 
 #approval-title,
 #picker-title,
+#session-title,
 #prompt-title,
 #detail-title {
     height: 1;
@@ -708,7 +786,8 @@ ApprovalModal #approval-buttons #once {
     margin: 0 1;
 }
 
-#picker-dialog {
+#picker-dialog,
+#session-dialog {
     height: 24;
 }
 
@@ -717,12 +796,14 @@ ApprovalModal #approval-buttons #once {
     height: 11;
 }
 
-#picker-filter {
+#picker-filter,
+#session-filter {
     margin-bottom: 1;
     border: round $nc-border;
 }
 
-#picker-filter:focus {
+#picker-filter:focus,
+#session-filter:focus {
     border: round $nc-accent;
 }
 
@@ -735,6 +816,7 @@ ApprovalModal #approval-buttons #once {
 }
 
 #picker-list,
+#session-list,
 #activity-list {
     height: 1fr;
     background: $nc-canvas;
@@ -744,6 +826,7 @@ ApprovalModal #approval-buttons #once {
 }
 
 #picker-hint,
+#session-hint,
 #prompt-hint,
 #detail-hint {
     height: 1;

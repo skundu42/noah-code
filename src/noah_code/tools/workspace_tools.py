@@ -14,7 +14,7 @@ import shlex
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
@@ -211,6 +211,24 @@ def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_CR_OVERWRITE_RE = re.compile(r"[^\r\n]*\r+(?=[^\r\n])")
+_LONE_CR_RE = re.compile(r"\r(?!\n)")
+
+
+def _clean_shell_text(text: str) -> str:
+    """Strip ANSI escape sequences and collapse carriage-return spinner overwrites."""
+
+    if not text or ("\x1b" not in text and "\r" not in text):
+        return text
+    cleaned = _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", text))
+    if "\r" in cleaned:
+        cleaned = _CR_OVERWRITE_RE.sub("", cleaned)
+        cleaned = _LONE_CR_RE.sub("", cleaned)
+    return cleaned
+
+
 class WorkspaceTools(Skill):
     """Read, search, edit, and run commands inside the active workspace.
 
@@ -285,6 +303,9 @@ class WorkspaceTools(Skill):
         # (Match) edits verify this fingerprint before splicing so a stale
         # anchor fails loudly instead of corrupting a concurrently changed file.
         self._read_fingerprints: dict[str, str] = {}
+        self._scoped_instruction_handler: Callable[[str], None] | None = None
+        self._surfaced_instruction_dirs: set[Path] = {workspace.root.resolve()}
+        self._surfaced_instruction_inodes: set[tuple[int, int]] = set()
 
     def set_efficiency_profile(self, profile: str) -> None:
         """Adjust model-facing output limits for the current session."""
@@ -309,6 +330,34 @@ class WorkspaceTools(Skill):
         """Install an async host callback used before untracked shell effects."""
 
         self._mutation_checkpoint_handler = handler
+
+    @hidden
+    def set_scoped_instruction_handler(
+        self,
+        handler: Callable[[str], None] | None,
+        *,
+        seen_inodes: set[tuple[int, int]] | None = None,
+    ) -> None:
+        """Install an optional host callback for newly entered subdirectory instructions."""
+
+        self._scoped_instruction_handler = handler
+        if seen_inodes is not None:
+            self._surfaced_instruction_inodes.update(seen_inodes)
+
+    def _surface_scoped_instructions(self, target_dir: Path) -> None:
+        if self._scoped_instruction_handler is None:
+            return
+        from noah_code.instructions import discover_scoped_subdir_instructions
+
+        notes = discover_scoped_subdir_instructions(
+            self._workspace.root,
+            target_dir,
+            surfaced_dirs=self._surfaced_instruction_dirs,
+            seen_inodes=self._surfaced_instruction_inodes,
+        )
+        for note in notes:
+            with contextlib.suppress(Exception):
+                self._scoped_instruction_handler(note)
 
     async def checkpoint_before_shell(self, command: str) -> None:
         if self._mutation_checkpoint_handler is not None:
@@ -356,6 +405,7 @@ class WorkspaceTools(Skill):
             ) from exc
         if stat.st_size <= self._journal.blob_limit:
             self._record_read_fingerprint(resolved)
+        self._surface_scoped_instructions(resolved.parent)
         bounded = self._bound(match.text)
         if bounded != match.text:
             # A head/tail preview is not contiguous file content and therefore
@@ -419,6 +469,8 @@ class WorkspaceTools(Skill):
             await self._authorize_path(item, PermissionCategory.READ, tool="ws_search")
             for item in requested
         ]
+        for item_path in resolved_paths:
+            self._surface_scoped_instructions(item_path if item_path.is_dir() else item_path.parent)
         targets = [str(item) if item != workspace_root else "." for item in resolved_paths]
         # Keep the command within NOOA's conservative pure-search grammar so it
         # can independently harvest and verify editable Match anchors. ``-i``
@@ -450,6 +502,7 @@ class WorkspaceTools(Skill):
         """List files under path matching a glob (deterministic, no shell)."""
         self._assert_internal_glob(pattern)
         root = await self._authorize_path(path, PermissionCategory.READ, tool="ws_list")
+        self._surface_scoped_instructions(root if root.is_dir() else root.parent)
         workspace_root = self._workspace.root.resolve()
         matches: list[str] = []
         truncated = False
@@ -602,6 +655,7 @@ class WorkspaceTools(Skill):
                         "since read(); call read() again to refresh the Match"
                     )
             result = self._native_replace_match(resolved, match, new_text)
+            self._surface_scoped_instructions(resolved.parent)
             if self._lsp is not None:
                 await self._lsp.sync_paths([resolved])
             return result
@@ -613,6 +667,7 @@ class WorkspaceTools(Skill):
                 )
             resolved = await self._authorize_path(match, PermissionCategory.EDIT, tool="ws_edit")
             result = self._native_replace_string(resolved, match, new_text, new)
+            self._surface_scoped_instructions(resolved.parent)
             if self._lsp is not None:
                 await self._lsp.sync_paths([resolved])
             return result
@@ -642,6 +697,7 @@ class WorkspaceTools(Skill):
             raise TypeError("write_file(path, content) requires the full file content as a string")
         resolved = await self._authorize_path(path, PermissionCategory.EDIT, tool="write_file")
         result = self._commit_file_write(resolved, content.encode("utf-8"), content)
+        self._surface_scoped_instructions(resolved.parent)
         if self._lsp is not None:
             await self._lsp.sync_paths([resolved])
         return result
@@ -919,6 +975,8 @@ class WorkspaceTools(Skill):
                     temp_path.unlink()
 
         rows = ["Applied atomic patch:"]
+        for item in prepared:
+            self._surface_scoped_instructions(cast(Path, item["resolved"]).parent)
         changed_paths: list[str] = []
         deleted_paths: list[str] = []
         for item in prepared:
@@ -1676,8 +1734,10 @@ class WorkspaceTools(Skill):
         result.matches = rewritten
 
     def _cap_shell_result(self, result: ShellResult) -> ShellResult:
-        stdout = self._bound(result.stdout)
-        stderr = self._bound(result.stderr)
+        raw_stdout = _clean_shell_text(result.stdout)
+        raw_stderr = _clean_shell_text(result.stderr)
+        stdout = self._bound(raw_stdout)
+        stderr = self._bound(raw_stderr)
         matches = result.matches
         if matches and len(matches) > self._max_search_results:
             matches = matches[: self._max_search_results]

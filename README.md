@@ -62,12 +62,12 @@ configuration or session history.
   pointer-eviction compaction with a practical context ceiling — measured live with `/tokens`.
 - **Explicit control.** Switch between implementation-focused **build** mode and read-only
   **plan** mode, with ordered `allow`, `ask`, and `deny` permission rules.
-- **Extensible workflows.** Add slash commands, opt-in skills, MCP servers, or markdown subagents;
-  attach `@files` and images when the task needs more context.
-- **Coordinated agent teams.** Launch a build, review, or investigation workflow from `F9` or
-  `/team`. Specialists hand off findings between phases, and the live work ledger shows progress.
-  Teams share session budgets and approvals; read-only work can run concurrently while edits
-  use one serialized mutation lane.
+- **Extensible workflows.** Add slash commands, opt-in skills (including `.claude/skills`,
+  `.claude/commands`, and `.claude/agents`), 1-click MCP presets (`noah mcp` / `/mcp`), or markdown
+  subagents; attach `@files` and images when the task needs more context.
+- **Coordinated agent teams & parallel orchestration.** Launch a build, review, or investigation
+  workflow from `F9` or `/team`, or fan out parallel subagents (`task.orchestrate`, including
+  isolated Git worktree writers) with live step telemetry in the TUI subagent strip and work ledger.
 - **Long-running by design.** Provider retries and configurable fallback models handle transient
   failures, while workspace leases, bounded artifacts, durable process ownership, and `/health`
   keep unattended sessions observable.
@@ -127,7 +127,8 @@ noah --permissions normal .
 # Auto-approve routine actions; interpreter commands remain blocked
 noah --auto .
 
-# Resume previous work
+# Resume previous work (picker for last 3 repo chats, latest chat, or exact ID)
+noah --resume .
 noah --continue .
 noah --session SESSION_ID .
 
@@ -198,8 +199,14 @@ Type `/` to search the full command and configuration reference. The most common
 | `F8` | Show or hide the sidebar |
 | `F9` | Choose a build, review, or investigation team workflow |
 | `Shift+F7` | Focus or leave the scrollable context rail |
-| `/model` | Configure a provider or switch the session model |
-| `/theme` | Choose Atom One Dark, Noah Ocean, Graphite, or High Contrast |
+| `Ctrl+E` | Edit the current prompt in `$EDITOR` |
+| `Ctrl+F` | Search messages in the active transcript |
+| `Alt+C` | Copy the latest fenced code block |
+| `F7` | Inspect active context sources and token budget |
+| `/resume` | Choose from the last 3 chats in this repository |
+| `/mcp` | Connect 1-click MCP presets, import Claude/Cursor MCPs, or add a server |
+| `/model` | Configure a provider or quick-pick mainstream coding & OpenRouter models |
+| `/theme` | Choose Atom One Dark, Noah Ocean, Graphite, High Contrast, or Daylight |
 | `/diff` | Review staged and unstaged changes |
 | `/undo` / `/redo` | Traverse the persistent edit journal |
 | `/checkpoints` | List rolling Git worktree checkpoints |

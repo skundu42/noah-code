@@ -8,8 +8,10 @@ import inspect
 import itertools
 import os as os
 import re
+import shlex
 import subprocess
 import sys as sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict, deque
@@ -19,12 +21,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rich.console import Group
+from rich.markdown import Markdown
 from rich.measure import measure_renderables
+from rich.padding import Padding
 from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
 from textual import events, on, work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.geometry import Offset
@@ -33,6 +37,7 @@ from textual.screen import ModalScreen
 from textual.selection import Selection
 from textual.timer import Timer
 from textual.widgets import Input, RichLog, Static, TextArea
+from textual.widgets.text_area import Selection as DocumentSelection
 from textual.widgets.text_area import TextAreaTheme
 
 from noah_code.approvals import ApprovalChoice, ApprovalRequest
@@ -50,6 +55,7 @@ from noah_code.steer import SAFE_SLASH_WHILE_BUSY
 from noah_code.themes import THEMES, ThemePalette, get_theme
 from noah_code.tools.question_tools import QuestionAnswer, QuestionPrompt
 from noah_code.ui import clipboard as _clipboard_module
+from noah_code.ui import modals as _modals_module
 from noah_code.ui.clipboard import (
     OSC_52_MAX_BYTES,
     _running_in_wsl,
@@ -80,6 +86,7 @@ from noah_code.ui.modals import (
     OnboardingScreen,
     QuestionModal,
     QueueManagerScreen,
+    ResumeSessionPicker,
     SelectableRichLog,
     TextPromptModal,
     TranscriptEntry,
@@ -149,12 +156,15 @@ def _text_area_theme(theme: ThemePalette) -> TextAreaTheme:
 TEXT_AREA_THEMES = tuple(_text_area_theme(theme) for theme in THEMES.values())
 
 MAX_TRANSCRIPT_LINES = 10_000
+TRANSCRIPT_MAX_ENTRIES = 500
+TRANSCRIPT_TRIM_THRESHOLD = 550
 MAX_ACTIVITY_HISTORY = 100
 MAX_TIMELINE_HISTORY = 200
 RECENT_HISTORY_SIZE = 24
 ROW_COUNT_CACHE_MAX = 1_024
 RESIZE_DEBOUNCE_SECONDS = 0.05
 STREAM_FLUSH_SECONDS = 0.05
+MODEL_STREAM_FLUSH_SECONDS = 0.04
 BUSY_REFRESH_SECONDS = 0.08
 WIDE_MIN_COLUMNS = 128
 COMPACT_MAX_ROWS = 25
@@ -429,10 +439,224 @@ def _welcome_renderable(theme: ThemePalette) -> Group:
     )
 
 
+def _read_plan_cached_state(
+    root: Path,
+    prev_sig: tuple[int, int] | None,
+    prev_text: str,
+) -> tuple[tuple[int, int] | None, str]:
+    """Stat-guarded plan reader: 0 file opens when plan.md is absent or unchanged."""
+
+    plan_path = Path(root) / ".noah-code" / "plan.md"
+    try:
+        st = plan_path.lstat()
+    except OSError:
+        return None, ""
+    sig = (st.st_mtime_ns, st.st_size)
+    if sig == prev_sig:
+        return sig, prev_text
+    try:
+        from noah_code.project_notes import PlanStore
+
+        text = PlanStore(Path(root)).read().strip()
+    except Exception:  # noqa: BLE001
+        text = ""
+    return sig, text
+
+
+_FENCE_LINE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
+_ACTIVE_SKILL_RE = re.compile(r"(?:^|(?<=\s))\$([A-Za-z0-9._-]*)$")
+
+
+def _close_unbalanced_markdown_fence(full_text: str, max_tail_chars: int = 3200) -> str:
+    """Slice streaming Markdown to *max_tail_chars* and auto-close any open code fence."""
+
+    if len(full_text) <= max_tail_chars:
+        tail = full_text
+        prefix = ""
+    else:
+        cut = len(full_text) - max_tail_chars
+        nl = full_text.find("\n", cut)
+        if nl != -1 and nl - cut < 200:
+            cut = nl + 1
+        prefix = full_text[:cut]
+        tail = full_text[cut:]
+
+    open_marker: str | None = None
+    open_header = ""
+    if prefix:
+        for line in prefix.splitlines():
+            match = _FENCE_LINE_RE.match(line)
+            if match is None:
+                continue
+            marker, rest = match.group(1), match.group(2).strip()
+            if open_marker is None:
+                open_marker = marker
+                open_header = line.strip()
+            elif marker[0] == open_marker[0] and len(marker) >= len(open_marker) and not rest:
+                open_marker = None
+                open_header = ""
+
+    rendered = f"{open_header}\n{tail}" if open_marker is not None else tail
+    tail_open: str | None = None
+    for line in rendered.splitlines():
+        match = _FENCE_LINE_RE.match(line)
+        if match is None:
+            continue
+        marker, rest = match.group(1), match.group(2).strip()
+        if tail_open is None:
+            tail_open = marker
+        elif marker[0] == tail_open[0] and len(marker) >= len(tail_open) and not rest:
+            tail_open = None
+    if tail_open is not None:
+        sep = "" if rendered.endswith("\n") else "\n"
+        return f"{rendered}{sep}{tail_open}"
+    return rendered
+
+
+def _extract_fenced_code_blocks(text: str) -> list[str]:
+    """Return pristine source code for each fenced code block in *text*."""
+
+    normalized = _normalize_markdown(text)
+    blocks: list[str] = []
+    open_fence: str | None = None
+    current: list[str] = []
+    for line in normalized.splitlines():
+        match = _FENCE_LINE_RE.match(line)
+        if open_fence is None:
+            if match is not None:
+                open_fence = match.group(1)
+                current = []
+        else:
+            if (
+                match is not None
+                and match.group(1)[0] == open_fence[0]
+                and len(match.group(1)) >= len(open_fence)
+                and not match.group(2).strip()
+            ):
+                blocks.append("\n".join(current))
+                open_fence = None
+                current = []
+            else:
+                current.append(line)
+    return blocks
+
+
+def _non_code_prose_lines(text: str) -> set[str]:
+    """Collect stripped prose lines outside fenced code blocks."""
+
+    normalized = _normalize_markdown(text)
+    prose: set[str] = set()
+    open_fence: str | None = None
+    for line in normalized.splitlines():
+        match = _FENCE_LINE_RE.match(line)
+        if open_fence is None:
+            if match is not None:
+                open_fence = match.group(1)
+            elif line.strip():
+                prose.add(line.strip())
+        elif (
+            match is not None
+            and match.group(1)[0] == open_fence[0]
+            and len(match.group(1)) >= len(open_fence)
+            and not match.group(2).strip()
+        ):
+            open_fence = None
+    return prose
+
+
+def _try_match_rows_to_block(
+    rows: list[str],
+    block_lines: list[str],
+    *,
+    anchor_start: bool = False,
+) -> str | None:
+    starts = [0] if anchor_start else list(range(len(block_lines)))
+    for start_idx in starts:
+        r_idx = 0
+        b_idx = start_idx
+        while r_idx < len(rows) and b_idx < len(block_lines):
+            src = block_lines[b_idx].strip()
+            rendered = rows[r_idx].lstrip(" │┃▎▍▌▏").rstrip()
+            if src == "":
+                if rendered == "":
+                    r_idx += 1
+                    b_idx += 1
+                    continue
+                break
+            if rendered == src:
+                r_idx += 1
+                b_idx += 1
+                continue
+            if rendered and src.startswith(rendered):
+                acc = rendered
+                k = r_idx + 1
+                matched_wrap = False
+                while k < len(rows):
+                    part = rows[k].lstrip(" │┃▎▍▌▏").rstrip()
+                    if not part:
+                        break
+                    if src.startswith(acc + part):
+                        acc = acc + part
+                    elif src.startswith(acc + " " + part):
+                        acc = f"{acc} {part}"
+                    else:
+                        break
+                    k += 1
+                    if acc == src:
+                        matched_wrap = True
+                        break
+                if matched_wrap:
+                    r_idx = k
+                    b_idx += 1
+                    continue
+            break
+        if r_idx == len(rows) and b_idx > start_idx:
+            candidate = "\n".join(block_lines[start_idx:b_idx])
+            if candidate.strip():
+                return candidate
+    return None
+
+
+def _match_fenced_code_selection(entry_text: str, selected_strips: list[Any]) -> str | None:
+    """If *selected_strips* lie strictly inside one fenced code block, return pristine code."""
+
+    blocks = _extract_fenced_code_blocks(entry_text)
+    if not blocks or not selected_strips:
+        return None
+    has_code_chrome = any(
+        (segment.style is not None and segment.style.bgcolor is not None)
+        or any(ch in segment.text for ch in "│┃▎▍▌▏")
+        for strip in selected_strips
+        for segment in strip
+        if segment.text.strip()
+    )
+    raw_lines = [strip.text.rstrip() for strip in selected_strips]
+    while raw_lines and not raw_lines[0].strip(" │┃▎▍▌▏╭╮╰╯─━"):
+        raw_lines.pop(0)
+    while raw_lines and not raw_lines[-1].strip(" │┃▎▍▌▏╭╮╰╯─━"):
+        raw_lines.pop()
+    if not raw_lines:
+        return None
+    prose = _non_code_prose_lines(entry_text)
+    for block in blocks:
+        block_lines = block.splitlines()
+        if not block_lines:
+            continue
+        matched = _try_match_rows_to_block(raw_lines, block_lines)
+        if matched is None and len(raw_lines) >= 2 and "copy" in raw_lines[0].lower():
+            matched = _try_match_rows_to_block(raw_lines[1:], block_lines, anchor_start=True)
+        if matched is not None and (
+            has_code_chrome
+            or not all(line.strip() in prose for line in matched.splitlines() if line.strip())
+        ):
+            return matched
+    return None
+
+
 def _command_insertion(invocation: str) -> str:
     """Turn a display invocation into editable composer text."""
 
-    if invocation.startswith("@"):
+    if invocation.startswith(("@", "$")):
         return invocation if invocation.endswith(" ") else f"{invocation} "
     if invocation.startswith("/model --global"):
         return "/model --global "
@@ -445,13 +669,14 @@ def _cursor_index(text: str, cursor_location: tuple[int, int] | None = None) -> 
     if cursor_location is None:
         return len(text)
     row, col = cursor_location
-    if (row, col) == (0, 0) and text:
-        return len(text)
+    if row < 0:
+        return 0
     lines = text.split("\n")
     if row >= len(lines):
         return len(text)
-    offset = sum(len(line) + 1 for line in lines[: max(row, 0)])
-    return min(offset + max(col, 0), len(text))
+    line = lines[row]
+    offset = sum(len(part) + 1 for part in lines[:row])
+    return min(offset + min(max(col, 0), len(line)), len(text))
 
 
 def _location_for_offset(text: str, offset: int) -> tuple[int, int]:
@@ -482,6 +707,28 @@ def _replace_active_mention(
     return updated, _location_for_offset(updated, len(prefix) + len(insertion))
 
 
+def _active_skill(text: str, cursor_location: tuple[int, int] | None = None) -> str | None:
+    head = text[: _cursor_index(text, cursor_location)]
+    match = _ACTIVE_SKILL_RE.search(head)
+    return f"${match.group(1)}" if match else None
+
+
+def _replace_active_skill(
+    text: str, insertion: str, cursor_location: tuple[int, int] | None = None
+) -> tuple[str, tuple[int, int]]:
+    pos = _cursor_index(text, cursor_location)
+    head = text[:pos]
+    tail = text[pos:]
+    match = _ACTIVE_SKILL_RE.search(head)
+    if match is None:
+        prefix = f"{head.rstrip()} " if head.rstrip() else ""
+        updated = f"{prefix}{insertion}{tail}"
+        return updated, _location_for_offset(updated, len(prefix) + len(insertion))
+    prefix = head[: match.start()]
+    updated = f"{prefix}{insertion}{tail}"
+    return updated, _location_for_offset(updated, len(prefix) + len(insertion))
+
+
 def _relative_age(timestamp: float) -> str:
     seconds = max(0, int(time.time() - timestamp))
     if seconds < 60:
@@ -495,11 +742,190 @@ def _relative_age(timestamp: float) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(timestamp))
 
 
+def _is_mock_object(value: Any) -> bool:
+    return type(value).__module__.startswith("unittest.mock")
+
+
+@dataclass(frozen=True)
+class _MCPPresetFallback:
+    key: str
+    label: str
+    description: str
+    transport: str
+    target: str
+    env_var: str | None = None
+
+
+_FALLBACK_MCP_PRESETS: tuple[_MCPPresetFallback, ...] = (
+    _MCPPresetFallback(
+        "context7",
+        "Context7",
+        "Up-to-date library & framework docs",
+        "stdio",
+        "npx -y @upstash/context7-mcp",
+    ),
+    _MCPPresetFallback(
+        "playwright",
+        "Playwright",
+        "Browser automation & UI verification",
+        "stdio",
+        "npx -y @playwright/mcp@latest",
+    ),
+    _MCPPresetFallback(
+        "filesystem",
+        "Filesystem",
+        "Scoped local directory access",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-filesystem .",
+    ),
+    _MCPPresetFallback(
+        "fetch",
+        "Fetch",
+        "Web page & Markdown fetcher",
+        "stdio",
+        "uvx mcp-server-fetch",
+    ),
+    _MCPPresetFallback(
+        "memory",
+        "Memory",
+        "Persistent knowledge graph memory",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-memory",
+    ),
+    _MCPPresetFallback(
+        "sequential-thinking",
+        "Sequential Thinking",
+        "Structured multi-step problem decomposition",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-sequential-thinking",
+    ),
+    _MCPPresetFallback(
+        "github",
+        "GitHub",
+        "Issues, PRs, code search & actions",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-github",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+    ),
+    _MCPPresetFallback(
+        "postgres",
+        "PostgreSQL",
+        "Read-only SQL schema & query inspection",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-postgres",
+        "POSTGRES_URL",
+    ),
+    _MCPPresetFallback(
+        "brave-search",
+        "Brave Search",
+        "Web & documentation search API",
+        "stdio",
+        "npx -y @modelcontextprotocol/server-brave-search",
+        "BRAVE_API_KEY",
+    ),
+    _MCPPresetFallback(
+        "linear",
+        "Linear",
+        "Issues, cycles, and project tracking",
+        "http",
+        "https://mcp.linear.app/mcp",
+    ),
+    _MCPPresetFallback(
+        "sentry",
+        "Sentry",
+        "Production errors, stacktraces & releases",
+        "http",
+        "https://mcp.sentry.dev/mcp",
+    ),
+    _MCPPresetFallback(
+        "cloudflare-docs",
+        "Cloudflare Docs",
+        "Workers, R2, D1 & platform documentation",
+        "http",
+        "https://docs.mcp.cloudflare.com/mcp",
+    ),
+)
+
+
+def _resolve_mcp_presets(host: Any) -> list[Any]:
+    getter = getattr(host, "list_mcp_presets", None)
+    if callable(getter):
+        with contextlib.suppress(Exception):
+            raw = getter()
+            if isinstance(raw, (list, tuple)) and raw and all(
+                not _is_mock_object(item)
+                and isinstance(getattr(item, "key", getattr(item, "name", None)), str)
+                for item in raw
+            ):
+                return list(raw)
+    with contextlib.suppress(ImportError, AttributeError):
+        from noah_code import mcp_setup as _mcp_mod
+
+        fn = getattr(_mcp_mod, "list_mcp_presets", None)
+        if callable(fn):
+            items = list(fn() or ())
+            if items:
+                return items
+        const_items = getattr(_mcp_mod, "MCP_PRESETS", None)
+        if isinstance(const_items, (list, tuple)) and const_items:
+            return list(const_items)
+    return list(_FALLBACK_MCP_PRESETS)
+
+
+def _build_base_commands(custom: Any) -> list[CommandSuggestion]:
+    custom_map = custom if isinstance(custom, dict) else None
+    suggestions = list(all_command_suggestions(custom_map))
+    has_resume = any(
+        (parse_slash(item.invocation) or ("", ""))[0] == "resume"
+        for item in suggestions
+    )
+    if not has_resume:
+        resume_suggestion = CommandSuggestion(
+            "/resume",
+            "Pick up right where you left off from the last 3 chats in this repo",
+            "Session",
+        )
+        insert_at = next(
+            (
+                idx + 1
+                for idx, item in enumerate(suggestions)
+                if (parse_slash(item.invocation) or ("", ""))[0] == "continue"
+            ),
+            len(suggestions),
+        )
+        suggestions.insert(insert_at, resume_suggestion)
+    return suggestions
+
+
+class TranscriptFindInput(Input):
+    """Inline find field with Enter/Shift+Enter match stepping and Esc close."""
+
+    async def _on_key(self, event: events.Key) -> None:
+        app = self.app
+        if event.key == "escape":
+            event.stop()
+            event.prevent_default()
+            app.close_transcript_find()  # type: ignore[attr-defined]
+            return
+        if event.key in {"enter", "down"}:
+            event.stop()
+            event.prevent_default()
+            app.step_transcript_find(1)  # type: ignore[attr-defined]
+            return
+        if event.key in {"shift+enter", "up"}:
+            event.stop()
+            event.prevent_default()
+            app.step_transcript_find(-1)  # type: ignore[attr-defined]
+            return
+        await super()._on_key(event)
+
+
 class ComposerTextArea(TextArea):
     """Composer with send/newline behavior and inline suggestion navigation."""
 
     BINDINGS = [
         Binding("ctrl+a", "select_all", "Select all", show=False),
+        Binding("ctrl+e", "app.edit_prompt_external", "Editor", show=False),
         Binding("ctrl+home", "cursor_document(False)", show=False),
         Binding("ctrl+end", "cursor_document(True)", show=False),
         Binding("ctrl+shift+home", "cursor_document(False, True)", show=False),
@@ -507,6 +933,40 @@ class ComposerTextArea(TextArea):
         Binding("f6", "app.notice_details", show=False),
         Binding("f7", "app.context_visibility", show=False),
     ]
+
+    _cursor_from_load: bool = False
+    _loading_text: bool = False
+
+    def load_text(self, text: str) -> None:
+        self._loading_text = True
+        try:
+            self._cursor_from_load = bool(text)
+            super().load_text(text)
+        finally:
+            self._loading_text = False
+
+    def move_cursor(
+        self,
+        location: tuple[int, int],
+        select: bool = False,
+        center: bool = False,
+        record_width: bool = True,
+    ) -> None:
+        was_from_load = self._cursor_from_load
+        if not self._loading_text:
+            self._cursor_from_load = False
+        super().move_cursor(
+            location, select=select, center=center, record_width=record_width
+        )
+        if was_from_load and not self._loading_text and self.is_mounted:
+            self.post_message(self.SelectionChanged(self.selection, self))
+
+    def _watch_selection(
+        self, previous_selection: DocumentSelection, selection: DocumentSelection
+    ) -> None:
+        if not self._loading_text:
+            self._cursor_from_load = False
+        super()._watch_selection(previous_selection, selection)
 
     def action_cursor_document(self, end: bool, select: bool = False) -> None:
         self.move_cursor(self.document.end if end else (0, 0), select=select)
@@ -550,6 +1010,29 @@ class ComposerTextArea(TextArea):
             event.prevent_default()
             app.close_suggestions()  # type: ignore[attr-defined]
             return
+        if (
+            not suggestions_open
+            and self.selection.is_empty
+            and event.key == "up"
+            and self.cursor_location[0] == 0
+        ):
+            cycle = getattr(app, "cycle_composer_history", None)
+            if callable(cycle) and cycle(-1):
+                event.stop()
+                event.prevent_default()
+                return
+        if (
+            not suggestions_open
+            and self.selection.is_empty
+            and event.key == "down"
+            and getattr(app, "_history_index", None) is not None
+            and self.cursor_location[0] == self.document.line_count - 1
+        ):
+            cycle = getattr(app, "cycle_composer_history", None)
+            if callable(cycle) and cycle(1):
+                event.stop()
+                event.prevent_default()
+                return
         if event.key in {"tab", "shift+tab"}:
             event.stop()
             event.prevent_default()
@@ -679,6 +1162,10 @@ class NoahCodeApp(App[None]):
         Binding("alt+up", "recall_queued_prompt", "Recall queued", show=False),
         Binding("alt+e", "reasoning_setup", "Reasoning", show=False),
         Binding("ctrl+b", "toggle_mode", "Build/Plan", show=True),
+        Binding("ctrl+e", "edit_prompt_external", "Editor", show=False),
+        Binding("ctrl+f", "find_in_transcript", "Find", show=False, priority=True),
+        Binding("alt+c", "copy_latest_code", "Copy code", show=False),
+        Binding("alt+i", "work_ledger", "Inspect", show=False),
         Binding("alt+enter", "expand_composer", "Expand prompt", show=False),
         Binding("alt+z", "restore_draft", "Restore draft", show=False),
         Binding("ctrl+d", "review_changes", "Review", show=True, priority=True),
@@ -752,8 +1239,16 @@ class NoahCodeApp(App[None]):
         self._available_update: UpdateStatus | None = None
         self._stream_fragments: list[tuple[str, str]] = []
         self._model_preview = ""
+        self._model_reasoning_preview = ""
+        self._model_thinking_chars = 0
         self._model_call_id = ""
+        self._model_preview_timer: Timer | None = None
+        self._model_preview_dirty = False
+        self._cached_plan_stat: tuple[int, int] | None = None
+        self._cached_plan_text = ""
         self._activities: dict[str, ActivityRecord] = {}
+        self._subagent_roster: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._subagent_logged_queued: set[str] = set()
         self._activity_seq = itertools.count(1)
         self._activity_history: deque[ActivityRecord] = deque(maxlen=MAX_ACTIVITY_HISTORY)
         self._timeline_history: deque[ActivityRecord] = deque(maxlen=MAX_TIMELINE_HISTORY)
@@ -776,15 +1271,26 @@ class NoahCodeApp(App[None]):
         self._suggestion_matches: list[CommandSuggestion] = []
         self._suggestion_index = 0
         self._skip_suggestion_text: str | None = None
-        self._base_commands = all_command_suggestions(host._custom_commands)
+        self._base_commands = _build_base_commands(host._custom_commands)
         self._recent_commands: deque[str] = deque(maxlen=8)
         self._config_commands: list[CommandSuggestion] | None = None
         self._composer_rows = 4
         self._composer_expanded = False
         self._composer_drafts: list[str] = []
-        self._input_context_signature = ""
+        self._history_index: int | None = None
+        self._history_stash = ""
+        self._history_prompts: list[str] = []
+        self._history_applied_text: str | None = None
+        self._find_matches: list[int] = []
+        self._find_index = -1
+        self._input_context_signature: object = None
         self._app_mounted = False
         host.on_session_changed = lambda _meta: self.call_later(self._session_changed)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "find_in_transcript" and isinstance(self.screen, ModalScreen):
+            return False
+        return super().check_action(action, parameters)
 
     @property
     def suggestions_open(self) -> bool:
@@ -808,6 +1314,12 @@ class NoahCodeApp(App[None]):
                     _welcome_renderable(self.theme_palette),
                     id="welcome",
                 )
+                with Horizontal(id="transcript-find-bar"):
+                    yield TranscriptFindInput(
+                        placeholder="Find in transcript… (Enter next · Shift+Enter prev · Esc close)",
+                        id="transcript-find-input",
+                    )
+                    yield Static("", id="transcript-find-count", markup=False)
                 yield SelectableRichLog(
                     id="conversation",
                     markup=False,
@@ -817,10 +1329,11 @@ class NoahCodeApp(App[None]):
                     min_width=0,
                     max_lines=MAX_TRANSCRIPT_LINES,
                 )
+                yield Static("", id="model-stream-preview", markup=False)
+                yield Static("", id="subagent-strip", markup=False)
                 with Horizontal(id="working-banner"):
                     yield Static("", id="working-loader")
                     yield Static("", id="working-status")
-                yield Static("", id="model-stream-preview", markup=False)
                 with Vertical(id="live-activity"):
                     yield Static("", id="activity-title")
                     yield SelectableRichLog(
@@ -874,6 +1387,10 @@ class NoahCodeApp(App[None]):
             self.call_after_refresh(self.action_onboarding)
         elif self._agent_ready:
             self._load_recent_history()
+            if getattr(self.host, "_open_resume_on_start", False) is True:
+                host_any: Any = self.host
+                host_any._open_resume_on_start = False
+                self.call_after_refresh(self.action_resume_session)
         else:
             self._set_agent_state(AgentDisplayState.STARTING)
             self._pre_prompt_status = "Starting Noah…"
@@ -888,6 +1405,7 @@ class NoahCodeApp(App[None]):
             self._loader_timer,
             self._status_timer,
             self._stream_timer,
+            self._model_preview_timer,
             self._notice_timer,
             self._resize_timer,
         ):
@@ -895,6 +1413,7 @@ class NoahCodeApp(App[None]):
                 timer.stop()
         self._loader_timer = None
         self._status_timer = None
+        self._model_preview_timer = None
         self._resize_timer = None
 
     def apply_theme(self, name: str) -> None:
@@ -911,6 +1430,13 @@ class NoahCodeApp(App[None]):
             layout=False,
         )
         self._rerender_transcript()
+        if self._model_preview:
+            self._render_model_stream_preview()
+        subagent_strip = self.query_one_optional("#subagent-strip", Static)
+        if subagent_strip is not None:
+            subagent_strip.styles.background = self.theme_palette.surface
+            subagent_strip.styles.border_left = ("tall", self.theme_palette.accent)
+        self._update_subagent_strip()
         self._working_loader_signature = None
         self._working_status_signature = None
         self._activity_title_signature = None
@@ -1022,7 +1548,7 @@ class NoahCodeApp(App[None]):
             self._onboarding_required = False
             self._set_agent_state(AgentDisplayState.READY)
             self._pre_prompt_status = "Ready for your first prompt"
-            self._base_commands = all_command_suggestions(self.host._custom_commands)
+            self._base_commands = _build_base_commands(self.host._custom_commands)
             self.query_one("#welcome", Static).update(
                 _welcome_renderable(self.theme_palette),
                 layout=False,
@@ -1049,6 +1575,10 @@ class NoahCodeApp(App[None]):
                 pending = self._pending_submit
                 self._pending_submit = None
                 self._run_turn(pending)
+            elif getattr(self.host, "_open_resume_on_start", False) is True:
+                host_any: Any = self.host
+                host_any._open_resume_on_start = False
+                self.call_after_refresh(self.action_resume_session)
         finally:
             self.ui.set_busy(False)
             self.update_chrome(force=True)
@@ -1127,13 +1657,19 @@ class NoahCodeApp(App[None]):
             and self._agent_state in _ANIMATED_STATES
         )
 
+    def _has_active_subagents(self) -> bool:
+        return any(
+            item.get("state") in {"queued", "running"}
+            for item in self._subagent_roster.values()
+        )
+
     def _sync_status_timers(self) -> None:
         if self._loader_timer is not None:
             (self._loader_timer.resume if self._animation_active() else self._loader_timer.pause)()
         if self._status_timer is not None:
             (
                 self._status_timer.resume
-                if self._working_state_visible()
+                if self._working_state_visible() or self._has_active_subagents()
                 else self._status_timer.pause
             )()
 
@@ -1147,6 +1683,8 @@ class NoahCodeApp(App[None]):
     def _refresh_working_status(self) -> None:
         """Refresh elapsed time at 1 Hz without touching the animated loader."""
 
+        if self._has_active_subagents():
+            self._update_subagent_strip()
         if not self._working_state_visible():
             return
         self._update_working_status()
@@ -1154,17 +1692,152 @@ class NoahCodeApp(App[None]):
         if self.screen.has_class("wide") and time.monotonic() - self._repository_refreshed_at >= 5:
             self._refresh_repository_snapshot()
 
+    def _update_subagent_strip(self) -> None:
+        """Render the live multi-subagent coordination card above the working banner."""
+
+        strip = self.query_one_optional("#subagent-strip", Static)
+        if strip is None:
+            return
+        if not self._subagent_roster:
+            strip.update("", layout=False)
+            strip.styles.display = "none"
+            return
+
+        palette = self.theme_palette
+        items = list(self._subagent_roster.values())
+        running = sum(1 for item in items if item.get("state") in {"queued", "running"})
+        done = sum(1 for item in items if item.get("state") == "completed")
+        failed = sum(1 for item in items if item.get("state") == "failed")
+        needs_input = sum(1 for item in items if item.get("state") == "needs_input")
+        workflow = next(
+            (str(item["workflow"]) for item in items if item.get("workflow")),
+            "",
+        )
+
+        content = Text()
+        content.append("⬡ SUBAGENTS", style=f"bold {palette.accent}")
+        content.append(
+            f" · {running} running",
+            style=f"bold {palette.warning}" if running else palette.muted,
+        )
+        content.append(
+            f" · {done} done",
+            style=palette.success if done else palette.muted,
+        )
+        if needs_input:
+            content.append(f" · {needs_input} input needed", style=palette.warning)
+        if failed:
+            content.append(f" · {failed} failed", style=palette.error)
+        if workflow:
+            content.append(f" · {workflow}", style=palette.accent)
+        content.append("  ·  ", style=palette.muted)
+        content.append(
+            "F4 / Alt+I inspect",
+            style=Style(color=palette.accent, meta={"@click": "app.work_ledger"}),
+        )
+
+        active_rows = [
+            item for item in items if item.get("state") in {"queued", "running", "needs_input"}
+        ]
+        finished_rows = list(
+            reversed(
+                [
+                    item
+                    for item in items
+                    if item.get("state") not in {"queued", "running", "needs_input"}
+                ]
+            )
+        )
+        ordered = active_rows + finished_rows
+        shown = ordered[:5]
+        extra = len(ordered) - len(shown)
+        now = time.monotonic()
+
+        for item in shown:
+            state = str(item.get("state", "running"))
+            if state in {"running", "queued"}:
+                icon, icon_style = "●", f"bold {palette.warning}"
+            elif state == "completed":
+                icon, icon_style = "✓", f"bold {palette.success}"
+            elif state == "needs_input":
+                icon, icon_style = "!", f"bold {palette.warning}"
+            elif state == "failed":
+                icon, icon_style = "✗", f"bold {palette.error}"
+            else:
+                icon, icon_style = "○", palette.muted
+
+            started_at = float(item.get("started_at", now) or now)
+            finished_at = item.get("finished_at")
+            raw_duration = float(item.get("duration", 0.0) or 0.0)
+            if state in {"queued", "running"}:
+                elapsed = max(raw_duration, now - started_at)
+            elif raw_duration > 0:
+                elapsed = raw_duration
+            else:
+                end_time = float(finished_at) if finished_at is not None else now
+                elapsed = max(0.0, end_time - started_at)
+
+            current_action = str(item.get("current_action", "") or "").strip()
+            prompt_text = str(item.get("prompt", "") or "").strip()
+            if state in {"running", "queued"}:
+                if current_action:
+                    detail_text = _truncate_middle(current_action, 42)
+                elif prompt_text:
+                    detail_text = _truncate_middle(prompt_text, 42)
+                else:
+                    detail_text = "Queued" if state == "queued" else "Starting…"
+            elif state == "completed":
+                detail_text = "Completed"
+            elif state == "needs_input":
+                detail_text = "Input needed"
+            elif state == "failed":
+                detail_text = "Failed"
+            else:
+                detail_text = "Cancelled"
+
+            content.append("\n  ")
+            content.append(icon, style=icon_style)
+            content.append(f" {item.get('agent', 'agent')}", style=f"bold {palette.text}")
+            if item.get("isolated"):
+                content.append(" [worktree]", style=palette.accent)
+            if item.get("phase"):
+                content.append(f" ({item['phase']})", style=palette.muted)
+            content.append(f"  {detail_text}", style=palette.text)
+            step_count = int(item.get("step_count", 0) or 0)
+            if step_count > 0:
+                content.append(f" · step {step_count}", style=palette.muted)
+            content.append(f" · {elapsed:.1f}s", style=palette.muted)
+
+        if extra > 0:
+            content.append(
+                f"\n  +{extra} more in F4",
+                style=Style(color=palette.accent, meta={"@click": "app.work_ledger"}),
+            )
+
+        strip.update(content, layout=False)
+        strip.styles.display = "block"
+
     @work(exclusive=True, group="repository-status")
     async def _refresh_repository_snapshot(self) -> None:
         self._repository_refreshed_at = time.monotonic()
-        snapshot = await asyncio.to_thread(
-            _read_repository_snapshot,
-            self.host.workspace.root,
-        )
+        root = Path(self.host.workspace.root)
+        prev_sig = self._cached_plan_stat
+        prev_text = self._cached_plan_text
+
+        def _probe() -> tuple[RepositorySnapshot | None, tuple[int, int] | None, str]:
+            snap = _read_repository_snapshot(root)
+            p_sig, p_text = _read_plan_cached_state(root, prev_sig, prev_text)
+            return snap, p_sig, p_text
+
+        snapshot, plan_sig, plan_text = await asyncio.to_thread(_probe)
         was_loaded = self._repository_status_loaded
         self._repository_status_loaded = True
         if not was_loaded or snapshot != self._repository_snapshot:
             self._repository_snapshot = snapshot
+            self._rail_dirty = True
+        if plan_sig != self._cached_plan_stat or plan_text != self._cached_plan_text:
+            self._cached_plan_stat = plan_sig
+            self._cached_plan_text = plan_text
             self._rail_dirty = True
         self.update_chrome()
 
@@ -1474,26 +2147,71 @@ class NoahCodeApp(App[None]):
                 with contextlib.suppress(Exception):
                     self.query_one("#context-rail-content", Static).update(rail, layout=False)
             self._rail_dirty = False
+        if force:
+            self._input_context_signature = None
         self._update_input_context()
         self._update_working_banner()
 
     def _update_context_hint(self, hint: str) -> None:
         """Render contextual keys with pi-style session telemetry when it fits."""
 
-        telemetry = ""
+        palette = self.theme_palette
+        ctx_span: Text | None = None
+        full_usage = ""
+        short_usage = ""
+        cost_only = ""
         with contextlib.suppress(AttributeError, TypeError, ValueError):
             usage = self.host.usage_snapshot()
+            last_in = int(getattr(usage, "last_input_tokens", 0) or 0)
+            ctx_win = int(getattr(usage, "context_window", 0) or 0)
+            if last_in > 0 and ctx_win > 0:
+                pct = last_in / ctx_win
+                ctx_color = (
+                    palette.error
+                    if pct >= 0.90
+                    else palette.warning
+                    if pct >= 0.70
+                    else palette.muted
+                )
+                ctx_span = Text(
+                    f"ctx {last_in / 1000:.1f}k/{ctx_win // 1000}k ({pct:.0%})",
+                    style=Style(color=ctx_color, meta={"@click": "app.context_visibility"}),
+                )
             prompt_tokens = int(usage.prompt_tokens)
             completion_tokens = int(usage.completion_tokens)
             cost = float(usage.cost_usd)
             if prompt_tokens or completion_tokens or cost:
-                telemetry = f"↑{prompt_tokens:,}  ↓{completion_tokens:,}"
+                full_usage = f"↑{prompt_tokens:,}  ↓{completion_tokens:,}"
                 if prompt_tokens:
-                    telemetry += f"  {float(usage.cache_hit_ratio):.0%} cache"
-                telemetry += f"  ${cost:.4f}"
+                    full_usage += f"  {float(usage.cache_hit_ratio):.0%} cache"
+                full_usage += f"  ${cost:.4f}"
+                short_usage = f"↑{prompt_tokens:,} ↓{completion_tokens:,} ${cost:.4f}"
+                cost_only = f"${cost:.4f}"
+
         available = max(self.size.width - 6, 0)
-        gap = available - len(hint) - len(telemetry)
-        palette = self.theme_palette
+        candidates: list[Text] = []
+        if ctx_span is not None and full_usage:
+            for extra in (full_usage, short_usage, cost_only, ""):
+                cand = ctx_span.copy()
+                if extra:
+                    cand.append(f"  {extra}", style=palette.muted)
+                candidates.append(cand)
+        elif ctx_span is not None:
+            candidates.append(ctx_span)
+        elif full_usage:
+            candidates.append(Text(full_usage, style=palette.muted))
+            if short_usage != full_usage:
+                candidates.append(Text(short_usage, style=palette.muted))
+
+        telemetry_renderable: Text | None = None
+        gap = 0
+        for cand in candidates:
+            cand_gap = available - len(hint) - cand.cell_len
+            if cand_gap >= 3:
+                telemetry_renderable = cand
+                gap = cand_gap
+                break
+
         actions = {
             "Enter send": "submit", "Enter queue": "submit",
             "/ commands": "palette", "Ctrl+P commands": "palette",
@@ -1515,9 +2233,9 @@ class NoahCodeApp(App[None]):
                 style=Style(color=palette.text, meta={"@click": f"app.{action}"})
                 if action else palette.muted,
             )
-        if telemetry and gap >= 3:
+        if telemetry_renderable is not None and gap >= 3:
             content.append(" " * gap)
-            content.append(telemetry, style=palette.muted)
+            content.append_text(telemetry_renderable)
         with contextlib.suppress(Exception):
             self.query_one("#context-hint", Static).update(content, layout=False)
 
@@ -1532,26 +2250,61 @@ class NoahCodeApp(App[None]):
         queue = getattr(self.host, "steer_queue", None)
         queue_items_getter = getattr(queue, "items", None)
         queued = list(queue_items_getter()) if callable(queue_items_getter) else []
-        parts: list[str] = []
-        if pending:
-            names = ", ".join(path.name for path in pending[:3])
-            if len(pending) > 3:
-                names += f" +{len(pending) - 3}"
-            parts.append(f"ATTACHED  {names}")
-        if queued:
-            preview = " ".join(str(queued[0].text).split())[:44]
-            state = "PAUSED" if getattr(self.host, "queue_paused", False) is True else "QUEUED"
-            parts.append(f"{state}  {len(queued)} · {preview}")
-        value = "   ".join(parts)
-        if value:
-            value += "   F5 manage"
-        if value == self._input_context_signature:
+        paused = getattr(self.host, "queue_paused", False) is True
+        signature = (
+            tuple(str(path) for path in pending),
+            paused,
+            tuple(str(item.text) for item in queued),
+            self._theme_name,
+        )
+        if signature == self._input_context_signature:
             return
-        self._input_context_signature = value
+        self._input_context_signature = signature
+        palette = self.theme_palette
+        content = Text(no_wrap=True, overflow="ellipsis")
+        if pending:
+            content.append("ATTACHED  ", style=palette.muted)
+            for idx, path in enumerate(pending[:4]):
+                if idx > 0:
+                    content.append(" ", style=palette.muted)
+                content.append(
+                    f"[× {path.name}]",
+                    style=Style(
+                        color=palette.accent,
+                        meta={"@click": f"app.remove_attachment({idx})"},
+                    ),
+                )
+            if len(pending) > 4:
+                content.append(f" +{len(pending) - 4}", style=palette.muted)
+        if queued:
+            if pending:
+                content.append("   ", style=palette.muted)
+            preview = " ".join(str(queued[0].text).split())[:44]
+            state = "PAUSED" if paused else "QUEUED"
+            content.append(
+                f"{state}  {len(queued)} · {preview}",
+                style=palette.warning if paused else palette.muted,
+            )
+        has_items = bool(pending or queued)
+        if has_items:
+            content.append("   ", style=palette.muted)
+            content.append(
+                "F5 manage",
+                style=Style(color=palette.accent, meta={"@click": "app.queue_manager"}),
+            )
         with contextlib.suppress(Exception):
             widget = self.query_one("#input-context", Static)
-            widget.update(value, layout=False)
-            widget.styles.display = "block" if value else "none"
+            widget.update(content if has_items else "", layout=False)
+            widget.styles.display = "block" if has_items else "none"
+
+    def action_remove_attachment(self, index: int) -> None:
+        remover = getattr(self.host, "remove_pending_attach", None)
+        removed = remover(index) if callable(remover) else None
+        self._rail_dirty = True
+        self.update_chrome(force=True)
+        if removed is not None:
+            name = getattr(removed, "name", str(removed))
+            self._show_notice(f"Removed attachment {name}", temporary=True)
 
     def _build_rail_text(self) -> Text:
         palette = self.theme_palette
@@ -1608,11 +2361,12 @@ class NoahCodeApp(App[None]):
                 candidate = self.host.agent.todos.list_todos()
                 if isinstance(candidate, list):
                     todos = candidate
-        plan_text = ""
-        with contextlib.suppress(Exception):
-            from noah_code.project_notes import PlanStore
-
-            plan_text = PlanStore(self.host.workspace.root).read().strip()
+        self._cached_plan_stat, self._cached_plan_text = _read_plan_cached_state(
+            Path(self.host.workspace.root),
+            self._cached_plan_stat,
+            self._cached_plan_text,
+        )
+        plan_text = self._cached_plan_text
         if todos or plan_text:
             text.append("\n\nPlan\n", style=f"bold {palette.accent}")
             if plan_text:
@@ -1634,25 +2388,82 @@ class NoahCodeApp(App[None]):
                     text.append(f"\n+{remaining} more · /todos", style=palette.muted)
 
         work = self.host.work_snapshot()
-        agents = [
-            item for item in reversed(work["agents"])
+        raw_agents = list(work.get("agents", [])) if isinstance(work, dict) else []
+        merged_agents: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        for item in raw_agents:
+            aid = str(item.get("id") or item.get("agent") or f"agent-{len(merged_agents)}")
+            merged_agents[aid] = dict(item)
+        for aid, live in self._subagent_roster.items():
+            if aid in merged_agents:
+                merged_agents[aid].update(
+                    {k: v for k, v in live.items() if v or k not in merged_agents[aid]}
+                )
+            else:
+                merged_agents[aid] = dict(live)
+        all_agents = list(merged_agents.values())
+        active_or_attention_agents = [
+            item
+            for item in reversed(all_agents)
             if item.get("state") in {"queued", "running", "needs_input", "failed"}
         ]
-        agents.sort(key=lambda item: item.get("state") not in {"needs_input", "failed"})
-        jobs = [item for item in work["jobs"] if item.get("state") in {"running", "stopping"}]
-        if agents or jobs:
-            text.append("\n\nWork\n", style=f"bold {palette.accent}")
-            for item in agents[:3]:
+        active_or_attention_agents.sort(
+            key=lambda item: item.get("state") not in {"needs_input", "failed"}
+        )
+        sidebar_agents = (
+            active_or_attention_agents
+            if active_or_attention_agents
+            else (list(reversed(all_agents)) if self._subagent_roster else [])
+        )
+        jobs = [
+            item
+            for item in (work.get("jobs", []) if isinstance(work, dict) else [])
+            if item.get("state") in {"running", "stopping"}
+        ]
+        if sidebar_agents:
+            text.append("\n\nAgents\n", style=f"bold {palette.accent}")
+            running_cnt = sum(
+                1 for item in all_agents if item.get("state") in {"queued", "running"}
+            )
+            done_cnt = sum(1 for item in all_agents if item.get("state") == "completed")
+            if len(all_agents) > 1 or self._subagent_roster:
+                text.append(f"{running_cnt} active · {done_cnt} done\n", style=palette.muted)
+            for item in sidebar_agents[:3]:
                 attention = item.get("state") in {"needs_input", "failed"}
-                state = "Input needed" if item.get("state") == "needs_input" else str(item.get("state"))
+                state = (
+                    "Input needed"
+                    if item.get("state") == "needs_input"
+                    else str(item.get("state", "running"))
+                )
+                badge = " [worktree]" if item.get("isolated") else ""
                 text.append(
-                    f"{state} · {item.get('agent', 'agent')}\n",
+                    f"{state} · {item.get('agent', 'agent')}{badge}\n",
                     style=palette.warning if attention else palette.text,
                 )
                 if item.get("workflow"):
-                    text.append(f"{item['workflow']} / {item.get('phase', '')}\n", style=palette.muted)
-                if item.get("prompt"):
-                    text.append(f"{_truncate_middle(str(item['prompt']), 29)}\n", style=palette.muted)
+                    text.append(
+                        f"{item['workflow']} / {item.get('phase', '')}\n",
+                        style=palette.muted,
+                    )
+                cur_act = str(item.get("current_action", "") or "").strip()
+                steps = int(item.get("step_count", 0) or 0)
+                if cur_act:
+                    step_tag = f" · s{steps}" if steps > 0 else ""
+                    text.append(
+                        f"{_truncate_middle(cur_act, 25)}{step_tag}\n",
+                        style=palette.muted,
+                    )
+                if item.get("prompt") and (not cur_act or attention):
+                    text.append(
+                        f"{_truncate_middle(str(item['prompt']), 29)}\n",
+                        style=palette.muted,
+                    )
+            if not jobs:
+                text.append(
+                    "F4 inspect work",
+                    style=Style(color=palette.accent, meta={"@click": "app.work_ledger"}),
+                )
+        if jobs:
+            text.append("\n\nWork\n", style=f"bold {palette.accent}")
             for item in jobs[:2]:
                 text.append(
                     f"{item.get('state')} · {item.get('name', 'job')}\n", style=palette.text
@@ -1670,6 +2481,58 @@ class NoahCodeApp(App[None]):
     def _at_transcript_end(self) -> bool:
         log = self.query_one("#conversation", RichLog)
         return log.is_vertical_scroll_end or len(log.lines) == 0
+
+    def _replace_last_transcript_entry(
+        self,
+        updated_entry: TranscriptEntry,
+        *,
+        at_end: bool,
+    ) -> None:
+        """Update the trailing transcript entry in O(1) without clearing RichLog."""
+
+        self._transcript_entries[-1] = updated_entry
+        log = self.query_one("#conversation", SelectableRichLog)
+        if (
+            len(self._transcript_line_counts) != len(self._transcript_entries)
+            or self._transcript_line_counts[-1] == 0
+        ) and len(log.lines) > 0:
+            # First write after revealing #conversation had deferred rows until layout;
+            # recover exact counts from cache without touching scroll or clearing log.
+            previous_entry = updated_entry
+            if len(self._transcript_entries) == 1:
+                self._transcript_line_counts = [len(log.lines)]
+            else:
+                self._recount_transcript_rows()
+            _ = previous_entry
+        if (
+            len(self._transcript_line_counts) == len(self._transcript_entries)
+            and self._transcript_line_counts[-1] > 0
+        ):
+            old_rows = self._transcript_line_counts[-1]
+            renderable = _role_renderable(updated_entry, self.theme_palette)
+            replace_tail = getattr(log, "replace_tail_lines", None)
+            new_rows = -1
+            if callable(replace_tail):
+                res = replace_tail(old_rows, renderable, scroll_end=at_end)
+                if isinstance(res, int):
+                    new_rows = res
+            elif getattr(log, "_size_known", False) and old_rows <= len(log.lines):
+                del log.lines[-old_rows:]
+                log._line_cache.clear()
+                total_before = len(log.lines) + getattr(log, "_start_line", 0)
+                log.write(renderable, scroll_end=at_end)
+                log.refresh()
+                total_after = len(log.lines) + getattr(log, "_start_line", 0)
+                new_rows = max(total_after - total_before, 0)
+            if new_rows >= 0:
+                self._transcript_line_counts[-1] = new_rows
+                width = log.scrollable_content_region.width
+                if width > 0 and new_rows > 0:
+                    self._cache_entry_row_count(
+                        updated_entry, width, log.min_width, self.theme_palette.name, new_rows
+                    )
+                return
+        self._rerender_transcript()
 
     def _append_entry(self, entry: TranscriptEntry) -> None:
         if entry.event_id and entry.event_id in self._transcript_event_ids:
@@ -1689,19 +2552,20 @@ class NoahCodeApp(App[None]):
             merged = _coalesce_activity_text(self._transcript_entries[-1].text, entry.text)
             if merged:
                 previous = self._transcript_entries[-1]
-                self._transcript_entries[-1] = TranscriptEntry(
+                updated = TranscriptEntry(
                     previous.role,
                     merged,
                     previous.markdown,
                     previous.event_id,
                 )
-                self._rerender_transcript()
+                self._replace_last_transcript_entry(updated, at_end=at_end)
                 if not at_end:
                     self._unread_count += 1
+                    self.update_chrome()
                 return
         self._transcript_entries.append(entry)
-        if len(self._transcript_entries) > 500:
-            self._transcript_entries = self._transcript_entries[-500:]
+        if len(self._transcript_entries) >= TRANSCRIPT_TRIM_THRESHOLD:
+            self._transcript_entries = self._transcript_entries[-TRANSCRIPT_MAX_ENTRIES:]
             self._rerender_transcript()
             if not at_end:
                 self._unread_count += 1
@@ -1867,24 +2731,94 @@ class NoahCodeApp(App[None]):
         self._rail_dirty = True
         self.update_chrome()
 
+    def _clear_model_stream_preview(self) -> None:
+        if self._model_preview_timer is not None:
+            self._model_preview_timer.stop()
+            self._model_preview_timer = None
+        self._model_preview_dirty = False
+        self._model_preview = ""
+        self._model_reasoning_preview = ""
+        self._model_thinking_chars = 0
+        with contextlib.suppress(Exception):
+            preview = self.query_one("#model-stream-preview", Static)
+            preview.update("", layout=False)
+            preview.display = False
+
+    def _render_model_stream_preview(self) -> None:
+        preview = self.query_one("#model-stream-preview", Static)
+        if not self._model_preview:
+            preview.update("", layout=False)
+            preview.display = False
+            return
+        palette = self.theme_palette
+        header = Text("▌ Noah · streaming…", style=f"bold {palette.success}")
+        md_source = _close_unbalanced_markdown_fence(self._model_preview, max_tail_chars=3200)
+        body = Markdown(
+            _normalize_markdown(md_source),
+            code_theme=getattr(palette, "code_theme", "monokai"),
+            hyperlinks=True,
+            style=palette.text,
+        )
+        preview.update(Group(header, Padding(body, (0, 0, 0, 2))))
+        preview.display = True
+        with contextlib.suppress(Exception):
+            preview.scroll_end(animate=False)
+            follow = (
+                self._follow_batch
+                if self._follow_batch is not None
+                else self._at_transcript_end()
+            )
+            if follow:
+                self.query_one("#conversation", RichLog).scroll_end(animate=False)
+
+    def _flush_model_stream_preview(self) -> None:
+        self._model_preview_timer = None
+        if not self._model_preview:
+            self._model_preview_dirty = False
+            with contextlib.suppress(Exception):
+                self.query_one("#model-stream-preview", Static).display = False
+            return
+        if self._model_preview_dirty:
+            self._model_preview_dirty = False
+            self._render_model_stream_preview()
+            self._model_preview_timer = self.set_timer(
+                MODEL_STREAM_FLUSH_SECONDS,
+                self._flush_model_stream_preview,
+            )
+
     def _process_host_event(self, event: HostEvent) -> None:
         text = event.text.rstrip()
         if event.kind == HostEventKind.MODEL_STREAM:
-            preview = self.query_one("#model-stream-preview", Static)
             phase = event.meta.get("phase")
             if phase == "start":
+                self._clear_model_stream_preview()
                 self._model_call_id = str(event.meta.get("call_id", ""))
-                self._model_preview = ""
-                preview.display = False
             elif event.meta.get("call_id") == self._model_call_id:
                 if phase in {"finish", "error", "cancel"}:
-                    self._model_preview = ""
-                    preview.display = False
-                elif phase == "text" or (phase == "reasoning" and self.host.config.ui.show_reasoning):
-                    self._model_preview = (self._model_preview + event.text)[-12_000:]
-                    preview.update(Text("Generating…\n" + self._model_preview[-1800:]))
-                    preview.display = bool(self._model_preview)
+                    self._clear_model_stream_preview()
+                else:
+                    if phase == "reasoning":
+                        self._model_thinking_chars += len(event.text)
+                        self._model_reasoning_preview = (
+                            self._model_reasoning_preview + event.text
+                        )[-4_000:]
+                    if phase == "text" or (
+                        phase == "reasoning" and self.host.config.ui.show_reasoning
+                    ):
+                        self._model_preview = (self._model_preview + event.text)[-12_000:]
+                        if not self._model_preview:
+                            self._clear_model_stream_preview()
+                        elif self._model_preview_timer is None:
+                            self._model_preview_dirty = False
+                            self._render_model_stream_preview()
+                            self._model_preview_timer = self.set_timer(
+                                MODEL_STREAM_FLUSH_SECONDS,
+                                self._flush_model_stream_preview,
+                            )
+                        else:
+                            self._model_preview_dirty = True
         elif event.kind == HostEventKind.MESSAGE:
+            self._clear_model_stream_preview()
             self._session_has_prompt = True
             self._pre_prompt_status = ""
             self._finish_orphan_activity()
@@ -1945,24 +2879,86 @@ class NoahCodeApp(App[None]):
                 if self._transcript_entries and self._transcript_entries[-1].role == "RECEIPT":
                     receipt = self._transcript_entries[-1]
                     if not receipt.text.startswith("◆ "):
-                        self._transcript_entries[-1] = TranscriptEntry(
+                        at_end = (
+                            self._follow_batch
+                            if self._follow_batch is not None
+                            else self._at_transcript_end()
+                        )
+                        updated = TranscriptEntry(
                             "RECEIPT",
                             f"◆ {receipt.text}",
                             receipt.markdown,
                             receipt.event_id,
                         )
-                        self._rerender_transcript()
+                        self._replace_last_transcript_entry(updated, at_end=at_end)
                 else:
                     self._checkpoint_pending = True
             elif kind == "subagent":
+                raw_id = event.meta.get("id")
+                team_id = str(event.meta.get("team_id", "") or "")
+                agent_name = str(event.meta.get("agent", "agent") or "agent")
+                phase = str(event.meta.get("phase", "") or "")
+                if raw_id:
+                    task_id = str(raw_id)
+                elif team_id or phase:
+                    task_id = f"{team_id}:{agent_name}:{phase}"
+                else:
+                    task_id = agent_name or "subagent"
                 state = str(event.meta.get("state", "running"))
-                if state == "running":
+                current_action = str(event.meta.get("current_action", "") or "")
+                step_count = int(event.meta.get("step_count", 0) or 0)
+                isolated = bool(event.meta.get("isolated", False))
+                workflow = str(event.meta.get("workflow", "") or "")
+                duration = float(event.meta.get("duration", 0.0) or 0.0)
+                prompt = str(event.meta.get("prompt", "") or "")
+                existing = self._subagent_roster.get(task_id)
+                now = time.monotonic()
+                started_at = float(existing["started_at"]) if existing else now
+                terminal = state in {"completed", "needs_input", "failed", "cancelled"}
+                finished_at = (
+                    (existing.get("finished_at") if existing else None) or now
+                    if terminal
+                    else None
+                )
+                self._subagent_roster[task_id] = {
+                    "id": task_id,
+                    "agent": agent_name,
+                    "state": state,
+                    "current_action": current_action
+                    or (existing.get("current_action", "") if existing and not terminal else ""),
+                    "step_count": step_count
+                    or (int(existing.get("step_count", 0) or 0) if existing else 0),
+                    "isolated": isolated or bool(existing.get("isolated", False) if existing else False),
+                    "phase": phase or (existing.get("phase", "") if existing else ""),
+                    "workflow": workflow or (existing.get("workflow", "") if existing else ""),
+                    "team_id": team_id or (existing.get("team_id", "") if existing else ""),
+                    "duration": duration,
+                    "prompt": prompt or (existing.get("prompt", "") if existing else ""),
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                }
+                active_subs = [
+                    item
+                    for item in self._subagent_roster.values()
+                    if item["state"] in {"queued", "running"}
+                ]
+                running_count = len(active_subs)
+                if state in {"queued", "running"} or running_count > 0:
+                    active_name = active_subs[0]["agent"] if active_subs else agent_name
                     self._set_agent_state(
                         AgentDisplayState.RUNNING,
-                        f"Agent {event.meta.get('agent', '')}".strip(),
+                        f"{running_count} subagents active"
+                        if running_count > 1
+                        else f"Agent {active_name}".strip(),
                     )
-                if state in {"queued", "completed", "needs_input", "failed", "cancelled"}:
+                if terminal:
                     self._append_entry(TranscriptEntry("ACTIVITY", text))
+                elif state == "queued" and step_count == 0 and task_id not in self._subagent_logged_queued:
+                    self._subagent_logged_queued.add(task_id)
+                    self._append_entry(TranscriptEntry("ACTIVITY", text))
+                self._update_subagent_strip()
+                self._sync_status_timers()
+                self._rail_dirty = True
             elif kind == "background_job":
                 self._append_entry(TranscriptEntry("ACTIVITY", text))
             elif kind == "llm_start":
@@ -2153,7 +3149,20 @@ class NoahCodeApp(App[None]):
         self.query_one("#live-activity", Vertical).styles.display = "none"
         self._activity_unread_lines = 0
         if self.ui.busy:
-            self._set_agent_state(AgentDisplayState.THINKING)
+            active_subs = [
+                item
+                for item in self._subagent_roster.values()
+                if item.get("state") in {"queued", "running"}
+            ]
+            if active_subs:
+                self._set_agent_state(
+                    AgentDisplayState.RUNNING,
+                    f"{len(active_subs)} subagents active"
+                    if len(active_subs) > 1
+                    else f"Agent {active_subs[0].get('agent', '')}".strip(),
+                )
+            else:
+                self._set_agent_state(AgentDisplayState.THINKING)
         else:
             self._set_agent_state(AgentDisplayState.READY)
         self._update_working_banner()
@@ -2190,13 +3199,19 @@ class NoahCodeApp(App[None]):
         self._active_activity_id = None
         self._activity_unread_lines = 0
         self._activity_title_signature = None
-        self._model_preview = ""
+        self._subagent_roster.clear()
+        self._subagent_logged_queued.clear()
+        self._update_subagent_strip()
+        self._clear_model_stream_preview()
         self._model_call_id = ""
         with contextlib.suppress(Exception):
             self.query_one("#live-activity", Vertical).styles.display = "none"
-            preview = self.query_one("#model-stream-preview", Static)
-            preview.update("", layout=False)
-            preview.display = False
+
+    @staticmethod
+    def _effective_composer_cursor(composer: ComposerTextArea) -> tuple[int, int] | None:
+        if getattr(composer, "_cursor_from_load", False) and composer.cursor_location == (0, 0):
+            return None
+        return composer.cursor_location
 
     def _matching_command_suggestions(
         self,
@@ -2210,6 +3225,35 @@ class NoahCodeApp(App[None]):
             return [
                 CommandSuggestion(mention_text(path), "Attach workspace file", "Project")
                 for path in matches
+            ]
+        skill = _active_skill(text, cursor_location)
+        if skill is not None:
+            raw_skill_query = skill[1:].lower()
+            try:
+                infos = list(self.host.list_skill_infos())
+            except Exception:  # noqa: BLE001
+                infos = []
+            doc_skills = [info for info in infos if getattr(info, "document_skill", False)]
+            prefix_matches = [
+                info
+                for info in doc_skills
+                if str(info.name).lower().startswith(raw_skill_query)
+            ]
+            prefix_names = {str(info.name) for info in prefix_matches}
+            substring_matches = [
+                info
+                for info in doc_skills
+                if str(info.name) not in prefix_names
+                and raw_skill_query
+                in f"{info.name} {getattr(info, 'description', '')}".lower()
+            ]
+            return [
+                CommandSuggestion(
+                    f"${info.name} ",
+                    getattr(info, "description", "") or "Activate skill",
+                    "Skills",
+                )
+                for info in [*prefix_matches, *substring_matches]
             ]
         if "\n" in text:
             return []
@@ -2344,6 +3388,7 @@ class NoahCodeApp(App[None]):
         insertion = _command_insertion(invocation)
         composer = self.query_one("#composer", ComposerTextArea)
         current = composer.text
+        cursor = self._effective_composer_cursor(composer)
         if invocation.startswith("/"):
             query = current.strip().lower()
             head = invocation.split(" [", 1)[0].rstrip().lower()
@@ -2355,10 +3400,13 @@ class NoahCodeApp(App[None]):
             self._skip_suggestion_text = insertion
             composer.text = insertion
             composer.cursor_location = (0, len(insertion))
+        elif invocation.startswith("$"):
+            replaced, location = _replace_active_skill(current, insertion, cursor)
+            self._skip_suggestion_text = replaced
+            composer.text = replaced
+            composer.cursor_location = location
         else:
-            replaced, location = _replace_active_mention(
-                current, insertion, composer.cursor_location
-            )
+            replaced, location = _replace_active_mention(current, insertion, cursor)
             self._skip_suggestion_text = replaced
             composer.text = replaced
             composer.cursor_location = location
@@ -2422,15 +3470,153 @@ class NoahCodeApp(App[None]):
         composer.cursor_location = composer.document.end
         composer.focus()
 
+    def _collect_prompt_history(self) -> list[str]:
+        """Merge in-memory session prompts with cross-session persisted history."""
+
+        seen: set[str] = set()
+        prompts: list[str] = []
+        for entry in reversed(self._transcript_entries):
+            if entry.role != "YOU":
+                continue
+            prompt = entry.text.strip()
+            if prompt and prompt not in seen:
+                seen.add(prompt)
+                prompts.append(prompt)
+        getter = getattr(self.host, "list_prompt_history", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                for raw in getter() or ():
+                    if not isinstance(raw, str):
+                        continue
+                    prompt = raw.strip()
+                    if prompt and prompt not in seen:
+                        seen.add(prompt)
+                        prompts.append(prompt)
+        return prompts
+
+    def cycle_composer_history(self, delta: int) -> bool:
+        """Step backward (delta=-1) or forward (delta=+1) through prompt history."""
+
+        composer = self.query_one("#composer", ComposerTextArea)
+        if delta < 0:
+            if self._history_index is None:
+                prompts = self._collect_prompt_history()
+                if not prompts:
+                    return False
+                self._history_prompts = prompts
+                self._history_stash = composer.text
+                self._history_index = 0
+            else:
+                if not self._history_prompts:
+                    return False
+                self._history_index = min(
+                    self._history_index + 1, len(self._history_prompts) - 1
+                )
+            target = self._history_prompts[self._history_index]
+            first_line = target.split("\n", 1)[0]
+            self._history_applied_text = target
+            self._skip_suggestion_text = target
+            composer.replace(target, (0, 0), composer.document.end)
+            composer.cursor_location = (0, len(first_line))
+            self.close_suggestions()
+            return True
+        if delta > 0 and self._history_index is not None:
+            if self._history_index <= 0:
+                target = self._history_stash
+                self._history_index = None
+                self._history_prompts = []
+            else:
+                self._history_index -= 1
+                target = self._history_prompts[self._history_index]
+            self._history_applied_text = target
+            self._skip_suggestion_text = target
+            composer.replace(target, (0, 0), composer.document.end)
+            composer.cursor_location = composer.document.end
+            self.close_suggestions()
+            return True
+        return False
+
+    def _run_external_editor(self, cmd: list[str]) -> subprocess.CompletedProcess[Any]:
+        try:
+            cm = self.suspend()
+            cm.__enter__()
+        except SuspendNotSupported:
+            return subprocess.run(cmd, check=False)
+        try:
+            return subprocess.run(cmd, check=False)
+        finally:
+            cm.__exit__(*sys.exc_info())
+
+    def action_edit_prompt_external(self) -> None:
+        """Open the current composer draft in $VISUAL / $EDITOR / vi."""
+
+        if isinstance(self.screen, ModalScreen):
+            return
+        composer = self.query_one("#composer", ComposerTextArea)
+        raw_editor = (
+            (os.environ.get("VISUAL") or "").strip()
+            or (os.environ.get("EDITOR") or "").strip()
+            or "vi"
+        )
+        try:
+            editor = shlex.split(raw_editor) or ["vi"]
+        except ValueError:
+            editor = [raw_editor]
+        fd, raw_tmp = tempfile.mkstemp(prefix="noah-prompt-", suffix=".md")
+        tmp_file = Path(raw_tmp)
+        try:
+            os.chmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(composer.text)
+            result = self._run_external_editor([*editor, str(tmp_file)])
+            if result.returncode == 0 and tmp_file.is_file():
+                edited = tmp_file.read_text(encoding="utf-8").rstrip("\r\n")
+                self._skip_suggestion_text = edited
+                composer.replace(edited, (0, 0), composer.document.end)
+                composer.cursor_location = composer.document.end
+                self.close_suggestions()
+                composer.focus()
+            elif result.returncode != 0:
+                self._show_notice(
+                    f"Editor exited with code {result.returncode} · kept draft",
+                    temporary=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._show_notice(f"Could not open editor: {exc}", kind="error", temporary=True)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp_file.unlink(missing_ok=True)
+
     @on(TextArea.Changed, "#composer")
     def _composer_changed(self, event: TextArea.Changed) -> None:
         text = event.text_area.text
+        if self._history_applied_text == text:
+            self._history_applied_text = None
+        else:
+            self._history_applied_text = None
+            self._history_index = None
+            self._history_prompts = []
         if self._skip_suggestion_text == text:
             self._skip_suggestion_text = None
         else:
             self._skip_suggestion_text = None
-            self._update_command_suggestions(text, event.text_area.cursor_location)
+            cursor = self._effective_composer_cursor(event.text_area)  # type: ignore[arg-type]
+            self._update_command_suggestions(text, cursor)
         self._resize_composer(text)
+
+    @on(TextArea.SelectionChanged, "#composer")
+    def _composer_selection_changed(self, event: TextArea.SelectionChanged) -> None:
+        if not self._suggestion_matches:
+            return
+        first = self._suggestion_matches[0].invocation
+        if not first.startswith(("@", "$")):
+            return
+        text = event.text_area.text
+        cursor = self._effective_composer_cursor(event.text_area)  # type: ignore[arg-type]
+        if (first.startswith("@") and _active_mention(text, cursor) is None) or (
+            first.startswith("$") and _active_skill(text, cursor) is None
+        ):
+            self.close_suggestions()
 
     @on(ComposerTextArea.Submitted, "#composer")
     def _composer_submitted(self) -> None:
@@ -2548,8 +3734,10 @@ class NoahCodeApp(App[None]):
             ("Shift+Enter / Ctrl+J", "Insert a new line", "Composer"),
             ("/", "Search commands", "Composer"),
             ("@path", "Attach a workspace file", "Composer"),
-            ("↑ / ↓", "Move through suggestions", "Composer"),
+            ("$skill", "Activate a document skill inline", "Composer"),
+            ("↑ / ↓", "Move through suggestions or prompt history", "Composer"),
             ("Tab / Shift+Tab", "Complete suggestions or move focus forward / back", "Composer"),
+            ("Ctrl+E", "Edit the current prompt in $EDITOR", "Composer"),
             ("Ctrl+B", "Toggle Build and Plan", "Global"),
             ("Alt+Enter", "Expand or collapse the prompt editor", "Composer"),
             ("Alt+Z", "Restore a draft replaced by a picker", "Composer"),
@@ -2570,13 +3758,15 @@ class NoahCodeApp(App[None]):
             ("Ctrl+N", "Start a new session", "Global"),
             ("F2", "Search the activity timeline and captured output", "Global"),
             ("F3", "Search loaded conversation history", "Global"),
-            ("F4", "Inspect agents, jobs, and terminals", "Global"),
+            ("F4 / Alt+I", "Inspect agents, jobs, and terminals", "Global"),
             ("F5", "Manage queued prompts and attachments", "Global"),
             ("F6", "Expand the latest notice or error", "Global"),
             ("F7", "Inspect active context sources", "Global"),
             ("F8", "Show or hide the context sidebar", "Global"),
             ("F9", "Choose a team workflow", "Global"),
             ("Ctrl+D", "Review current file changes", "Global"),
+            ("Ctrl+F", "Find text in the current transcript", "Transcript"),
+            ("Alt+C", "Copy the latest fenced code block", "Transcript"),
             ("Shift+F7", "Focus or leave the scrollable context rail", "Global"),
             ("? / F1", "Search this keyboard reference", "Global"),
             ("Ctrl+]", "Jump to the latest transcript and tool output", "Transcript"),
@@ -2611,7 +3801,7 @@ class NoahCodeApp(App[None]):
 
     @work(exclusive=True, group="palette")
     async def action_palette(self) -> None:
-        rows = []
+        rows: list[tuple[str, str, str]] = []
         seen_ids: set[str] = set()
         recency = {value: index for index, value in enumerate(reversed(self._recent_commands))}
         commands = sorted(
@@ -2636,12 +3826,122 @@ class NoahCodeApp(App[None]):
                     command.description,
                 )
             )
+        ui_actions: list[tuple[str, str, str]] = [
+            (
+                "__ui_action__:review_changes",
+                "Review file changes · Ctrl+D",
+                "Open interactive Git diff review",
+            ),
+            (
+                "__ui_action__:find_in_transcript",
+                "Find in transcript · Ctrl+F",
+                "Search messages in the current conversation",
+            ),
+            (
+                "__ui_action__:work_ledger",
+                "Inspector / Work ledger · Alt+I / F4",
+                "Inspect delegated agents, jobs, and terminals",
+            ),
+            (
+                "__ui_action__:activity_history",
+                "Activity timeline · F2",
+                "Search tool runs, thoughts, and captured output",
+            ),
+            (
+                "__ui_action__:conversation_history",
+                "Conversation history · F3",
+                "Browse and search persisted session messages",
+            ),
+            (
+                "__ui_action__:context_visibility",
+                "Context & token budget · F7",
+                "Inspect active context sources and token budget",
+            ),
+            (
+                "__ui_action__:edit_prompt_external",
+                "Edit prompt in $EDITOR · Ctrl+E",
+                "Compose or edit the current draft in your external editor",
+            ),
+            (
+                "__ui_action__:copy_latest_code",
+                "Copy latest code block · Alt+C",
+                "Copy the most recent fenced code block to clipboard",
+            ),
+            (
+                "__ui_action__:sessions",
+                "Switch / manage sessions · Ctrl+O",
+                "Resume, rename, fork, delete, or branch sessions",
+            ),
+            (
+                "__ui_action__:resume_session",
+                "Resume recent chat (last 3) · /resume",
+                "Pick up right where you left off from the last 3 chats in this repo",
+            ),
+            (
+                "__ui_action__:toggle_context_rail",
+                "Toggle sidebar · F8",
+                "Show or hide the workspace context rail",
+            ),
+            (
+                "__ui_action__:toggle_mode",
+                "Switch Build / Plan mode · Ctrl+B",
+                "Toggle between Build and Plan agent modes",
+            ),
+            (
+                "__ui_action__:coding_models",
+                "Popular coding models (quick pick) · Ctrl+L",
+                "One-step picker for Claude, GPT Codex, OpenRouter, Qwen, DeepSeek, Gemini, Grok, GLM",
+            ),
+            (
+                "__ui_action__:model_setup",
+                "Choose model · Ctrl+L",
+                "Configure provider, model, and reasoning effort",
+            ),
+            (
+                "__ui_action__:reasoning_setup",
+                "Set reasoning effort · Alt+E",
+                "Change reasoning budget for the active model",
+            ),
+            (
+                "__ui_action__:mcp",
+                "Connect MCP server · /mcp",
+                "1-click popular MCP presets, Claude/Cursor import, or custom server",
+            ),
+            (
+                "__ui_action__:skills",
+                "Skills & Claude skills · Ctrl+G",
+                "Search, activate, or import SKILL.md and Claude skills",
+            ),
+            (
+                "__ui_action__:queue_manager",
+                "Manage prompt queue · F5",
+                "Reorder, edit, or remove queued prompts and attachments",
+            ),
+            (
+                "__ui_action__:team_setup",
+                "Team workflows · F9",
+                "Launch multi-agent Build, Review, or Investigate workflows",
+            ),
+        ]
+        rows.extend(ui_actions)
         choice = await self.push_screen_wait(
             FilteredPicker("Commands", rows, "↑/↓ choose · Enter/click run · Esc close")
         )
-        if choice:
-            self._replace_composer_draft(_command_insertion(choice))
-            self._submit_command_choice(choice)
+        if not choice:
+            return
+        if choice.startswith("__ui_action__:"):
+            action_name = choice.removeprefix("__ui_action__:")
+            with contextlib.suppress(ValueError):
+                self._recent_commands.remove(choice)
+            self._recent_commands.append(choice)
+            method = getattr(self, f"action_{action_name}", None)
+            if callable(method):
+                result = method()
+                if inspect.isawaitable(result):
+                    await result
+            return
+        self._replace_composer_draft(_command_insertion(choice))
+        self._submit_command_choice(choice)
 
     @work(exclusive=True, group="prompt-history")
     async def action_prompt_history(self) -> None:
@@ -2649,13 +3949,7 @@ class NoahCodeApp(App[None]):
 
         if isinstance(self.screen, ModalScreen):
             return
-        seen: set[str] = set()
-        prompts: list[str] = []
-        for entry in reversed(self._transcript_entries):
-            prompt = entry.text.strip()
-            if entry.role == "YOU" and prompt and prompt not in seen:
-                seen.add(prompt)
-                prompts.append(prompt)
+        prompts = self._collect_prompt_history()
         if not prompts:
             self._show_notice("No prior prompts to recall", temporary=True)
             return
@@ -2691,18 +3985,29 @@ class NoahCodeApp(App[None]):
             for info in infos:
                 label = f"${info.name}" if info.document_skill else info.name
                 state = "active" if info.active else "available"
+                source_text = str(getattr(info, "source", "") or "")
+                source_lower = source_text.lower()
+                origin_badge = ""
+                if ".claude" in source_lower or "claude" in source_lower:
+                    origin_badge = " · Claude skill"
+                elif ".codex" in source_lower:
+                    origin_badge = " · Codex skill"
+                elif ".cursor" in source_lower:
+                    origin_badge = " · Cursor skill"
+                elif ".agents" in source_lower:
+                    origin_badge = " · Portable skill"
                 rows.append(
                     (
                         f"skill:{info.registry_name}",
                         label,
-                        f"{state} · {info.description} · {info.source}",
+                        f"{state}{origin_badge} · {info.description} · {source_text}",
                     )
                 )
             choice = await self.push_screen_wait(
                 FilteredPicker(
                     "Skills",
                     rows,
-                    "Type to search · Enter use · Add imports scripts/assets too · Esc close",
+                    "Type to search (try 'claude') · Enter use · Add imports SKILL.md folders · Esc close",
                 )
             )
             if not choice:
@@ -2740,16 +4045,62 @@ class NoahCodeApp(App[None]):
 
     @work(exclusive=True, group="mcp")
     async def action_mcp(self) -> None:
-        """Open the MCP palette and guided STDIO/HTTP connection flow."""
+        """Open the MCP palette with 1-click presets, external import, and STDIO/HTTP setup."""
 
         if not self._agent_ready:
             return
         try:
             infos = self.host.list_mcp_infos()
-            rows = [
-                ("__add_stdio__", "+ Add STDIO server", "Local command or package runner"),
-                ("__add_http__", "+ Add HTTP server", "Streamable HTTP endpoint"),
+            presets = _resolve_mcp_presets(self.host)
+            importable: list[Any] = []
+            importable_fn = getattr(self.host, "list_importable_mcp_servers", None)
+            if callable(importable_fn):
+                with contextlib.suppress(Exception):
+                    raw_imp = await asyncio.to_thread(importable_fn)
+                    if isinstance(raw_imp, (list, tuple)) and all(
+                        not _is_mock_object(item) for item in raw_imp
+                    ):
+                        importable = list(raw_imp)
+            elif not _is_mock_object(self.host):
+                with contextlib.suppress(ImportError, AttributeError, Exception):
+                    from noah_code import mcp_setup as _mcp_mod
+
+                    disc_fn = getattr(
+                        _mcp_mod,
+                        "list_importable_mcp_servers",
+                        getattr(_mcp_mod, "discover_external_mcp_servers", None),
+                    )
+                    if callable(disc_fn):
+                        raw_disc = await asyncio.to_thread(disc_fn, self.host.workspace.root)
+                        if isinstance(raw_disc, (list, tuple)):
+                            importable = list(raw_disc)
+
+            rows: list[tuple[str, str, str]] = [
+                (
+                    "__mcp_presets__",
+                    "★ Quick-connect popular MCP server",
+                    "1-click setup · Context7, Playwright, Filesystem, Fetch, Linear, Sentry & more",
+                ),
             ]
+            if importable:
+                rows.append(
+                    (
+                        "__mcp_import__",
+                        "⇄ Import MCPs from Claude / Cursor",
+                        f"Import & connect {len(importable)} server(s) from Claude Code / Desktop / Cursor",
+                    )
+                )
+            rows.extend(
+                [
+                    (
+                        "__add_smart__",
+                        "+ Add server (command or URL)",
+                        "Paste an npx/uvx command or https:// MCP endpoint",
+                    ),
+                    ("__add_stdio__", "+ Add STDIO server", "Local command or package runner"),
+                    ("__add_http__", "+ Add HTTP server", "Streamable HTTP endpoint"),
+                ]
+            )
             for info in infos:
                 state = "connected" if info.name in self.host._mcp_attached else "available"
                 rows.append(
@@ -2763,13 +4114,133 @@ class NoahCodeApp(App[None]):
                 FilteredPicker(
                     "MCP servers",
                     rows,
-                    "Type to search · Enter connect · Esc close",
+                    "Type to search · Enter connect · ★ 1-click presets · Esc close",
                 )
             )
             if not choice:
                 return
             if choice.startswith("mcp:"):
                 status = await self.host.connect_mcp_server(choice.removeprefix("mcp:"))
+            elif choice == "__mcp_presets__":
+                preset_rows: list[tuple[str, str, str]] = []
+                preset_by_key: dict[str, Any] = {}
+                for preset in presets:
+                    pkey = str(getattr(preset, "key", getattr(preset, "name", "")))
+                    if not pkey:
+                        continue
+                    preset_by_key[pkey] = preset
+                    plabel = str(getattr(preset, "label", getattr(preset, "title", pkey)))
+                    pdesc = str(getattr(preset, "description", ""))
+                    ptransport = str(getattr(preset, "transport", "stdio"))
+                    penv = getattr(preset, "env_var", getattr(preset, "required_env", None))
+                    penv_str = str(penv).strip() if isinstance(penv, str) and penv.strip() else ""
+                    if pkey in self.host._mcp_attached:
+                        pstate = "connected"
+                    elif penv_str and not os.environ.get(penv_str):
+                        pstate = f"needs {penv_str}"
+                    else:
+                        pstate = "ready"
+                    preset_rows.append(
+                        (
+                            f"preset:{pkey}",
+                            plabel,
+                            f"{pstate} · {ptransport} · {pdesc}",
+                        )
+                    )
+                preset_choice = await self.push_screen_wait(
+                    FilteredPicker(
+                        "Popular MCP servers",
+                        preset_rows,
+                        "Type to filter · Enter 1-click connect · Esc cancel",
+                    )
+                )
+                if not preset_choice:
+                    return
+                selected_key = preset_choice.removeprefix("preset:")
+                chosen_preset = preset_by_key.get(selected_key)
+                if chosen_preset is None:
+                    return
+                plabel = str(getattr(chosen_preset, "label", selected_key))
+                ptransport = str(getattr(chosen_preset, "transport", "stdio"))
+                penv = getattr(
+                    chosen_preset, "env_var", getattr(chosen_preset, "required_env", None)
+                )
+                penv_name = str(penv).strip() if isinstance(penv, str) and penv.strip() else None
+                env_val: str | None = None
+                if penv_name and not os.environ.get(penv_name):
+                    env_val = await self.push_screen_wait(
+                        TextPromptModal(
+                            f"{plabel} · {penv_name}",
+                            f"Paste {penv_name}",
+                            "Masked while typing · passed only to this MCP server",
+                            password=True,
+                        )
+                    )
+                    if not env_val:
+                        return
+                connect_preset_fn = getattr(self.host, "connect_mcp_preset", None)
+                if callable(connect_preset_fn) and (
+                    not _is_mock_object(connect_preset_fn)
+                    or inspect.iscoroutinefunction(connect_preset_fn)
+                ):
+                    try:
+                        call_out = connect_preset_fn(selected_key, env_value=env_val)
+                    except TypeError:
+                        call_out = (
+                            connect_preset_fn(selected_key, env_val)
+                            if env_val is not None
+                            else connect_preset_fn(selected_key)
+                        )
+                    status = await call_out if inspect.isawaitable(call_out) else str(call_out)
+                else:
+                    ptarget = str(
+                        getattr(chosen_preset, "target", getattr(chosen_preset, "url", "")) or ""
+                    )
+                    if not ptarget and getattr(chosen_preset, "command", None):
+                        pargs = list(getattr(chosen_preset, "args", ()) or ())
+                        ptarget = " ".join([str(chosen_preset.command), *(str(a) for a in pargs)])
+                    if env_val and penv_name:
+                        os.environ[penv_name] = env_val
+                    fallback_kind = (
+                        "http" if ptransport in {"http", "streamable-http"} else "stdio"
+                    )
+                    status = await self.host.add_mcp_server(
+                        fallback_kind, selected_key, ptarget
+                    )
+            elif choice == "__mcp_import__":
+                import_fn = getattr(self.host, "import_external_mcp_servers", None)
+                if callable(import_fn) and (
+                    not _is_mock_object(import_fn) or inspect.iscoroutinefunction(import_fn)
+                ):
+                    imp_res = import_fn()
+                    status = await imp_res if inspect.isawaitable(imp_res) else str(imp_res)
+                else:
+                    status = "External MCP import is unavailable"
+            elif choice == "__add_smart__":
+                name = await self.push_screen_wait(
+                    TextPromptModal(
+                        "Server name",
+                        "my-mcp",
+                        "Letters, numbers, dots, underscores, and hyphens",
+                    )
+                )
+                if not name:
+                    return
+                target = await self.push_screen_wait(
+                    TextPromptModal(
+                        "Command or URL",
+                        "npx -y @upstash/context7-mcp  or  https://example.com/mcp",
+                        "Auto-detects STDIO command vs Streamable HTTP endpoint",
+                    )
+                )
+                if not target:
+                    return
+                detected_kind = (
+                    "http"
+                    if target.strip().lower().startswith(("http://", "https://"))
+                    else "stdio"
+                )
+                status = await self.host.add_mcp_server(detected_kind, name, target)
             else:
                 kind = "stdio" if choice == "__add_stdio__" else "http"
                 name = await self.push_screen_wait(
@@ -2938,9 +4409,42 @@ class NoahCodeApp(App[None]):
         self._show_notice("Loading available models…", temporary=True)
         result = await discover_models(provider, base_url=base_url, api_key_env=api_key_env)
         if result.models:
-            rows = [(f"model:{model.id}", model.id, model.description) for model in result.models]
-            rows.append(("__manual__", "Enter a model ID manually", "Use a new, private, or unlisted model"))
-            choice = await self.push_screen_wait(FilteredPicker(title, rows, result.message))
+            meta_model = getattr(self.host.meta, "model", None) if self.host.meta else None
+            active_raw = str(
+                meta_model if isinstance(meta_model, str) and meta_model else self.host.config.model or ""
+            ).strip()
+            active_ids: set[str] = set()
+            if active_raw:
+                try:
+                    from noah_code.providers import provider_preset
+
+                    prefix = provider_preset(provider).prefix
+                except KeyError:
+                    prefix = provider
+                if active_raw.startswith(f"{prefix}/"):
+                    active_ids.add(active_raw.removeprefix(f"{prefix}/"))
+                    active_ids.add(active_raw)
+                elif "/" not in active_raw or provider == "custom":
+                    active_ids.add(active_raw)
+            rows = [
+                (
+                    f"model:{model.id}",
+                    model.id,
+                    f"active · {model.description}"
+                    if model.id in active_ids and not model.description.startswith("active · ")
+                    else model.description,
+                )
+                for model in result.models
+            ]
+            rows.append(
+                ("__manual__", "Enter a model ID manually", "Use a new, private, or unlisted model")
+            )
+            picker_hint = (
+                "Filter: openai/, anthropic/, coder, claude, gpt, qwen, deepseek, gemini, grok, glm · Enter select"
+                if provider == "openrouter"
+                else result.message
+            )
+            choice = await self.push_screen_wait(FilteredPicker(title, rows, picker_hint))
             if not choice:
                 return None
             if choice != "__manual__":
@@ -3156,6 +4660,13 @@ class NoahCodeApp(App[None]):
                 )
             rows.append(
                 (
+                    "__coding_models__",
+                    "★ Popular coding models (quick pick)",
+                    "Claude 5.5/4.6, GPT-5.3 Codex/6.1, OpenRouter, Qwen3 Coder, DeepSeek V4, Gemini 4/3.8, Grok, Devstral, GLM, Kimi",
+                )
+            )
+            rows.append(
+                (
                     "__advanced__",
                     "Advanced provider setup",
                     "Azure, Bedrock, Ollama endpoints, and custom OpenAI-compatible APIs",
@@ -3169,6 +4680,9 @@ class NoahCodeApp(App[None]):
                 )
             )
             if not choice:
+                return
+            if choice == "__coding_models__":
+                await self._pick_quick_coding_model(list(infos))
                 return
             if choice == "__advanced__":
                 self.action_providers()
@@ -3232,6 +4746,130 @@ class NoahCodeApp(App[None]):
                 self._pre_prompt_status = "Model setup failed · open /model to retry"
                 self._show_notice(message, kind="error")
 
+    @work(exclusive=True, group="model-setup")
+    async def action_coding_models(self) -> None:
+        """Open the one-step popular coding models quick picker directly."""
+
+        if isinstance(self.screen, ModalScreen):
+            return
+        if not await self._ensure_permission_mode():
+            return
+        if self.ui.busy and self._agent_ready:
+            self._show_notice(
+                "Finish or cancel the active turn before changing models",
+                temporary=True,
+            )
+            return
+        try:
+            infos = await asyncio.to_thread(self.host.list_provider_infos)
+            await self._pick_quick_coding_model(list(infos))
+        except Exception as exc:  # noqa: BLE001
+            message = f"Model setup failed: {exc}"
+            if self._session_has_prompt:
+                self._append_entry(TranscriptEntry("ERROR", message))
+            else:
+                self._pre_prompt_status = "Model setup failed · open /model to retry"
+                self._show_notice(message, kind="error")
+
+    async def _pick_quick_coding_model(self, infos: list[Any]) -> None:
+        """Select a mainstream coding model across providers without typing model IDs."""
+
+        from noah_code.model_catalog import quick_pick_coding_models
+        from noah_code.providers import _credentials_ready, provider_preset
+
+        meta_model = getattr(self.host.meta, "model", None) if self.host.meta else None
+        active_raw = str(
+            meta_model if isinstance(meta_model, str) and meta_model else self.host.config.model or ""
+        ).strip()
+        info_by_key = {str(getattr(item, "key", "")): item for item in infos}
+        rows: list[tuple[str, str, str]] = []
+        seen_row_ids: set[str] = set()
+        for spec in quick_pick_coding_models():
+            row_id = f"quick:{spec.provider}:{spec.model_id}"
+            if row_id in seen_row_ids:
+                continue
+            seen_row_ids.add(row_id)
+            preset = provider_preset(spec.provider)
+            info = info_by_key.get(spec.provider)
+            provider_label = str(getattr(info, "label", "") or preset.label)
+            is_configured = (
+                bool(info.configured) if info is not None else _credentials_ready(preset)
+            )
+            full_route = f"{preset.prefix}/{spec.model_id}"
+            is_active = active_raw in {full_route, spec.model_id}
+            ready_state = (
+                "active"
+                if is_active
+                else "ready"
+                if is_configured
+                else "sign-in needed"
+                if spec.provider == "codex"
+                else "key needed"
+            )
+            rows.append(
+                (
+                    row_id,
+                    f"{spec.model_id}  [{provider_label}]",
+                    f"{ready_state} · {spec.tag} · {spec.context_tokens:,} ctx",
+                )
+            )
+        choice = await self.push_screen_wait(
+            FilteredPicker(
+                "Popular coding models · quick pick",
+                rows,
+                "Type claude, gpt, codex, openrouter, qwen, deepseek, gemini, grok, glm · Enter select · Esc cancel",
+            )
+        )
+        if not choice or not choice.startswith("quick:"):
+            return
+        _, chosen_provider, chosen_model_id = choice.split(":", 2)
+        preset = provider_preset(chosen_provider)
+        info = info_by_key.get(chosen_provider)
+        provider_label = str(getattr(info, "label", "") or preset.label)
+        is_configured = bool(info.configured) if info is not None else _credentials_ready(preset)
+        credential_result = None
+        if chosen_provider == "codex" and not await self.push_screen_wait(
+            CodexLoginScreen(self.host)
+        ):
+            return
+        if preset.api_key_env is not None and not is_configured:
+            api_key = await self.push_screen_wait(
+                TextPromptModal(
+                    f"Quick model setup · {provider_label} API key",
+                    f"Paste {preset.api_key_env}",
+                    "Masked while typing · saved to ~/.local/share/noah-code/auth.json",
+                    password=True,
+                )
+            )
+            if not api_key:
+                return
+            credential_result = await self.host.set_provider_api_key(chosen_provider, api_key)
+
+        reasoning_effort = await self._pick_reasoning_effort(
+            f"Quick model setup · {chosen_model_id} · Reasoning"
+        )
+        if reasoning_effort is None:
+            if credential_result and getattr(credential_result, "message", ""):
+                if self._session_has_prompt:
+                    self._append_entry(TranscriptEntry("STATUS", credential_result.message))
+                else:
+                    self._show_notice(credential_result.message, temporary=True)
+            return
+        status = await self.host.configure_provider(
+            chosen_provider,
+            chosen_model_id,
+            reasoning_effort=reasoning_effort,
+        )
+        if credential_result and getattr(credential_result, "message", ""):
+            status = f"{status}\n{credential_result.message}."
+        if self._session_has_prompt:
+            self._append_entry(TranscriptEntry("STATUS", status))
+        else:
+            self._pre_prompt_status = "Model configured · starting agent"
+            self._show_notice("Model configured · starting Noah", temporary=True)
+        self.update_chrome(force=True)
+        self._retry_startup_after_setup()
+
     def _retry_startup_after_setup(self) -> None:
         """Retry startup after credentials are configured from a failed shell."""
 
@@ -3262,6 +4900,56 @@ class NoahCodeApp(App[None]):
             )
             return
         try:
+            session_picker_cls = getattr(_modals_module, "SessionPickerScreen", None)
+            if session_picker_cls is not None:
+                sig = inspect.signature(session_picker_cls)
+                params = [
+                    p
+                    for p in sig.parameters.values()
+                    if p.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                ]
+                kwargs: dict[str, Any] = {}
+                if "sessions" in sig.parameters:
+                    kwargs["sessions"] = await asyncio.to_thread(self.host.list_session_metas)
+                if params and params[0].name == "host":
+                    picker = session_picker_cls(self.host, **kwargs)
+                elif "host" in sig.parameters:
+                    sessions = kwargs.pop("sessions", None) or await asyncio.to_thread(
+                        self.host.list_session_metas
+                    )
+                    rows = [
+                        (
+                            session.session_id,
+                            session.title if session.title != "untitled" else session.session_id[:8],
+                            (
+                                f"{session.worktree_name} · {session.mode} · {session.model}"
+                                if session.worktree_name
+                                else f"{session.mode} · {session.model}"
+                            ),
+                        )
+                        for session in sessions
+                    ]
+                    picker = session_picker_cls(
+                        "Sessions",
+                        rows,
+                        "↑/↓ select · Enter resume · Esc close",
+                        host=self.host,
+                        **kwargs,
+                    )
+                else:
+                    picker = session_picker_cls(self.host)
+                session_id = await self.push_screen_wait(picker)
+                if not session_id:
+                    self.update_chrome(force=True)
+                    return
+                current = self.host.meta.session_id if self.host.meta else None
+                if isinstance(session_id, str) and session_id != current:
+                    await self.host.switch_session(session_id)
+                return
             sessions = await asyncio.to_thread(self.host.list_session_metas)
             rows = [
                 (
@@ -3335,6 +5023,231 @@ class NoahCodeApp(App[None]):
         except Exception as exc:  # noqa: BLE001
             self._append_entry(TranscriptEntry("ERROR", f"Could not continue session: {exc}"))
 
+    async def _load_recent_resume_items(self) -> list[dict[str, Any]]:
+        recent_fn = getattr(self.host, "recent_repo_sessions", None)
+        raw_sessions: list[Any] | None = None
+        if callable(recent_fn):
+            with contextlib.suppress(Exception):
+                try:
+                    sig = inspect.signature(recent_fn)
+                    call_res = (
+                        await asyncio.to_thread(recent_fn, limit=3)
+                        if "limit" in sig.parameters
+                        else await asyncio.to_thread(recent_fn)
+                    )
+                except (TypeError, ValueError):
+                    call_res = await asyncio.to_thread(recent_fn)
+                if inspect.isawaitable(call_res):
+                    call_res = await call_res
+                if isinstance(call_res, (list, tuple)) and all(
+                    not _is_mock_object(item) for item in call_res
+                ):
+                    raw_sessions = list(call_res)[:3]
+        if raw_sessions is None:
+            raw_sessions = list(await asyncio.to_thread(self.host.list_session_metas))[:3]
+
+        normalized: list[dict[str, Any]] = []
+        store = getattr(self.host, "store", None)
+        can_read_store = store is not None and not _is_mock_object(store)
+        for item in raw_sessions[:3]:
+            meta_obj: Any = None
+            preview_raw: Any = ""
+            if isinstance(item, tuple) and len(item) == 2:
+                meta_obj, preview_raw = item
+            elif isinstance(item, dict):
+                sid = str(item.get("session_id", "") or "")
+                if not sid:
+                    continue
+                raw_title = str(item.get("title", "") or "")
+                title = raw_title if raw_title and raw_title != "untitled" else sid[:8]
+                updated_raw = item.get("updated_at", 0.0)
+                updated_at = float(updated_raw) if isinstance(updated_raw, (int, float)) else 0.0
+                mode = str(item.get("mode", "build") or "build")
+                model = str(item.get("model", "") or "")
+                wt_raw = item.get("worktree_name", "")
+                worktree_name = str(wt_raw) if isinstance(wt_raw, str) and wt_raw else ""
+                preview_raw = (
+                    item.get("preview")
+                    or item.get("message_preview")
+                    or item.get("last_message")
+                    or ""
+                )
+                preview = _truncate_middle(" ".join(str(preview_raw or "").split()), 56)
+                normalized.append(
+                    {
+                        "session_id": sid,
+                        "title": title,
+                        "updated_at": updated_at,
+                        "mode": mode,
+                        "model": model,
+                        "worktree_name": worktree_name,
+                        "preview": preview,
+                    }
+                )
+                continue
+            else:
+                nested_meta = getattr(item, "meta", None)
+                if nested_meta is not None and not _is_mock_object(nested_meta):
+                    meta_obj = nested_meta
+                else:
+                    meta_obj = item
+                preview_raw = (
+                    getattr(item, "preview", None)
+                    or getattr(item, "message_preview", None)
+                    or getattr(item, "last_message", None)
+                    or ""
+                )
+            if _is_mock_object(preview_raw):
+                preview_raw = ""
+            sid = str(getattr(meta_obj, "session_id", "") or "")
+            if not sid:
+                continue
+            raw_title = str(getattr(meta_obj, "title", "") or "")
+            title = raw_title if raw_title and raw_title != "untitled" else sid[:8]
+            updated_raw = getattr(meta_obj, "updated_at", 0.0)
+            updated_at = float(updated_raw) if isinstance(updated_raw, (int, float)) else 0.0
+            mode = str(getattr(meta_obj, "mode", "build") or "build")
+            model = str(getattr(meta_obj, "model", "") or "")
+            wt_raw = getattr(meta_obj, "worktree_name", "")
+            worktree_name = str(wt_raw) if isinstance(wt_raw, str) and wt_raw else ""
+            preview = _truncate_middle(" ".join(str(preview_raw or "").split()), 56)
+            load_event_page_fn = getattr(store, "load_event_page", None) if can_read_store else None
+            if not preview and callable(load_event_page_fn):
+                with contextlib.suppress(Exception):
+                    events_page = await asyncio.to_thread(load_event_page_fn, sid, limit=12)
+                    for rec in reversed(events_page):
+                        if rec.event_type in {"Task", "Message", "AgentMessage", "AssistantEvent"}:
+                            body = str(
+                                rec.payload.get("prompt") or rec.payload.get("content") or ""
+                            ).strip()
+                            if body:
+                                preview = _truncate_middle(" ".join(body.split()), 56)
+                                break
+            normalized.append(
+                {
+                    "session_id": sid,
+                    "title": title,
+                    "updated_at": updated_at,
+                    "mode": mode,
+                    "model": model,
+                    "worktree_name": worktree_name,
+                    "preview": preview,
+                }
+            )
+        return normalized
+
+    @work(exclusive=True, group="sessions")
+    async def action_resume_session(self, target: str = "") -> None:
+        """Open the last-3-chats repo resume picker or jump directly to 1..3 / ID."""
+
+        if not self._agent_ready:
+            return
+        if self.ui.busy:
+            self._show_notice(
+                "Cancel the running turn before resuming another chat",
+                temporary=True,
+            )
+            return
+        try:
+            items = await self._load_recent_resume_items()
+            arg = target.strip()
+            if arg:
+                chosen_item: dict[str, Any] | None = None
+                if arg in {"1", "2", "3"}:
+                    idx = int(arg) - 1
+                    if 0 <= idx < len(items):
+                        chosen_item = items[idx]
+                if chosen_item is None:
+                    chosen_item = next(
+                        (
+                            it
+                            for it in items
+                            if it["session_id"] == arg or it["session_id"].startswith(arg)
+                        ),
+                        None,
+                    )
+                if chosen_item is None:
+                    all_metas = list(await asyncio.to_thread(self.host.list_session_metas))
+                    matched_meta = next(
+                        (
+                            m
+                            for m in all_metas
+                            if str(m.session_id) == arg or str(m.session_id).startswith(arg)
+                        ),
+                        None,
+                    )
+                    if matched_meta is not None:
+                        m_title = (
+                            str(matched_meta.title)
+                            if getattr(matched_meta, "title", "")
+                            and matched_meta.title != "untitled"
+                            else str(matched_meta.session_id)[:8]
+                        )
+                        chosen_item = {
+                            "session_id": str(matched_meta.session_id),
+                            "title": m_title,
+                        }
+                if chosen_item is not None:
+                    await self.host.switch_session(chosen_item["session_id"])
+                    with contextlib.suppress(Exception):
+                        self.query_one("#conversation", RichLog).scroll_end(animate=False)
+                    self.query_one("#composer", ComposerTextArea).focus()
+                    self._show_notice(f"Resumed · {chosen_item['title']}", temporary=True)
+                    return
+                if not _is_mock_object(self.host):
+                    await self.host.handle_line(f"/resume {arg}")
+                    return
+                self._show_notice(f"No matching chat for '{arg}'", kind="error", temporary=True)
+                return
+
+            if not items:
+                self._show_notice("No previous chats for this repository", temporary=True)
+                return
+            current = self.host.meta.session_id if self.host.meta else ""
+            rows: list[tuple[str, str, str]] = []
+            for idx, item in enumerate(items, start=1):
+                age = (
+                    "current"
+                    if item["session_id"] == current
+                    else (
+                        _relative_age(item["updated_at"])
+                        if item["updated_at"] > 0
+                        else "recent"
+                    )
+                )
+                workspace = f" · {item['worktree_name']}" if item["worktree_name"] else ""
+                if item["preview"]:
+                    subtitle = (
+                        f'{age} · "{item["preview"]}" · {item["mode"]} · {item["model"]}{workspace}'
+                    )
+                else:
+                    subtitle = (
+                        f"{age} · {item['mode']} · {item['model']}{workspace} · "
+                        f"{item['session_id'][:8]}"
+                    )
+                rows.append((item["session_id"], f"{idx}. {item['title']}", subtitle))
+
+            session_id = await self.push_screen_wait(
+                ResumeSessionPicker(
+                    "Resume chat · last 3 in this repo",
+                    rows,
+                    "Enter or 1–3 to pick up right where you left off · Esc close",
+                )
+            )
+            if not session_id:
+                return
+            chosen_title = next(
+                (it["title"] for it in items if it["session_id"] == session_id),
+                session_id[:8],
+            )
+            await self.host.switch_session(session_id)
+            with contextlib.suppress(Exception):
+                self.query_one("#conversation", RichLog).scroll_end(animate=False)
+            self.query_one("#composer", ComposerTextArea).focus()
+            self._show_notice(f"Resumed · {chosen_title}", temporary=True)
+        except Exception as exc:  # noqa: BLE001
+            self._append_entry(TranscriptEntry("ERROR", f"Could not resume chat: {exc}"))
+
     @work(exclusive=True, group="sessions")
     async def action_new_session(self) -> None:
         if not self._agent_ready:
@@ -3360,7 +5273,7 @@ class NoahCodeApp(App[None]):
         changed_session = self._session_id is not None and current_session_id != self._session_id
         self._session_id = current_session_id
         self._agent_ready = True
-        self._base_commands = all_command_suggestions(self.host._custom_commands)
+        self._base_commands = _build_base_commands(self.host._custom_commands)
         self._rail_dirty = True
         if active_startup_turn:
             self._refresh_repository_snapshot()
@@ -3377,6 +5290,13 @@ class NoahCodeApp(App[None]):
             self.update_chrome(force=True)
             return
         self._reset_transient_turn_widgets()
+        self._history_index = None
+        self._history_prompts = []
+        self._history_stash = ""
+        self._find_matches = []
+        self._find_index = -1
+        with contextlib.suppress(Exception):
+            self.query_one("#transcript-find-bar", Horizontal).display = False
         self._activity_history.clear()
         self._last_thought = ""
         self._unread_count = 0
@@ -3449,22 +5369,43 @@ class NoahCodeApp(App[None]):
     @work(exclusive=True, group="undo-confirmation")
     async def action_confirm_undo(self) -> None:
         preview = _undo_preview(self.host)
-        if preview.startswith("There is no reversible") or "full undo is unavailable" in preview:
-            message = (
-                "Nothing to undo"
-                if preview.startswith("There is no reversible")
-                else "Undo unavailable because the turn used shell mutations"
-            )
-            self._show_notice(message, kind="error", temporary=True, detail=preview)
+        use_checkpoint = False
+        if preview.startswith("There is no reversible"):
+            self._show_notice("Nothing to undo", kind="error", temporary=True, detail=preview)
             return
-        confirmed = await self.push_screen_wait(
-            ConfirmationModal("Undo last turn?", preview, "Undo turn")
-        )
+        if "full undo is unavailable" in preview:
+            has_checkpoint_fn = getattr(self.host, "has_git_checkpoint", None)
+            if callable(has_checkpoint_fn) and has_checkpoint_fn() is True:
+                use_checkpoint = True
+            else:
+                self._show_notice(
+                    "Undo unavailable because the turn used shell mutations",
+                    kind="error",
+                    temporary=True,
+                    detail=preview,
+                )
+                return
+        if use_checkpoint:
+            preview_fn = getattr(self.host, "checkpoint_undo_preview", None)
+            cp_preview = preview_fn() if callable(preview_fn) else None
+            modal_body = (
+                cp_preview if isinstance(cp_preview, str) and cp_preview.strip() else preview
+            )
+            confirmed = await self.push_screen_wait(
+                ConfirmationModal("Restore Git checkpoint?", modal_body, "Restore checkpoint")
+            )
+        else:
+            confirmed = await self.push_screen_wait(
+                ConfirmationModal("Undo last turn?", preview, "Undo turn")
+            )
         if not confirmed:
             self._show_notice("Undo cancelled", temporary=True)
             return
         try:
-            status = await self.host.undo_last_turn_async()
+            if use_checkpoint:
+                status = await self.host.undo_last_turn_async(use_checkpoint=True)
+            else:
+                status = await self.host.undo_last_turn_async()
         except Exception as exc:  # noqa: BLE001
             self._append_entry(TranscriptEntry("ERROR", f"Undo failed: {exc}"))
             self._last_notice_title = "Undo error"
@@ -3472,6 +5413,98 @@ class NoahCodeApp(App[None]):
         else:
             self._append_entry(TranscriptEntry("STATUS", status))
             self._refresh_repository_snapshot()
+
+    def action_find_in_transcript(self) -> None:
+        """Show the inline transcript search bar and focus its query field."""
+
+        if isinstance(self.screen, ModalScreen):
+            return
+        bar = self.query_one("#transcript-find-bar", Horizontal)
+        find_input = self.query_one("#transcript-find-input", TranscriptFindInput)
+        bar.display = True
+        find_input.focus()
+        if find_input.value:
+            find_input.action_select_all()
+            self._recompute_find_matches(find_input.value)
+        else:
+            self.query_one("#transcript-find-count", Static).update("")
+
+    @on(Input.Changed, "#transcript-find-input")
+    def _on_transcript_find_changed(self, event: Input.Changed) -> None:
+        self._recompute_find_matches(event.value)
+
+    def _recompute_find_matches(self, query: str) -> None:
+        count_widget = self.query_one("#transcript-find-count", Static)
+        needle = query.strip().casefold()
+        if not needle:
+            self._find_matches = []
+            self._find_index = -1
+            count_widget.update("")
+            return
+        if self._transcript_entries:
+            self._reveal_transcript()
+        log = self.query_one("#conversation", SelectableRichLog)
+        counts = self._transcript_line_counts
+        if len(counts) != len(self._transcript_entries) or sum(counts) < len(log.lines):
+            self._recount_transcript_rows()
+            counts = self._transcript_line_counts
+        if len(counts) != len(self._transcript_entries):
+            counts = [1] * len(self._transcript_entries)
+        evicted = max(sum(counts) - len(log.lines), 0) if log.lines else 0
+        matches: list[int] = []
+        offset = 0
+        for entry, count in zip(self._transcript_entries, counts, strict=False):
+            raw_start = offset - evicted
+            raw_end = raw_start + count
+            offset += count
+            if needle not in entry.text.casefold():
+                continue
+            start = max(raw_start, 0)
+            end = min(raw_end, len(log.lines))
+            row_hits = [r for r in range(start, end) if needle in log.lines[r].text.casefold()]
+            if row_hits:
+                matches.extend(row_hits)
+            else:
+                matches.append(start)
+        self._find_matches = matches
+        if not matches:
+            self._find_index = -1
+            count_widget.update(Text("No matches", style=self.theme_palette.error))
+            return
+        self._find_index = 0
+        self._jump_to_find_match()
+
+    def step_transcript_find(self, delta: int) -> None:
+        if not self._find_matches:
+            find_input = self.query_one("#transcript-find-input", TranscriptFindInput)
+            if find_input.value.strip():
+                self._recompute_find_matches(find_input.value)
+            return
+        self._find_index = (self._find_index + delta) % len(self._find_matches)
+        self._jump_to_find_match()
+
+    def _jump_to_find_match(self) -> None:
+        if not self._find_matches or self._find_index < 0:
+            return
+        target_row = self._find_matches[self._find_index]
+        count_widget = self.query_one("#transcript-find-count", Static)
+        count_widget.update(
+            Text(
+                f"{self._find_index + 1} of {len(self._find_matches)}",
+                style=self.theme_palette.accent,
+            )
+        )
+        log = self.query_one("#conversation", SelectableRichLog)
+        log.scroll_to(y=max(target_row, 0), animate=False, force=True)
+
+    def close_transcript_find(self) -> None:
+        bar = self.query_one_optional("#transcript-find-bar", Horizontal)
+        if bar is not None:
+            bar.display = False
+        self._find_matches = []
+        self._find_index = -1
+        with contextlib.suppress(Exception):
+            self.query_one("#composer", ComposerTextArea).focus()
 
     def action_conversation_history(self) -> None:
         self.push_screen(ConversationHistoryScreen(self.host))
@@ -3608,7 +5641,8 @@ class NoahCodeApp(App[None]):
             if not self._recount_transcript_rows():
                 return None
             counts = self._transcript_line_counts
-        if selection.start is None and selection.end is None:
+        is_select_all = selection.start is None and selection.end is None
+        if is_select_all:
             first_row, last_row = 0, max(len(log.lines) - 1, 0)
         else:
             points = [point for point in (selection.start, selection.end) if point is not None]
@@ -3619,7 +5653,7 @@ class NoahCodeApp(App[None]):
             first_row, last_row = min(ys), max(ys)
         # Rows evicted by max_lines shift live rows toward the front.
         evicted = max(sum(counts) - len(log.lines), 0)
-        picked: list[str] = []
+        touched: list[tuple[TranscriptEntry, int, int]] = []
         offset = 0
         for entry, count in zip(self._transcript_entries, counts, strict=False):
             start = offset - evicted
@@ -3629,10 +5663,116 @@ class NoahCodeApp(App[None]):
                 continue
             if start > last_row:
                 break
-            picked.append(entry.text)
-        if not picked:
+            touched.append((entry, start, count))
+        if not touched:
             return None
-        return "\n".join(picked)
+        if len(touched) == 1 and not is_select_all:
+            single_entry, entry_start, entry_row_count = touched[0]
+            if (
+                single_entry.role == "NOAH"
+                and single_entry.markdown
+                and first_row > entry_start
+                and (last_row - first_row + 1) < entry_row_count - 1
+            ):
+                slice_start = max(first_row, 0)
+                slice_end = min(last_row + 1, len(log.lines))
+                code_match = _match_fenced_code_selection(
+                    single_entry.text,
+                    log.lines[slice_start:slice_end],
+                )
+                if code_match is not None:
+                    return code_match
+        return "\n".join(entry.text for entry, _, _ in touched)
+
+    def action_copy_code_id(self, block_id: str) -> None:
+        """Copy a registered fenced code block by ID."""
+
+        getter = getattr(_modals_module, "get_registered_code_block", None)
+        code = getter(block_id) if callable(getter) else None
+        if isinstance(code, str) and code:
+            self.copy_to_clipboard(code)
+            self._show_notice("Copied code block to clipboard", temporary=True)
+            return
+        self._show_notice("Code block is no longer available", temporary=True)
+
+    def action_copy_latest_code(self) -> None:
+        """Copy the most recent fenced code block from Noah's replies."""
+
+        for entry in reversed(self._transcript_entries):
+            if entry.role != "NOAH":
+                continue
+            blocks = _extract_fenced_code_blocks(entry.text)
+            if blocks:
+                self.copy_to_clipboard(blocks[-1])
+                self._show_notice("Copied latest code block", temporary=True)
+                return
+        self._show_notice("No fenced code block to copy", temporary=True)
+
+    @work(exclusive=True, group="open-file-ref")
+    async def action_open_file_id(self, ref_id: str) -> None:
+        """Open a registered path:line reference in DiffReviewScreen or $EDITOR."""
+
+        getter = getattr(_modals_module, "get_registered_file_ref", None)
+        ref = getter(ref_id) if callable(getter) else None
+        if ref is None:
+            self._show_notice("File reference is no longer available", temporary=True)
+            return
+        if isinstance(ref, tuple):
+            raw_path = str(ref[0])
+            raw_line = ref[1] if len(ref) > 1 else None
+        else:
+            raw_path = str(getattr(ref, "path", ref))
+            raw_line = getattr(ref, "line", None)
+        line_num = int(raw_line) if isinstance(raw_line, int) and raw_line > 0 else None
+
+        root = Path(self.host.workspace.root).resolve()
+        resolved = _resolve(root, raw_path)
+        if resolved is None:
+            self._show_notice("Cannot open file outside workspace or missing", temporary=True)
+            return
+        rel_posix = resolved.relative_to(root).as_posix()
+        modified_paths = (
+            set(self._repository_snapshot.paths)
+            if self._repository_snapshot is not None
+            else set()
+        )
+        if (rel_posix in modified_paths or raw_path in modified_paths) and self._agent_ready:
+            try:
+                review = await self.host.diff_review()
+                screen = DiffReviewScreen(self.host, review)
+                matched = next(
+                    (
+                        item
+                        for item in getattr(review, "files", ())
+                        if item.path in {rel_posix, raw_path}
+                    ),
+                    None,
+                )
+                if matched is not None:
+                    screen._selected_key = matched.key
+                self.push_screen(screen)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+
+        raw_editor = (
+            (os.environ.get("VISUAL") or "").strip()
+            or (os.environ.get("EDITOR") or "").strip()
+            or "vi"
+        )
+        try:
+            editor = shlex.split(raw_editor) or ["vi"]
+        except ValueError:
+            editor = [raw_editor]
+        exe = Path(editor[0]).name.lower()
+        cmd = list(editor)
+        if line_num is not None and exe in {"vi", "vim", "nvim", "nano", "code", "zed"}:
+            cmd.append(f"+{line_num}")
+        cmd.append(str(resolved))
+        try:
+            self._run_external_editor(cmd)
+        except Exception as exc:  # noqa: BLE001
+            self._show_notice(f"Could not open editor: {exc}", kind="error", temporary=True)
 
     def _mouse_selection_text(self) -> str | None:
         """Combined selection text across widgets, transcript-aware.
@@ -3888,6 +6028,11 @@ class NoahCodeApp(App[None]):
                 self.close_suggestions()
                 self.action_context_visibility()
                 return
+            if name == "resume":
+                composer.text = ""
+                self.close_suggestions()
+                self.action_resume_session(slash[1])
+                return
             if name in SAFE_SLASH_WHILE_BUSY or name in {"attach", "team"}:
                 composer.text = ""
                 self.close_suggestions()
@@ -3937,6 +6082,9 @@ class NoahCodeApp(App[None]):
             return
         if isinstance(self.screen, (ApprovalModal, QuestionModal)):
             return
+        self._history_index = None
+        self._history_prompts = []
+        self._history_stash = ""
         slash = parse_slash(text)
         if slash:
             insertion = f"/{slash[0]}"
@@ -4014,6 +6162,16 @@ class NoahCodeApp(App[None]):
             composer.text = ""
             self.close_suggestions()
             self.action_continue_session()
+            return
+        if text == "/resume":
+            composer.text = ""
+            self.close_suggestions()
+            self.action_resume_session()
+            return
+        if slash is not None and slash[0] == "resume" and slash[1].strip():
+            composer.text = ""
+            self.close_suggestions()
+            self.action_resume_session(slash[1].strip())
             return
         if self._agent_ready and text == "/undo":
             composer.text = ""
@@ -4096,6 +6254,10 @@ class NoahCodeApp(App[None]):
         is_agent_turn = (
             slash is None or team_request or queue_resume or attach_turn or custom_turn
         )
+        if is_agent_turn:
+            self._subagent_roster.clear()
+            self._subagent_logged_queued.clear()
+            self._update_subagent_strip()
         started_at = time.monotonic()
         turn_timeline = self._timeline_begin(
             "Team request" if team_request else "Turn started",

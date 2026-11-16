@@ -24,6 +24,16 @@ class UsageSnapshot:
     prefix_append_only: int = 0
     prefix_reused_chars: int = 0
     prefix_total_chars: int = 0
+    last_input_tokens: int = 0
+    context_window: int = 0
+
+    @property
+    def context_utilization_ratio(self) -> float:
+        """Share of the active model's context window used by the latest main turn call."""
+
+        if self.last_input_tokens > 0 and self.context_window > 0:
+            return self.last_input_tokens / self.context_window
+        return 0.0
 
     @property
     def uncached_tokens(self) -> int:
@@ -50,24 +60,28 @@ class UsageSnapshot:
         return self.llm_seconds / self.calls if self.calls else 0.0
 
     def format(self) -> str:
-        return "\n".join(
-            [
-                "Token and latency usage",
-                f"  calls             {self.calls} ({self.failed_calls} failed)",
-                f"  input tokens      {self.prompt_tokens:,}",
-                f"  cached input      {self.cached_tokens:,} ({self.cache_hit_ratio:.0%})",
-                f"  uncached input    {self.uncached_tokens:,}",
-                f"  output tokens     {self.completion_tokens:,}",
-                f"  reasoning tokens  {self.reasoning_tokens:,}",
-                f"  model wait        {self.llm_seconds:.2f}s ({self.average_llm_seconds:.2f}s/call)",
-                f"  tool output       {self.tool_output_chars:,} chars",
-                f"  prefix stability  {self.prefix_append_only}/{self.prefix_calls}"
-                f" ({self.prefix_stability_ratio:.0%})",
-                f"  prefix reuse est. {self.prefix_reused_chars:,}/{self.prefix_total_chars:,} chars"
-                f" ({self.prefix_reuse_ratio:.0%})",
-                f"  estimated cost    ${self.cost_usd:.6f}",
-            ]
-        )
+        lines = [
+            "Token and latency usage",
+            f"  calls             {self.calls} ({self.failed_calls} failed)",
+            f"  input tokens      {self.prompt_tokens:,}",
+            f"  cached input      {self.cached_tokens:,} ({self.cache_hit_ratio:.0%})",
+            f"  uncached input    {self.uncached_tokens:,}",
+            f"  output tokens     {self.completion_tokens:,}",
+            f"  reasoning tokens  {self.reasoning_tokens:,}",
+            f"  model wait        {self.llm_seconds:.2f}s ({self.average_llm_seconds:.2f}s/call)",
+            f"  tool output       {self.tool_output_chars:,} chars",
+            f"  prefix stability  {self.prefix_append_only}/{self.prefix_calls}"
+            f" ({self.prefix_stability_ratio:.0%})",
+            f"  prefix reuse est. {self.prefix_reused_chars:,}/{self.prefix_total_chars:,} chars"
+            f" ({self.prefix_reuse_ratio:.0%})",
+        ]
+        if self.context_window > 0:
+            lines.append(
+                f"  context window    {self.last_input_tokens:,}/{self.context_window:,} tokens"
+                f" ({self.context_utilization_ratio:.0%})"
+            )
+        lines.append(f"  estimated cost    ${self.cost_usd:.6f}")
+        return "\n".join(lines)
 
     def to_dict(self) -> dict[str, int | float]:
         return {
@@ -84,6 +98,8 @@ class UsageSnapshot:
             "prefix_append_only": self.prefix_append_only,
             "prefix_reused_chars": self.prefix_reused_chars,
             "prefix_total_chars": self.prefix_total_chars,
+            "last_input_tokens": self.last_input_tokens,
+            "context_window": self.context_window,
         }
 
 
@@ -112,16 +128,28 @@ class UsageTracker:
         self._prefix_append_only = 0
         self._prefix_reused_chars = 0
         self._prefix_total_chars = 0
+        self._last_input_tokens = 0
+        self._context_window = 0
+        self._last_started_is_main = True
+        self._generation_is_main: dict[str, bool] = {}
         self._last_serializations: dict[str, str] = {}
 
     def llm_start(self, event: Any) -> None:
-        key = (str(getattr(event, "generation_id", "")), int(getattr(event, "turn_number", 0)))
+        gen_id = str(getattr(event, "generation_id", "") or "")
+        method = str(getattr(event, "method_name", "") or "")
+        primary = method in {"", "handle"}
+        key = (gen_id, int(getattr(event, "turn_number", 0)))
         with self._lock:
             self._started[key] = time.perf_counter()
             self._calls += 1
+            self._last_started_is_main = primary
+            if gen_id:
+                if gen_id not in self._generation_is_main and len(self._generation_is_main) >= 64:
+                    self._generation_is_main.pop(next(iter(self._generation_is_main)))
+                self._generation_is_main[gen_id] = primary
 
     def llm_end(self, event: Any) -> None:
-        key = (str(getattr(event, "generation_id", "")), int(getattr(event, "turn_number", 0)))
+        key = (str(getattr(event, "generation_id", "") or ""), int(getattr(event, "turn_number", 0)))
         with self._lock:
             started = self._started.pop(key, None)
             if started is not None:
@@ -129,7 +157,13 @@ class UsageTracker:
             if not bool(getattr(event, "success", True)):
                 self._failed += 1
 
-    def llm_complete(self, event: Any) -> None:
+    def llm_complete(
+        self,
+        event: Any,
+        *,
+        is_main: bool | None = None,
+        context_window: int | None = None,
+    ) -> None:
         usage = getattr(event, "usage", None)
 
         def _pick(*names: str, default: Any = 0) -> Any:
@@ -142,12 +176,24 @@ class UsageTracker:
                         return value
             return default
 
+        input_tokens = int(_pick("input_tokens", "prompt_tokens") or 0)
+        gen_id = str(getattr(event, "generation_id", "") or "")
         with self._lock:
-            self._prompt += int(_pick("input_tokens", "prompt_tokens") or 0)
+            self._prompt += input_tokens
             self._cached += int(_pick("cached_input_tokens", "cached_tokens") or 0)
             self._completion += int(_pick("output_tokens", "completion_tokens") or 0)
             self._reasoning += int(_pick("reasoning_tokens") or 0)
             self._cost += float(_pick("cost_usd", "cost", default=0.0) or 0.0)
+            if is_main is not None:
+                effective_main = is_main
+            elif gen_id and gen_id in self._generation_is_main:
+                effective_main = self._generation_is_main[gen_id]
+            else:
+                effective_main = self._last_started_is_main
+            if input_tokens > 0 and (effective_main or self._last_input_tokens == 0):
+                self._last_input_tokens = input_tokens
+            if context_window is not None and int(context_window) > 0:
+                self._context_window = int(context_window)
 
     def tool_output(self, event: Any) -> None:
         fields = ("stdout", "stderr", "error", "value")
@@ -231,6 +277,8 @@ class UsageTracker:
                 prefix_append_only=self._prefix_append_only,
                 prefix_reused_chars=self._prefix_reused_chars,
                 prefix_total_chars=self._prefix_total_chars,
+                last_input_tokens=self._last_input_tokens,
+                context_window=self._context_window,
             )
 
     def load_dict(self, data: dict[str, Any] | None) -> None:
@@ -240,6 +288,8 @@ class UsageTracker:
             return
         with self._lock:
             self._started.clear()
+            self._generation_is_main.clear()
+            self._last_started_is_main = True
             self._calls = max(int(data.get("calls", 0)), 0)
             self._failed = max(int(data.get("failed_calls", 0)), 0)
             self._prompt = max(int(data.get("prompt_tokens", 0)), 0)
@@ -253,4 +303,6 @@ class UsageTracker:
             self._prefix_append_only = max(int(data.get("prefix_append_only", 0)), 0)
             self._prefix_reused_chars = max(int(data.get("prefix_reused_chars", 0)), 0)
             self._prefix_total_chars = max(int(data.get("prefix_total_chars", 0)), 0)
+            self._last_input_tokens = max(int(data.get("last_input_tokens", 0)), 0)
+            self._context_window = max(int(data.get("context_window", 0)), 0)
             self._last_serializations.clear()

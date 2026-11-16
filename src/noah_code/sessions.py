@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
 import os
@@ -295,6 +296,128 @@ class SessionStore:
         sessions = self.list_sessions(workspace)
         return sessions[0] if sessions else None
 
+    def _prompt_history_file(self, workspace: Workspace) -> Path:
+        raw_family = family_id(workspace.root, workspace.identity)
+        safe_family = re.sub(r"[^0-9a-zA-Z_.-]", "_", raw_family) or "default"
+        return self.session_dir / ".prompt_history" / f"{safe_family}.json"
+
+    def record_prompt_history(self, workspace: Workspace, text: str) -> None:
+        """Persist a workspace-family prompt most-recent-first with 0600 permissions."""
+
+        cleaned = str(text or "").strip()
+        if not cleaned or cleaned.startswith("/"):
+            return
+        cleaned = cleaned[:8000]
+        existing = self.list_prompt_history(workspace, limit=100)
+        updated = [cleaned, *(item for item in existing if item != cleaned)][:100]
+        path = self._prompt_history_file(workspace)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with contextlib.suppress(OSError):
+            path.parent.chmod(0o700)
+        self._atomic_write_json(path, json.dumps(updated, ensure_ascii=False, indent=1))
+
+    def list_prompt_history(self, workspace: Workspace, limit: int = 100) -> list[str]:
+        """Return persisted workspace-family prompts (most-recent-first)."""
+
+        if limit <= 0:
+            return []
+        path = self._prompt_history_file(workspace)
+        if not path.is_file():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(data, list):
+            return []
+        seen: set[str] = set()
+        items: list[str] = []
+        cap = min(int(limit), 100)
+        for raw in data:
+            if not isinstance(raw, str):
+                continue
+            cleaned = raw.strip()[:8000]
+            if not cleaned or cleaned.startswith("/") or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            items.append(cleaned)
+            if len(items) >= cap:
+                break
+        return items
+
+    def rename(self, session_id: str, title: str) -> SessionMeta:
+        """Rename a persisted session and return its updated metadata."""
+
+        cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", str(title or "")).strip()[:60]
+        if not cleaned:
+            raise ValueError("session title cannot be empty")
+        meta = self.load_meta(session_id)
+        meta.title = cleaned
+        self.save_meta(meta)
+        return meta
+
+    def fork(self, session_id: str, workspace: Workspace) -> SessionMeta:
+        """Clone a session's SQLite history and undo journal into a new session."""
+
+        import shutil
+
+        source_meta = self.load_meta(session_id)
+        rebound = self.workspace_for_resume(source_meta, workspace)
+        new_id = uuid.uuid4().hex[:12]
+        dest_dir = self._session_path(new_id)
+        dest_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+        try:
+            src_db = self._db_path(session_id)
+            if src_db.is_file():
+                dst_db = self._db_path(new_id)
+                src_uri = f"{src_db.resolve().as_uri()}?mode=ro"
+                with (
+                    contextlib.closing(sqlite3.connect(src_uri, uri=True, timeout=5.0)) as src_conn,
+                    contextlib.closing(sqlite3.connect(dst_db, timeout=5.0)) as dst_conn,
+                ):
+                    src_conn.backup(dst_conn)
+                dst_db.chmod(0o600)
+
+            src_journal = self._journal_path(session_id)
+            if src_journal.is_file():
+                self._atomic_write_json(
+                    self._journal_path(new_id),
+                    src_journal.read_text(encoding="utf-8"),
+                )
+
+            src_blobs = self.blob_dir(session_id)
+            if src_blobs.is_dir():
+                dst_blobs = self.blob_dir(new_id)
+                dst_blobs.mkdir(parents=True, exist_ok=True, mode=0o700)
+                for blob in src_blobs.iterdir():
+                    if blob.is_file():
+                        target_blob = dst_blobs / blob.name
+                        shutil.copy2(blob, target_blob)
+                        target_blob.chmod(0o600)
+
+            now = time.time()
+            forked = SessionMeta(
+                session_id=new_id,
+                workspace_path=str(rebound.root),
+                workspace_identity=rebound.identity,
+                title=f"{source_meta.title} (fork)"[:60],
+                mode=source_meta.mode,
+                model=source_meta.model,
+                reasoning_effort=source_meta.reasoning_effort,
+                created_at=now,
+                updated_at=now,
+                permission_rules=list(source_meta.permission_rules),
+                journal=dict(source_meta.journal),
+                todos=dict(source_meta.todos),
+                repo_id=source_meta.repo_id or repo_id_for(rebound.root),
+                worktree_name=source_meta.worktree_name,
+            )
+            self.save_meta(forked)
+            return forked
+        except BaseException:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            raise
+
     def delete(self, session_id: str) -> None:
         import shutil
 
@@ -428,3 +551,146 @@ class SessionStore:
                 )
             )
         return records
+
+    def session_has_messages(self, session_id: str) -> bool:
+        """Return True when ``session_id`` has at least one persisted user or assistant message."""
+
+        return bool(self.last_message_preview(session_id, max_chars=16))
+
+    def last_message_preview(self, session_id: str, *, max_chars: int = 72) -> str:
+        """Return a single-line snippet of the most recent message in ``session_id``."""
+
+        if max_chars <= 0:
+            return ""
+        try:
+            session_path = self._session_path(session_id)
+        except SessionError:
+            return ""
+
+        snippet = ""
+        db_path = session_path / "session.db"
+        if db_path.is_file():
+            has_wal = (session_path / "session.db-wal").exists()
+            uri = (
+                f"{db_path.resolve().as_uri()}?mode=ro"
+                if has_wal
+                else f"{db_path.resolve().as_uri()}?mode=ro&immutable=1"
+            )
+            query = (
+                "SELECT event_type, data FROM events "
+                "WHERE event_type IN ("
+                "'Task', 'QueueOutput', 'Notification', 'PythonOutput', "
+                "'AgentMessage', 'Message', 'AssistantEvent', 'TextOnlyReply'"
+                ") AND json_valid(data) AND json_type(data) = 'object' "
+                "ORDER BY insertion_order DESC LIMIT 50"
+            )
+            try:
+                with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
+                    rows = conn.execute(query).fetchall()
+            except sqlite3.Error:
+                rows = []
+
+            user_candidate = ""
+            assistant_candidate = ""
+            for raw_type, raw_data in rows:
+                try:
+                    payload = json.loads(raw_data)
+                except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                etype = str(raw_type)
+                if not user_candidate:
+                    if etype == "Task":
+                        prompt = str(payload.get("prompt", "") or "").strip()
+                        if prompt and not prompt.startswith("## Task: handle"):
+                            user_candidate = prompt
+                    elif etype == "QueueOutput" and "user_messages" in str(
+                        payload.get("source", "")
+                    ):
+                        val = payload.get("value") or payload.get("value_preview") or ""
+                        if isinstance(val, str) and val.strip():
+                            user_candidate = val.strip()
+                    elif etype == "Notification" and "user" in str(
+                        payload.get("source", "")
+                    ).lower():
+                        desc = str(payload.get("description", "") or "").strip()
+                        if desc:
+                            user_candidate = desc
+                    elif etype == "PythonOutput":
+                        meta = payload.get("metadata")
+                        if isinstance(meta, dict) and meta.get("prefill_type") == "inspect_inputs":
+                            extracted = _extract_prefill_user_message(
+                                str(payload.get("stdout", "") or "")
+                            )
+                            if extracted:
+                                user_candidate = extracted
+                if not assistant_candidate and etype in {
+                    "AgentMessage",
+                    "Message",
+                    "AssistantEvent",
+                    "TextOnlyReply",
+                }:
+                    content = str(payload.get("content", "") or "").strip()
+                    if content:
+                        assistant_candidate = content
+                if user_candidate:
+                    break
+            snippet = user_candidate or assistant_candidate
+
+        runtime_db = session_path / "runtime.db"
+        if runtime_db.is_file():
+            rt_has_wal = (session_path / "runtime.db-wal").exists()
+            rt_uri = (
+                f"{runtime_db.resolve().as_uri()}?mode=ro"
+                if rt_has_wal
+                else f"{runtime_db.resolve().as_uri()}?mode=ro&immutable=1"
+            )
+            try:
+                with contextlib.closing(sqlite3.connect(rt_uri, uri=True, timeout=1.0)) as rt_conn:
+                    row = rt_conn.execute(
+                        "SELECT user_text FROM runs WHERE trim(user_text) != '' "
+                        "ORDER BY updated_at DESC LIMIT 1"
+                    ).fetchone()
+                    if row and row[0]:
+                        rt_text = str(row[0]).strip()
+                        if rt_text:
+                            snippet = rt_text
+            except sqlite3.Error:
+                pass
+
+        return _format_preview_snippet(snippet, max_chars=max_chars)
+
+
+def _extract_prefill_user_message(stdout: str) -> str:
+    marker = "notification (dict):"
+    idx = stdout.find(marker)
+    if idx < 0:
+        return ""
+    raw_dict = stdout[idx + len(marker) :].strip()
+    with contextlib.suppress(ValueError, SyntaxError, TypeError):
+        parsed = ast.literal_eval(raw_dict)
+        if isinstance(parsed, dict):
+            msgs = parsed.get("user_messages")
+            if isinstance(msgs, list) and msgs:
+                return str(msgs[-1]).strip()
+    match = re.search(r"['\"]user_messages['\"]\s*:\s*\[\s*(['\"])(.*?)\1", raw_dict, re.DOTALL)
+    return match.group(2).strip() if match else ""
+
+
+def _format_preview_snippet(raw: str, *, max_chars: int) -> str:
+    if not raw or max_chars <= 0:
+        return ""
+    cleaned = re.sub(
+        r"^Use the \$[A-Za-z0-9._-]+ skill instructions for this task:\s*",
+        "",
+        raw.strip(),
+    )
+    single_line = " ".join(re.sub(r"[\x00-\x1f\x7f]+", " ", cleaned).split())
+    if not single_line:
+        return ""
+    if len(single_line) <= max_chars:
+        return single_line
+    if max_chars == 1:
+        return single_line[:1]
+    return single_line[: max_chars - 1].rstrip() + "…"

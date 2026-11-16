@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib
 import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -99,7 +100,21 @@ class HostCommandsMixin:
         ) -> str: ...
         async def connect_mcp_server(self, name: str) -> str: ...
         async def add_mcp_server(self, kind: str, name: str, target: str) -> str: ...
+        async def connect_mcp_preset(
+            self, preset_key: str, *, env_value: str | None = None
+        ) -> str: ...
+        async def import_external_mcp_servers(
+            self, names: list[str] | None = None
+        ) -> str: ...
+        async def remove_mcp_server(self, name: str) -> str: ...
         def list_mcp_infos(self) -> list[Any]: ...
+        def list_mcp_presets(self) -> list[Any]: ...
+        def list_importable_mcp_servers(
+            self,
+        ) -> list[tuple[str, dict[str, Any], str]]: ...
+        def recent_repo_sessions(
+            self, limit: int = 3
+        ) -> list[tuple[SessionMeta, str]]: ...
         def list_skill_infos(self) -> list[Any]: ...
         def add_skill_from_path(self, path: str) -> Any: ...
         async def diff_review(self) -> Any: ...
@@ -131,6 +146,102 @@ class HostCommandsMixin:
         with contextlib.suppress(Exception):
             jobs = self.agent.processes.snapshot(limit=20)
         return {"agents": agents, "jobs": jobs}
+
+    def work_job_logs(self, job_id: str, max_chars: int = 8000) -> str:
+        """Return bounded recent job/terminal output without advancing model cursors."""
+
+        if self._agent is None:
+            return ""
+        with contextlib.suppress(Exception):
+            return str(self.agent.processes.peek_logs(job_id, max_chars=max_chars))
+        return ""
+
+    async def stop_work_item(self, unit: str, item_id: str) -> str:
+        """Stop a running child agent, terminal, or background job."""
+
+        if unit == "agent":
+            tasks = getattr(self.agent, "task", None)
+            if tasks is None:
+                raise RuntimeError("no child task runner")
+            return str(await tasks.cancel(item_id))
+        if unit == "job":
+            return str(await self.agent.processes.stop(item_id))
+        raise ValueError(f"unknown work unit: {unit!r}")
+
+    async def work_agent_diff(self, task_id: str) -> str:
+        """Return bounded git status and unified diff for an isolated child worktree."""
+
+        tasks = getattr(self.agent, "task", None)
+        if tasks is None:
+            raise RuntimeError("no child task runner")
+        return str(await tasks.diff(task_id))
+
+    async def apply_work_agent(self, task_id: str) -> str:
+        """Apply finished isolated child edits into the workspace as a journaled turn."""
+
+        tasks = getattr(self.agent, "task", None)
+        if tasks is None:
+            raise RuntimeError("no child task runner")
+        self._require_review_idle()
+        async with self._session_lock:
+            self._active_turn = asyncio.current_task()
+            self.ui.set_busy(True)
+            self.agent.journal.begin_turn()
+            try:
+                return str(await tasks.apply(task_id))
+            finally:
+                self.agent.journal.end_turn()
+                try:
+                    await self._persist_async()
+                finally:
+                    self._active_turn = None
+                    self.ui.set_busy(False)
+
+    async def cleanup_work_agent(self, task_id: str) -> str:
+        """Remove a finished isolated child's retained linked worktree."""
+
+        tasks = getattr(self.agent, "task", None)
+        if tasks is None:
+            raise RuntimeError("no child task runner")
+        return str(await tasks.cleanup(task_id))
+
+    async def follow_up_work_agent(self, task_id: str, prompt: str) -> str:
+        """Send a background follow-up prompt to a saved child agent."""
+
+        tasks = getattr(self.agent, "task", None)
+        if tasks is None:
+            raise RuntimeError("no child task runner")
+        return str(await tasks.follow_up(task_id, prompt, background=True))
+
+    def _checkpoint_undo_target(self) -> dict[str, Any] | None:
+        manager = getattr(self, "_checkpoints", None)
+        if manager is None:
+            return None
+        try:
+            entries = manager.list()
+        except Exception:  # noqa: BLE001
+            return None
+        if not entries:
+            return None
+        return entries[-2] if len(entries) >= 2 else entries[-1]
+
+    def has_git_checkpoint(self) -> bool:
+        """Return True when at least one Git checkpoint is available to restore."""
+
+        return self._checkpoint_undo_target() is not None
+
+    def checkpoint_undo_preview(self) -> str | None:
+        """Describe the available Git checkpoint fallback when journal undo is blocked."""
+
+        target = self._checkpoint_undo_target()
+        if target is None:
+            return None
+        ref = str(target.get("ref", ""))
+        commit = str(target.get("commit", ""))[:12]
+        return (
+            "Journal undo is unavailable because shell commands ran, "
+            f"but Git checkpoint {ref} ({commit}) can restore the worktree."
+        )
 
     def work_status_text(self) -> str:
         snapshot = self.work_snapshot()
@@ -170,16 +281,32 @@ class HostCommandsMixin:
 
         rows: list[dict[str, str]] = []
         root = self.workspace.root
-        for relative in ("AGENTS.md", "CLAUDE.md", ".noah-code/instructions.md"):
-            path = root / relative
-            if path.is_file():
-                rows.append(
-                    {
-                        "kind": "instruction",
-                        "label": relative,
-                        "detail": f"Repository instructions · {path}",
-                    }
+        discover_fn: Any = None
+        with contextlib.suppress(ImportError):
+            instr_mod = importlib.import_module("noah_code.instructions")
+            discover_fn = getattr(instr_mod, "discover_instruction_files", None)
+        if callable(discover_fn):
+            for src in discover_fn(root):
+                scope = getattr(src, "scope", "repo")
+                src_path = getattr(src, "path", "")
+                src_label = str(getattr(src, "label", Path(str(src_path)).name))
+                detail = (
+                    f"User instructions · {src_path}"
+                    if scope == "user"
+                    else f"Repository instructions · {src_path}"
                 )
+                rows.append({"kind": "instruction", "label": src_label, "detail": detail})
+        else:
+            for relative in ("AGENTS.md", "CLAUDE.md", ".noah-code/instructions.md"):
+                path = root / relative
+                if path.is_file():
+                    rows.append(
+                        {
+                            "kind": "instruction",
+                            "label": relative,
+                            "detail": f"Repository instructions · {path}",
+                        }
+                    )
         if PlanStore(root).exists():
             rows.append(
                 {
@@ -724,9 +851,12 @@ class HostCommandsMixin:
             return "handled"
         if name == "mcp":
             try:
+                from noah_code.mcp_setup import MCP_PRESETS, parse_mcp_add_target
+
                 parts = shlex.split(args)
                 if not parts:
                     rows = await asyncio.to_thread(self.list_mcp_infos)
+                    importable = await asyncio.to_thread(self.list_importable_mcp_servers)
                     text = "MCP servers"
                     if rows:
                         for row in rows:
@@ -737,19 +867,59 @@ class HostCommandsMixin:
                             )
                     else:
                         text += "\n\n  None configured"
+                    if importable:
+                        names_preview = ", ".join(item[0] for item in importable[:5])
+                        text += (
+                            f"\n\n  Importable from Claude/Cursor ({len(importable)}): "
+                            f"{names_preview}\n"
+                            "  Run: /mcp import"
+                        )
                     text += (
-                        "\n\nAdd with: /mcp add stdio NAME COMMAND…\n"
-                        "          /mcp add http NAME URL"
+                        "\n\nQuick setup:\n"
+                        "  /mcp presets                 Browse 1-click MCP presets\n"
+                        "  /mcp preset NAME             Install & connect a preset (e.g. context7, playwright)\n"
+                        "  /mcp import [NAME]           Import from Claude Code / Claude Desktop / Cursor\n"
+                        "  /mcp add NAME URL_OR_CMD…    Auto-detect HTTP URL or STDIO command\n"
+                        "  /mcp remove NAME             Remove from user mcp.json"
                     )
+                elif parts[0] == "presets" and len(parts) == 1:
+                    existing_names = {row.name for row in await asyncio.to_thread(self.list_mcp_infos)}
+                    lines = ["Built-in MCP presets (connect in 1 step with `/mcp preset KEY`):"]
+                    for preset in self.list_mcp_presets():
+                        status = (
+                            "connected"
+                            if preset.key in self._mcp_attached
+                            else "saved"
+                            if preset.key in existing_names
+                            else "preset"
+                        )
+                        env_hint = f" · env: {preset.env_var}" if preset.env_var else ""
+                        lines.append(
+                            f"\n  {preset.key:<20} [{status}] {preset.label}\n"
+                            f"    {preset.description}{env_hint}\n"
+                            f"    {preset.transport} · {preset.target}"
+                        )
+                    text = "\n".join(lines)
+                elif parts[0] in {"preset", "install"} and len(parts) in {2, 3}:
+                    env_val = parts[2] if len(parts) == 3 else None
+                    text = await self.connect_mcp_preset(parts[1], env_value=env_val)
+                elif parts[0] == "import":
+                    text = await self.import_external_mcp_servers(parts[1:] or None)
+                elif parts[0] in {"remove", "rm"} and len(parts) == 2:
+                    text = await self.remove_mcp_server(parts[1])
                 elif parts[0] == "connect" and len(parts) == 2:
                     text = await self.connect_mcp_server(parts[1])
-                elif parts[:2] == ["add", "stdio"] and len(parts) >= 4:
-                    text = await self.add_mcp_server("stdio", parts[2], shlex.join(parts[3:]))
-                elif parts[:2] == ["add", "http"] and len(parts) == 4:
-                    text = await self.add_mcp_server("http", parts[2], parts[3])
+                elif parts[0] == "add" and len(parts) == 2 and parts[1].lower() in {
+                    p.key for p in MCP_PRESETS
+                }:
+                    text = await self.connect_mcp_preset(parts[1])
+                elif parts[0] == "add" and len(parts) >= 3:
+                    kind, srv_name, target = parse_mcp_add_target(parts[1:])
+                    text = await self.add_mcp_server(kind, srv_name, target)
                 else:
                     text = (
-                        "usage: /mcp [connect NAME | add stdio NAME COMMAND… | add http NAME URL]"
+                        "usage: /mcp [presets | preset NAME | import [NAME] | connect NAME | "
+                        "add NAME URL_OR_COMMAND… | remove NAME]"
                     )
                 self.ui.render(_command_output(text))
             except Exception as exc:  # noqa: BLE001
@@ -1167,6 +1337,99 @@ class HostCommandsMixin:
             status = "history compacted" if compacted else "nothing eligible to compact"
             self.ui.render(HostEvent(HostEventKind.STATUS, status))
             return "handled"
+        if name == "resume":
+            raw_arg = args.strip()
+            recent = await asyncio.to_thread(self.recent_repo_sessions, 3)
+            if not raw_arg:
+                if not recent:
+                    self.ui.render(_command_output("No previous chats in this repository."))
+                    return "handled"
+                lines = ["Recent chats in this repository:"]
+                for idx, (s, preview) in enumerate(recent, start=1):
+                    current_tag = (
+                        "  ← current" if self.meta and s.session_id == self.meta.session_id else ""
+                    )
+                    wt_tag = f" · wt:{s.worktree_name}" if s.worktree_name else ""
+                    lines.append(
+                        f"\n  {idx}. {s.title}  ({s.session_id[:8]} · {s.mode} · {s.model}{wt_tag}){current_tag}"
+                    )
+                    if preview:
+                        lines.append(f"     “{preview}”")
+                lines.append("\nResume with: /resume 1")
+                self.ui.render(_command_output("\n".join(lines)))
+                return "handled"
+            if raw_arg.isdigit():
+                idx = int(raw_arg) - 1
+                if not recent:
+                    self.ui.render(
+                        HostEvent(HostEventKind.ERROR, "No previous chats in this repository")
+                    )
+                    return "handled"
+                if idx < 0 or idx >= len(recent):
+                    self.ui.render(
+                        HostEvent(
+                            HostEventKind.ERROR,
+                            f"Choose 1..{len(recent)} (only {len(recent)} recent chat(s) in this repository)",
+                        )
+                    )
+                    return "handled"
+                chosen, _preview = recent[idx]
+                if self.meta and chosen.session_id == self.meta.session_id:
+                    self.ui.render(
+                        HostEvent(
+                            HostEventKind.STATUS,
+                            f"already on session {chosen.session_id[:8]} · {chosen.title}",
+                        )
+                    )
+                    return "handled"
+                try:
+                    resumed = await self.switch_session(chosen.session_id)
+                except Exception as exc:  # noqa: BLE001
+                    self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
+                    return "handled"
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.STATUS,
+                        f"resumed session {resumed.session_id[:8]} · {resumed.title}",
+                    )
+                )
+                return "handled"
+            repo_sessions = await asyncio.to_thread(self.store.list_sessions, self.workspace)
+            exact = [s for s in repo_sessions if s.session_id == raw_arg]
+            matches = exact or (
+                [s for s in repo_sessions if s.session_id.startswith(raw_arg.lower())]
+                if len(raw_arg) >= 4
+                else []
+            )
+            if len(matches) > 1:
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.ERROR,
+                        f"ambiguous session prefix {raw_arg!r}; provide more characters",
+                    )
+                )
+                return "handled"
+            target_id = matches[0].session_id if matches else raw_arg.split()[0]
+            if self.meta and target_id == self.meta.session_id:
+                self.ui.render(
+                    HostEvent(
+                        HostEventKind.STATUS,
+                        f"already on session {self.meta.session_id[:8]} · {self.meta.title}",
+                    )
+                )
+                return "handled"
+            try:
+                resumed = await self.switch_session(target_id)
+            except Exception as exc:  # noqa: BLE001
+                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
+                return "handled"
+            self.ui.render(
+                HostEvent(
+                    HostEventKind.STATUS,
+                    f"resumed session {resumed.session_id[:8]} · {resumed.title}",
+                )
+            )
+            return "handled"
         if name == "continue":
             latest = await asyncio.to_thread(self.store.latest_for_workspace, self.workspace)
             if latest is None:
@@ -1182,6 +1445,16 @@ class HostCommandsMixin:
                 HostEvent(HostEventKind.STATUS, f"continued session {latest.session_id}")
             )
             return "handled"
+        skill_matches = [
+            info
+            for info in self.list_skill_infos()
+            if info.document_skill and name in {info.name.lower(), info.registry_name.lower()}
+        ]
+        if skill_matches:
+            matched = skill_matches[0]
+            task_body = args.strip() or f"Apply the {matched.name} skill to this workspace."
+            res = await self.submit_prompt(f"${matched.name} {task_body}")
+            return "continue" if res is not None else "handled"
         self.ui.render(HostEvent(HostEventKind.ERROR, f"unknown command /{name} - try /help"))
         return "handled"
 
