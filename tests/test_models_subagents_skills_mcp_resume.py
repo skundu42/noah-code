@@ -540,6 +540,7 @@ async def test_claude_frontmatter_optional_skills_commands_agents_and_slash_invo
             "session_dir": str(tmp_path / "sessions"),
             "tracing": {"enabled": False},
             "efficiency": {"memory_distillation": "off"},
+            "unsafe_inprocess_code_execution": True,
             "auto_approve": True,
         },
     )
@@ -659,6 +660,7 @@ async def test_mcp_presets_shorthand_add_external_import_and_cli(
         cli_overrides={
             "session_dir": str(tmp_path / "sessions"),
             "tracing": {"enabled": False},
+            "unsafe_inprocess_code_execution": True,
             "auto_approve": True,
         },
     )
@@ -835,6 +837,7 @@ async def test_resume_last_3_repo_chats_previews_slash_and_cli(
         cli_overrides={
             "session_dir": str(session_dir),
             "tracing": {"enabled": False},
+            "unsafe_inprocess_code_execution": True,
             "auto_approve": True,
         },
     )

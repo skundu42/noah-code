@@ -246,7 +246,11 @@ async def test_progressive_scoped_subdir_instructions_preserve_edit_anchors(
 
     agent = CodingAgent(
         Workspace(root=tmp_path.resolve()),
-        NoahCodeConfig(auto_approve=True, session_dir=tmp_path / "sessions"),
+        NoahCodeConfig(
+            auto_approve=True,
+            session_dir=tmp_path / "sessions",
+            unsafe_inprocess_code_execution=True,
+        ),
         llm=FakeLLMClient(),
     )
     try:
@@ -330,6 +334,7 @@ async def test_skills_and_agents_are_cached_in_prefix_and_noop_blocks_omitted(
             "session_dir": str(tmp_path / "sessions"),
             "tracing": {"enabled": False},
             "efficiency": {"memory_distillation": "off"},
+            "unsafe_inprocess_code_execution": True,
         },
     )
     llm = _RecordingLLM(context_window=200_000)
@@ -545,7 +550,8 @@ def test_event_bridge_forwards_llm_context_window() -> None:
             unsub()
 
 
-def test_install_skills_updates_static_prefix_on_activation(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_install_skills_updates_static_prefix_on_activation(tmp_path: Path) -> None:
     from noah_code.agent import CodingAgent
 
     skill_dir = tmp_path / ".agents" / "skills" / "demo-skill"
@@ -555,13 +561,19 @@ def test_install_skills_updates_static_prefix_on_activation(tmp_path: Path) -> N
     )
     agent = CodingAgent(
         Workspace(root=tmp_path.resolve()),
-        NoahCodeConfig(session_dir=tmp_path / "sessions"),
+        NoahCodeConfig(
+            session_dir=tmp_path / "sessions",
+            unsafe_inprocess_code_execution=True,
+        ),
         llm=FakeLLMClient(),
     )
-    install_skills(agent, tmp_path, NoahCodeConfig(), home=tmp_path / "home")
-    assert "cmd.demo-skill" in str(agent.context["skills"])
-    assert agent.context_manager._static.get("skills") is True  # noqa: SLF001
+    try:
+        install_skills(agent, tmp_path, NoahCodeConfig(), home=tmp_path / "home")
+        assert "cmd.demo-skill" in str(agent.context["skills"])
+        assert agent.context_manager._static.get("skills") is True  # noqa: SLF001
 
-    agent.skills.activate("demo-skill")
-    assert "Active Skills" in str(agent.context["skills"])
-    assert "self.demo_skill" in str(agent.context["skills"])
+        agent.skills.activate("demo-skill")
+        assert "Active Skills" in str(agent.context["skills"])
+        assert "self.demo_skill" in str(agent.context["skills"])
+    finally:
+        await agent.close_tools()

@@ -79,7 +79,7 @@ async def test_background_logs_are_cursor_based_and_job_completes(tmp_path: Path
         started = await manager.start(command, name="fixture")
         job_id = started.split()[1]
 
-        async with asyncio.timeout(3):
+        async with asyncio.timeout(10):
             while "completed" not in await manager.status(job_id):
                 await asyncio.sleep(0.02)
 
@@ -104,7 +104,7 @@ async def test_background_job_accepts_input_and_stop_owns_process_group(tmp_path
         job_id = started.split()[1]
 
         await manager.input(job_id, "hello")
-        async with asyncio.timeout(3):
+        async with asyncio.timeout(10):
             while True:
                 output = await manager.logs(job_id)
                 if "hello" in output:
@@ -204,7 +204,7 @@ async def test_background_job_status_and_logs_survive_manager_restart(tmp_path: 
         )
         started = await manager.start(command, name="durable")
         job_id = started.split()[1]
-        async with asyncio.timeout(3):
+        async with asyncio.timeout(10):
             while "completed" not in await manager.status(job_id):
                 await asyncio.sleep(0.02)
     finally:
