@@ -29,7 +29,17 @@ def test_default_is_a_side_effect_free_dry_run(monkeypatch, capsys, tmp_path):
     assert evaluation.main(["--output", str(output)]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["dry_run"] is True
-    assert len(report["tasks"]) == 2
+    assert [task["id"] for task in report["tasks"]] == [
+        "page-ranges",
+        "config-merge",
+        "event-pipeline",
+        "build-graph",
+    ]
+    assert report["options"] == {
+        "enable_subagents": False,
+        "enable_skills": False,
+        "enable_retries": False,
+    }
     assert not output.exists()
 
 
@@ -138,10 +148,11 @@ def test_fixture_launch_uses_explicit_permissions_without_auto_interpreter_denia
         ("task", "general"),
     ):
         assert engine.decide(category, target).action == "deny"
-    # Preserve the product's --auto security floor; only this trusted fixture
-    # harness's invocation changed.
+    # Preserve the product's --auto security floor: standard unittest stays
+    # available under auto while arbitrary interpreter execution is denied.
     guarded = PermissionEngine(config.permission_rules, mode=config.mode, auto_approve=True)
-    assert guarded.decide("bash", acceptance).action == "deny"
+    assert guarded.decide("bash", acceptance).action == "allow"
+    assert guarded.decide("bash", "python -c 'print(1)'").action == "deny"
 
 
 def test_noah_config_override_does_not_modify_default_path(monkeypatch, tmp_path):
@@ -257,3 +268,323 @@ async def test_scorer_ignores_replaced_tests_and_shadow_stdlib(tmp_path):
     assert report["tests_run"] == report["tests_discovered"] == 5
     assert report["failures"]
     assert not (tmp_path / "state" / "scoring" / "unittest.py").exists()
+
+
+def test_manifest_validation_allows_nested_paths_and_blocks_escapes(tmp_path):
+    fixture = tmp_path / "fixtures" / "nested"
+    (fixture / "src" / "pkg").mkdir(parents=True)
+    (fixture / "src" / "pkg" / "loader.py").write_text("x = 1\n")
+    (fixture / "src" / "router.js").write_text("export const x = 1;\n")
+    (fixture / "tests").mkdir()
+    (fixture / "tests" / "acceptance.py").write_text("pass\n")
+
+    def write_manifest(impl, runner="unittest"):
+        manifest = tmp_path / "tasks.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "tasks": [
+                        {
+                            "id": "nested-task",
+                            "fixture": "fixtures/nested",
+                            "prompt": "Fix bug",
+                            "runner": runner,
+                            "acceptance": ["{python}", "-m", "unittest"],
+                            "implementation": impl,
+                            "expected_tests": 1,
+                        }
+                    ],
+                }
+            )
+        )
+        return manifest
+
+    loaded = evaluation.load_tasks(write_manifest(["src/pkg/loader.py", "src/router.js"]))
+    assert loaded[0].implementation == ("src/pkg/loader.py", "src/router.js")
+
+    for bad in (
+        ["../escape.py"],
+        ["/etc/passwd"],
+        ["tests/acceptance.py"],
+        ["unittest.py"],
+        ["sitecustomize.py"],
+        ["json.py"],
+        ["src/../loader.py"],
+    ):
+        with pytest.raises(ValueError):
+            evaluation.load_tasks(write_manifest(bad))
+
+    link = fixture / "src" / "link.py"
+    link.symlink_to(fixture / "src" / "pkg" / "loader.py")
+    with pytest.raises(ValueError, match="symlink"):
+        evaluation.load_tasks(write_manifest(["src/link.py"]))
+
+
+def test_opt_in_feature_flags_configure_subagents_skills_and_retries(tmp_path):
+    from noah_code.config import NoahCodeConfig
+    from noah_code.permissions import PermissionEngine
+
+    evaluation.write_run_config(
+        tmp_path,
+        "http://127.0.0.1:1234/v1",
+        "z-ai/test",
+        150,
+        4096,
+        enable_subagents=True,
+        enable_skills=True,
+        enable_retries=True,
+    )
+    config = NoahCodeConfig.model_validate(tomllib.loads((tmp_path / "noah.toml").read_text()))
+    assert config.enabled_skills == ["*"]
+    assert config.reliability.retries.max_attempts == 3
+    engine = PermissionEngine(config.permission_rules, mode=config.mode, auto_approve=False)
+    assert engine.decide("task", "explore").action == "allow"
+    assert engine.decide("websearch", "anything").action == "deny"
+    opencode = json.loads((tmp_path / "config" / "opencode" / "opencode.json").read_text())
+    denied_actions = {r["action"] for r in opencode["permissions"] if r["effect"] == "deny"}
+    assert "subagent" not in denied_actions
+    assert {"websearch", "webfetch"} <= denied_actions
+
+
+async def test_pytest_and_command_runners_score_isolated_worktrees(tmp_path):
+    fixture = tmp_path / "fixture"
+    (fixture / "pkg").mkdir(parents=True)
+    (fixture / "pkg" / "__init__.py").write_text("from pkg.math_ops import double\n")
+    (fixture / "pkg" / "math_ops.py").write_text("def double(x):\n    return x\n")
+    (fixture / "tests").mkdir()
+    (fixture / "tests" / "test_ops.py").write_text(
+        "from pkg import double\n\n"
+        "def test_pos():\n    assert double(3) == 6\n\n"
+        "def test_zero():\n    assert double(0) == 0\n"
+    )
+    snapshot = {Path("test_ops.py"): (fixture / "tests" / "test_ops.py").read_bytes()}
+
+    pytest_task = evaluation.Task(
+        id="pytest-demo",
+        fixture=fixture,
+        prompt="Fix double",
+        acceptance=("{python}", "-m", "pytest"),
+        implementation=("pkg/math_ops.py",),
+        expected_tests=2,
+        runner="pytest",
+    )
+    worktree = tmp_path / "worktree"
+    shutil.copytree(fixture, worktree)
+    baseline = await evaluation.score_worktree(
+        pytest_task, worktree, tmp_path / "base-state", snapshot, sys.executable, dict(os.environ), ()
+    )
+    assert not evaluation.acceptance_passed(baseline, 2)
+
+    (worktree / "pkg" / "math_ops.py").write_text("def double(x):\n    return x * 2\n")
+    passed = await evaluation.score_worktree(
+        pytest_task, worktree, tmp_path / "pass-state", snapshot, sys.executable, dict(os.environ), ()
+    )
+    assert evaluation.acceptance_passed(passed, 2)
+
+    cmd_task = replace(
+        pytest_task,
+        id="cmd-demo",
+        runner="command",
+        expected_tests=1,
+        acceptance=("{python}", "-c", "import sys; sys.path.insert(0, '.'); from pkg import double; assert double(4) == 8"),
+    )
+    cmd_res = await evaluation.score_worktree(
+        cmd_task, worktree, tmp_path / "cmd-state", snapshot, sys.executable, dict(os.environ), ()
+    )
+    assert evaluation.acceptance_passed(cmd_res, 1)
+
+
+async def test_multi_file_tasks_fail_baseline_and_pass_with_reference_repairs(tmp_path):
+    tasks = {t.id: t for t in evaluation.load_tasks(evaluation.DEFAULT_MANIFEST)}
+    for task_id, task in tasks.items():
+        snapshot = {
+            p.relative_to(task.fixture / "tests"): p.read_bytes()
+            for p in (task.fixture / "tests").rglob("*")
+            if p.is_file()
+        }
+        base_res = await evaluation.score_worktree(
+            task,
+            task.fixture,
+            tmp_path / f"baseline-{task_id}",
+            snapshot,
+            sys.executable,
+            dict(os.environ),
+            (),
+        )
+        assert not evaluation.acceptance_passed(base_res, task.expected_tests), task_id
+
+    # Verify reference multi-file repair for event-pipeline
+    ep_task = tasks["event-pipeline"]
+    ep_work = tmp_path / "ep-work"
+    shutil.copytree(ep_task.fixture, ep_work)
+    (ep_work / "pkg" / "parser.py").write_text(
+        "from __future__ import annotations\nimport json\nfrom typing import Any\n\n"
+        "def parse_raw_lines(text: str) -> list[tuple[int, dict[str, Any] | Exception]]:\n"
+        "    parsed: list[tuple[int, dict[str, Any] | Exception]] = []\n"
+        "    for line_no, raw in enumerate(text.splitlines(), start=1):\n"
+        "        stripped = raw.strip()\n"
+        "        if not stripped or stripped.startswith('#'):\n"
+        "            continue\n"
+        "        try:\n"
+        "            value = json.loads(stripped, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))\n"
+        "        except ValueError as exc:\n"
+        "            parsed.append((line_no, exc))\n"
+        "            continue\n"
+        "        if not isinstance(value, dict):\n"
+        "            parsed.append((line_no, ValueError('event must be a JSON object')))\n"
+        "            continue\n"
+        "        parsed.append((line_no, value))\n"
+        "    return parsed\n"
+    )
+    (ep_work / "pkg" / "validator.py").write_text(
+        "from __future__ import annotations\nimport math\nfrom typing import Any\n\n"
+        "def _is_number(v: Any) -> bool:\n"
+        "    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))\n\n"
+        "def normalize_record(payload: dict[str, Any]) -> dict[str, Any]:\n"
+        "    event_id = payload.get('event_id')\n"
+        "    actor = payload.get('actor')\n"
+        "    if not isinstance(event_id, str) or not event_id.strip():\n"
+        "        raise ValueError('event_id')\n"
+        "    if not isinstance(actor, str) or not actor.strip():\n"
+        "        raise ValueError('actor')\n"
+        "    ts = payload.get('ts')\n"
+        "    if not _is_number(ts) or float(ts) < 0:\n"
+        "        raise ValueError('ts')\n"
+        "    raw_metrics = payload.get('metrics')\n"
+        "    if not isinstance(raw_metrics, dict) or not raw_metrics:\n"
+        "        raise ValueError('metrics')\n"
+        "    metrics: dict[str, float] = {}\n"
+        "    for k, v in raw_metrics.items():\n"
+        "        if not isinstance(k, str) or not k.strip() or not _is_number(v):\n"
+        "            raise ValueError('metric')\n"
+        "        metrics[k.strip()] = float(v)\n"
+        "    raw_tags = payload.get('tags', [])\n"
+        "    if not isinstance(raw_tags, list) or any(not isinstance(t, str) for t in raw_tags):\n"
+        "        raise ValueError('tags')\n"
+        "    tags = sorted({t.strip() for t in raw_tags if t.strip()})\n"
+        "    return {'event_id': event_id.strip(), 'actor': actor.strip(), 'ts': float(ts), 'metrics': metrics, 'tags': tags}\n"
+    )
+    (ep_work / "pkg" / "pipeline.py").write_text(
+        "from __future__ import annotations\nfrom dataclasses import dataclass\nfrom typing import Any\n"
+        "from pkg.parser import parse_raw_lines\nfrom pkg.validator import normalize_record\n\n"
+        "@dataclass(frozen=True)\nclass BatchReport:\n"
+        "    events: list[dict[str, Any]]\n    totals: dict[str, dict[str, float]]\n    rejected: list[tuple[int, str]]\n\n"
+        "def ingest_batch(text: str) -> BatchReport:\n"
+        "    by_id: dict[str, dict[str, Any]] = {}\n"
+        "    rejected: list[tuple[int, str]] = []\n"
+        "    for line_no, item in parse_raw_lines(text):\n"
+        "        if isinstance(item, Exception):\n"
+        "            rejected.append((line_no, str(item)))\n"
+        "            continue\n"
+        "        try:\n"
+        "            event = normalize_record(item)\n"
+        "        except ValueError as exc:\n"
+        "            rejected.append((line_no, str(exc)))\n"
+        "            continue\n"
+        "        prev = by_id.get(event['event_id'])\n"
+        "        if prev is None or event['ts'] >= prev['ts']:\n"
+        "            by_id[event['event_id']] = event\n"
+        "    events = sorted(by_id.values(), key=lambda r: (r['ts'], r['event_id']))\n"
+        "    totals: dict[str, dict[str, float]] = {}\n"
+        "    for ev in events:\n"
+        "        bucket = totals.setdefault(ev['actor'], {})\n"
+        "        for m, val in ev['metrics'].items():\n"
+        "            bucket[m] = bucket.get(m, 0.0) + val\n"
+        "    return BatchReport(events=events, totals=totals, rejected=rejected)\n"
+    )
+    ep_snap = {Path("acceptance.py"): (ep_task.fixture / "tests" / "acceptance.py").read_bytes()}
+    ep_res = await evaluation.score_worktree(
+        ep_task, ep_work, tmp_path / "ep-pass", ep_snap, sys.executable, dict(os.environ), ()
+    )
+    assert evaluation.acceptance_passed(ep_res, ep_task.expected_tests), ep_res.stdout
+
+    # Verify reference multi-file repair for build-graph
+    bg_task = tasks["build-graph"]
+    bg_work = tmp_path / "bg-work"
+    shutil.copytree(bg_task.fixture, bg_work)
+    (bg_work / "buildgraph" / "graph.py").write_text(
+        "from __future__ import annotations\nimport heapq\nfrom collections.abc import Iterable\nfrom dataclasses import dataclass\n\n"
+        "class CycleError(ValueError): pass\nclass UnknownTargetError(KeyError): pass\n\n"
+        "@dataclass(frozen=True)\nclass TargetSpec:\n    name: str\n    source_hash: str\n    deps: tuple[str, ...]\n\n"
+        "class DependencyGraph:\n"
+        "    def __init__(self) -> None:\n        self._targets: dict[str, TargetSpec] = {}\n"
+        "    def add_target(self, name: str, source_hash: str, deps: Iterable[str] = ()) -> None:\n"
+        "        self._targets[name] = TargetSpec(name=name, source_hash=source_hash, deps=tuple(dict.fromkeys(deps)))\n"
+        "    def get_target(self, name: str) -> TargetSpec:\n"
+        "        if name not in self._targets: raise UnknownTargetError(name)\n"
+        "        return self._targets[name]\n"
+        "    def execution_order(self, targets: Iterable[str]) -> list[str]:\n"
+        "        req = list(targets)\n"
+        "        if not req: return []\n"
+        "        closure: set[str] = set()\n"
+        "        stack = list(req)\n"
+        "        while stack:\n"
+        "            cur = stack.pop()\n"
+        "            if cur not in self._targets: raise UnknownTargetError(cur)\n"
+        "            if cur in closure: continue\n"
+        "            closure.add(cur)\n"
+        "            for dep in self._targets[cur].deps:\n"
+        "                if dep not in self._targets: raise UnknownTargetError(dep)\n"
+        "                if dep == cur: raise CycleError(cur)\n"
+        "                stack.append(dep)\n"
+        "        in_deg = {n: 0 for n in closure}\n"
+        "        dependents: dict[str, list[str]] = {n: [] for n in closure}\n"
+        "        for n in closure:\n"
+        "            for dep in self._targets[n].deps:\n"
+        "                in_deg[n] += 1\n"
+        "                dependents[dep].append(n)\n"
+        "        heap = [n for n, d in in_deg.items() if d == 0]\n"
+        "        heapq.heapify(heap)\n"
+        "        order: list[str] = []\n"
+        "        while heap:\n"
+        "            cur = heapq.heappop(heap)\n"
+        "            order.append(cur)\n"
+        "            for nxt in dependents[cur]:\n"
+        "                in_deg[nxt] -= 1\n"
+        "                if in_deg[nxt] == 0: heapq.heappush(heap, nxt)\n"
+        "        if len(order) != len(closure): raise CycleError('cycle')\n"
+        "        return order\n"
+    )
+    (bg_work / "buildgraph" / "cache.py").write_text(
+        "from __future__ import annotations\nimport hashlib\nfrom collections.abc import Mapping\n\n"
+        "class BuildCache:\n"
+        "    def __init__(self) -> None:\n        self._digests: dict[str, str] = {}\n"
+        "    @staticmethod\n    def compute_digest(target: str, source_hash: str, dep_digests: Mapping[str, str]) -> str:\n"
+        "        h = hashlib.sha256(f'{target}:{source_hash}\\n'.encode())\n"
+        "        for k in sorted(dep_digests): h.update(f'dep:{k}={dep_digests[k]}\\n'.encode())\n"
+        "        return h.hexdigest()\n"
+        "    def is_up_to_date(self, target: str, digest: str) -> bool: return self._digests.get(target) == digest\n"
+        "    def record(self, target: str, digest: str) -> None: self._digests[target] = digest\n"
+        "    def invalidate(self, target: str) -> None: self._digests.pop(target, None)\n"
+    )
+    (bg_work / "buildgraph" / "planner.py").write_text(
+        "from __future__ import annotations\nfrom collections.abc import Iterable\nfrom dataclasses import dataclass\n"
+        "from buildgraph.cache import BuildCache\nfrom buildgraph.graph import DependencyGraph\n\n"
+        "@dataclass(frozen=True)\nclass BuildPlan:\n    order: list[str]\n    rebuild: list[str]\n    cached: list[str]\n\n"
+        "class BuildPlanner:\n"
+        "    def __init__(self, graph: DependencyGraph | None = None, cache: BuildCache | None = None) -> None:\n"
+        "        self.graph = graph or DependencyGraph()\n        self.cache = cache or BuildCache()\n"
+        "    def register(self, name: str, source_hash: str, deps: Iterable[str] = ()) -> None:\n"
+        "        self.graph.add_target(name, source_hash, deps)\n"
+        "    def plan(self, targets: Iterable[str], *, commit: bool = False) -> BuildPlan:\n"
+        "        order = self.graph.execution_order(targets)\n"
+        "        digests: dict[str, str] = {}\n        rebuilt_set: set[str] = set()\n"
+        "        rebuild: list[str] = []\n        cached: list[str] = []\n"
+        "        for name in order:\n"
+        "            spec = self.graph.get_target(name)\n"
+        "            digest = self.cache.compute_digest(name, spec.source_hash, {d: digests[d] for d in spec.deps})\n"
+        "            digests[name] = digest\n"
+        "            if self.cache.is_up_to_date(name, digest) and not any(d in rebuilt_set for d in spec.deps):\n"
+        "                cached.append(name)\n"
+        "            else:\n"
+        "                rebuild.append(name)\n"
+        "                rebuilt_set.add(name)\n"
+        "                if commit: self.cache.record(name, digest)\n"
+        "        return BuildPlan(order=order, rebuild=rebuild, cached=cached)\n"
+    )
+    bg_snap = {Path("acceptance.py"): (bg_task.fixture / "tests" / "acceptance.py").read_bytes()}
+    bg_res = await evaluation.score_worktree(
+        bg_task, bg_work, tmp_path / "bg-pass", bg_snap, sys.executable, dict(os.environ), ()
+    )
+    assert evaluation.acceptance_passed(bg_res, bg_task.expected_tests), bg_res.stdout

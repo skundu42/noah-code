@@ -20,6 +20,8 @@ from noah_code import __version__
 
 MIN_CODEX_VERSION = (0, 153, 4)
 
+_VERIFIED_CODEX_BINARIES: dict[tuple[str, int], bool] = {}
+
 
 class CodexError(RuntimeError):
     """A safe, user-facing Codex connection error."""
@@ -51,6 +53,50 @@ def codex_environment() -> dict[str, str]:
     }
     environment["CODEX_HOME"] = str(codex_home())
     return environment
+
+
+async def verify_codex_cli(
+    executable: str,
+    environment: dict[str, str] | None = None,
+    *,
+    cwd: str | None = None,
+) -> None:
+    """Verify ``codex --version`` once per ``(resolved_binary_path, st_mtime_ns)``."""
+
+    cache_key: tuple[str, int] | None = None
+    with suppress(OSError):
+        resolved = Path(executable).resolve()
+        stat = resolved.stat()
+        cache_key = (str(resolved), stat.st_mtime_ns)
+    if cache_key is not None and _VERIFIED_CODEX_BINARIES.get(cache_key):
+        return
+
+    env = codex_environment() if environment is None else environment
+    process = await asyncio.create_subprocess_exec(
+        executable,
+        "--version",
+        cwd=cwd or None,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        output, _ = await asyncio.wait_for(process.communicate(), timeout=10)
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+    match = re.search(rb"codex-cli (\d+)\.(\d+)\.(\d+)", output[:1024])
+    if (
+        process.returncode != 0
+        or not match
+        or tuple(map(int, match.groups())) < MIN_CODEX_VERSION
+    ):
+        raise CodexError("Codex CLI 0.153.4 or newer is required for isolated account access.")
+    if cache_key is not None:
+        if len(_VERIFIED_CODEX_BINARIES) >= 16:
+            _VERIFIED_CODEX_BINARIES.pop(next(iter(_VERIFIED_CODEX_BINARIES)))
+        _VERIFIED_CODEX_BINARIES[cache_key] = True
 
 
 # These controls complement environments=[] on every model thread and turn.
@@ -100,6 +146,7 @@ class CodexAppServer:
     def __init__(self, *, timeout: float = 30.0) -> None:
         self.timeout = timeout
         self.cwd = ""
+        self.closed = False
         self._temporary: tempfile.TemporaryDirectory[str] | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task[None] | None = None
@@ -109,8 +156,21 @@ class CodexAppServer:
         self._counter = 0
         self._failure: CodexError | None = None
 
+    @property
+    def is_running(self) -> bool:
+        return (
+            not self.closed
+            and self._failure is None
+            and self._process is not None
+            and self._process.returncode is None
+            and self._reader is not None
+            and not self._reader.done()
+        )
+
     async def __aenter__(self) -> CodexAppServer:
         try:
+            self.closed = False
+            self._failure = None
             executable = codex_executable()
             environment = codex_environment()
             self._temporary = tempfile.TemporaryDirectory(prefix="noah-codex-")
@@ -145,27 +205,10 @@ class CodexAppServer:
             raise
 
     async def _check_version(self, executable: str, environment: dict[str, str]) -> None:
-        process = await asyncio.create_subprocess_exec(
-            executable,
-            "--version",
-            cwd=self.cwd,
-            env=environment,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        try:
-            output, _ = await asyncio.wait_for(process.communicate(), timeout=10)
-        finally:
-            if process.returncode is None:
-                process.kill()
-                await process.wait()
-        match = re.search(rb"codex-cli (\d+)\.(\d+)\.(\d+)", output[:1024])
-        if (
-            process.returncode != 0
-            or not match
-            or tuple(map(int, match.groups())) < MIN_CODEX_VERSION
-        ):
-            raise CodexError("Codex CLI 0.153.4 or newer is required for isolated account access.")
+        await verify_codex_cli(executable, environment, cwd=self.cwd)
+
+    async def aclose(self) -> None:
+        await self.__aexit__(None, None, None)
 
     async def __aexit__(self, *_: Any) -> None:
         closing = asyncio.create_task(self._close())
@@ -180,6 +223,7 @@ class CodexAppServer:
             raise asyncio.CancelledError
 
     async def _close(self) -> None:
+        self.closed = True
         if self._reader is not None:
             self._reader.cancel()
             with suppress(asyncio.CancelledError):
@@ -240,6 +284,17 @@ class CodexAppServer:
             )
         except TimeoutError as exc:
             raise CodexError("Timed out waiting for Codex.") from exc
+        if isinstance(message, CodexError):
+            raise message
+        return message
+
+    def try_next_notification(self) -> dict[str, Any] | None:
+        if self._failure is not None:
+            raise self._failure
+        try:
+            message = self._notifications.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
         if isinstance(message, CodexError):
             raise message
         return message

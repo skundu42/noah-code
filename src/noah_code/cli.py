@@ -9,7 +9,8 @@ import os
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlsplit
 
 import click
 
@@ -25,11 +26,9 @@ from noah_code.config import (
     user_default_model,
     user_permission_mode,
 )
-from noah_code.host import AgentHost, HostResult
 from noah_code.permission_modes import PERMISSION_MODES, permission_mode_flags
 from noah_code.redaction import safe_error_message
 from noah_code.sessions import SessionError, SessionStore
-from noah_code.ui.console import ConsoleUI
 from noah_code.updates import (
     UpdateError,
     _acquire_auto_update_lock,
@@ -41,12 +40,34 @@ from noah_code.updates import (
 )
 from noah_code.workspace import WorkspaceError, open_workspace
 
+if TYPE_CHECKING:
+    from noah_code.host import AgentHost
+
 EXIT_OK = 0
 EXIT_AGENT = 1
 EXIT_CONFIG = 2
 EXIT_SIGINT = 130
 
 _AUTO_UPDATE_CHECKED = False
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"AgentHost", "HostResult"}:
+        from noah_code.host import AgentHost, HostResult
+
+        globals()["AgentHost"] = AgentHost
+        globals()["HostResult"] = HostResult
+        return globals()[name]
+    if name == "ConsoleUI":
+        from noah_code.ui.console import ConsoleUI
+
+        globals()["ConsoleUI"] = ConsoleUI
+        return ConsoleUI
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _lazy_symbol(name: str) -> Any:
+    return getattr(sys.modules[__name__], name)
 
 
 def _run_async(coro):  # noqa: ANN001
@@ -296,13 +317,36 @@ def cli_group() -> None:
 @click.option("--port", type=click.IntRange(0, 65535), default=0, show_default=True)
 @click.option("--token-env", default="NOAH_CODE_SERVER_TOKEN", show_default=True,
               help="Environment variable containing a bearer token of at least 32 characters")
+@click.option(
+    "--restrict-workspace/--any-workspace",
+    "restrict_workspace",
+    default=None,
+    help="Restrict sessions to the served workspace (enabled by default when PATH is given)",
+)
 @_common_options
-def serve_cmd(path: str | None, port: int, token_env: str, **options: Any) -> None:
+def serve_cmd(
+    path: str | None,
+    port: int,
+    token_env: str,
+    restrict_workspace: bool | None,
+    **options: Any,
+) -> None:
     """Serve persistent agent sessions over authenticated loopback HTTP/SSE."""
     token = os.environ.get(token_env, "")
     if len(token) < 32:
         raise click.UsageError(f"{token_env} must contain a bearer token of at least 32 characters")
-    raise SystemExit(_run_async(_run_transport(path, token=token, port=port, **options)))
+    effective_restrict = (path is not None) if restrict_workspace is None else restrict_workspace
+    raise SystemExit(
+        _run_async(
+            _run_transport(
+                path,
+                token=token,
+                port=port,
+                restrict_workspace=effective_restrict,
+                **options,
+            )
+        )
+    )
 
 
 @cli_group.command("acp")
@@ -314,7 +358,12 @@ def acp_cmd(path: str | None, **options: Any) -> None:
 
 
 async def _run_transport(
-    path: str | None, *, token: str | None = None, port: int = 0, **options: Any,
+    path: str | None,
+    *,
+    token: str | None = None,
+    port: int = 0,
+    restrict_workspace: bool = False,
+    **options: Any,
 ) -> int:
     from noah_code.service import AgentService, ServiceError, serve_http
 
@@ -326,7 +375,15 @@ async def _run_transport(
         if prepared is None:
             return code
         workspace, config, _store, _meta = prepared
-        service = AgentService(workspace, config)
+        service_factory: Any = AgentService
+        try:
+            service = service_factory(
+                workspace,
+                config,
+                restrict_workspace=restrict_workspace,
+            )
+        except TypeError:
+            service = AgentService(workspace, config)
         try:
             if token is None:
                 from noah_code.acp import run_stdio
@@ -376,6 +433,20 @@ def browser_setup_cmd(browser: str, headed: bool, name: str) -> None:
 @click.argument("path", required=False, type=click.Path())
 @_common_options
 @click.option("--session", "session_id", default=None)
+@click.option(
+    "--attach",
+    "attach_url",
+    default=None,
+    envvar="NOAH_CODE_SERVER_URL",
+    help="Attach to a running noah serve URL instead of starting an in-process host",
+)
+@click.option(
+    "--token-env",
+    "token_env",
+    default="NOAH_CODE_SERVER_TOKEN",
+    show_default=True,
+    help="Environment variable with the bearer token when --attach is used",
+)
 @click.option("--json", "json_output", is_flag=True, help="Print one JSON outcome; send progress to stderr")
 def run_cmd(
     prompt: str,
@@ -388,6 +459,8 @@ def run_cmd(
     mode: str | None,
     max_iterations: int | None,
     session_id: str | None,
+    attach_url: str | None,
+    token_env: str,
     unsafe_inprocess_code_execution: bool,
     json_output: bool,
 ) -> None:
@@ -405,6 +478,8 @@ def run_cmd(
             mode=mode,
             max_iterations=max_iterations,
             session_id=session_id,
+            attach_url=attach_url,
+            token_env=token_env,
             unsafe_inprocess_code_execution=unsafe_inprocess_code_execution,
             json_output=json_output,
         )
@@ -1246,10 +1321,11 @@ async def _interactive(
         flags = permission_mode_flags(selected_permissions)
         config.auto_approve = flags["auto_approve"]
         config.yolo = flags["yolo"]
+    agent_host_cls = _lazy_symbol("AgentHost")
     if use_tui:
         from noah_code.providers import model_setup_required
 
-        host = AgentHost(workspace, config, session_meta=meta, store=store)
+        host = agent_host_cls(workspace, config, session_meta=meta, store=store)
         onboarding_required = (
             (
                 first_run
@@ -1275,12 +1351,13 @@ async def _interactive(
             # run_tui closes itself, but an import failure or a close that was
             # cut short by cancellation must not leak leases, storage, or tools.
             await host.close()
-    host = AgentHost(
+    console_ui_cls = _lazy_symbol("ConsoleUI")
+    host = agent_host_cls(
         workspace,
         config,
         session_meta=meta,
         store=store,
-        ui=ConsoleUI(markdown=config.ui.markdown),
+        ui=console_ui_cls(markdown=config.ui.markdown),
     )
     try:
         try:
@@ -1289,6 +1366,286 @@ async def _interactive(
             return EXIT_SIGINT
     finally:
         await host.close()
+
+
+def _parse_attach_endpoint(url: str) -> tuple[str, int, bool, str]:
+    parsed = urlsplit(url.strip())
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        raise ConfigError("--attach must be an http:// or https:// URL")
+    use_tls = scheme == "https"
+    host = parsed.hostname
+    if not use_tls and host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ConfigError(
+            "--attach over plaintext http:// is restricted to loopback (127.0.0.1, localhost, ::1)"
+        )
+    port = parsed.port or (443 if use_tls else 80)
+    prefix = parsed.path.rstrip("/")
+    return host, port, use_tls, prefix
+
+
+async def _http_service_json(
+    host: str,
+    port: int,
+    use_tls: bool,
+    token: str,
+    method: str,
+    target: str,
+    payload: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8") if payload is not None else b""
+    reader, writer = await asyncio.open_connection(host, port, ssl=use_tls or None)
+    try:
+        host_header = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        request = (
+            f"{method} {target} HTTP/1.1\r\n"
+            f"Host: {host_header}\r\n"
+            f"Authorization: Bearer {token}\r\n"
+            "Accept: application/json\r\n"
+            + (
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+                if payload is not None
+                else ""
+            )
+            + "Connection: close\r\n\r\n"
+        ).encode("ascii") + body
+        writer.write(request)
+        await writer.drain()
+        raw_head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=30)
+        status_line = raw_head.decode("iso-8859-1").split("\r\n", 1)[0]
+        parts = status_line.split(" ", 2)
+        status = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 500
+        raw_body = await asyncio.wait_for(reader.read(), timeout=30)
+        decoded = json.loads(raw_body.decode("utf-8")) if raw_body.strip() else {}
+        return status, decoded if isinstance(decoded, dict) else {"data": decoded}
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+
+
+async def _run_attached(
+    *,
+    attach_url: str,
+    token_env: str,
+    prompt: str,
+    path: str | None,
+    session_id: str | None,
+    yolo: bool,
+    json_output: bool,
+) -> int:
+    from noah_code.events import HostEvent, HostEventKind
+
+    host_result_cls = _lazy_symbol("HostResult")
+    console_ui_cls = _lazy_symbol("ConsoleUI")
+    active_sid: str | None = session_id
+    active_req_id: str | None = None
+    endpoint: tuple[str, int, bool, str] | None = None
+    token = os.environ.get(token_env, "")
+
+    with contextlib.redirect_stdout(sys.stderr) if json_output else contextlib.nullcontext():
+        try:
+            if len(token) < 32 or not token.isascii() or any(ch.isspace() for ch in token):
+                raise ConfigError(
+                    f"{token_env} must contain a bearer token of at least 32 non-whitespace ASCII characters"
+                )
+            endpoint = _parse_attach_endpoint(attach_url)
+            srv_host, srv_port, use_tls, prefix = endpoint
+            workspace = open_workspace(path)
+            ui = console_ui_cls(markdown=True)
+
+            open_body: dict[str, Any] = {"cwd": str(workspace.root)}
+            if session_id is not None:
+                open_body["session_id"] = session_id
+            status, opened = await _http_service_json(
+                srv_host, srv_port, use_tls, token, "POST", f"{prefix}/v1/sessions", open_body
+            )
+            if status not in {200, 201}:
+                raise RuntimeError(str(opened.get("error") or f"HTTP {status} opening session"))
+            active_sid = str(opened["session_id"])
+            after_seq = int(opened.get("sequence", 0))
+
+            status, submitted = await _http_service_json(
+                srv_host,
+                srv_port,
+                use_tls,
+                token,
+                "POST",
+                f"{prefix}/v1/sessions/{active_sid}/prompt",
+                {"prompt": prompt, "queue": False},
+            )
+            if status != 202:
+                raise RuntimeError(str(submitted.get("error") or f"HTTP {status} submitting prompt"))
+            active_req_id = (
+                str(submitted["request_id"]) if submitted.get("request_id") is not None else None
+            )
+
+            reader, writer = await asyncio.open_connection(
+                srv_host, srv_port, ssl=use_tls or None, limit=262_144
+            )
+            result = None
+            try:
+                host_header = (
+                    f"[{srv_host}]:{srv_port}" if ":" in srv_host else f"{srv_host}:{srv_port}"
+                )
+                sse_req = (
+                    f"GET {prefix}/v1/sessions/{active_sid}/events?after={after_seq} HTTP/1.1\r\n"
+                    f"Host: {host_header}\r\n"
+                    f"Authorization: Bearer {token}\r\n"
+                    "Accept: text/event-stream\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii")
+                writer.write(sse_req)
+                await writer.drain()
+                raw_head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=30)
+                status_line = raw_head.decode("iso-8859-1").split("\r\n", 1)[0]
+                if " 200 " not in status_line:
+                    err_body = await asyncio.wait_for(reader.read(), timeout=10)
+                    raise RuntimeError(
+                        err_body.decode("utf-8", errors="replace") or status_line
+                    )
+
+                valid_kinds = {item.value for item in HostEventKind}
+                while True:
+                    line_bytes = await reader.readline()
+                    if not line_bytes:
+                        break
+                    line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line.startswith("data:"):
+                        continue
+                    event = json.loads(line[5:].strip())
+                    if not isinstance(event, dict):
+                        continue
+                    kind = str(event.get("kind", ""))
+                    if kind == "turn_complete" and (
+                        active_req_id is None or event.get("request_id") == active_req_id
+                    ):
+                        raw_res = event.get("result")
+                        raw_res = raw_res if isinstance(raw_res, dict) else {}
+                        result = host_result_cls(
+                            exit_code=int(raw_res.get("exit_code", 0)),
+                            explanation=str(raw_res.get("explanation", "")),
+                            session_id=raw_res.get("session_id") or active_sid,
+                            status=str(raw_res.get("status", "completed")),
+                            run_id=raw_res.get("run_id"),
+                            usage=raw_res.get("usage") if isinstance(raw_res.get("usage"), dict) else {},
+                            checks=raw_res.get("checks") if isinstance(raw_res.get("checks"), list) else [],
+                        )
+                        break
+                    if kind == "interaction":
+                        iid = str(event.get("interaction_id", ""))
+                        if event.get("type") == "approval":
+                            choice = "once" if yolo else "reject"
+                            if not yolo and sys.stdin is not None and sys.stdin.isatty():
+                                import time as _time
+
+                                from noah_code.approvals import ApprovalRequest
+                                from noah_code.permissions import PermissionDecision
+
+                                loop = asyncio.get_running_loop()
+                                target = str(event.get("target", ""))
+                                req = ApprovalRequest(
+                                    id=iid,
+                                    decision=PermissionDecision(
+                                        category=str(event.get("category", "bash")),
+                                        target=target,
+                                        action="ask",
+                                        matching_rule=None,
+                                        reason=str(event.get("reason", "")),
+                                        remember_pattern=target,
+                                    ),
+                                    created_at=_time.monotonic(),
+                                    future=loop.create_future(),
+                                )
+                                ans = await ui.ask_approval(req)
+                                choice = ans.value
+                            await _http_service_json(
+                                srv_host,
+                                srv_port,
+                                use_tls,
+                                token,
+                                "POST",
+                                f"{prefix}/v1/sessions/{active_sid}/interactions/{iid}",
+                                {"choice": choice},
+                            )
+                        elif event.get("type") == "question":
+                            selections: list[str] = []
+                            custom = ""
+                            if sys.stdin is not None and sys.stdin.isatty():
+                                from noah_code.tools.question_tools import QuestionPrompt
+
+                                prompts = [
+                                    QuestionPrompt(
+                                        header=str(p.get("header", "Question")),
+                                        prompt=str(p.get("prompt", p.get("question", ""))),
+                                        options=tuple(str(o) for o in p.get("options", [])),
+                                    )
+                                    for p in event.get("prompts", [])
+                                    if isinstance(p, dict)
+                                ]
+                                q_ans = await ui.ask_questions(prompts)
+                                selections = list(q_ans.selections)
+                                custom = str(q_ans.custom)
+                            await _http_service_json(
+                                srv_host,
+                                srv_port,
+                                use_tls,
+                                token,
+                                "POST",
+                                f"{prefix}/v1/sessions/{active_sid}/interactions/{iid}",
+                                {"selections": selections, "custom": custom},
+                            )
+                        continue
+                    if kind in valid_kinds:
+                        meta_dict = event.get("meta")
+                        ui.render(
+                            HostEvent(
+                                HostEventKind(kind),
+                                str(event.get("text", "")),
+                                meta=meta_dict if isinstance(meta_dict, dict) else {},
+                            )
+                        )
+            finally:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+
+            if result is None:
+                raise RuntimeError("event stream closed before turn_complete")
+        except (Exception, asyncio.CancelledError, KeyboardInterrupt) as exc:
+            cancelled = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt))
+            if cancelled and endpoint is not None and active_sid is not None:
+                srv_host, srv_port, use_tls, prefix = endpoint
+                with contextlib.suppress(Exception):
+                    await _http_service_json(
+                        srv_host,
+                        srv_port,
+                        use_tls,
+                        token,
+                        "POST",
+                        f"{prefix}/v1/sessions/{active_sid}/cancel",
+                        {"request_id": active_req_id} if active_req_id else {},
+                    )
+            code = (
+                EXIT_SIGINT
+                if cancelled
+                else EXIT_CONFIG
+                if isinstance(exc, (ConfigError, WorkspaceError))
+                else EXIT_AGENT
+            )
+            explanation = "cancelled" if cancelled else safe_error_message(exc)
+            result = host_result_cls(
+                code,
+                explanation,
+                active_sid,
+                status="cancelled" if cancelled else "failed",
+            )
+            if not cancelled:
+                click.echo(f"error: {explanation}", err=True)
+
+    if json_output:
+        click.echo(json.dumps(asdict(result), ensure_ascii=False))
+    return int(result.exit_code)
 
 
 async def _run_session(
@@ -1305,9 +1662,24 @@ async def _run_session(
     unsafe_inprocess_code_execution: bool,
     json_output: bool = False,
     permissions: str | None = None,
+    attach_url: str | None = None,
+    token_env: str = "NOAH_CODE_SERVER_TOKEN",
 ) -> int:
     """Run one task through the normal host without automation-only adapters."""
+    if attach_url:
+        return await _run_attached(
+            attach_url=attach_url,
+            token_env=token_env,
+            prompt=prompt,
+            path=path,
+            session_id=session_id,
+            yolo=yolo,
+            json_output=json_output,
+        )
 
+    agent_host_cls = _lazy_symbol("AgentHost")
+    host_result_cls = _lazy_symbol("HostResult")
+    console_ui_cls = _lazy_symbol("ConsoleUI")
     host: AgentHost | None = None
     # Some provider libraries print directly; stdout stays machine-readable.
     with contextlib.redirect_stdout(sys.stderr) if json_output else contextlib.nullcontext():
@@ -1327,15 +1699,15 @@ async def _run_session(
                 allow_auto_install=False,
             )
             if prepared is None:
-                result = HostResult(
+                result = host_result_cls(
                     code, "Could not prepare the task; see stderr for details.",
                     session_id, status="failed",
                 )
             else:
                 workspace, config, store, meta = prepared
-                host = AgentHost(
+                host = agent_host_cls(
                     workspace, config, session_meta=meta, store=store,
-                    ui=ConsoleUI(markdown=config.ui.markdown),
+                    ui=console_ui_cls(markdown=config.ui.markdown),
                 )
                 try:
                     result = await host.run_once(prompt)
@@ -1348,7 +1720,7 @@ async def _run_session(
             explanation = "cancelled" if cancelled else safe_error_message(exc)
             previous = getattr(host, "last_result", None)
             result = replace(
-                previous if isinstance(previous, HostResult) else HostResult(code, session_id=session_id),
+                previous if isinstance(previous, host_result_cls) else host_result_cls(code, session_id=session_id),
                 exit_code=code, explanation=explanation,
                 status="cancelled" if cancelled else "failed",
             )

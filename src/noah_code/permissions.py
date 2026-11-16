@@ -439,11 +439,14 @@ class PermissionEngine:
         normalized_tokens = " ".join(tokens)
 
         segments = _split_shell_commands(command) or [command]
+        segment_normalized: list[str] = []
         for segment in segments:
             try:
                 seg_tokens = shlex.split(segment)
             except ValueError:
                 seg_tokens = []
+            if seg_tokens:
+                segment_normalized.append(" ".join(seg_tokens))
             effective_tokens = _effective_shell_tokens(seg_tokens)
             effective_program = _program_name(effective_tokens[0]) if effective_tokens else ""
 
@@ -477,7 +480,11 @@ class PermissionEngine:
                     remember_pattern=command,
                 )
 
-            for index, token in enumerate(seg_tokens):
+            scan_tokens = [*seg_tokens]
+            for extra in effective_tokens:
+                if extra not in scan_tokens:
+                    scan_tokens.append(extra)
+            for index, token in enumerate(scan_tokens):
                 if _is_secret_shell_token(token):
                     return PermissionDecision(
                         category=PermissionCategory.BASH,
@@ -490,7 +497,7 @@ class PermissionEngine:
                 program = Path(token).name.lower()
                 if program != "git":
                     continue
-                remaining = seg_tokens[index + 1 :]
+                remaining = scan_tokens[index + 1 :]
                 if any(part in {"push", "clean", "filter-branch"} for part in remaining) or (
                     "reset" in remaining and "--hard" in remaining
                 ):
@@ -526,7 +533,11 @@ class PermissionEngine:
             # Scan both the source and shlex-normalized tokens. Shell quote
             # fragments such as ``r''m`` execute as ``rm`` but deliberately do
             # not contain the raw substring matched by the policy regex.
-            if pat.search(command) or (normalized_tokens and pat.search(normalized_tokens)):
+            if (
+                pat.search(command)
+                or (normalized_tokens and pat.search(normalized_tokens))
+                or any(pat.search(seg_norm) for seg_norm in segment_normalized)
+            ):
                 return PermissionDecision(
                     category=PermissionCategory.BASH,
                     target=command,
@@ -562,14 +573,26 @@ class PermissionEngine:
         except ValueError:
             tokens = []
         normalized_tokens = " ".join(tokens)
-        effective = _effective_shell_tokens(tokens)
-        unsafe_filter = bool(
-            effective
-            and _program_name(effective[0]) in _READ_ONLY_FILTER_FLAGS
-            and not self.is_readonly_command(command)
-        )
+        segment_norms: list[str] = []
+        unsafe_filter = False
+        for seg in _split_shell_commands(command) or [command]:
+            try:
+                seg_toks = shlex.split(seg)
+            except ValueError:
+                seg_toks = []
+            if seg_toks:
+                segment_norms.append(" ".join(seg_toks))
+            eff = _effective_shell_tokens(seg_toks)
+            if (
+                eff
+                and _program_name(eff[0]) in _READ_ONLY_FILTER_FLAGS
+                and not self.is_readonly_command(command)
+            ):
+                unsafe_filter = True
         if unsafe_filter or any(
-            pat.search(command) or (normalized_tokens and pat.search(normalized_tokens))
+            pat.search(command)
+            or (normalized_tokens and pat.search(normalized_tokens))
+            or any(pat.search(seg_norm) for seg_norm in segment_norms)
             for pat in _ALWAYS_ASK_BASH
         ):
             return PermissionDecision(
@@ -715,18 +738,22 @@ def _is_readonly_filter(program: str, args: list[str]) -> bool:
 
 
 def _is_compound(command: str) -> bool:
-    """Detect pipes, chains, redirects, substitutions, heredocs."""
+    """Detect pipes, chains, redirects, substitutions, subshells, groups, heredocs."""
     # Rough conservative scan - not a full shell parser. /dev/null stream
     # discards (2>/dev/null) are harmless and excluded.
     command = _DEVNULL_REDIRECT.sub("", command)
     if _has_ambiguous_shell_expansion(command):
         return True
-    specials = ("|", "&&", "||", ";", "&", "`", "$(", "${", ">", "<", ">>", "\n")
+    specials = ("|", "&&", "||", ";", "&", "`", "$(", "${", ">", "<", ">>", "\n", "(", ")")
     in_single = False
     in_double = False
     i = 0
-    while i < len(command):
+    n = len(command)
+    while i < n:
         ch = command[i]
+        if ch == "\\" and not in_single:
+            i += 2
+            continue
         if ch == "'" and not in_double:
             in_single = not in_single
         elif ch == '"' and not in_single:
@@ -735,6 +762,18 @@ def _is_compound(command: str) -> bool:
             for sp in specials:
                 if command.startswith(sp, i):
                     return True
+            if (
+                ch == "{"
+                and (i == 0 or command[i - 1].isspace() or command[i - 1] in "|&;(\n")
+                and (i + 1 < n and command[i + 1].isspace())
+            ):
+                return True
+            if (
+                ch == "}"
+                and (i == 0 or command[i - 1].isspace() or command[i - 1] in ";\n")
+                and (i + 1 >= n or command[i + 1].isspace() or command[i + 1] in "|&;)\n")
+            ):
+                return True
         i += 1
     try:
         shlex.split(command)
@@ -876,12 +915,18 @@ def _is_secret_shell_token(token: str) -> bool:
     are scanned as path candidates as well.
     """
 
-    if token.startswith("-") and "=" in token:
-        values = token.split("=", 1)[1:]
-    elif _SHORT_FLAG_JOINED_VALUE.match(token):
-        values = [token[2:]]
-    else:
-        values = [token]
+    base_tokens = [token]
+    stripped_group = token.strip("(){};")
+    if stripped_group and stripped_group != token:
+        base_tokens.append(stripped_group)
+    values: list[str] = []
+    for item in base_tokens:
+        if item.startswith("-") and "=" in item:
+            values.extend(item.split("=", 1)[1:])
+        elif _SHORT_FLAG_JOINED_VALUE.match(item):
+            values.append(item[2:])
+        else:
+            values.append(item)
     candidates = list(values)
     for value in values:
         git_object_path = _git_object_path_candidate(value)
@@ -983,12 +1028,13 @@ def _glob_pattern_specificity(pattern: str) -> int:
 
 
 def _split_shell_commands(command: str) -> list[str]:
-    """Split a shell command on unquoted command/pipeline separators."""
+    """Split a shell command on unquoted command/pipeline/subshell/group separators."""
 
     segments: list[str] = []
     current: list[str] = []
     in_single = False
     in_double = False
+    subst_paren_depth = 0
     i = 0
     n = len(command)
     while i < n:
@@ -1008,6 +1054,21 @@ def _split_shell_commands(command: str) -> list[str]:
             i += 1
             continue
         if not in_single and not in_double:
+            if command.startswith("$(", i):
+                subst_paren_depth += 1
+                current.append("$(")
+                i += 2
+                continue
+            if ch == "(" and subst_paren_depth > 0:
+                subst_paren_depth += 1
+                current.append(ch)
+                i += 1
+                continue
+            if ch == ")" and subst_paren_depth > 0:
+                subst_paren_depth -= 1
+                current.append(ch)
+                i += 1
+                continue
             if command.startswith(("&&", "||"), i):
                 seg = "".join(current).strip()
                 if seg:
@@ -1015,10 +1076,23 @@ def _split_shell_commands(command: str) -> list[str]:
                 current = []
                 i += 2
                 continue
-            if ch in {"|", ";", "\n"} or (
-                ch == "&"
-                and (i + 1 >= n or command[i + 1] not in {">", "<"})
-                and (i == 0 or command[i - 1] not in {">", "<"})
+            if (
+                ch in {"|", ";", "\n", "(", ")"}
+                or (
+                    ch == "&"
+                    and (i + 1 >= n or command[i + 1] not in {">", "<"})
+                    and (i == 0 or command[i - 1] not in {">", "<"})
+                )
+                or (
+                    ch == "{"
+                    and (i == 0 or command[i - 1].isspace() or command[i - 1] in "|&;(\n")
+                    and (i + 1 < n and command[i + 1].isspace())
+                )
+                or (
+                    ch == "}"
+                    and not "".join(current).strip()
+                    and (i + 1 >= n or command[i + 1].isspace() or command[i + 1] in "|&;)\n")
+                )
             ):
                 seg = "".join(current).strip()
                 if seg:
@@ -1251,9 +1325,42 @@ def _command_has_external_path(command: str) -> bool:
 
 
 _ENV_DUMP_PROGRAMS = frozenset({"set", "declare", "local", "typeset", "readonly", "export"})
-_AUTO_ENV_INTERPRETERS = frozenset({"python", "python3", "node", "perl", "ruby", "php"})
+_AUTO_ENV_INTERPRETERS = frozenset(
+    {
+        "python",
+        "python3",
+        "node",
+        "nodejs",
+        "bun",
+        "deno",
+        "tsx",
+        "ts-node",
+        "perl",
+        "ruby",
+        "php",
+        "lua",
+        "luajit",
+    }
+)
+_PYTHON_INTERPRETER_NAME = re.compile(r"(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?t?")
 _AUTO_INTERPRETER_NAME = re.compile(
-    r"(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?t?|node(?:js)?|perl|ruby|php|(?:ba|z|k|da)?sh"
+    r"(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?t?|node(?:js)?|bun|deno|tsx|ts-node|perl|ruby|php|lua(?:jit|\d+(?:\.\d+)*)?|(?:ba|z|k|da)?sh"
+)
+_SAFE_PYTHON_UNITTEST_FLAGS = re.compile(r"-[BIq]+")
+_SAFE_UV_RUN_FLAGS = frozenset(
+    {
+        "--no-sync",
+        "--locked",
+        "--frozen",
+        "--offline",
+        "-q",
+        "--quiet",
+        "--no-project",
+        "--isolated",
+        "--no-dev",
+        "--only-dev",
+        "--no-config",
+    }
 )
 _INERT_INTERPRETER_FLAGS = frozenset({"-v", "-V", "-VV", "--version"})
 _SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=.*", re.DOTALL)
@@ -1268,41 +1375,76 @@ def _program_name(token: str) -> str:
     return Path(token).name.lower().removesuffix(".exe")
 
 
+def _strip_closing_paren(items: list[str], start: int) -> None:
+    if not items or len(items) <= start:
+        return
+    if items[-1] == ")" and len(items) - 1 > start:
+        items.pop()
+    elif items[-1].endswith(")") and items[-1].count(")") > items[-1].count("("):
+        items[-1] = items[-1][:-1]
+        if not items[-1] and len(items) - 1 > start:
+            items.pop()
+
+
 def _effective_shell_tokens(tokens: list[str]) -> list[str]:
-    """Resolve the command position through simple shell builtins/wrappers."""
+    """Resolve the command position through simple shell builtins/wrappers/groups."""
 
+    items = list(tokens)
     index = 0
-    while index < len(tokens) and _SHELL_ASSIGNMENT.fullmatch(tokens[index]):
-        index += 1
+    while index < len(items):
+        while index < len(items) and _SHELL_ASSIGNMENT.fullmatch(items[index]):
+            index += 1
+        if index >= len(items):
+            break
+        tok = items[index]
+        if tok == "(":
+            _strip_closing_paren(items, index)
+            index += 1
+            continue
+        if tok.startswith("(") and tok != "(":
+            items[index] = tok[1:]
+            _strip_closing_paren(items, index)
+            continue
+        if tok == "{":
+            if len(items) - 1 > index and items[-1] == "}":
+                items.pop()
+            if len(items) - 1 > index and items[-1].endswith(";"):
+                items[-1] = items[-1][:-1]
+                if not items[-1]:
+                    items.pop()
+            index += 1
+            continue
+        if tok in {")", "}"}:
+            index += 1
+            continue
 
-    while index < len(tokens):
         wrapper_start = index
-        program = _program_name(tokens[index])
+        program = _program_name(items[index])
         if program == "command":
             index += 1
-            while index < len(tokens) and tokens[index].startswith("-"):
-                option = tokens[index]
+            while index < len(items) and items[index].startswith("-"):
+                option = items[index]
                 if option in {"-v", "-V"}:
                     # Query-only forms inspect a name without invoking it.
-                    return tokens[wrapper_start:]
+                    return items[wrapper_start:]
                 index += 1
                 if option == "--":
                     break
             continue
         if program == "builtin":
             index += 1
-            if index < len(tokens) and tokens[index] == "--":
+            if index < len(items) and items[index] == "--":
                 index += 1
                 continue
-            if index < len(tokens) and tokens[index].startswith("-"):
+            if index < len(items) and items[index].startswith("-"):
                 # ``builtin -p/-a/-s`` query builtin metadata; it does not run
                 # the following name as a command.
-                return tokens[wrapper_start:]
+                return items[wrapper_start:]
             continue
         if program == "env":
             index += 1
-            while index < len(tokens):
-                token = tokens[index]
+            while index < len(items):
+                token = items[index]
                 if _SHELL_ASSIGNMENT.fullmatch(token):
                     index += 1
                     continue
@@ -1310,16 +1452,16 @@ def _effective_shell_tokens(tokens: list[str]) -> list[str]:
                 if option_name in _ENV_SPLIT_OPTIONS:
                     if "=" in token:
                         split_value = token.split("=", 1)[1]
-                        remainder = tokens[index + 1 :]
-                    elif index + 1 < len(tokens):
-                        split_value = tokens[index + 1]
-                        remainder = tokens[index + 2 :]
+                        remainder = items[index + 1 :]
+                    elif index + 1 < len(items):
+                        split_value = items[index + 1]
+                        remainder = items[index + 2 :]
                     else:
-                        return tokens[wrapper_start:]
+                        return items[wrapper_start:]
                     try:
                         split_tokens = shlex.split(split_value)
                     except ValueError:
-                        return tokens[wrapper_start:]
+                        return items[wrapper_start:]
                     return _effective_shell_tokens([*split_tokens, *remainder])
                 if option_name in _ENV_OPTIONS_WITH_VALUE and "=" not in token:
                     index += 2
@@ -1331,12 +1473,31 @@ def _effective_shell_tokens(tokens: list[str]) -> list[str]:
                     index += 1
                     continue
                 break
-            if index >= len(tokens):
+            if index >= len(items):
                 # ``env`` with only options/assignments prints the environment.
-                return tokens[wrapper_start:]
+                return items[wrapper_start:]
             continue
         break
-    return tokens[index:]
+    result = items[index:]
+    while result and result[-1] in {"}", ")"}:
+        result.pop()
+    if result and result[-1].endswith(";"):
+        trimmed = result[-1][:-1]
+        result = [*result[:-1], *([trimmed] if trimmed else [])]
+    return result
+
+
+def _is_safe_python_unittest(program_name: str, remaining: list[str]) -> bool:
+    if _PYTHON_INTERPRETER_NAME.fullmatch(program_name) is None:
+        return False
+    idx = 0
+    while idx < len(remaining) and _SAFE_PYTHON_UNITTEST_FLAGS.fullmatch(remaining[idx]):
+        idx += 1
+    return (
+        len(remaining) >= idx + 2
+        and remaining[idx] == "-m"
+        and remaining[idx + 1] == "unittest"
+    )
 
 
 def _contains_executing_interpreter(tokens: list[str]) -> bool:
@@ -1344,7 +1505,8 @@ def _contains_executing_interpreter(tokens: list[str]) -> bool:
 
     The effective-command pass prevents argument text such as ``echo python``
     from being mistaken for execution while retaining wrapper coverage.
-    Version-only invocations remain a useful inert operation under auto.
+    Version-only invocations and standard ``python -m unittest`` runs remain
+    available under auto.
     """
 
     effective = _effective_shell_tokens(tokens)
@@ -1360,11 +1522,21 @@ def _contains_executing_interpreter(tokens: list[str]) -> bool:
 
     if _AUTO_INTERPRETER_NAME.fullmatch(program) is not None:
         remaining = effective[1:]
-        return not (len(remaining) == 1 and remaining[0] in _INERT_INTERPRETER_FLAGS)
+        if len(remaining) == 1 and remaining[0] in _INERT_INTERPRETER_FLAGS:
+            return False
+        return not _is_safe_python_unittest(program, remaining)
 
     if program == "uv" and "run" in effective[1:]:
         run_index = effective.index("run", 1)
         run_args = effective[run_index + 1 :]
+        uv_idx = 0
+        while uv_idx < len(run_args) and run_args[uv_idx] in _SAFE_UV_RUN_FLAGS:
+            uv_idx += 1
+        if uv_idx < len(run_args):
+            target_prog = _program_name(run_args[uv_idx])
+            target_rem = run_args[uv_idx + 1 :]
+            if _is_safe_python_unittest(target_prog, target_rem):
+                return False
         if any(arg in {"-m", "--module", "-s", "--script", "--gui-script"} for arg in run_args):
             return True
         for index, token in enumerate(run_args):
@@ -1373,6 +1545,11 @@ def _contains_executing_interpreter(tokens: list[str]) -> bool:
             remaining = run_args[index + 1 :]
             return not (len(remaining) == 1 and remaining[0] in _INERT_INTERPRETER_FLAGS)
     return False
+
+
+_INLINE_ENV_DUMP_RE = re.compile(
+    r"\b(?:os\s*\.\s*environ|process\s*\.\s*env|deno\s*\.\s*env|bun\s*\.\s*env)\b"
+)
 
 
 def _is_env_dump(tokens: list[str]) -> bool:
@@ -1396,13 +1573,14 @@ def _is_env_dump(tokens: list[str]) -> bool:
             return True
         # Bare or flag-only invocations list variables; assignments do not.
         return not rest or all(part.startswith("-") for part in rest)
-    if program in _AUTO_ENV_INTERPRETERS:
-        for index in range(len(rest) - 1):
-            if rest[index] not in {"-c", "-e"}:
+    if program in _AUTO_ENV_INTERPRETERS or _PYTHON_INTERPRETER_NAME.fullmatch(program) is not None:
+        for index, arg in enumerate(rest):
+            if arg.startswith("--eval="):
+                code = arg.split("=", 1)[1].lower()
+            elif arg in {"-c", "-e", "-r", "--eval", "eval"} and index + 1 < len(rest):
+                code = rest[index + 1].lower()
+            else:
                 continue
-            code = rest[index + 1].lower()
-            if re.search(r"\bos\s*\.\s*environ\b", code) or re.search(
-                r"\bprocess\s*\.\s*env\b", code
-            ):
+            if _INLINE_ENV_DUMP_RE.search(code):
                 return True
     return False

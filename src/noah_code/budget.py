@@ -23,6 +23,7 @@ from nooa.unifiedllm.unifiedllm import UnifiedLLM
 
 from noah_code import nooa_compat
 from noah_code.config import BudgetConfig
+from noah_code.model_streaming import stream_chunk_counter
 
 
 class BudgetExceeded(RuntimeError):
@@ -296,6 +297,8 @@ class BudgetedLLM(UnifiedLLM):
         self._inner = inner
         self._guard = guard
         self._prefix_observer = prefix_observer
+        self._last_stream_chunks = 0
+        self._last_stream_chars = 0
         nooa_compat.init_llm_wrapper(self, inner)
 
     @property
@@ -305,6 +308,14 @@ class BudgetedLLM(UnifiedLLM):
     @property
     def context_window(self) -> Any:
         return getattr(self._inner, "context_window", None)
+
+    def get_context_limits(
+        self, overrides: dict[str, Any] | None = None, *, fallback_reserve: int = 0
+    ) -> Any:
+        get_limits = getattr(self._inner, "get_context_limits", None)
+        if callable(get_limits):
+            return get_limits(overrides, fallback_reserve=fallback_reserve)
+        return super().get_context_limits(overrides, fallback_reserve=fallback_reserve)
 
     def _observe_prefix(self, messages: list[dict], *, route: str | None = None) -> None:
         if self._prefix_observer is not None:
@@ -321,56 +332,88 @@ class BudgetedLLM(UnifiedLLM):
             )
 
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
-        # Active caps serialize reservations across parent and subagent routes;
-        # without this lane, concurrent calls can all pass the same preflight.
-        self._guard.enforce()
+        async with self._guard._async_provider_lock:
+            self._guard.enforce()
+            self._observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
+            call_kwargs = dict(kwargs)
+            # NOOA shields LiteLLM's provider task from cancellation.
+            # Bound its own request timeout as well as our outer wait.
+            self._limit_timeout(call_kwargs)
+            remaining = self._guard.remaining_seconds()
+
         try:
-            async with asyncio.timeout(self._guard.remaining_seconds()):
-                async with self._guard._async_provider_lock:
-                    self._guard.enforce()
-                    self._observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
-                    # NOOA shields LiteLLM's provider task from cancellation.
-                    # Bound its own request timeout as well as our outer wait.
-                    self._limit_timeout(kwargs)
-                    response = await self._inner.acall(
-                        messages, tools=tools, output_model=output_model, **kwargs
-                    )
-                    prompt, completion, cost = _usage_from_response(response)
-                    self._guard.add_usage(
-                        prompt_tokens=prompt,
-                        completion_tokens=completion,
-                        cost_usd=cost,
-                    )
-                    self._guard.enforce()
-                    return response
+            async with asyncio.timeout(remaining):
+                with stream_chunk_counter() as stream_stats:
+                    try:
+                        response = await self._inner.acall(
+                            messages, tools=tools, output_model=output_model, **call_kwargs
+                        )
+                    finally:
+                        self._last_stream_chunks = stream_stats.chunks
+                        self._last_stream_chars = stream_stats.chars
         except TimeoutError:
             # Preserve a provider's own timeout unless the session deadline
             # expired. A session timeout must surface as a sticky budget stop.
             self._guard.enforce()
             raise
 
-    def call(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
-        with self._guard._provider_lock:
-            self._guard.enforce()
-            self._observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
-            self._limit_timeout(kwargs)
-            response = self._inner.call(
-                messages, tools=tools, output_model=output_model, **kwargs
-            )
-            prompt, completion, cost = _usage_from_response(response)
+        prompt, completion, cost = _usage_from_response(response)
+        async with self._guard._async_provider_lock:
             self._guard.add_usage(
                 prompt_tokens=prompt,
                 completion_tokens=completion,
                 cost_usd=cost,
             )
             self._guard.enforce()
-            return response
+        return response
+
+    def call(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
+        with self._guard._provider_lock:
+            self._guard.enforce()
+            self._observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
+            call_kwargs = dict(kwargs)
+            self._limit_timeout(call_kwargs)
+        try:
+            with stream_chunk_counter() as stream_stats:
+                try:
+                    response = self._inner.call(
+                        messages, tools=tools, output_model=output_model, **call_kwargs
+                    )
+                finally:
+                    self._last_stream_chunks = stream_stats.chunks
+                    self._last_stream_chars = stream_stats.chars
+        except TimeoutError:
+            self._guard.enforce()
+            raise
+        prompt, completion, cost = _usage_from_response(response)
+        with self._guard._provider_lock:
+            self._guard.add_usage(
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+                cost_usd=cost,
+            )
+            self._guard.enforce()
+        return response
 
     def count_tokens(self, text: str) -> int:
         return self._inner.count_tokens(text)
 
     def get_model_info(self) -> Any:
         return self._inner.get_model_info()
+
+    async def aclose(self) -> None:
+        aclose = getattr(self._inner, "aclose", None)
+        if callable(aclose):
+            await aclose()
+        else:
+            await super().aclose()
+
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if callable(close):
+            close()
+        else:
+            super().close()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -408,6 +451,22 @@ class _PrefixObserverOnly(UnifiedLLM):
         self._observer = observer
         nooa_compat.init_llm_wrapper(self, inner)
 
+    @property
+    def model(self) -> Any:
+        return getattr(self._inner, "model", None)
+
+    @property
+    def context_window(self) -> Any:
+        return getattr(self._inner, "context_window", None)
+
+    def get_context_limits(
+        self, overrides: dict[str, Any] | None = None, *, fallback_reserve: int = 0
+    ) -> Any:
+        get_limits = getattr(self._inner, "get_context_limits", None)
+        if callable(get_limits):
+            return get_limits(overrides, fallback_reserve=fallback_reserve)
+        return super().get_context_limits(overrides, fallback_reserve=fallback_reserve)
+
     async def acall(self, messages: list[dict], tools=None, output_model=None, **kwargs) -> Any:
         self._observer.observe_prefix(messages, route=kwargs.get("prompt_cache_key"))
         response = await self._inner.acall(messages, tools=tools, output_model=output_model, **kwargs)
@@ -422,6 +481,23 @@ class _PrefixObserverOnly(UnifiedLLM):
 
     def count_tokens(self, text: str) -> int:
         return self._inner.count_tokens(text)
+
+    def get_model_info(self) -> Any:
+        return self._inner.get_model_info()
+
+    async def aclose(self) -> None:
+        aclose = getattr(self._inner, "aclose", None)
+        if callable(aclose):
+            await aclose()
+        else:
+            await super().aclose()
+
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if callable(close):
+            close()
+        else:
+            super().close()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)

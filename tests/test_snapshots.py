@@ -411,3 +411,51 @@ def test_capture_only_reconstructs_last_mutation_per_path(tmp_path: Path) -> Non
     with pytest.raises(RuntimeError, match="postimage not stored"):
         journal.undo()
     assert path.read_text() == "v2"
+
+
+def test_content_addressed_blob_dir_deduplicates_and_preserves_backcompat(tmp_path: Path) -> None:
+    blobs = tmp_path / "blobs"
+    path = tmp_path / "doc.txt"
+    path.write_text("v0")
+
+    journal = SnapshotJournal(blob_dir=blobs)
+    journal.begin_turn()
+    m1 = journal.record_preimage(path)
+    path.write_text("v1")
+    journal.record_postimage(m1, path)
+    journal.end_turn()
+
+    journal.begin_turn()
+    m2 = journal.record_preimage(path)
+    path.write_text("v2")
+    journal.record_postimage(m2, path)
+    journal.end_turn()
+
+    serialized = journal.to_dict()
+    mut_entry = serialized["turns"][0]["mutations"][0]
+    assert "pre_blob" in mut_entry and "post_blob" in mut_entry
+    assert "pre_bytes_b64" not in mut_entry and "post_bytes_b64" not in mut_entry
+
+    # Three distinct contents ("v0", "v1", "v2"), stored once each with 0600 permissions.
+    stored_files = [p for p in blobs.iterdir() if p.is_file()]
+    assert len(stored_files) == 3
+    for blob_file in stored_files:
+        assert blob_file.stat().st_mode & 0o777 == 0o600
+
+    # Reload via explicit blob_dir argument and undo/redo both turns.
+    reloaded = SnapshotJournal()
+    reloaded.load_dict(serialized, blob_dir=blobs)
+    reloaded.undo()
+    assert path.read_text() == "v1"
+    reloaded.undo()
+    assert path.read_text() == "v0"
+    reloaded.redo()
+    assert path.read_text() == "v1"
+
+    # Corrupting one turn's blob drops only that damaged turn instead of crashing.
+    bad_blob = blobs / serialized["turns"][0]["mutations"][0]["pre_blob"]
+    bad_blob.write_bytes(b"tampered")
+    partial = SnapshotJournal(blob_dir=blobs)
+    partial.load_dict(serialized)
+    assert len(partial._turns) == 1
+    assert partial._turns[0].turn_id == serialized["turns"][1]["turn_id"]

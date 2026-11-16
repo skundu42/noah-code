@@ -260,3 +260,71 @@ async def test_check_history_records_cwd_and_redacts_and_bounds_persisted_text(
     assert "private-value" not in rows[0]["command"]
     assert len(rows[0]["command"]) <= 4000
     assert len(rows[0]["source"]) <= 256
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("PYTHONPATH=src pytest -q", "pytest"),
+        ("CI=1 RUST_BACKTRACE=1 cargo test", "cargo test"),
+        ("npx --no-install tsc --noEmit", "tsc"),
+        ("npx eslint src", "eslint"),
+        ("bunx vitest run", "vitest"),
+        ("poetry run pytest", "pytest"),
+        ("pdm run mypy src", "mypy"),
+        ("hatch run ruff check .", "ruff"),
+        ("bun test", "bun test"),
+        ("deno test", "deno test"),
+        ("tox", "tox"),
+        ("nox", "nox"),
+        ("gradle test", "gradle test"),
+        ("./gradlew check", "gradle check"),
+        ("eslint .", "eslint"),
+        ("biome check .", "biome check"),
+        ("biome lint src", "biome lint"),
+        ("biome ci .", "biome ci"),
+        ("golangci-lint run ./...", "golangci-lint"),
+        ("ruff format --check .", "ruff format"),
+        ("ruff format .", None),
+        ("python -m unittest 2>/dev/null", None),
+    ],
+)
+def test_expanded_check_labels(command: str, expected: str | None) -> None:
+    assert check_label(command) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("git", [False, True])
+async def test_coverage_and_build_artifacts_do_not_stale_passing_checks(
+    tmp_path: Path, git: bool
+) -> None:
+    source = tmp_path / "app.py"
+    source.write_text("x = 1\n")
+    if git:
+        _git(tmp_path, "init")
+        _git(tmp_path, "add", "app.py")
+
+    ledger = CheckLedger(tmp_path)
+    record = await ledger.begin("pytest --cov")
+    for folder in (
+        "target/debug",
+        ".next/cache",
+        ".nuxt/dist",
+        ".turbo/runs",
+        ".gradle/8.5",
+        ".nox/tests",
+        "htmlcov",
+        "test-results",
+        "playwright-report",
+    ):
+        artifact_dir = tmp_path / folder
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "out.bin").write_text("generated")
+    (tmp_path / ".coverage").write_text("cov")
+    (tmp_path / ".coverage.worker-1").write_text("cov-shard")
+    (tmp_path / "coverage.xml").write_text("<coverage/>")
+    await ledger.finish(record, 0)
+
+    snap = await ledger.snapshot()
+    assert snap[0]["state"] == "passed"
+    assert await ledger.completion_blockers() == []

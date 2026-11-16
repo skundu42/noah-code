@@ -11,6 +11,7 @@ import re
 import shutil
 import signal
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -20,6 +21,7 @@ from urllib.request import url2pathname
 from nooa import Skill, hidden, spec
 
 from noah_code.approvals import ApprovalBroker
+from noah_code.credentials import scrubbed_subprocess_env
 from noah_code.permissions import PermissionCategory, PermissionEngine, is_secret_path
 from noah_code.workspace import Workspace, parse_porcelain_z
 
@@ -222,6 +224,7 @@ class _LSPClient:
             self.process = await asyncio.create_subprocess_exec(
                 *self.command,
                 cwd=self.root,
+                env=scrubbed_subprocess_env(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -509,45 +512,381 @@ class _LSPClient:
         await self._cancel_pump_tasks()
 
 
+_IDENT_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+_CONTROL_KEYWORDS = frozenset(
+    {
+        "if",
+        "else",
+        "for",
+        "while",
+        "switch",
+        "catch",
+        "synchronized",
+        "return",
+        "sizeof",
+        "alignof",
+        "decltype",
+        "throw",
+        "new",
+        "delete",
+        "case",
+        "do",
+        "try",
+    }
+)
+
+_RUST_DECL_RE = re.compile(
+    r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?"
+    r"(?:(?:default|const|async|unsafe|extern(?:\s+\"[^\"]*\")?)\s+)*"
+    r"(?P<kind>fn|struct|enum|trait|type|mod)\s+"
+    r"(?P<name>[A-Za-z_]\w*)",
+    re.MULTILINE,
+)
+
+_GO_METHOD_RE = re.compile(
+    r"^\s*func\s*\(\s*(?:[A-Za-z_]\w*\s+)?\*?\s*(?P<recv>[A-Za-z_]\w*)(?:\[[^\]]*\])?\s*\)\s*"
+    r"(?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*\(",
+    re.MULTILINE,
+)
+_GO_FUNC_RE = re.compile(
+    r"^\s*func\s+(?P<name>[A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*\(",
+    re.MULTILINE,
+)
+_GO_TYPE_RE = re.compile(
+    r"^\s*type\s+(?P<name>[A-Za-z_]\w*)(?:\s*\[[^\]]*\])?\s+(?:=\s*)?(?P<tkind>struct|interface)\b"
+    r"|^\s*type\s+(?P<alias>[A-Za-z_]\w*)(?:\s*\[[^\]]*\])?\s+",
+    re.MULTILINE,
+)
+
+_TS_FUNC_RE = re.compile(
+    r"^\s*(?:export\s+)?(?P<default>default\s+)?(?:declare\s+)?(?:async\s+)?function\s*\*?\s*"
+    r"(?P<name>[A-Za-z_$][\w$]*)?\s*(?:<[^>\n]*>)?\s*\("
+)
+_TS_CLASS_RE = re.compile(
+    r"^\s*(?:export\s+)?(?P<default>default\s+)?(?:declare\s+)?(?:abstract\s+)?class\s*"
+    r"(?P<name>[A-Za-z_$][\w$]*)?"
+)
+_TS_TYPE_DECL_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:const\s+)?"
+    r"(?P<kind>interface|type|enum)\s+(?P<name>[A-Za-z_$][\w$]*)"
+)
+_TS_ARROW_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)"
+    r"(?:\s*:[^=\n]+)?\s*=\s*(?:async\s+)?"
+    r"(?:function\b|(?:<[^>\n]+>\s*)?(?:\([^)\n]*\)|[A-Za-z_$][\w$]*)\s*(?::[^=\n>]+)?\s*=>)"
+)
+_TS_DEFAULT_ARROW_RE = re.compile(
+    r"^\s*export\s+default\s+(?:async\s+)?(?:\([^)\n]*\)|[A-Za-z_$][\w$]*)\s*=>"
+)
+_TS_EXPORT_DEFAULT_IDENT_RE = re.compile(
+    r"^\s*export\s+default\s+(?P<name>[A-Za-z_$][\w$]*)\s*;?\s*$"
+)
+_TS_METHOD_RE = re.compile(
+    r"^\s*(?:(?:public|private|protected|readonly|static|abstract|override|async|get|set)\s+)*"
+    r"\*?\s*(?P<name>[A-Za-z_$#][\w$]*)\s*(?:<[^>\n]*>)?\s*\([^;\n]*\)(?:\s*:[^{\n]+)?\s*\{"
+)
+_TS_ARROW_PROP_RE = re.compile(
+    r"^\s*(?:(?:public|private|protected|readonly|static|override)\s+)*"
+    r"(?P<name>[A-Za-z_$#][\w$]*)(?:\s*:[^=\n]+)?\s*=\s*(?:async\s+)?"
+    r"(?:<[^>\n]+>\s*)?(?:\([^)\n]*\)|[A-Za-z_$][\w$]*)\s*(?::[^=\n>]+)?\s*=>"
+)
+
+_RUBY_CONTAINER_RE = re.compile(r"^\s*(?P<kind>class|module)\s+(?P<name>[A-Za-z_][\w:]*)")
+_RUBY_DEF_RE = re.compile(r"^\s*def\s+(?:self\.)?(?P<name>[A-Za-z_]\w*[?!=]?)")
+
+_C_TYPE_CONTAINER_RE = re.compile(
+    r"^\s*(?:template\s*<[^>]*>\s*)?"
+    r"(?:(?:public|private|protected|internal|static|final|abstract|sealed|non-sealed)\s+)*"
+    r"(?P<kind>class|struct|interface|enum|record|namespace)\s+"
+    r"(?P<name>[A-Za-z_]\w*)"
+)
+_C_TYPED_FUNC_RE = re.compile(
+    r"^\s*(?:@[A-Za-z_][\w.]*(?:\([^)]*\))?\s+)*"
+    r"(?:template\s*<[^>]*>\s*)?"
+    r"(?:(?:public|private|protected|internal|static|final|abstract|synchronized|native|"
+    r"strictfp|default|inline|virtual|explicit|constexpr|consteval|constinit|extern|friend)\s+)*"
+    r"(?:(?:const|volatile|unsigned|signed|short|long|struct|enum|typename)\s+)*"
+    r"(?P<ret>[A-Za-z_][\w:.]*\s*(?:<[^>{;]*>)?(?:\s*[\*&\[\]]+)*)\s+"
+    r"(?:(?P<qual>[A-Za-z_]\w*)::)?(?P<name>~?[A-Za-z_]\w*)\s*"
+    r"\((?P<params>[^{;]*)\)"
+    r"(?:\s*(?:const|volatile|noexcept(?:\([^)]*\))?|override|final|"
+    r"throws\s+[A-Za-z0-9_.,\s]+))*\s*\{"
+)
+_C_CTOR_RE = re.compile(
+    r"^\s*(?:@[A-Za-z_][\w.]*(?:\([^)]*\))?\s+)*"
+    r"(?:(?:public|private|protected|explicit|constexpr|inline)\s+)*"
+    r"(?P<name>~?[A-Za-z_]\w*)\s*\((?P<params>[^{;]*)\)"
+    r"(?:\s*(?::[^{;]+|noexcept(?:\([^)]*\))?|throws\s+[A-Za-z0-9_.,\s]+))*\s*\{"
+)
+
+
+def _strip_line_strings_and_comments(line: str) -> str:
+    """Strip single-line comments and string literals for lightweight brace counting."""
+    out: list[str] = []
+    in_quote: str | None = None
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if in_quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == in_quote:
+                in_quote = None
+            i += 1
+            continue
+        if ch in {"'", '"', "`"}:
+            in_quote = ch
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and line[i + 1] == "/":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _format_python_signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    args = node.args
+    parts: list[str] = []
+    positional = [*args.posonlyargs, *args.args]
+    num_defaults = len(args.defaults)
+    default_start = len(positional) - num_defaults
+
+    def fmt_arg(arg: ast.arg, has_default: bool = False, prefix: str = "") -> str:
+        item = f"{prefix}{arg.arg}"
+        if arg.annotation is not None:
+            with contextlib.suppress(Exception):
+                ann = ast.unparse(arg.annotation)
+                if len(ann) <= 24:
+                    item += f": {ann}"
+        if has_default:
+            item += "=..."
+        return item
+
+    for idx, arg in enumerate(positional):
+        parts.append(fmt_arg(arg, has_default=idx >= default_start))
+        if args.posonlyargs and idx == len(args.posonlyargs) - 1:
+            parts.append("/")
+    if args.vararg is not None:
+        parts.append(fmt_arg(args.vararg, prefix="*"))
+    elif args.kwonlyargs:
+        parts.append("*")
+    for kw_arg, kw_def in zip(args.kwonlyargs, args.kw_defaults, strict=False):
+        parts.append(fmt_arg(kw_arg, has_default=kw_def is not None))
+    if args.kwarg is not None:
+        parts.append(fmt_arg(args.kwarg, prefix="**"))
+
+    ret_suffix = ""
+    if node.returns is not None:
+        with contextlib.suppress(Exception):
+            ret_str = ast.unparse(node.returns)
+            if len(ret_str) <= 28:
+                ret_suffix = f" -> {ret_str}"
+    full = f"({', '.join(parts)}){ret_suffix}"
+    if len(full) <= 88:
+        return full
+    bare_names = [a.arg for a in positional]
+    if args.vararg is not None:
+        bare_names.append(f"*{args.vararg.arg}")
+    bare_names.extend(a.arg for a in args.kwonlyargs)
+    if args.kwarg is not None:
+        bare_names.append(f"**{args.kwarg.arg}")
+    compact = f"({', '.join(bare_names)}){ret_suffix}"
+    return compact if len(compact) <= 88 else compact[:85] + "...)"
+
+
+def _walk_python_stmts(
+    stmts: list[ast.stmt],
+    rel: str,
+    class_stack: tuple[str, ...],
+    found: list[RepositorySymbol],
+) -> None:
+    for stmt in stmts:
+        if isinstance(stmt, ast.ClassDef):
+            qualname = ".".join((*class_stack, stmt.name))
+            detail = ""
+            if stmt.bases:
+                with contextlib.suppress(Exception):
+                    bases = ", ".join(ast.unparse(b) for b in stmt.bases)
+                    if bases and len(bases) <= 60:
+                        detail = f"({bases})"
+            found.append(RepositorySymbol(rel, stmt.lineno, "class", qualname, detail))
+            _walk_python_stmts(stmt.body, rel, (*class_stack, stmt.name), found)
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            qualname = ".".join((*class_stack, stmt.name))
+            kind = "method" if class_stack else "function"
+            found.append(
+                RepositorySymbol(rel, stmt.lineno, kind, qualname, _format_python_signature(stmt))
+            )
+        elif isinstance(stmt, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+            _walk_python_stmts(stmt.body, rel, class_stack, found)
+            _walk_python_stmts(stmt.orelse, rel, class_stack, found)
+        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+            _walk_python_stmts(stmt.body, rel, class_stack, found)
+        elif isinstance(stmt, (ast.Try, ast.TryStar)):
+            _walk_python_stmts(stmt.body, rel, class_stack, found)
+            for handler in stmt.handlers:
+                _walk_python_stmts(handler.body, rel, class_stack, found)
+            _walk_python_stmts(stmt.orelse, rel, class_stack, found)
+            _walk_python_stmts(stmt.finalbody, rel, class_stack, found)
+        elif isinstance(stmt, ast.Match):
+            for case in stmt.cases:
+                _walk_python_stmts(case.body, rel, class_stack, found)
+
+
 class RepositoryMap:
-    """Lazy, mtime-keyed declaration map with no embedding index."""
+    """Lazy, mtime-keyed declaration map with cross-file reference ranking."""
 
     def __init__(self, root: Path, *, max_files: int = 2500, max_file_bytes: int = 512_000) -> None:
         self.root = root
         self.max_files = max_files
         self.max_file_bytes = max_file_bytes
         self._cache: dict[Path, tuple[int, int, list[RepositorySymbol]]] = {}
+        self._token_cache: dict[Path, tuple[int, int, frozenset[str]]] = {}
 
-    def symbols_for(self, path: Path) -> list[RepositorySymbol]:
+    def _load_file(self, path: Path) -> tuple[list[RepositorySymbol], frozenset[str]]:
         stat = path.stat()
-        cached = self._cache.get(path)
         key = (stat.st_mtime_ns, stat.st_size)
-        if cached and cached[:2] == key:
-            return cached[2]
+        cached_syms = self._cache.get(path)
+        cached_toks = self._token_cache.get(path)
+        if cached_syms and cached_syms[:2] == key and cached_toks and cached_toks[:2] == key:
+            return cached_syms[2], cached_toks[2]
         if stat.st_size > self.max_file_bytes or path.suffix.lower() not in _LANGUAGES:
             symbols: list[RepositorySymbol] = []
+            tokens: frozenset[str] = frozenset()
         else:
             text = path.read_text(errors="replace")
-            symbols = self._extract(path, text)
+            tokens = frozenset(_IDENT_RE.findall(text))
+            symbols = (
+                cached_syms[2]
+                if cached_syms and cached_syms[:2] == key
+                else self._extract(path, text)
+            )
         self._cache[path] = (*key, symbols)
+        self._token_cache[path] = (*key, tokens)
+        return symbols, tokens
+
+    def symbols_for(self, path: Path) -> list[RepositorySymbol]:
+        symbols, _tokens = self._load_file(path)
         return symbols
 
+    @staticmethod
+    def _module_stem(rel_path: str) -> str:
+        p = Path(rel_path)
+        stem = p.stem
+        if stem in {"__init__", "index", "mod", "lib", "main"} and len(p.parts) >= 2:
+            return p.parts[-2]
+        return stem
+
     def build(self, query: str = "", *, limit: int = 300) -> list[RepositorySymbol]:
-        lowered = query.casefold()
-        symbols: list[RepositorySymbol] = []
+        if limit <= 0:
+            return []
+        lowered = query.strip().casefold()
+        file_symbols: dict[str, list[RepositorySymbol]] = {}
+        file_tokens: dict[str, frozenset[str]] = {}
+        file_stems: dict[str, str] = {}
+
         for path in self._files():
             if is_secret_path(path) or path.suffix.lower() not in _LANGUAGES:
                 continue
             with contextlib.suppress(OSError, UnicodeError, SyntaxError):
-                for symbol in self.symbols_for(path):
+                rel = str(path.relative_to(self.root))
+                syms, idents = self._load_file(path)
+                file_tokens[rel] = idents
+                file_stems[rel] = self._module_stem(rel)
+                matched = [
+                    symbol
+                    for symbol in syms
                     if (
                         not lowered
                         or lowered in f"{symbol.name} {symbol.path} {symbol.kind}".casefold()
-                    ):
-                        symbols.append(symbol)
-                        if len(symbols) >= limit:
-                            return symbols
-        return symbols
+                    )
+                ]
+                if matched:
+                    file_symbols[rel] = matched
+
+        if not file_symbols:
+            return []
+
+        doc_freq: Counter[str] = Counter()
+        for idents in file_tokens.values():
+            doc_freq.update(idents)
+
+        scored_candidates: list[tuple[float, float, RepositorySymbol]] = []
+        for rel, syms in file_symbols.items():
+            idents = file_tokens.get(rel, frozenset())
+            stem = file_stems.get(rel, "")
+            stem_refs = (
+                float(max(0, doc_freq[stem] - (1 if stem in idents else 0)))
+                if len(stem) >= 3
+                else 0.0
+            )
+            per_file: list[tuple[float, RepositorySymbol]] = []
+            for sym in syms:
+                short_name = sym.name.rsplit(".", 1)[-1]
+                owner_name = sym.name.split(".", 1)[0] if "." in sym.name else ""
+                if short_name.startswith("__") and short_name.endswith("__") and owner_name:
+                    sym_refs = (
+                        max(0, doc_freq[owner_name] - (1 if owner_name in idents else 0)) * 0.5
+                    )
+                else:
+                    sym_refs = float(
+                        max(0, doc_freq[short_name] - (1 if short_name in idents else 0))
+                    )
+                    if owner_name:
+                        sym_refs += 0.25 * max(
+                            0, doc_freq[owner_name] - (1 if owner_name in idents else 0)
+                        )
+                kind_bonus = (
+                    2.0
+                    if sym.kind
+                    in {"class", "interface", "struct", "trait", "enum", "type", "module"}
+                    else (1.0 if sym.kind == "function" else 0.5)
+                )
+                query_bonus = 0.0
+                if lowered:
+                    name_cf = sym.name.casefold()
+                    short_cf = short_name.casefold()
+                    path_cf = sym.path.casefold()
+                    if short_cf == lowered or name_cf == lowered:
+                        query_bonus = 1000.0
+                    elif short_cf.startswith(lowered) or name_cf.startswith(lowered):
+                        query_bonus = 500.0
+                    elif lowered in short_cf or lowered in name_cf:
+                        query_bonus = 250.0
+                    elif stem.casefold() == lowered:
+                        query_bonus = 150.0
+                    elif lowered in path_cf:
+                        query_bonus = 50.0
+                    else:
+                        query_bonus = 10.0
+                raw_score = query_bonus + sym_refs * 10.0 + stem_refs * 3.0 + kind_bonus
+                per_file.append((raw_score, sym))
+
+            per_file.sort(key=lambda item: (-item[0], item[1].line, item[1].name))
+            for rank_in_file, (raw_score, sym) in enumerate(per_file):
+                effective_score = raw_score - 0.3 * rank_in_file
+                scored_candidates.append((effective_score, raw_score, sym))
+
+        scored_candidates.sort(
+            key=lambda item: (-item[0], -item[1], item[2].path, item[2].line, item[2].name)
+        )
+        selected = scored_candidates[:limit]
+
+        grouped: dict[str, list[RepositorySymbol]] = {}
+        file_top_score: dict[str, float] = {}
+        for _effective, raw_score, sym in selected:
+            grouped.setdefault(sym.path, []).append(sym)
+            if raw_score > file_top_score.get(sym.path, float("-inf")):
+                file_top_score[sym.path] = raw_score
+
+        ordered_files = sorted(grouped, key=lambda rel: (-file_top_score[rel], rel))
+        output: list[RepositorySymbol] = []
+        for rel in ordered_files:
+            output.extend(sorted(grouped[rel], key=lambda item: (item.line, item.name)))
+        return output
 
     def _files(self) -> list[Path]:
         try:
@@ -596,31 +935,223 @@ class RepositoryMap:
 
     def _extract(self, path: Path, text: str) -> list[RepositorySymbol]:
         rel = str(path.relative_to(self.root))
-        if path.suffix.lower() in {".py", ".pyi"}:
+        suffix = path.suffix.lower()
+        if suffix in {".py", ".pyi"}:
             tree = ast.parse(text)
             found: list[RepositorySymbol] = []
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                    kind = "class" if isinstance(node, ast.ClassDef) else "function"
-                    found.append(RepositorySymbol(rel, node.lineno, kind, node.name))
+            _walk_python_stmts(tree.body, rel, (), found)
             return sorted(found, key=lambda item: (item.line, item.name))
-        pattern = re.compile(
-            r"^\s*(?:(?:export|public|private|protected|static|async|final|abstract)\s+)*"
-            r"(?P<kind>class|interface|enum|struct|trait|type|function|fn|def|func)\s+"
-            r"(?P<name>[A-Za-z_$][\w$]*)",
-            re.MULTILINE,
-        )
-        return [
+        if suffix == ".rs":
+            return self._extract_rust(rel, text)
+        if suffix == ".go":
+            return self._extract_go(rel, text)
+        if suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+            return self._extract_ts_js(rel, text)
+        if suffix == ".rb":
+            return self._extract_ruby(rel, text)
+        if suffix in {".java", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp"}:
+            return self._extract_c_family(rel, text)
+        return []
+
+    @staticmethod
+    def _extract_rust(rel: str, text: str) -> list[RepositorySymbol]:
+        kind_map = {"fn": "function", "mod": "module"}
+        found = [
             RepositorySymbol(
                 rel,
                 text.count("\n", 0, match.start()) + 1,
-                {"fn": "function", "func": "function", "def": "function"}.get(
-                    match.group("kind"), match.group("kind")
-                ),
+                kind_map.get(match.group("kind"), match.group("kind")),
                 match.group("name"),
             )
-            for match in pattern.finditer(text)
+            for match in _RUST_DECL_RE.finditer(text)
         ]
+        return sorted(found, key=lambda item: (item.line, item.name))
+
+    @staticmethod
+    def _extract_go(rel: str, text: str) -> list[RepositorySymbol]:
+        found: list[RepositorySymbol] = []
+        for match in _GO_METHOD_RE.finditer(text):
+            lineno = text.count("\n", 0, match.start()) + 1
+            found.append(
+                RepositorySymbol(
+                    rel, lineno, "method", f"{match.group('recv')}.{match.group('name')}"
+                )
+            )
+        for match in _GO_FUNC_RE.finditer(text):
+            lineno = text.count("\n", 0, match.start()) + 1
+            found.append(RepositorySymbol(rel, lineno, "function", match.group("name")))
+        for match in _GO_TYPE_RE.finditer(text):
+            lineno = text.count("\n", 0, match.start()) + 1
+            if match.group("name"):
+                found.append(
+                    RepositorySymbol(rel, lineno, match.group("tkind"), match.group("name"))
+                )
+            elif match.group("alias"):
+                found.append(RepositorySymbol(rel, lineno, "type", match.group("alias")))
+        return sorted(found, key=lambda item: (item.line, item.name))
+
+    @staticmethod
+    def _extract_ts_js(rel: str, text: str) -> list[RepositorySymbol]:
+        found: list[RepositorySymbol] = []
+        brace_depth = 0
+        class_stack: list[tuple[str, int]] = []
+        for lineno, raw_line in enumerate(text.splitlines(), 1):
+            cleaned = _strip_line_strings_and_comments(raw_line)
+            while class_stack and brace_depth < class_stack[-1][1]:
+                class_stack.pop()
+
+            matched_line = False
+            if m := _TS_CLASS_RE.match(cleaned):
+                name = m.group("name") or ("default" if m.group("default") else "")
+                if name:
+                    found.append(RepositorySymbol(rel, lineno, "class", name))
+                    opens = cleaned.count("{") - cleaned.count("}")
+                    if "{" in cleaned:
+                        class_stack.append((name, brace_depth + max(opens, 1)))
+                    matched_line = True
+            elif m := _TS_FUNC_RE.match(cleaned):
+                name = m.group("name") or ("default" if m.group("default") else "")
+                if name:
+                    found.append(RepositorySymbol(rel, lineno, "function", name))
+                    matched_line = True
+            elif m := _TS_TYPE_DECL_RE.match(cleaned):
+                found.append(RepositorySymbol(rel, lineno, m.group("kind"), m.group("name")))
+                matched_line = True
+            elif m := _TS_ARROW_RE.match(cleaned):
+                if not class_stack:
+                    found.append(RepositorySymbol(rel, lineno, "function", m.group("name")))
+                    matched_line = True
+            elif _TS_DEFAULT_ARROW_RE.match(cleaned):
+                found.append(RepositorySymbol(rel, lineno, "function", "default"))
+                matched_line = True
+            elif m := _TS_EXPORT_DEFAULT_IDENT_RE.match(cleaned):
+                found.append(RepositorySymbol(rel, lineno, "variable", m.group("name")))
+                matched_line = True
+
+            if not matched_line and class_stack and brace_depth == class_stack[-1][1]:
+                cls_name = class_stack[-1][0]
+                if (m := _TS_METHOD_RE.match(cleaned)) or (m := _TS_ARROW_PROP_RE.match(cleaned)):
+                    mname = m.group("name")
+                    if mname not in _CONTROL_KEYWORDS:
+                        found.append(RepositorySymbol(rel, lineno, "method", f"{cls_name}.{mname}"))
+
+            brace_depth += cleaned.count("{") - cleaned.count("}")
+            if brace_depth < 0:
+                brace_depth = 0
+            while class_stack and brace_depth < class_stack[-1][1]:
+                class_stack.pop()
+        return sorted(found, key=lambda item: (item.line, item.name))
+
+    @staticmethod
+    def _extract_ruby(rel: str, text: str) -> list[RepositorySymbol]:
+        found: list[RepositorySymbol] = []
+        containers: list[str] = []
+        depth_stack: list[str] = []
+        block_openers = re.compile(
+            r"^\s*(?:class|module|def|if|unless|case|while|until|for|begin)\b|\bdo(?:\s*\|[^|]*\|)?\s*$"
+        )
+        for lineno, raw_line in enumerate(text.splitlines(), 1):
+            stripped = raw_line.split("#", 1)[0].strip()
+            if not stripped:
+                continue
+            if m := _RUBY_CONTAINER_RE.match(stripped):
+                kind = m.group("kind")
+                name = m.group("name").rsplit("::", 1)[-1]
+                qual = ".".join((*containers, name)) if containers else name
+                found.append(RepositorySymbol(rel, lineno, kind, qual))
+                containers.append(name)
+                depth_stack.append("container")
+                continue
+            if m := _RUBY_DEF_RE.match(stripped):
+                mname = m.group("name")
+                if containers:
+                    found.append(
+                        RepositorySymbol(rel, lineno, "method", f"{'.'.join(containers)}.{mname}")
+                    )
+                else:
+                    found.append(RepositorySymbol(rel, lineno, "function", mname))
+                if not stripped.endswith("end"):
+                    depth_stack.append("other")
+                continue
+            if stripped == "end" or stripped.startswith("end "):
+                if depth_stack:
+                    popped = depth_stack.pop()
+                    if popped == "container" and containers:
+                        containers.pop()
+                continue
+            if block_openers.search(stripped) and not stripped.endswith("end"):
+                depth_stack.append("other")
+        return sorted(found, key=lambda item: (item.line, item.name))
+
+    @staticmethod
+    def _extract_c_family(rel: str, text: str) -> list[RepositorySymbol]:
+        found: list[RepositorySymbol] = []
+        brace_depth = 0
+        type_stack: list[tuple[str, str, int]] = []
+        lines = text.splitlines()
+        total = len(lines)
+        for idx, raw_line in enumerate(lines):
+            lineno = idx + 1
+            cleaned = _strip_line_strings_and_comments(raw_line)
+            while type_stack and brace_depth < type_stack[-1][2]:
+                type_stack.pop()
+
+            stripped = cleaned.strip()
+            if stripped and not stripped.startswith("#"):
+                probe = cleaned
+                if "(" in cleaned and "{" not in cleaned and ";" not in cleaned and idx + 1 < total:
+                    probe = cleaned + " " + _strip_line_strings_and_comments(lines[idx + 1])
+
+                if m := _C_TYPE_CONTAINER_RE.match(cleaned):
+                    raw_kind = m.group("kind")
+                    kind = (
+                        "class"
+                        if raw_kind == "record"
+                        else ("module" if raw_kind == "namespace" else raw_kind)
+                    )
+                    name = m.group("name")
+                    if "{" in probe or not stripped.endswith(";"):
+                        found.append(RepositorySymbol(rel, lineno, kind, name))
+                        if "{" in probe:
+                            opens = cleaned.count("{") - cleaned.count("}")
+                            if opens > 0:
+                                type_stack.append((name, kind, brace_depth + opens))
+                elif m := _C_TYPED_FUNC_RE.match(probe):
+                    ret = m.group("ret").strip()
+                    name = m.group("name")
+                    qual = m.group("qual")
+                    if name not in _CONTROL_KEYWORDS and ret not in _CONTROL_KEYWORDS:
+                        if qual:
+                            found.append(RepositorySymbol(rel, lineno, "method", f"{qual}.{name}"))
+                        elif type_stack and type_stack[-1][1] in {
+                            "class",
+                            "struct",
+                            "interface",
+                            "enum",
+                        }:
+                            found.append(
+                                RepositorySymbol(
+                                    rel, lineno, "method", f"{type_stack[-1][0]}.{name}"
+                                )
+                            )
+                        else:
+                            found.append(RepositorySymbol(rel, lineno, "function", name))
+                elif (
+                    type_stack
+                    and type_stack[-1][1] in {"class", "struct"}
+                    and (m := _C_CTOR_RE.match(probe))
+                ):
+                    cname = m.group("name")
+                    owner = type_stack[-1][0]
+                    if cname in {owner, f"~{owner}"}:
+                        found.append(RepositorySymbol(rel, lineno, "method", f"{owner}.{cname}"))
+
+            brace_depth += cleaned.count("{") - cleaned.count("}")
+            if brace_depth < 0:
+                brace_depth = 0
+            while type_stack and brace_depth < type_stack[-1][2]:
+                type_stack.pop()
+        return sorted(found, key=lambda item: (item.line, item.name))
 
 
 class LSPTools(Skill):

@@ -7,19 +7,26 @@ https://github.com/agentclientprotocol/agent-client-protocol/blob/main/schema/v1
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import sys
+import time
 import uuid
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlparse
 
 from noah_code import __version__
 from noah_code.approvals import ApprovalChoice, ApprovalRequest
+from noah_code.permissions import PermissionDecision
 from noah_code.redaction import safe_error_message
 from noah_code.service import AgentService, ServiceError, ServiceSession
 
 MAX_FRAME_BYTES = 1_048_576
+
+ToolKind = Literal["read", "edit", "search", "execute", "fetch", "think", "other"]
 
 
 class RPCError(Exception):
@@ -35,6 +42,55 @@ def _string(params: dict[str, Any], name: str) -> str:
     return value
 
 
+def _infer_tool_kind(
+    title: str,
+    meta: Mapping[str, Any] | None = None,
+    *,
+    category: str = "",
+) -> ToolKind:
+    cat = category.strip().lower()
+    if cat == "edit":
+        return "edit"
+    if cat in {"read", "lsp"}:
+        return "read"
+    if cat == "bash":
+        return "execute"
+    if cat == "websearch":
+        return "search"
+    if cat == "webfetch":
+        return "fetch"
+
+    segments = [seg.strip() for seg in title.split("·") if seg.strip()]
+    verbs = [seg.split(None, 1)[0].rstrip(":").lower() for seg in segments if seg]
+    if any(v in {"edit", "write", "replace", "patch", "apply_patch"} for v in verbs):
+        return "edit"
+    if any(v in {"bash", "process", "run", "shell", "terminal"} for v in verbs):
+        return "execute"
+    if any(v in {"fetch", "webfetch"} for v in verbs):
+        return "fetch"
+    if any(v in {"grep", "glob", "search", "websearch", "find"} for v in verbs):
+        return "search"
+    if any(v in {"read", "inspect", "lsp", "git"} for v in verbs):
+        return "read"
+    if any(v in {"think", "todos", "plan", "reasoning"} for v in verbs):
+        return "think"
+
+    tool_name = str((meta or {}).get("tool") or title).strip().lower()
+    if tool_name in {"write", "write_file", "edit", "replace", "apply_patch", "apply_unified_diff"}:
+        return "edit"
+    if tool_name in {"read", "ws_read", "inspect"} or tool_name.startswith("lsp"):
+        return "read"
+    if tool_name in {"search", "grep", "glob", "list", "list_files", "websearch"}:
+        return "search"
+    if tool_name in {"fetch", "webfetch"}:
+        return "fetch"
+    if tool_name in {"bash", "sh", "run", "terminal_run"} or tool_name.startswith("process"):
+        return "execute"
+    if tool_name in {"think", "todos", "plan"}:
+        return "think"
+    return "other"
+
+
 def _prompt_text(blocks: Any) -> str:
     if not isinstance(blocks, list) or not blocks or len(blocks) > 100:
         raise RPCError(-32602, "prompt must contain 1 to 100 content blocks")
@@ -42,48 +98,132 @@ def _prompt_text(blocks: Any) -> str:
     for block in blocks:
         if not isinstance(block, dict):
             raise RPCError(-32602, "invalid prompt content block")
-        if block.get("type") == "text":
+        btype = block.get("type")
+        if btype == "text":
             parts.append(_string(block, "text"))
-        elif block.get("type") == "resource_link":
+        elif btype == "resource_link":
             # References stay references. Host tools perform any subsequent
             # reads/fetches with the existing path and network permission gates.
             parts.append(
                 f"Referenced resource: {_string(block, 'name')}\nURI: {_string(block, 'uri')}"
             )
+        elif btype == "resource":
+            res = block.get("resource") if isinstance(block.get("resource"), dict) else block
+            if not isinstance(res, dict):
+                raise RPCError(-32602, "invalid resource content block")
+            uri = _string(res, "uri")
+            mime = res.get("mimeType")
+            mime_label = f", {mime.strip()}" if isinstance(mime, str) and mime.strip() else ""
+            res_text = res.get("text")
+            res_blob = res.get("blob")
+            if isinstance(res_text, str):
+                parts.append(f"Embedded resource ({uri}{mime_label}):\n{res_text[:120_000]}")
+            elif isinstance(res_blob, str) and res_blob.strip():
+                try:
+                    raw = base64.b64decode(res_blob, validate=True)
+                except ValueError as exc:
+                    raise RPCError(-32602, "invalid base64 resource blob") from exc
+                parts.append(
+                    f"Embedded binary resource ({uri}{mime_label}, {len(raw)} bytes)"
+                )
+            else:
+                raise RPCError(-32602, "resource block must contain text or blob")
+        elif btype == "image":
+            mime_type = _string(block, "mimeType")
+            if not mime_type.lower().startswith("image/"):
+                raise RPCError(-32602, "image mimeType must start with 'image/'")
+            data = block.get("data")
+            image_uri = block.get("uri")
+            if isinstance(data, str) and data.strip():
+                try:
+                    raw = base64.b64decode(data, validate=True)
+                except ValueError as exc:
+                    raise RPCError(-32602, "invalid base64 image data") from exc
+                uri_note = (
+                    f", uri={image_uri.strip()}"
+                    if isinstance(image_uri, str) and image_uri.strip()
+                    else ""
+                )
+                parts.append(f"[Image: {mime_type}, {len(raw)} bytes{uri_note}]")
+            elif isinstance(image_uri, str) and image_uri.strip():
+                parts.append(f"[Image: {mime_type}, uri={image_uri.strip()}]")
+            else:
+                raise RPCError(-32602, "image block requires base64 data or uri")
         else:
-            raise RPCError(-32602, "only text and resource_link prompt blocks are supported")
+            raise RPCError(
+                -32602,
+                "only text, resource_link, resource, and image prompt blocks are supported",
+            )
     return "\n\n".join(parts)
 
 
 def _mcp_servers(params: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    from pathlib import Path
-
     servers = params.get("mcpServers")
     if not isinstance(servers, list) or len(servers) > 32:
-        raise RPCError(-32602, "mcpServers must be an array of at most 32 stdio servers")
+        raise RPCError(-32602, "mcpServers must be an array of at most 32 servers")
     result: dict[str, dict[str, Any]] = {}
     for server in servers:
-        if not isinstance(server, dict) or server.get("type") not in {None, "stdio"}:
-            raise RPCError(-32602, "only stdio MCP servers are supported")
-        name, command = _string(server, "name"), _string(server, "command")
-        if name in result or not Path(command).is_absolute():
-            raise RPCError(-32602, "MCP names must be unique and commands must be absolute paths")
-        args, env = server.get("args"), server.get("env", [])
-        if (
-            not isinstance(args, list)
-            or any(not isinstance(item, str) for item in args)
-            or not isinstance(env, list)
-        ):
-            raise RPCError(-32602, "invalid stdio MCP args or env")
-        environment: dict[str, str] = {}
-        for item in env:
-            if not isinstance(item, dict) or not isinstance(item.get("value"), str):
-                raise RPCError(-32602, "invalid MCP environment variable")
-            key = _string(item, "name")
-            if "=" in key or "\0" in key or "\0" in item["value"]:
-                raise RPCError(-32602, "invalid MCP environment variable")
-            environment[key] = item["value"]
-        result[name] = {"transport": "stdio", "command": command, "args": args, "env": environment}
+        if not isinstance(server, dict):
+            raise RPCError(-32602, "invalid MCP server entry")
+        stype = server.get("type")
+        name = _string(server, "name")
+        if name in result:
+            raise RPCError(-32602, "MCP names must be unique")
+        if stype in {None, "stdio"}:
+            command = _string(server, "command")
+            if not Path(command).is_absolute():
+                raise RPCError(-32602, "stdio MCP commands must be absolute paths")
+            args, env = server.get("args"), server.get("env", [])
+            if (
+                not isinstance(args, list)
+                or any(not isinstance(item, str) for item in args)
+                or not isinstance(env, list)
+            ):
+                raise RPCError(-32602, "invalid stdio MCP args or env")
+            environment: dict[str, str] = {}
+            for item in env:
+                if not isinstance(item, dict) or not isinstance(item.get("value"), str):
+                    raise RPCError(-32602, "invalid MCP environment variable")
+                key = _string(item, "name")
+                if "=" in key or "\0" in key or "\0" in item["value"]:
+                    raise RPCError(-32602, "invalid MCP environment variable")
+                environment[key] = item["value"]
+            result[name] = {
+                "transport": "stdio",
+                "command": command,
+                "args": args,
+                "env": environment,
+                "trusted": False,
+            }
+        elif stype in {"http", "sse"}:
+            url = _string(server, "url")
+            parsed = urlparse(url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or any(ch in url for ch in "\r\n\0")
+            ):
+                raise RPCError(-32602, "MCP URL must be an absolute http(s) endpoint")
+            raw_headers = server.get("headers", [])
+            if not isinstance(raw_headers, list):
+                raise RPCError(-32602, "invalid MCP HTTP headers")
+            headers: dict[str, str] = {}
+            for item in raw_headers:
+                if not isinstance(item, dict) or not isinstance(item.get("value"), str):
+                    raise RPCError(-32602, "invalid MCP HTTP header")
+                hname = _string(item, "name")
+                hval = item["value"]
+                if any(ch in hname or ch in hval for ch in "\r\n\0"):
+                    raise RPCError(-32602, "invalid MCP HTTP header")
+                headers[hname] = hval
+            result[name] = {
+                "transport": "streamable-http" if stype == "http" else "sse",
+                "url": url,
+                "headers": headers,
+                "trusted": False,
+            }
+        else:
+            raise RPCError(-32602, "only stdio, http, and sse MCP servers are supported")
     return result
 
 
@@ -99,6 +239,7 @@ class ACPConnection:
         self._permission_responses: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         self._loading: set[str] = set()
+        self._streamed_reasoning: dict[str, set[str]] = {}
 
     async def send(self, value: dict[str, Any]) -> None:
         data = (
@@ -132,6 +273,12 @@ class ACPConnection:
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._permission_responses[request_id] = future
         decision = request.decision
+        title = f"{decision.category}: {decision.target}"[:8000]
+        tool_kind = _infer_tool_kind(
+            title,
+            {"tool": getattr(decision, "tool", "")},
+            category=str(decision.category),
+        )
         try:
             await self.send(
                 {
@@ -141,8 +288,8 @@ class ACPConnection:
                         "sessionId": session_id,
                         "toolCall": {
                             "toolCallId": request.id,
-                            "title": f"{decision.category}: {decision.target}"[:8000],
-                            "kind": "other",
+                            "title": title,
+                            "kind": tool_kind,
                             "status": "pending",
                         },
                         "options": [
@@ -220,13 +367,14 @@ class ACPConnection:
                     result = payload.get("result")
                     result = result if isinstance(result, dict) else {}
                     failed = result.get("result_status") in {"failed", "error", "fail"}
+                    title = str(payload.get("name", "Recorded tool call"))
                     await self.update(
                         session.meta.session_id,
                         {
                             "sessionUpdate": "tool_call",
                             "toolCallId": row.event_id,
-                            "title": str(payload.get("name", "Recorded tool call")),
-                            "kind": "other",
+                            "title": title,
+                            "kind": _infer_tool_kind(title, {"tool": title}),
                             "status": "failed" if failed else "completed",
                         },
                     )
@@ -235,7 +383,22 @@ class ACPConnection:
         kind, text = event["kind"], event.get("text", "")
         if kind == "message":
             await self._message(session_id, text)
+        elif kind == "model_stream":
+            meta = event.get("meta")
+            if not isinstance(meta, dict):
+                return
+            phase = meta.get("phase")
+            call_id = str(meta.get("call_id") or "_active")
+            if phase == "reasoning" and text:
+                self._streamed_reasoning.setdefault(session_id, set()).add(call_id)
+                await self._message(session_id, text, kind="agent_thought_chunk")
+            elif phase in {"error", "cancel"}:
+                self._streamed_reasoning.get(session_id, set()).discard(call_id)
         elif kind == "reasoning":
+            streamed = self._streamed_reasoning.get(session_id)
+            if streamed:
+                streamed.pop()
+                return
             await self._message(session_id, text, kind="agent_thought_chunk")
         elif kind == "error" and text.strip():
             await self._message(session_id, f"Error: {text}")
@@ -251,7 +414,7 @@ class ACPConnection:
                         "sessionUpdate": "tool_call",
                         "toolCallId": tool_id,
                         "title": text,
-                        "kind": "other",
+                        "kind": _infer_tool_kind(text, meta),
                         "status": "in_progress",
                     },
                 )
@@ -275,8 +438,9 @@ class ACPConnection:
                 },
             )
         elif kind == "replay_gap":
-            raise RPCError(
-                -32603, "client could not keep up with session updates; reload the session"
+            await self._message(
+                session_id,
+                "[Note: some intermediate stream updates were skipped due to high output volume.]",
             )
 
     async def handle(self, method: str, params: dict[str, Any]) -> dict[str, Any] | None:
@@ -293,19 +457,17 @@ class ACPConnection:
                 "agentCapabilities": {
                     "loadSession": True,
                     "promptCapabilities": {
-                        "image": False,
+                        "image": True,
                         "audio": False,
-                        "embeddedContext": False,
+                        "embeddedContext": True,
                     },
-                    "mcpCapabilities": {"http": False, "sse": False},
+                    "mcpCapabilities": {"http": True, "sse": True},
                 },
                 "authMethods": [],
             }
         if not self.initialized:
             raise RPCError(-32600, "initialize must be called first")
         if method in {"session/new", "session/load"}:
-            from pathlib import Path
-
             from noah_code.workspace import open_workspace
 
             cwd = _string(params, "cwd")
@@ -314,6 +476,7 @@ class ACPConnection:
                     -32602, "cwd must be absolute; additional directories are unsupported"
                 )
             session_id = _string(params, "sessionId") if method == "session/load" else None
+            mcp_servers = _mcp_servers(params)
             workspace_root = open_workspace(cwd).root
             for existing in list(self.service.sessions.values()):
                 same_session = session_id is not None and existing.meta.session_id == session_id
@@ -322,10 +485,50 @@ class ACPConnection:
                     if existing.active or existing.meta.session_id in self._loading:
                         raise RPCError(-32000, "session is busy")
                     await self.service.close_session(existing.meta.session_id)
+            approved_mcp: set[str] = set()
+
+            async def _open_approval(sid: str, request: ApprovalRequest) -> ApprovalChoice:
+                choice = await self._approval(sid, request)
+                if choice != ApprovalChoice.REJECT:
+                    approved_mcp.add(str(request.decision.target))
+                return choice
+
             session = await self.service.open_session(
-                cwd=cwd, session_id=session_id, mcp_servers=_mcp_servers(params)
+                cwd=cwd,
+                session_id=session_id,
+                mcp_servers=mcp_servers,
+                approval_handler=_open_approval,
             )
             self._bind_ui(session)
+            host_cfg = getattr(session.host, "config", self.service.config)
+            if not (getattr(host_cfg, "auto_approve", False) or getattr(host_cfg, "yolo", False)):
+                for srv_name, srv_spec in mcp_servers.items():
+                    if (
+                        srv_spec.get("transport") == "stdio"
+                        and srv_spec.get("trusted") is False
+                        and srv_name not in approved_mcp
+                    ):
+                        decision = PermissionDecision(
+                            "mcp",
+                            f"{srv_name} ({srv_spec.get('command', '')})",
+                            "ask",
+                            None,
+                            "client-supplied stdio MCP server requires approval",
+                            srv_name,
+                            tool="mcp",
+                        )
+                        req = ApprovalRequest(
+                            f"mcp-{uuid.uuid4().hex}",
+                            decision,
+                            time.time(),
+                            asyncio.get_running_loop().create_future(),
+                        )
+                        choice = await self._approval(session.meta.session_id, req)
+                        if choice == ApprovalChoice.REJECT:
+                            await self.service.close_session(session.meta.session_id)
+                            raise RPCError(
+                                -32000, f"rejected client-supplied stdio MCP server: {srv_name}"
+                            )
             if method == "session/load":
                 session_id = session.meta.session_id
                 if session.active or session_id in self._loading:
@@ -337,6 +540,48 @@ class ACPConnection:
                     self._loading.discard(session_id)
                 return {}
             return {"sessionId": session.meta.session_id}
+        if method == "session/set_mode":
+            session_id = _string(params, "sessionId")
+            raw_mode = params.get("modeId") if "modeId" in params else params.get("mode")
+            if not isinstance(raw_mode, str) or raw_mode.strip().lower() not in {"build", "plan"}:
+                raise RPCError(-32602, "modeId must be 'build' or 'plan'")
+            mode = raw_mode.strip().lower()
+            session = self.service.get(session_id)
+            async with session.lock:
+                if session.active:
+                    raise RPCError(-32000, "session is busy")
+                if getattr(session.host, "_agent", None) is not None:
+                    session.host.agent.set_mode(mode)
+                session.meta.mode = mode
+                if getattr(session.host, "meta", None) is not None:
+                    session.host.meta.mode = mode
+                await asyncio.to_thread(self.service.store.save_meta, session.meta)
+            return {}
+        if method == "session/set_model":
+            session_id = _string(params, "sessionId")
+            raw_model = params.get("modelId") if "modelId" in params else params.get("model")
+            if (
+                not isinstance(raw_model, str)
+                or not raw_model.strip()
+                or any(ch.isspace() for ch in raw_model.strip())
+            ):
+                raise RPCError(-32602, "modelId must be a nonempty model identifier")
+            model = raw_model.strip()
+            session = self.service.get(session_id)
+            async with session.lock:
+                if session.active:
+                    raise RPCError(-32000, "session is busy")
+                switch_fn = getattr(session.host, "_switch_model", None)
+                if callable(switch_fn) and getattr(session.host, "_agent", None) is not None:
+                    await switch_fn(model)
+                else:
+                    session.meta.model = model
+                    if getattr(session.host, "meta", None) is not None:
+                        session.host.meta.model = model
+                    if hasattr(session.host, "config"):
+                        session.host.config.model = model
+                    await asyncio.to_thread(self.service.store.save_meta, session.meta)
+            return {}
         if method == "session/cancel":
             await self.service.cancel(_string(params, "sessionId"))
             return None
@@ -346,19 +591,25 @@ class ACPConnection:
                 raise RPCError(-32000, "session history is still loading")
             session = self.service.get(session_id)
             after = session.ui.sequence
+            self._streamed_reasoning.pop(session_id, None)
             receipt = self.service.submit(session_id, _prompt_text(params.get("prompt")))
-            async for event in session.ui.stream(after):
-                if (
-                    event["kind"] == "turn_complete"
-                    and event["request_id"] == receipt["request_id"]
-                ):
-                    result = event["result"]
-                    if result["status"] == "failed":
-                        raise RPCError(-32000, safe_error_message(result["explanation"]))
-                    return {
-                        "stopReason": "cancelled" if result["status"] == "cancelled" else "end_turn"
-                    }
-                await self._event(session_id, event)
+            try:
+                async for event in session.ui.stream(after):
+                    if (
+                        event["kind"] == "turn_complete"
+                        and event["request_id"] == receipt["request_id"]
+                    ):
+                        result = event["result"]
+                        if result["status"] == "failed":
+                            raise RPCError(-32000, safe_error_message(result["explanation"]))
+                        return {
+                            "stopReason": (
+                                "cancelled" if result["status"] == "cancelled" else "end_turn"
+                            )
+                        }
+                    await self._event(session_id, event)
+            finally:
+                self._streamed_reasoning.pop(session_id, None)
             raise RPCError(-32000, "session closed during prompt")
         raise RPCError(-32601, "method not found")
 

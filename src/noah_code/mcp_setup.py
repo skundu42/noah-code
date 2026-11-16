@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import json
 import os
 import re
 import tempfile
 import types
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -56,6 +60,7 @@ _RESERVED_AGENT_ATTRS = frozenset(
         "_journal",
         "_llm",
         "_lightweight_llm",
+        "_mcp_stdio_pools",
         "_observability_event_manager",
         "_observability_unsubs",
         "_runtime",
@@ -72,6 +77,26 @@ _MUTATING_MCP_TOOL = re.compile(
 _READ_ONLY_BROWSER_TOOLS = frozenset(
     {"browser_snapshot", "browser_console_messages", "browser_network_requests"}
 )
+_STDIO_TRANSPORT_ERROR_NAMES = frozenset(
+    {
+        "ClosedResourceError",
+        "BrokenResourceError",
+        "EndOfStream",
+    }
+)
+_STDIO_TRANSPORT_ERROR_MARKERS = (
+    "broken pipe",
+    "eof",
+    "end of stream",
+    "endofstream",
+    "closed resource",
+    "closedresourceerror",
+    "brokenresourceerror",
+    "connection closed",
+    "connection reset",
+    "process exited",
+    "not running",
+)
 
 
 def browser_tool_mutates(name: str, arguments: dict[str, Any] | None = None) -> bool:
@@ -85,6 +110,193 @@ def browser_tool_mutates(name: str, arguments: dict[str, Any] | None = None) -> 
     if not name.startswith("browser_"):
         return False
     return name not in _READ_ONLY_BROWSER_TOOLS or bool((arguments or {}).get("filename"))
+
+
+def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    found: list[BaseException] = []
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        found.append(current)
+        if isinstance(current, BaseExceptionGroup):
+            stack.extend(current.exceptions)
+        if current.__cause__ is not None:
+            stack.append(current.__cause__)
+        if current.__context__ is not None:
+            stack.append(current.__context__)
+    return found
+
+
+def _is_stdio_transport_error(exc: BaseException) -> bool:
+    for item in _iter_exception_chain(exc):
+        if isinstance(
+            item,
+            (BrokenPipeError, EOFError, ConnectionError, ProcessLookupError),
+        ):
+            return True
+        if type(item).__name__ in _STDIO_TRANSPORT_ERROR_NAMES:
+            return True
+        text = str(item).lower()
+        if any(marker in text for marker in _STDIO_TRANSPORT_ERROR_MARKERS):
+            return True
+    return False
+
+
+class _PersistentStdioSession:
+    """Keep one stdio MCP server process/session alive across tool calls.
+
+    Runs ``connect_to_server()`` inside a dedicated task so ``anyio`` task
+    groups are always entered and exited on the same asyncio task.
+    """
+
+    def __init__(
+        self, connect_factory: Callable[[], AbstractAsyncContextManager[Any]]
+    ) -> None:
+        self._connect_factory = connect_factory
+        self._lock = asyncio.Lock()
+        self._runner_task: asyncio.Task[None] | None = None
+        self._ready: asyncio.Future[Any] | None = None
+        self._stop_event: asyncio.Event | None = None
+
+    @property
+    def is_connected(self) -> bool:
+        return (
+            self._runner_task is not None
+            and not self._runner_task.done()
+            and self._ready is not None
+            and self._ready.done()
+            and not self._ready.cancelled()
+            and self._ready.exception() is None
+        )
+
+    @property
+    def runner_failed(self) -> bool:
+        return self._runner_task is not None and self._runner_task.done()
+
+    async def _run(
+        self,
+        ready: asyncio.Future[Any],
+        stop_event: asyncio.Event,
+    ) -> None:
+        try:
+            async with self._connect_factory() as session:
+                if not ready.done():
+                    ready.set_result(session)
+                await stop_event.wait()
+        except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            elif not isinstance(exc, asyncio.CancelledError):
+                raise
+
+    async def _ensure_session_locked(self) -> Any:
+        if self.is_connected and self._ready is not None:
+            return self._ready.result()
+        await self._teardown_locked()
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[Any] = loop.create_future()
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(self._run(ready, stop_event))
+        self._runner_task = task
+        self._ready = ready
+        self._stop_event = stop_event
+        try:
+            return await ready
+        except BaseException:
+            await self._teardown_locked()
+            raise
+
+    async def _teardown_locked(self) -> None:
+        task = self._runner_task
+        stop_event = self._stop_event
+        self._runner_task = None
+        self._ready = None
+        self._stop_event = None
+        if stop_event is not None:
+            stop_event.set()
+        if task is not None:
+            if not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
+                except (TimeoutError, BaseException):
+                    task.cancel()
+                    with suppress(BaseException):
+                        await task
+            else:
+                with suppress(BaseException):
+                    task.result()
+
+    @asynccontextmanager
+    async def connect(self) -> AsyncIterator[Any]:
+        async with self._lock:
+            session = await self._ensure_session_locked()
+            try:
+                yield session
+            except BaseException as exc:
+                if self.runner_failed or _is_stdio_transport_error(exc):
+                    await self._teardown_locked()
+                raise
+
+    async def aclose(self) -> None:
+        async with self._lock:
+            await self._teardown_locked()
+
+
+def _install_persistent_stdio_pool(tool: Any) -> _PersistentStdioSession | None:
+    client = getattr(tool, "_client", None)
+    if client is None or getattr(client, "transport", None) != "stdio":
+        return None
+    connect = getattr(client, "connect_to_server", None)
+    if not callable(connect) or inspect.iscoroutinefunction(connect):
+        return None
+    existing = getattr(client, "_noah_stdio_pool", None)
+    if isinstance(existing, _PersistentStdioSession):
+        return existing
+    pool = _PersistentStdioSession(connect)
+    client.connect_to_server = pool.connect
+    with suppress(Exception):
+        client._noah_stdio_pool = pool
+    with suppress(Exception):
+        tool._noah_stdio_pool = pool
+    return pool
+
+
+async def close_mcp_servers(agent: Any) -> None:
+    """Close all persistent stdio MCP sessions attached to ``agent``."""
+
+    pools: list[_PersistentStdioSession] = []
+    seen: set[int] = set()
+    tracked = getattr(agent, "_mcp_stdio_pools", None)
+    if isinstance(tracked, dict):
+        for pool in list(tracked.values()):
+            if isinstance(pool, _PersistentStdioSession) and id(pool) not in seen:
+                seen.add(id(pool))
+                pools.append(pool)
+        tracked.clear()
+    elif isinstance(tracked, list):
+        for pool in list(tracked):
+            if isinstance(pool, _PersistentStdioSession) and id(pool) not in seen:
+                seen.add(id(pool))
+                pools.append(pool)
+        tracked.clear()
+
+    agent_dict = getattr(agent, "__dict__", None)
+    if isinstance(agent_dict, dict):
+        for value in list(agent_dict.values()):
+            pool = getattr(value, "_noah_stdio_pool", None)
+            if pool is None:
+                client = getattr(value, "_client", None)
+                pool = getattr(client, "_noah_stdio_pool", None)
+            if isinstance(pool, _PersistentStdioSession) and id(pool) not in seen:
+                seen.add(id(pool))
+                pools.append(pool)
+
+    if pools:
+        await asyncio.gather(*(pool.aclose() for pool in pools), return_exceptions=True)
 
 
 @dataclass(frozen=True)
@@ -140,6 +352,16 @@ def _server_mapping(data: Any) -> dict[str, dict[str, Any]]:
     return {str(name): dict(spec) for name, spec in candidate.items() if isinstance(spec, dict)}
 
 
+def _normalize_oauth_scope(value: Any) -> str | None:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned or None
+    if isinstance(value, list | tuple | set):
+        joined = " ".join(str(part).strip() for part in value if str(part).strip())
+        return joined or None
+    return None
+
+
 def _normalized_spec(spec: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(spec)
     kind = str(normalized.pop("type", "") or "").lower()
@@ -151,14 +373,39 @@ def _normalized_spec(spec: dict[str, Any]) -> dict[str, Any]:
         normalized.setdefault("transport", "stdio")
     if normalized.get("url") and not normalized.get("transport"):
         normalized["transport"] = "streamable-http"
+
+    if "oauth_scopes" in normalized:
+        raw_scopes = normalized.pop("oauth_scopes")
+        if normalized.get("oauth_scope") is None:
+            mapped_scope = _normalize_oauth_scope(raw_scopes)
+            if mapped_scope is not None:
+                normalized["oauth_scope"] = mapped_scope
+    elif "oauth_scope" in normalized:
+        mapped_scope = _normalize_oauth_scope(normalized["oauth_scope"])
+        if mapped_scope is not None:
+            normalized["oauth_scope"] = mapped_scope
+        else:
+            normalized.pop("oauth_scope", None)
+
+    if "oauth_callback_port" in normalized:
+        raw_port = normalized.pop("oauth_callback_port")
+        if not normalized.get("oauth_redirect_uri") and raw_port is not None:
+            port = int(raw_port)
+            if not (0 <= port <= 65535):
+                raise ValueError("oauth_callback_port must be between 0 and 65535")
+            normalized["oauth_redirect_uri"] = f"http://127.0.0.1:{port}/callback"
+
     allowed = {
         "args",
         "command",
         "env",
         "headers",
-        "oauth_callback_port",
         "oauth_client_id",
-        "oauth_scopes",
+        "oauth_manual",
+        "oauth_open_browser",
+        "oauth_redirect_uri",
+        "oauth_scope",
+        "oauth_timeout",
         "transport",
         "url",
     }
@@ -318,12 +565,13 @@ async def attach_mcp_server(
         name,
         **_normalized_spec(spec),
     )
+    stdio_pool = _install_persistent_stdio_pool(tool)
     runtime = getattr(agent, "_runtime", None)
     if callable(getattr(tool, "_call_tool", None)):
         original_call = tool._call_tool
         browser_effect_lock = asyncio.Lock()
 
-        async def _call_underlying(
+        async def _call_once(
             tool_name: str,
             clean: dict[str, Any],
             preserve_none: set[str] | frozenset[str],
@@ -331,6 +579,24 @@ async def attach_mcp_server(
             if preserve_none:
                 return await original_call(tool_name, clean, _preserve_none=preserve_none)
             return await original_call(tool_name, clean)
+
+        async def _call_underlying(
+            tool_name: str,
+            clean: dict[str, Any],
+            preserve_none: set[str] | frozenset[str],
+        ) -> Any:
+            was_connected = stdio_pool.is_connected if stdio_pool is not None else False
+            try:
+                return await _call_once(tool_name, clean, preserve_none)
+            except Exception as exc:
+                if (
+                    stdio_pool is not None
+                    and was_connected
+                    and _is_stdio_transport_error(exc)
+                ):
+                    await stdio_pool.aclose()
+                    return await _call_once(tool_name, clean, preserve_none)
+                raise
 
         async def _invoke(
             tool_name: str,
@@ -435,6 +701,16 @@ async def attach_mcp_server(
 
         tool._call_tool = types.MethodType(_durable_mcp_call, tool)
     attr = re_attr(name)
+    if stdio_pool is not None:
+        with contextlib.suppress(Exception):
+            pools = getattr(agent, "_mcp_stdio_pools", None)
+            if not isinstance(pools, dict):
+                pools = {}
+                agent._mcp_stdio_pools = pools
+            previous = pools.pop(attr, None)
+            if isinstance(previous, _PersistentStdioSession) and previous is not stdio_pool:
+                await previous.aclose()
+            pools[attr] = stdio_pool
     setattr(agent, attr, tool)
     approved = getattr(agent, "_sandbox_approved_roots", None)
     if isinstance(approved, set):

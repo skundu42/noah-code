@@ -20,6 +20,7 @@ from noah_code.llm_replies import (
     ConversationalReplyLLM,
     coerce_text_only_response,
     recover_empty_truncated_response,
+    recover_truncated_prose_response,
 )
 from noah_code.workspace import Workspace
 
@@ -207,3 +208,31 @@ async def test_truncated_response_budget_breach_prevents_any_retry():
             await client.acall([], tools=tools, max_tokens=4096)
     assert model.call_count == 1
     assert guard.total_tokens == 4196
+
+
+async def test_truncated_nonempty_prose_preserves_partial_text_and_appends_limit_notice(tmp_path):
+    partial = _empty("Partial investigation summary before hitting token cap.")
+    recovered = recover_truncated_prose_response(partial)
+    assert recovered is not partial
+    assert recovered.finish_reason == "length"
+    assert "Partial investigation summary before hitting token cap." in recovered.content
+    assert "[Noah host recovery notice; not model output]" in recovered.content
+    assert "finish_reason=length" in recovered.content
+
+    model = FakeLLMClient(
+        [
+            partial,
+            _code("return_result(Done(explanation='Resumed cleanly after prose truncation'))", "ok"),
+        ]
+    )
+    agent = _agent(tmp_path, ConversationalReplyLLM(model))
+    try:
+        result = await agent.handle({"user_messages": ["Investigate and finish."]})
+    finally:
+        await agent.close_tools()
+
+    assert isinstance(result, Done)
+    assert model.call_count == 2
+    prompt_blob = json.dumps(model.last_messages)
+    assert "Partial investigation summary before hitting token cap." in prompt_blob
+    assert "finish_reason=length" in prompt_blob

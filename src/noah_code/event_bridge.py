@@ -39,9 +39,11 @@ _WEB_SEARCH = re.compile(
     re.IGNORECASE,
 )
 _TASK_CALL = re.compile(
-    r"self\.task\.run\s*\(\s*(?P<q>['\"])(?P<name>(?:(?!(?P=q)).){1,80})(?P=q)",
+    r"self\.task\.(?P<method>run|run_many|collaborate|team|start|follow_up|diff|apply|cleanup)\s*\(\s*"
+    r"(?:(?P<q>['\"])(?P<name>(?:(?!(?P=q)).){1,80})(?P=q))?",
     re.IGNORECASE,
 )
+_MULTILINE_STRING = re.compile(r"('''[\s\S]*?'''|\"\"\"[\s\S]*?\"\"\")")
 _TODO_CALL = re.compile(r"self\.todos\.\w+", re.IGNORECASE)
 _LSP_CALL = re.compile(r"self\.lsp\.\w+", re.IGNORECASE)
 _PROCESS_CALL = re.compile(r"self\.processes\.\w+", re.IGNORECASE)
@@ -118,6 +120,12 @@ def _format_path_group(verb: str, paths: list[str]) -> str:
 def _collect_actions(code: str) -> list[tuple[int, str, str]]:
     """Return (offset, verb, target) tuples in source order."""
 
+    # Cap length and blank triple-quoted string bodies (preserving offsets for
+    # surrounding statements) so large file writes neither stall the event loop
+    # nor fabricate UI action cards from quoted code examples.
+    bounded = code[:16_000]
+    code = _MULTILINE_STRING.sub(lambda m: m.group(0)[:3] + (" " * max(len(m.group(0)) - 6, 0)) + m.group(0)[-3:], bounded)
+
     found: list[tuple[int, str, str]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -150,7 +158,10 @@ def _collect_actions(code: str) -> list[tuple[int, str, str]]:
     for match in _WEB_SEARCH.finditer(code):
         add(match.start(), "Search", _shorten(match.group("query"), 56))
     for match in _TASK_CALL.finditer(code):
-        add(match.start(), "Task", match.group("name").strip())
+        method = match.group("method").lower()
+        raw_name = (match.group("name") or "").strip()
+        label = raw_name if method in {"run", "start"} and raw_name else method
+        add(match.start(), "Task", _shorten(label, 48))
     for match in _TODO_CALL.finditer(code):
         add(match.start(), "Todos", "")
         break

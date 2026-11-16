@@ -12,6 +12,7 @@ from noah_code.approvals import ApprovalBroker, ApprovalChoice
 from noah_code.config import DEFAULT_PERMISSION_RULES, NoahCodeConfig
 from noah_code.mcp_setup import (
     attach_mcp_server,
+    close_mcp_servers,
     install_mcp,
     load_mcp_servers,
     mcp_source_is_trusted,
@@ -246,3 +247,136 @@ async def test_mutating_mcp_calls_are_cached_and_ambiguous_replays_are_blocked(
     with pytest.raises(RuntimeError, match="may already have completed"):
         await attached._call_tool("create_issue", {"title": "Ambiguous"})
     assert tool.calls == 1
+
+
+def test_oauth_kwarg_mapping_normalizes_scopes_callback_port_and_flags(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "oauth_srv": {
+                        "url": "https://mcp.example.com/sse",
+                        "type": "sse",
+                        "oauth_client_id": "cid-1",
+                        "oauth_scopes": ["read:issues", "write:issues"],
+                        "oauth_callback_port": 8912,
+                        "oauth_open_browser": False,
+                        "oauth_manual": True,
+                        "oauth_timeout": 45.0,
+                    }
+                }
+            }
+        )
+    )
+    servers, _ = load_mcp_servers(workspace, NoahCodeConfig(), home=tmp_path / "home")
+    assert servers["oauth_srv"] == {
+        "transport": "sse",
+        "url": "https://mcp.example.com/sse",
+        "oauth_client_id": "cid-1",
+        "oauth_scope": "read:issues write:issues",
+        "oauth_redirect_uri": "http://127.0.0.1:8912/callback",
+        "oauth_open_browser": False,
+        "oauth_manual": True,
+        "oauth_timeout": 45.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stdio_mcp_pools_persistent_session_reconnects_on_pipe_error_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    import anyio
+
+    fake = ModuleType("nooa.mcp")
+    connect_entries = 0
+    connect_exits = 0
+    fail_next = False
+
+    class FakeSession:
+        def __init__(self, session_num: int) -> None:
+            self.session_num = session_num
+            self.state: list[str] = []
+
+        async def call_tool(self, tool_name: str, args: dict[str, object]) -> dict[str, object]:
+            nonlocal fail_next
+            if fail_next:
+                fail_next = False
+                raise BrokenPipeError("broken pipe from crashed stdio server")
+            self.state.append(f"{tool_name}:{args.get('url', '')}")
+            return {"session": self.session_num, "history": list(self.state)}
+
+    class FakeStdioClient:
+        transport = "stdio"
+
+        @asynccontextmanager
+        async def connect_to_server(self):
+            nonlocal connect_entries, connect_exits
+            connect_entries += 1
+            current = connect_entries
+            # Use a real anyio task group to verify task-affinity safety across callers!
+            async with anyio.create_task_group():
+                try:
+                    yield FakeSession(current)
+                finally:
+                    connect_exits += 1
+
+    class FakeTool:
+        def __init__(self) -> None:
+            self._client = FakeStdioClient()
+
+        async def _call_tool(self, tool_name: str, arguments: dict[str, object]) -> object:
+            async with self._client.connect_to_server() as session:
+                return await session.call_tool(tool_name, arguments)
+
+    class FakeManager:
+        @staticmethod
+        def create_from_server(_name: str, **_spec: object) -> FakeTool:
+            return FakeTool()
+
+    fake.MCPManager = FakeManager
+    monkeypatch.setitem(sys.modules, "nooa.mcp", fake)
+    agent = SimpleNamespace(_sandbox_approved_roots=set())
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+
+    await attach_mcp_server(
+        agent,
+        "playwright",
+        {"command": "npx", "args": ["@playwright/mcp", "--isolated"]},
+        engine=engine,
+        approvals=ApprovalBroker(engine),
+        startup=True,
+    )
+    # Lazy: not entered until first call
+    assert connect_entries == 0
+
+    first = await asyncio.create_task(
+        agent.playwright._call_tool("get_page", {"url": "https://a.test"})
+    )
+    second = await asyncio.create_task(
+        agent.playwright._call_tool("get_page", {"url": "https://b.test"})
+    )
+    assert connect_entries == 1
+    assert connect_exits == 0
+    assert first == {"session": 1, "history": ["get_page:https://a.test"]}
+    assert second == {
+        "session": 1,
+        "history": ["get_page:https://a.test", "get_page:https://b.test"],
+    }
+
+    # BrokenPipeError tears down session #1 and transparently reconnects session #2!
+    fail_next = True
+    third = await asyncio.create_task(
+        agent.playwright._call_tool("get_page", {"url": "https://c.test"})
+    )
+    assert connect_entries == 2
+    assert connect_exits == 1
+    assert third == {"session": 2, "history": ["get_page:https://c.test"]}
+
+    # Closing from a separate task cleanly exits the anyio task group without error!
+    await asyncio.create_task(close_mcp_servers(agent))
+    assert connect_exits == 2

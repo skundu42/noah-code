@@ -647,3 +647,79 @@ async def test_stopping_survives_runtime_storage_failure(
         assert not manager.has_running()
     finally:
         await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_process_tools_scrubs_secrets_and_rotates_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from noah_code import credentials
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(credentials, "_HYDRATED_ENV_VARS", set())
+    credentials.store_provider_api_key("openai", "openai-secret")
+    monkeypatch.setenv("NOAH_CODE_SERVER_TOKEN", "server-secret")
+    monkeypatch.setenv("PUBLIC_ENV_VAR", "public-value")
+
+    runtime = RuntimeStateStore(tmp_path / "session")
+    manager = _manager(tmp_path, runtime=runtime, max_log_bytes=1_500)
+    rotation_threads: list[threading.Thread] = []
+    real_cap = manager._cap_durable_log
+
+    def spy_cap(job: BackgroundJob) -> None:
+        rotation_threads.append(threading.current_thread())
+        real_cap(job)
+
+    monkeypatch.setattr(manager, "_cap_durable_log", spy_cap)
+    loop_thread = threading.current_thread()
+    try:
+        cmd = f"{shlex.quote(sys.executable)} -u -c " + shlex.quote(
+            "import os; "
+            "print('ENV:' + str(os.environ.get('NOAH_CODE_SERVER_TOKEN')) + ':' "
+            "+ str(os.environ.get('OPENAI_API_KEY')) + ':' "
+            "+ str(os.environ.get('PUBLIC_ENV_VAR'))); "
+            "[print('pad-' + 'z' * 80) for _ in range(30)]"
+        )
+        started = await manager.start(cmd, name="check-scrub")
+        job_id = started.split()[1]
+        async with asyncio.timeout(5):
+            while "completed" not in await manager.status(job_id):
+                await asyncio.sleep(0.02)
+        logs = await manager.logs(job_id, cursor=0)
+        assert "ENV:None:None:public-value" in logs
+        assert rotation_threads
+        assert all(t is not loop_thread for t in rotation_threads)
+    finally:
+        await manager.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX-only")
+@pytest.mark.asyncio
+async def test_terminate_uses_actual_pgid_and_skips_exited_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path)
+    signaled: list[tuple[int, int]] = []
+    real_killpg = os.killpg
+
+    def spy_killpg(pgid: int, sig: int) -> None:
+        signaled.append((pgid, int(sig)))
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", spy_killpg)
+    try:
+        started = await manager.start("sleep 30", name="sleeper")
+        job_id = started.split()[1]
+        job = manager._jobs[job_id]
+        expected_pgid = os.getpgid(job.process.pid)
+        await manager.stop(job_id)
+        assert signaled
+        assert signaled[0][0] == expected_pgid
+
+        signaled.clear()
+        await manager._terminate(job)
+        assert signaled == []
+    finally:
+        await manager.close()

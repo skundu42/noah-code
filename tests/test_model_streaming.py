@@ -8,12 +8,15 @@ from typing import Any
 import httpx
 import litellm
 import pytest
+from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import ModelResponseStream
-from nooa.unifiedllm import CompletionClient, FakeLLMClient
+from nooa.unifiedllm import CompletionClient, FakeLLMClient, ResponsesClient
 from nooa.unifiedllm.retry_config import RetryConfig
 from pydantic import BaseModel
 
 from noah_code.model_streaming import ModelStreamEvent, model_stream, with_model_streaming
+
+_STREAM_WAIT_TIMEOUT = 15.0
 
 
 class _Chunks(litellm.CustomStreamWrapper):
@@ -129,7 +132,7 @@ async def test_real_deltas_arrive_before_completion_and_preserve_parsed_response
     monkeypatch.setattr(litellm, "acompletion", completion)
     with model_stream(observe):
         task = asyncio.create_task(_client().acall([], output_model=Answer))
-        await asyncio.wait_for(saw_reasoning.wait(), 1)
+        await asyncio.wait_for(saw_reasoning.wait(), _STREAM_WAIT_TIMEOUT)
         assert not task.done()
         assert [(e.kind, e.text) for e in events] == [("start", ""), ("reasoning", "Checking")]
         gate.set()
@@ -247,7 +250,7 @@ async def test_cancellation_closes_transport_and_does_not_emit_finish(monkeypatc
     monkeypatch.setattr(litellm, "acompletion", completion)
     with model_stream(observe):
         task = asyncio.create_task(_client().acall([]))
-        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.wait_for(started.wait(), _STREAM_WAIT_TIMEOUT)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -372,7 +375,7 @@ async def test_tasks_outliving_observer_scope_cannot_write_to_closed_consumer(mo
     events = []
     with model_stream(observe):
         task = asyncio.create_task(_client().acall([]))
-        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.wait_for(started.wait(), _STREAM_WAIT_TIMEOUT)
     gate.set()
     assert (await task).content == "firstlate"
     assert [e.kind for e in events] == ["start", "text"]
@@ -381,6 +384,7 @@ async def test_tasks_outliving_observer_scope_cannot_write_to_closed_consumer(mo
 @pytest.mark.asyncio
 async def test_traced_real_litellm_sse_preserves_deltas_tools_and_usage():
     """Exercise the installed SDK, LiteLLM, tracing wrapper, and NOOA parser."""
+    import litellm.main  # noqa: F401 - pre-load LiteLLM runtime outside timed wait_for
     from openai import AsyncOpenAI
     from openinference.instrumentation.litellm import LiteLLMInstrumentor
     from opentelemetry.sdk.trace import TracerProvider
@@ -455,7 +459,7 @@ async def test_traced_real_litellm_sse_preserves_deltas_tools_and_usage():
                     )
                 )
                 try:
-                    await asyncio.wait_for(observed.wait(), 3)
+                    await asyncio.wait_for(observed.wait(), _STREAM_WAIT_TIMEOUT)
                     assert not job.done()
                     gate.set()
                     response = await job
@@ -515,10 +519,228 @@ async def test_traced_response_still_parses_if_observer_scope_ends_before_http_r
     events = []
     with model_stream(events.append):
         task = asyncio.create_task(_client().acall([]))
-        await asyncio.wait_for(pending.wait(), 1)
+        await asyncio.wait_for(pending.wait(), _STREAM_WAIT_TIMEOUT)
     release.set()
     response = await task
     assert response.content == "late response"
     assert response.usage is not None
     assert response.usage.total_tokens == 14
     assert events == []
+
+
+class _ResponsesEvents:
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        gate: asyncio.Event | None = None,
+    ) -> None:
+        self.items = items
+        self.gate = gate
+        self.response = type(
+            "FakeHTTPResponse",
+            (),
+            {"closed": False, "close": self._close, "aclose": self._aclose},
+        )()
+
+    def _close(self) -> None:
+        self.response.closed = True
+
+    async def _aclose(self) -> None:
+        self.response.closed = True
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        yield from self.items
+
+    async def __aiter__(self) -> AsyncIterator[dict[str, Any]]:
+        for index, item in enumerate(self.items):
+            if index == 1 and self.gate is not None:
+                await self.gate.wait()
+            await asyncio.sleep(0)
+            yield item
+
+
+def _responses_client(*, retries: int = 0):
+    return with_model_streaming(
+        ResponsesClient(
+            "openai/gpt-5",
+            api_key="test-only",
+            retry_config=RetryConfig(
+                max_retries=retries,
+                rate_limit_extra_retries=0,
+                base_delay=0,
+                max_delay=0,
+                jitter_factor=0,
+            ),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_responses_client_streams_deltas_and_preserves_structured_output_and_usage(
+    monkeypatch,
+):
+    class Answer(BaseModel):
+        result: int
+
+    gate = asyncio.Event()
+    saw_reasoning = asyncio.Event()
+    events: list[ModelStreamEvent] = []
+    requests: list[dict[str, Any]] = []
+    final_response = ResponsesAPIResponse(
+        id="resp_1",
+        object="response",
+        created_at=1,
+        status="completed",
+        model="gpt-5",
+        output=[
+            {
+                "id": "rs_1",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "Thinking via Responses"}],
+                "encrypted_content": "enc_payload",
+            },
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": '{"result":42}', "annotations": []}],
+            },
+        ],
+        usage={"input_tokens": 12, "output_tokens": 6, "total_tokens": 18},
+    )
+    stream = _ResponsesEvents(
+        [
+            {"type": "response.reasoning_summary_text.delta", "delta": "Thinking via Responses"},
+            {"type": "response.output_text.delta", "delta": '{"result":'},
+            {"type": "response.output_text.delta", "delta": "42}"},
+            {"type": "response.completed", "response": final_response},
+        ],
+        gate=gate,
+    )
+
+    async def aresponses(**kwargs):
+        requests.append(kwargs)
+        return stream
+
+    def observe(event: ModelStreamEvent) -> None:
+        events.append(event)
+        if event.kind == "reasoning":
+            saw_reasoning.set()
+
+    monkeypatch.setattr(litellm, "aresponses", aresponses)
+    client = _responses_client()
+    try:
+        with model_stream(observe):
+            task = asyncio.create_task(
+                client.acall([{"role": "user", "content": "Solve"}], output_model=Answer)
+            )
+            await asyncio.wait_for(saw_reasoning.wait(), _STREAM_WAIT_TIMEOUT)
+            assert not task.done()
+            assert [(e.kind, e.text) for e in events] == [
+                ("start", ""),
+                ("reasoning", "Thinking via Responses"),
+            ]
+            gate.set()
+            response = await task
+    finally:
+        await client.aclose()
+
+    assert response.parsed == Answer(result=42)
+    assert response.content == '{"result":42}'
+    assert response.reasoning == "Thinking via Responses"
+    assert response.replay_scope is not None
+    assert response.usage is not None
+    assert response.usage.input_tokens == 12
+    assert response.usage.output_tokens == 6
+    assert [e.kind for e in events] == ["start", "reasoning", "text", "text", "finish"]
+    assert requests[0]["stream"] is True
+    assert "stream_options" not in requests[0]
+
+
+def test_responses_client_sync_tool_call_and_cancellation_preserve_semantics(monkeypatch):
+    final_response = ResponsesAPIResponse(
+        id="resp_tool",
+        object="response",
+        created_at=1,
+        status="completed",
+        model="gpt-5",
+        output=[
+            {
+                "id": "rs_tool",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "Need lookup"}],
+                "encrypted_content": "enc_tool",
+            },
+            {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_resp_1",
+                "name": "lookup",
+                "arguments": '{"path":"a.py"}',
+                "status": "completed",
+            },
+        ],
+        usage={"input_tokens": 9, "output_tokens": 3, "total_tokens": 12},
+    )
+    stream = _ResponsesEvents(
+        [
+            {"type": "response.reasoning_summary_text.delta", "delta": "Need lookup"},
+            {"type": "response.function_call_arguments.delta", "delta": '{"path":'},
+            {"type": "response.function_call_arguments.delta", "delta": '"a.py"}'},
+            {"type": "response.completed", "response": final_response},
+        ]
+    )
+    monkeypatch.setattr(litellm, "responses", lambda **kwargs: stream)
+    events: list[ModelStreamEvent] = []
+    client = _responses_client()
+    try:
+        with model_stream(events.append):
+            response = client.call([{"role": "user", "content": "Check a.py"}])
+    finally:
+        client.close()
+
+    assert response.finish_reason == "tool_calls"
+    assert response.tool_calls[0].id == "call_resp_1"
+    assert response.tool_calls[0].name == "lookup"
+    assert response.tool_calls[0].arguments == '{"path":"a.py"}'
+    assert [e.kind for e in events] == ["start", "reasoning", "finish"]
+
+
+@pytest.mark.asyncio
+async def test_responses_client_cancellation_closes_underlying_http_response(monkeypatch):
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    stream = _ResponsesEvents(
+        [
+            {"type": "response.output_text.delta", "delta": "partial"},
+            {"type": "response.output_text.delta", "delta": "never"},
+        ],
+        gate=gate,
+    )
+
+    async def aresponses(**kwargs):
+        return stream
+
+    events: list[ModelStreamEvent] = []
+
+    def observe(event: ModelStreamEvent) -> None:
+        events.append(event)
+        if event.kind == "text":
+            started.set()
+
+    monkeypatch.setattr(litellm, "aresponses", aresponses)
+    client = _responses_client()
+    try:
+        with model_stream(observe):
+            task = asyncio.create_task(client.acall([{"role": "user", "content": "Hi"}]))
+            await asyncio.wait_for(started.wait(), _STREAM_WAIT_TIMEOUT)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    finally:
+        await client.aclose()
+
+    assert stream.response.closed is True
+    assert [e.kind for e in events] == ["start", "text", "cancel"]

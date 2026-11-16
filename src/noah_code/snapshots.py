@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import os
+import re
 import stat
 import tempfile
 import time
@@ -13,10 +15,53 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 JOURNAL_MAX_TURNS = 20
+_HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+class JournalData(dict):
+    """Journal dictionary carrying an optional default blob directory for load_dict."""
+
+    def __init__(self, *args: object, blob_dir: Path | None = None, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._blob_dir = blob_dir
 
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _write_blob(blob_dir: Path, data: bytes) -> str:
+    digest = _sha256(data)
+    blob_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        blob_dir.chmod(0o700)
+    target = blob_dir / digest
+    if target.is_file():
+        return digest
+    fd, temp_name = tempfile.mkstemp(prefix=".blob-", dir=blob_dir)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, target)
+    finally:
+        Path(temp_name).unlink(missing_ok=True)
+    return digest
+
+
+def _read_blob(blob_dir: Path, digest: str) -> bytes:
+    if not isinstance(digest, str) or _HEX_SHA256.fullmatch(digest) is None:
+        raise ValueError("invalid blob digest")
+    path = blob_dir / digest
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"missing journal blob: {digest}") from exc
+    if _sha256(data) != digest:
+        raise ValueError(f"corrupt journal blob: {digest}")
+    return data
 
 
 @dataclass
@@ -44,9 +89,16 @@ class TurnJournal:
 class SnapshotJournal:
     """Journal WorkspaceTools mutations; refuse concurrent overwrites."""
 
-    def __init__(self, *, blob_limit: int = 2_000_000, root: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        blob_limit: int = 2_000_000,
+        root: Path | None = None,
+        blob_dir: Path | None = None,
+    ) -> None:
         self.blob_limit = blob_limit
         self._root = root.resolve() if root is not None else None
+        self._blob_dir = blob_dir.expanduser().resolve() if blob_dir is not None else None
         self._turns: list[TurnJournal] = []
         self._redo: list[TurnJournal] = []
         self._current: TurnJournal | None = None
@@ -352,76 +404,115 @@ class SnapshotJournal:
             with contextlib.suppress(FileNotFoundError):
                 Path(temp_name).unlink()
 
-    def to_dict(self) -> dict:
+    def to_dict(self, blob_dir: Path | None = None) -> dict:
+        target_dir = (
+            blob_dir.expanduser().resolve() if blob_dir is not None else self._blob_dir
+        )
         return {
-            "turns": [self._turn_to_dict(t) for t in self._turns],
-            "redo": [self._turn_to_dict(t) for t in self._redo],
+            "turns": [self._turn_to_dict(t, blob_dir=target_dir) for t in self._turns],
+            "redo": [self._turn_to_dict(t, blob_dir=target_dir) for t in self._redo],
         }
 
-    def load_dict(self, data: dict | None) -> None:
+    def load_dict(self, data: dict | None, blob_dir: Path | None = None) -> None:
         """Restore a journal, dropping individually corrupted turns.
 
         A persisted journal can be partially corrupted (truncated base64,
-        missing fields). Undo is all-or-nothing per turn, so discarding a
-        damaged turn keeps the remaining turns internally consistent instead
-        of crashing on load.
+        missing blobs, missing fields). Undo is all-or-nothing per turn, so
+        discarding a damaged turn keeps the remaining turns internally
+        consistent instead of crashing on load.
         """
 
-        turns = self._load_turns(data.get("turns") if isinstance(data, dict) else None)
-        redo = self._load_turns(data.get("redo") if isinstance(data, dict) else None)
+        inferred_dir = getattr(data, "_blob_dir", None) if isinstance(data, dict) else None
+        target_dir = (
+            blob_dir.expanduser().resolve()
+            if blob_dir is not None
+            else self._blob_dir
+            if self._blob_dir is not None
+            else inferred_dir.expanduser().resolve()
+            if isinstance(inferred_dir, Path)
+            else None
+        )
+        turns = self._load_turns(
+            data.get("turns") if isinstance(data, dict) else None,
+            blob_dir=target_dir,
+        )
+        redo = self._load_turns(
+            data.get("redo") if isinstance(data, dict) else None,
+            blob_dir=target_dir,
+        )
         self._turns = turns
         self._redo = redo
 
-    def _load_turns(self, entries: object) -> list[TurnJournal]:
+    def _load_turns(
+        self, entries: object, *, blob_dir: Path | None = None
+    ) -> list[TurnJournal]:
         if not isinstance(entries, list):
             return []
         loaded: list[TurnJournal] = []
         for entry in entries[-JOURNAL_MAX_TURNS:]:
             try:
-                loaded.append(self._turn_from_dict(entry))
+                loaded.append(self._turn_from_dict(entry, blob_dir=blob_dir))
             except (AttributeError, KeyError, TypeError, ValueError):
                 continue
         return loaded
 
     @staticmethod
-    def _turn_to_dict(turn: TurnJournal) -> dict:
+    def _turn_to_dict(turn: TurnJournal, *, blob_dir: Path | None = None) -> dict:
+        mutations = []
+        for m in turn.mutations:
+            entry: dict[str, object] = {
+                "id": m.id,
+                "path": m.path,
+                "existed_before": m.existed_before,
+                "pre_hash": m.pre_hash,
+                "post_hash": m.post_hash,
+            }
+            if blob_dir is not None:
+                entry["pre_blob"] = (
+                    _write_blob(blob_dir, m.pre_bytes) if m.pre_bytes is not None else None
+                )
+                entry["post_blob"] = (
+                    _write_blob(blob_dir, m.post_bytes) if m.post_bytes is not None else None
+                )
+            else:
+                entry["pre_bytes_b64"] = (
+                    base64.b64encode(m.pre_bytes).decode() if m.pre_bytes is not None else None
+                )
+                entry["post_bytes_b64"] = (
+                    base64.b64encode(m.post_bytes).decode() if m.post_bytes is not None else None
+                )
+            entry.update(
+                mode=m.mode,
+                post_mode=m.post_mode,
+                turn_id=m.turn_id,
+                timestamp=m.timestamp,
+            )
+            mutations.append(entry)
         return {
             "turn_id": turn.turn_id,
             "shell_may_bypass": turn.shell_may_bypass,
-            "mutations": [
-                {
-                    "id": m.id,
-                    "path": m.path,
-                    "existed_before": m.existed_before,
-                    "pre_hash": m.pre_hash,
-                    "post_hash": m.post_hash,
-                    "pre_bytes_b64": (
-                        __import__("base64").b64encode(m.pre_bytes).decode()
-                        if m.pre_bytes is not None
-                        else None
-                    ),
-                    "post_bytes_b64": (
-                        __import__("base64").b64encode(m.post_bytes).decode()
-                        if m.post_bytes is not None
-                        else None
-                    ),
-                    "mode": m.mode,
-                    "post_mode": m.post_mode,
-                    "turn_id": m.turn_id,
-                    "timestamp": m.timestamp,
-                }
-                for m in turn.mutations
-            ],
+            "mutations": mutations,
         }
 
     @staticmethod
-    def _turn_from_dict(data: dict) -> TurnJournal:
-        import base64
+    def _turn_from_dict(data: dict, *, blob_dir: Path | None = None) -> TurnJournal:
+        def _decode_image(
+            item: dict, blob_key: str, b64_key: str, legacy_key: str
+        ) -> bytes | None:
+            blob_ref = item.get(blob_key)
+            if blob_ref is not None:
+                if blob_dir is None:
+                    raise ValueError(f"blob_dir required to load {blob_key}")
+                return _read_blob(blob_dir, blob_ref)
+            raw_b64 = item.get(b64_key)
+            if raw_b64 is None:
+                raw_b64 = item.get(legacy_key)
+            return base64.b64decode(raw_b64) if raw_b64 is not None else None
 
         muts = []
         for m in data.get("mutations", []):
-            pre = m.get("pre_bytes_b64")
-            post = m.get("post_bytes_b64")
+            pre_bytes = _decode_image(m, "pre_blob", "pre_bytes_b64", "pre_b64")
+            post_bytes = _decode_image(m, "post_blob", "post_bytes_b64", "post_b64")
             muts.append(
                 FileMutation(
                     id=m["id"],
@@ -429,11 +520,11 @@ class SnapshotJournal:
                     existed_before=m["existed_before"],
                     pre_hash=m.get("pre_hash"),
                     post_hash=m.get("post_hash"),
-                    pre_bytes=base64.b64decode(pre) if pre is not None else None,
+                    pre_bytes=pre_bytes,
                     mode=m.get("mode"),
                     turn_id=m["turn_id"],
                     timestamp=m.get("timestamp", 0.0),
-                    post_bytes=base64.b64decode(post) if post is not None else None,
+                    post_bytes=post_bytes,
                     post_mode=m.get("post_mode"),
                 )
             )
@@ -442,3 +533,76 @@ class SnapshotJournal:
             mutations=muts,
             shell_may_bypass=bool(data.get("shell_may_bypass")),
         )
+
+
+def externalize_journal_dict(
+    data: dict,
+    blob_dir: Path,
+    *,
+    prune_unreferenced: bool = True,
+) -> dict:
+    """Convert inline base64 mutations to content-addressed blobs and prune stale blobs."""
+
+    resolved_dir = blob_dir.expanduser().resolve()
+    referenced: set[str] = set()
+
+    def _convert_turns(entries: object) -> list[dict]:
+        if not isinstance(entries, list):
+            return []
+        converted: list[dict] = []
+        for turn in entries[-JOURNAL_MAX_TURNS:]:
+            if not isinstance(turn, dict):
+                continue
+            raw_muts = turn.get("mutations")
+            if not isinstance(raw_muts, list):
+                converted.append(dict(turn))
+                continue
+            new_muts: list[dict] = []
+            for mut in raw_muts:
+                if not isinstance(mut, dict):
+                    continue
+                item = dict(mut)
+                for blob_key, b64_key, legacy_key in (
+                    ("pre_blob", "pre_bytes_b64", "pre_b64"),
+                    ("post_blob", "post_bytes_b64", "post_b64"),
+                ):
+                    if blob_key in item:
+                        ref = item.get(blob_key)
+                        if isinstance(ref, str) and _HEX_SHA256.fullmatch(ref):
+                            referenced.add(ref)
+                        item.pop(b64_key, None)
+                        item.pop(legacy_key, None)
+                    else:
+                        raw_b64 = item.pop(b64_key, None)
+                        if raw_b64 is None:
+                            raw_b64 = item.pop(legacy_key, None)
+                        if isinstance(raw_b64, str):
+                            try:
+                                raw = base64.b64decode(raw_b64)
+                            except ValueError:
+                                item[b64_key] = raw_b64
+                            else:
+                                digest = _write_blob(resolved_dir, raw)
+                                item[blob_key] = digest
+                                referenced.add(digest)
+                        else:
+                            item[blob_key] = None
+                new_muts.append(item)
+            converted.append({**turn, "mutations": new_muts})
+        return converted
+
+    out = {
+        "turns": _convert_turns(data.get("turns") if isinstance(data, dict) else None),
+        "redo": _convert_turns(data.get("redo") if isinstance(data, dict) else None),
+    }
+    if prune_unreferenced and resolved_dir.is_dir():
+        with contextlib.suppress(OSError):
+            for entry in resolved_dir.iterdir():
+                if (
+                    entry.is_file()
+                    and _HEX_SHA256.fullmatch(entry.name)
+                    and entry.name not in referenced
+                ):
+                    with contextlib.suppress(OSError):
+                        entry.unlink()
+    return out

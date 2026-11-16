@@ -725,3 +725,137 @@ def test_console_respects_noah_code_model_env_without_prompt(monkeypatch, tmp_pa
     result = CliRunner().invoke(interactive_cmd, ["--console", str(tmp_path)])
     assert result.exit_code == 0, result.output
     assert launches == ["openai/env-model"]
+
+
+def test_cli_lazy_import_avoids_host_and_console() -> None:
+    import sys
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys, noah_code.cli; "
+                "assert 'noah_code.host' not in sys.modules, 'host imported eagerly'; "
+                "assert 'noah_code.ui.console' not in sys.modules, 'console imported eagerly'"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_run_attach_rejects_non_loopback_http(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("NOAH_CODE_SERVER_TOKEN", "t" * 40)
+    result = CliRunner().invoke(
+        cli_group,
+        ["run", "--attach", "http://example.com:9000", "--json", "hello", str(tmp_path)],
+    )
+    assert result.exit_code == EXIT_CONFIG
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "failed"
+    assert "loopback" in payload["explanation"]
+
+
+@pytest.mark.enable_socket
+@pytest.mark.asyncio
+async def test_run_attach_streams_and_preserves_service_session(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from noah_code.cli import _run_session
+    from noah_code.config import NoahCodeConfig
+    from noah_code.events import HostEvent, HostEventKind
+    from noah_code.host import HostResult
+    from noah_code.service import AgentService, serve_http
+    from noah_code.steer import SteerQueue
+    from noah_code.workspace import Workspace
+
+    class FakeServedHost:
+        def __init__(self, workspace, config, *, ui, session_meta=None, store=None, **_kw):
+            self.workspace = workspace
+            self.config = config
+            self.ui = ui
+            self.store = store
+            self.steer_queue = SteerQueue()
+            self.queue_paused = False
+            self.closed = False
+            self.meta = session_meta
+
+        async def start(self):
+            self.meta = self.meta or self.store.create(self.workspace, model=self.config.model)
+            return self.meta
+
+        async def submit_prompt(self, prompt: str):
+            self.ui.render(HostEvent(HostEventKind.MESSAGE, f"ack:{prompt}"))
+            return HostResult(
+                0,
+                f"completed:{prompt}",
+                self.meta.session_id,
+                status="completed",
+                run_id="run-attached-1",
+            )
+
+        def cancel_active_turn(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            self.closed = True
+
+    token = "a" * 40
+    monkeypatch.setenv("NOAH_CODE_SERVER_TOKEN", token)
+    service = AgentService(
+        Workspace(root=tmp_path.resolve()),
+        NoahCodeConfig(session_dir=tmp_path / "sessions"),
+        host_factory=FakeServedHost,
+    )
+    endpoint = await serve_http(service, token=token, port=0)
+    try:
+        assert endpoint.server is not None
+        port = endpoint.server.sockets[0].getsockname()[1]
+        code = await _run_session(
+            prompt="ship-feature",
+            path=str(tmp_path),
+            model=None,
+            reasoning_effort=None,
+            auto=False,
+            yolo=False,
+            mode=None,
+            max_iterations=None,
+            session_id=None,
+            unsafe_inprocess_code_execution=False,
+            json_output=False,
+            attach_url=f"http://127.0.0.1:{port}",
+        )
+        assert code == 0
+        # Session stays alive on the daemon after --attach returns!
+        assert len(service.sessions) == 1
+        assert next(iter(service.sessions.values())).closed is False
+    finally:
+        await endpoint.close()
+
+
+def test_serve_restricts_workspace_by_default_when_path_given(
+    monkeypatch, tmp_path: Path
+) -> None:
+    captured: list[tuple[str | None, bool | None]] = []
+
+    async def fake_transport(path, *, restrict_workspace=False, **_kwargs):
+        captured.append((path, restrict_workspace))
+        return 0
+
+    monkeypatch.setenv("NOAH_CODE_SERVER_TOKEN", "b" * 40)
+    monkeypatch.setattr("noah_code.cli._run_transport", fake_transport)
+
+    res_with_path = CliRunner().invoke(cli_group, ["serve", str(tmp_path)])
+    assert res_with_path.exit_code == 0
+    assert captured[-1] == (str(tmp_path), True)
+
+    res_any = CliRunner().invoke(cli_group, ["serve", str(tmp_path), "--any-workspace"])
+    assert res_any.exit_code == 0
+    assert captured[-1] == (str(tmp_path), False)
+
+    res_no_path = CliRunner().invoke(cli_group, ["serve"])
+    assert res_no_path.exit_code == 0
+    assert captured[-1] == (None, False)

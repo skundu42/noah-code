@@ -102,6 +102,8 @@ async def test_text_stream_usage_and_isolation(monkeypatch):
         reasoning_tokens=2,
     )
     assert client.context_window == 100_000
+    assert not server.closed
+    await client.aclose()
     assert server.closed
     assert [value.kind for value in events] == ["start", "text", "finish"]
     requests = dict(server.requests)
@@ -124,13 +126,16 @@ async def test_tool_call_returns_to_noah_without_executing_and_history_round_tri
     call["id"] = 42
     server = Server([call])
     monkeypatch.setattr(codex_client, "CodexAppServer", lambda: server)
-    result = await CodexClient("codex/test").acall(
+    client = CodexClient("codex/test")
+    result = await client.acall(
         [{"role": "user", "content": "Do it"}], tools=[tool()]
     )
     assert result.finish_reason == "tool_calls"
     assert result.tool_calls[0].name == "execute_python"
     assert json.loads(result.tool_calls[0].arguments) == {"code": "print(1)"}
     assert result.usage is None
+    assert not server.closed
+    await client.aclose()
     assert server.closed
     _, history, continuation = _prepare_messages(
         [
@@ -245,21 +250,71 @@ async def test_nooa_codeact_executes_returned_dynamic_tool_through_noah(tmp_path
     from noah_code.workspace import Workspace
 
     code = 'self.message("Codex bridge answer")\nreturn_result(Done(explanation="complete"))'
-    first = Server(
+
+    class MultiTurnServer(Server):
+        def __init__(self, turn_batches):
+            super().__init__([])
+            self._batches = list(turn_batches)
+            self._turn_num = 0
+            self.injected_histories = []
+
+        async def request(self, method, params, **kwargs):
+            self.requests.append((method, params))
+            if method == "account/read":
+                return {"account": {"type": self.account_type}}
+            if method == "thread/start":
+                return {
+                    "thread": {"id": f"thread-{self._turn_num + 1}"},
+                    "model": params["model"],
+                    "instructionSources": self.instructions,
+                }
+            if method == "thread/inject_items":
+                self.injected_histories.append(params["items"])
+                return {}
+            if method == "turn/start":
+                self._turn_num += 1
+                turn_id = f"turn-{self._turn_num}"
+                thread_id = params["threadId"]
+                batch = self._batches.pop(0)
+                for item in batch:
+                    enriched = dict(item)
+                    enriched["params"] = {
+                        **item["params"],
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                    }
+                    self.events.append(enriched)
+                return {"turn": {"id": turn_id}}
+            return {}
+
+    shared_server = MultiTurnServer(
         [
-            event(
-                "item/tool/call",
-                tool="execute_python",
-                callId="call-1",
-                arguments={"code": 'print("tool output")'},
-            )
+            [
+                event(
+                    "item/tool/call",
+                    tool="execute_python",
+                    callId="call-1",
+                    arguments={"code": 'print("tool output")'},
+                )
+            ],
+            [
+                event(
+                    "item/tool/call",
+                    tool="execute_python",
+                    callId="call-2",
+                    arguments={"code": code},
+                )
+            ],
         ]
     )
-    second = Server(
-        [event("item/tool/call", tool="execute_python", callId="call-2", arguments={"code": code})]
-    )
-    servers = iter([first, second])
-    monkeypatch.setattr(codex_client, "CodexAppServer", lambda: next(servers))
+    spawns = 0
+
+    def build_server():
+        nonlocal spawns
+        spawns += 1
+        return shared_server
+
+    monkeypatch.setattr(codex_client, "CodexAppServer", build_server)
     workspace = Workspace(root=tmp_path.resolve())
     config = load_config(
         workspace.root,
@@ -299,16 +354,93 @@ async def test_nooa_codeact_executes_returned_dynamic_tool_through_noah(tmp_path
     result = await host.run_once("Say hello")
     assert result.exit_code == 0
     assert any("Codex bridge answer" in value.text for value in events)
-    assert first.closed and second.closed
-    history = dict(second.requests)["thread/inject_items"]["items"]
-    turn_input = dict(second.requests)["turn/start"]["input"]
+    assert spawns == 1
+    assert shared_server.closed
+    assert shared_server.injected_histories
+    history = shared_server.injected_histories[-1]
+    turn_inputs = [params["input"] for method, params in shared_server.requests if method == "turn/start"]
     assert any(
         item.get("type") == "function_call_output"
         and item.get("call_id") == "call-1"
         and item.get("output")
         for item in history
     )
-    assert "tool output" in json.dumps([*history, *turn_input])
+    assert "tool output" in json.dumps([*history, *turn_inputs[-1]])
+
+
+@pytest.mark.asyncio
+async def test_codex_client_batches_multiple_tool_calls_and_restarts_dead_server(monkeypatch):
+    batched_server = Server(
+        [
+            event(
+                "item/tool/call",
+                tool="execute_python",
+                callId="call-a",
+                arguments={"code": "a = 1"},
+            ),
+            event(
+                "item/tool/call",
+                tool="execute_python",
+                callId="call-b",
+                arguments={"code": "b = 2"},
+            ),
+        ]
+    )
+    recovery_server = Server(
+        [
+            event(
+                "turn/completed",
+                turn={
+                    "id": "turn",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "id": "m1", "text": "Recovered"}],
+                },
+            )
+        ]
+    )
+    created = iter([batched_server, recovery_server])
+    monkeypatch.setattr(codex_client, "CodexAppServer", lambda: next(created))
+
+    client = CodexClient("codex/test")
+    first = await client.acall([{"role": "user", "content": "Batch"}], tools=[tool()])
+    assert [c.id for c in first.tool_calls] == ["call-a", "call-b"]
+    assert not batched_server.closed
+
+    # Simulate subprocess exit between turns; next acall transparently starts recovery_server.
+    batched_server.closed = True
+    second = await client.acall([{"role": "user", "content": "Continue"}])
+    assert second.content == "Recovered"
+    assert not recovery_server.closed
+    await client.aclose()
+    assert recovery_server.closed
+
+
+@pytest.mark.asyncio
+async def test_verify_codex_cli_caches_version_by_path_and_mtime(tmp_path):
+    import os
+
+    marker = tmp_path / "version_calls.txt"
+    script = tmp_path / "codex-cached"
+    script.write_text(
+        f"""#!/usr/bin/env python3
+import pathlib
+p = pathlib.Path({str(marker)!r})
+p.write_text(p.read_text() + '1' if p.exists() else '1')
+print('codex-cli 0.153.4')
+"""
+    )
+    script.chmod(0o700)
+    codex_rpc._VERIFIED_CODEX_BINARIES.clear()
+
+    await codex_rpc.verify_codex_cli(str(script))
+    await codex_rpc.verify_codex_cli(str(script))
+    assert marker.read_text() == "1"
+
+    # Updating mtime invalidates cache and re-verifies once.
+    stat = script.stat()
+    os.utime(script, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+    await codex_rpc.verify_codex_cli(str(script))
+    assert marker.read_text() == "11"
 
 
 def test_model_constructor_routes_without_litellm_account_auth(monkeypatch):

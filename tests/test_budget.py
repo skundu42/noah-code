@@ -286,32 +286,71 @@ def test_response_cost_nan_is_stamped_as_zero() -> None:
 
 @pytest.mark.asyncio
 async def test_deadline_cancels_inflight_and_queued_provider_calls() -> None:
-    started = asyncio.Event()
+    started_first = asyncio.Event()
+    started_second = asyncio.Event()
     cancelled = asyncio.Event()
 
     class HangingLLM:
+        def __init__(self, flag: asyncio.Event) -> None:
+            self.flag = flag
+
         async def acall(self, *_args, **_kwargs):
-            started.set()
+            self.flag.set()
             try:
                 await asyncio.Event().wait()
             finally:
                 cancelled.set()
 
-    first, guard = wrap_with_budget(HangingLLM(), BudgetConfig(max_seconds=0.05))
+    first, guard = wrap_with_budget(
+        HangingLLM(started_first), BudgetConfig(max_seconds=0.05)
+    )
+    second = SharedBudgetLLM(HangingLLM(started_second), guard)
     queued_inner = FakeLLM(responses=[FakeResponse()])
-    second = SharedBudgetLLM(queued_inner, guard)
-    pending = asyncio.create_task(first.acall([]))
-    await started.wait()
+    queued = SharedBudgetLLM(queued_inner, guard)
+    pending_first = asyncio.create_task(first.acall([]))
+    pending_second = asyncio.create_task(second.acall([]))
+    await asyncio.gather(started_first.wait(), started_second.wait())
     results = await asyncio.wait_for(
-        asyncio.gather(pending, second.acall([]), return_exceptions=True), timeout=1
+        asyncio.gather(pending_first, pending_second, return_exceptions=True), timeout=1
     )
 
     assert all(isinstance(result, BudgetExceeded) for result in results)
     assert cancelled.is_set()
-    assert queued_inner.calls == 0
     assert guard.remaining_seconds() == 0
     with pytest.raises(BudgetExceeded, match="time limit"):
-        await first.acall([])
+        await queued.acall([])
+    assert queued_inner.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_parallel_subagent_calls_execute_concurrently_under_shared_budget() -> None:
+    both_inflight = asyncio.Barrier(2)
+
+    class ConcurrentLLM:
+        async def acall(self, *_args, **_kwargs):
+            await asyncio.wait_for(both_inflight.wait(), timeout=0.5)
+            return FakeResponse(usage={"prompt_tokens": 20, "completion_tokens": 10})
+
+    first, guard = wrap_with_budget(
+        ConcurrentLLM(), BudgetConfig(max_tokens=100, max_seconds=5)
+    )
+    second = SharedBudgetLLM(ConcurrentLLM(), guard)
+    await asyncio.gather(first.acall([]), second.acall([]))
+    assert guard.total_tokens == 60
+
+
+def test_init_llm_wrapper_preserves_context_window_and_route_metadata() -> None:
+    from noah_code import nooa_compat
+
+    delegate = SimpleNamespace(
+        model="openai/gpt-5",
+        _context_window=272_000,
+        _registry_context_route=("openai/gpt-5", {"api_base": "https://api.example"}, "responses"),
+    )
+    wrapper = SimpleNamespace()
+    nooa_compat.init_llm_wrapper(wrapper, delegate)
+    assert wrapper._context_window == 272_000
+    assert wrapper._registry_context_route == delegate._registry_context_route
 
 
 @pytest.mark.asyncio

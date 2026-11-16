@@ -485,3 +485,66 @@ async def test_macos_sandbox_worker_accepts_codeact_module_builtins() -> None:
     assert listed.stdout.strip() == "hi what is 1+4"
     assert signal.error is None, signal.error
     assert signal.stdout.strip() == "ok"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_broker_gates_skill_activation_and_readonly_task_mutations() -> None:
+    assert _PermissionSandboxedExecutor._path_allowed(("task", "diff"))
+    assert _PermissionSandboxedExecutor._path_allowed(("task", "apply"))
+    assert _PermissionSandboxedExecutor._path_allowed(("task", "cleanup"))
+    assert _PermissionSandboxedExecutor._path_allowed(("skills", "list_skills"))
+    assert _PermissionSandboxedExecutor._path_allowed(("skills", "activate"))
+    assert not _PermissionSandboxedExecutor._path_allowed(("skills", "register"))
+
+    readonly_exec = object.__new__(_PermissionSandboxedExecutor)
+    readonly_exec._max_error = effective_error_limit(None)
+    readonly_exec._agent = SimpleNamespace(
+        _readonly=True,
+        _sandbox_approved_roots=set(),
+        task=SimpleNamespace(diff=lambda tid: f"diff:{tid}"),
+    )
+    for blocked_path in (["task", "apply"], ["task", "cleanup"]):
+        res = await readonly_exec._dispatch_tool_call({"kind": "attr", "path": blocked_path})
+        assert res["ok"] is False
+        assert res["error_type"] == "PermissionError"
+    ok_diff = await readonly_exec._dispatch_tool_call(
+        {"kind": "call", "path": ["task", "diff"], "args": ["wt-1"], "kwargs": {}}
+    )
+    assert ok_diff["ok"] is True
+    assert ok_diff["result"] == "diff:wt-1"
+
+    checked: list[tuple[str, str]] = []
+    activated: list[list[str]] = []
+
+    class FakeApprovals:
+        async def require(self, decision: object) -> None:
+            if getattr(decision, "target", "") == "blocked-skill":
+                raise PermissionError("denied skill")
+
+    gated_exec = object.__new__(_PermissionSandboxedExecutor)
+    gated_exec._max_error = effective_error_limit(None)
+    gated_exec._agent = SimpleNamespace(
+        _readonly=False,
+        _sandbox_approved_roots=set(),
+        engine=SimpleNamespace(
+            decide=lambda cat, target, tool="": (
+                checked.append((cat, target)) or SimpleNamespace(target=target)
+            )
+        ),
+        approvals=FakeApprovals(),
+        skills=SimpleNamespace(activate=lambda names: activated.append(list(names)) or "ok"),
+    )
+
+    denied = await gated_exec._dispatch_tool_call(
+        {"kind": "call", "path": ["skills", "activate"], "args": [["blocked-skill"]], "kwargs": {}}
+    )
+    assert denied["ok"] is False
+    assert denied["error_type"] == "PermissionError"
+    assert activated == []
+
+    allowed = await gated_exec._dispatch_tool_call(
+        {"kind": "call", "path": ["skills", "activate"], "args": [["safe-skill"]], "kwargs": {}}
+    )
+    assert allowed["ok"] is True
+    assert ("skill", "safe-skill") in checked
+    assert activated == [["safe-skill"]]

@@ -14,11 +14,12 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from noah_code.approvals import ApprovalChoice, ApprovalRequest
-from noah_code.config import NoahCodeConfig
+from noah_code.config import NoahCodeConfig, _load_project_toml, _project_config_path, load_config
 from noah_code.events import HostEvent
 from noah_code.host import AgentHost, HostResult
 from noah_code.redaction import safe_error_message
@@ -90,11 +91,12 @@ def _history_event(record: SessionEventRecord) -> dict[str, Any] | None:
 class ServiceUI:
     """HostUI with bounded replay and interactions independent of connections."""
 
-    def __init__(self, *, history_limit: int = 1024) -> None:
+    def __init__(self, *, history_limit: int = 4096) -> None:
         if not 1 <= history_limit <= 10_000:
             raise ValueError("history_limit must be between 1 and 10000")
         self.events: deque[dict[str, Any]] = deque(maxlen=history_limit)
         self.sequence = 0
+        self._max_consumed_sequence = 0
         self.changed = asyncio.Event()
         self.closed = False
         self.busy = False
@@ -116,6 +118,29 @@ class ServiceUI:
         if self.closed:
             return
         self.sequence += 1
+        if kind == "model_stream" and self.events:
+            tail = self.events[-1]
+            tail_meta = tail.get("meta")
+            new_meta = data.get("meta")
+            if (
+                tail["kind"] == "model_stream"
+                and tail["sequence"] > self._max_consumed_sequence
+                and isinstance(tail_meta, dict)
+                and isinstance(new_meta, dict)
+                and tail_meta.get("call_id") == new_meta.get("call_id")
+                and tail_meta.get("phase") == new_meta.get("phase")
+                and tail_meta.get("phase") in {"text", "reasoning"}
+                and len(str(tail.get("text", ""))) + len(str(data.get("text", "")))
+                <= MAX_EVENT_TEXT
+            ):
+                self.events[-1] = {
+                    "sequence": self.sequence,
+                    "kind": kind,
+                    **data,
+                    "text": str(tail.get("text", "")) + str(data.get("text", "")),
+                }
+                self._signal()
+                return
         self.events.append({"sequence": self.sequence, "kind": kind, **data})
         self._signal()
 
@@ -245,6 +270,7 @@ class ServiceUI:
             for item in tuple(self.events):
                 if item["sequence"] > after:
                     after = item["sequence"]
+                    self._max_consumed_sequence = max(self._max_consumed_sequence, after)
                     yield item
             if self.closed:
                 return
@@ -293,6 +319,24 @@ class ServiceSession:
         }
 
 
+def _resolve_workspace_config(
+    target_root: Path, base_root: Path, base_config: NoahCodeConfig
+) -> NoahCodeConfig:
+    """Load project-specific config for target_root while preserving runtime overrides."""
+
+    loaded = load_config(target_root)
+    loaded.session_dir = base_config.session_dir
+    loaded.auto_approve = base_config.auto_approve
+    loaded.yolo = base_config.yolo
+    if "tracing" in base_config.model_fields_set:
+        loaded.tracing = base_config.tracing.model_copy(deep=True)
+    if "model" in base_config.model_fields_set:
+        base_proj_model = _load_project_toml(_project_config_path(base_root)).get("model")
+        if base_config.model != base_proj_model:
+            loaded.model = base_config.model
+    return loaded
+
+
 class AgentService:
     """Own hosts until explicit close; transport disconnects do not cancel HTTP work."""
 
@@ -303,7 +347,8 @@ class AgentService:
         *,
         host_factory: Callable[..., Any] = AgentHost,
         max_sessions: int = 8,
-        history_limit: int = 1024,
+        history_limit: int = 4096,
+        restrict_workspace: bool = False,
     ) -> None:
         if not 1 <= max_sessions <= 64:
             raise ValueError("max_sessions must be between 1 and 64")
@@ -311,9 +356,30 @@ class AgentService:
         self.store = SessionStore(config.session_dir)
         self.sessions: dict[str, ServiceSession] = {}
         self._host_factory = host_factory
-        self._max_sessions, self._history_limit = max_sessions, history_limit
+        self.max_sessions = max_sessions
+        self._max_sessions = max_sessions
+        self._history_limit = history_limit
+        self.restrict_workspace = restrict_workspace
+        self._restrict_workspace = restrict_workspace
         self._lock = asyncio.Lock()
         self._closed = False
+
+    async def _evict_oldest_idle_locked(self) -> bool:
+        for sid, candidate in list(self.sessions.items()):
+            if (
+                not candidate.active
+                and not candidate.ui.busy
+                and not candidate.ui.pending
+                and not candidate.lock.locked()
+            ):
+                candidate.closed = True
+                self.sessions.pop(sid, None)
+                try:
+                    await candidate.host.close()
+                finally:
+                    candidate.ui.close()
+                return True
+        return False
 
     async def open_session(
         self,
@@ -321,11 +387,16 @@ class AgentService:
         cwd: str | None = None,
         session_id: str | None = None,
         mcp_servers: dict[str, dict[str, Any]] | None = None,
+        approval_handler: Callable[[str, ApprovalRequest], Awaitable[ApprovalChoice]] | None = None,
     ) -> ServiceSession:
         async with self._lock:
             if self._closed:
                 raise ServiceError("service is closed", 503)
             workspace = open_workspace(cwd or self.workspace.root)
+            if self._restrict_workspace and not workspace.root.resolve().is_relative_to(
+                self.workspace.root.resolve()
+            ):
+                raise ServiceError("workspace outside service root is not allowed", 403)
             if session_id in self.sessions:
                 existing = self.sessions[session_id]
                 if existing.host.workspace.root != workspace.root:
@@ -333,7 +404,9 @@ class AgentService:
                 if mcp_servers:
                     raise ServiceError("close the active session before changing MCP servers", 409)
                 return existing
-            if len(self.sessions) >= self._max_sessions:
+            if len(self.sessions) >= self.max_sessions:
+                await self._evict_oldest_idle_locked()
+            if len(self.sessions) >= self.max_sessions:
                 raise ServiceError("active session limit reached; close a session first", 409)
             if any(item.host.workspace.root == workspace.root for item in self.sessions.values()):
                 raise ServiceError(
@@ -342,7 +415,12 @@ class AgentService:
             meta = await asyncio.to_thread(self.store.load_meta, session_id) if session_id else None
             if meta is not None:
                 self.store.verify_workspace(meta, workspace)
-            config = self.config.model_copy(deep=True)
+            if workspace.root != self.workspace.root:
+                config = await asyncio.to_thread(
+                    _resolve_workspace_config, workspace.root, self.workspace.root, self.config
+                )
+            else:
+                config = self.config.model_copy(deep=True)
             clean_mcp_servers: dict[str, Any] = {}
             if mcp_servers is not None:
                 if not isinstance(mcp_servers, dict):
@@ -370,6 +448,37 @@ class AgentService:
                     host._client_mcp_servers = clean_mcp_servers
             try:
                 meta = await host.start()
+                if approval_handler is not None:
+                    bound_sid = meta.session_id
+                    ui.approval_handler = lambda req: approval_handler(bound_sid, req)
+                if (
+                    clean_mcp_servers
+                    and not set(clean_mcp_servers).issubset(host._mcp_attached)
+                    and getattr(host, "_agent", None) is not None
+                ):
+                    from noah_code.mcp_setup import attach_mcp_server
+
+                    for name, spec in clean_mcp_servers.items():
+                        if name in host._mcp_attached:
+                            continue
+                        is_stdio = spec.get("transport") == "stdio" or bool(
+                            spec.get("command")
+                        )
+                        trusted = (
+                            bool(config.auto_approve or config.yolo)
+                            if is_stdio
+                            else bool(spec.get("trusted", True))
+                        )
+                        await attach_mcp_server(
+                            host.agent,
+                            name,
+                            spec,
+                            engine=host.agent.engine,
+                            approvals=host.agent.approvals,
+                            trusted=trusted,
+                            startup=False,
+                        )
+                        host._mcp_attached.add(name)
                 if clean_mcp_servers and not set(clean_mcp_servers).issubset(host._mcp_attached):
                     raise ServiceError("one or more requested MCP servers could not connect", 409)
             except BaseException:
@@ -396,7 +505,9 @@ class AgentService:
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 256_000:
             raise ServiceError("prompt must contain 1 to 256000 characters")
         session = self.get(session_id)
-        if session.active:
+        if session.closed:
+            raise ServiceError("session is not open; create or load it first", 404)
+        if session.active or session.lock.locked():
             if not queue:
                 raise ServiceError("session is busy; use queue=true or cancel it", 409)
             from noah_code.steer import STEER_QUEUE_CAP
@@ -419,12 +530,14 @@ class AgentService:
 
     def resume_queue(self, session_id: str) -> dict[str, Any]:
         session = self.get(session_id)
+        if session.closed:
+            raise ServiceError("session is not open; create or load it first", 404)
         resume = getattr(session.host, "resume_queued_input", None)
         if callable(resume):
             resume()
         elif hasattr(session.host, "queue_paused"):
             session.host.queue_paused = False
-        if session.active:
+        if session.active or session.lock.locked():
             session.ui.publish("queue_resumed")
             return {"status": "resumed", "request_id": session.request_id}
         queued = session.host.steer_queue.pop()
@@ -483,7 +596,9 @@ class AgentService:
 
     def recover(self, session_id: str) -> dict[str, Any]:
         session = self.get(session_id)
-        if session.active:
+        if session.closed:
+            raise ServiceError("session is not open; create or load it first", 404)
+        if session.active or session.lock.locked():
             raise ServiceError("session is busy", 409)
         session.request_id = uuid.uuid4().hex
         session.result = None

@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import email.utils
+import inspect
+import math
 import os
 import random
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 from nooa.unifiedllm.unifiedllm import UnifiedLLM
@@ -105,6 +109,7 @@ _NON_RETRYABLE_MARKERS = (
     "content policy",
     "invalid request",
 )
+_LOCAL_PROGRAMMING_ERRORS = (TypeError, ValueError, KeyError, AttributeError)
 
 
 def is_transient_llm_error(exc: BaseException) -> bool:
@@ -121,6 +126,8 @@ def is_transient_llm_error(exc: BaseException) -> bool:
             return int(status) in _TRANSIENT_STATUS_CODES
         except (TypeError, ValueError):
             pass
+    if isinstance(exc, _LOCAL_PROGRAMMING_ERRORS):
+        return False
     text = str(exc).lower()
     if any(marker in text for marker in _NON_RETRYABLE_MARKERS):
         return False
@@ -141,6 +148,44 @@ def _disable_inner_retries(client: Any) -> None:
                 current.retry_config = NooaRetryConfig(
                     max_retries=0, rate_limit_extra_retries=0
                 )
+        current = getattr(current, "_inner", None)
+
+
+async def _aclose_client_tree(client: Any, seen: set[int]) -> None:
+    current = client
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        aclose = getattr(current, "aclose", None)
+        if callable(aclose):
+            with contextlib.suppress(Exception):
+                result = aclose()
+                if inspect.isawaitable(result):
+                    await result
+        else:
+            http = getattr(current, "_http", None)
+            http_aclose = getattr(http, "aclose", None) if http is not None else None
+            if callable(http_aclose):
+                with contextlib.suppress(Exception):
+                    result = http_aclose()
+                    if inspect.isawaitable(result):
+                        await result
+        current = getattr(current, "_inner", None)
+
+
+def _close_client_tree(client: Any, seen: set[int]) -> None:
+    current = client
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        close = getattr(current, "close", None)
+        if callable(close) and not inspect.iscoroutinefunction(close):
+            with contextlib.suppress(Exception):
+                close()
+        else:
+            http = getattr(current, "_http", None)
+            http_close = getattr(http, "close", None) if http is not None else None
+            if callable(http_close) and not inspect.iscoroutinefunction(http_close):
+                with contextlib.suppress(Exception):
+                    http_close()
         current = getattr(current, "_inner", None)
 
 
@@ -174,6 +219,14 @@ class ResilientLLM(UnifiedLLM):
     @property
     def context_window(self) -> Any:
         return getattr(self._clients[0], "context_window", None)
+
+    def get_context_limits(
+        self, overrides: dict[str, Any] | None = None, *, fallback_reserve: int = 0
+    ) -> Any:
+        get_limits = getattr(self._clients[0], "get_context_limits", None)
+        if callable(get_limits):
+            return get_limits(overrides, fallback_reserve=fallback_reserve)
+        return super().get_context_limits(overrides, fallback_reserve=fallback_reserve)
 
     async def acall(
         self,
@@ -256,7 +309,7 @@ class ResilientLLM(UnifiedLLM):
     def _delay(self, attempt: int, exc: BaseException) -> float:
         retry_after = _retry_after_seconds(exc)
         if retry_after is not None:
-            return min(retry_after, self._config.max_delay_seconds)
+            return min(retry_after, self._config.request_timeout_seconds)
         base = min(
             self._config.base_delay_seconds * (2 ** max(attempt - 1, 0)),
             self._config.max_delay_seconds,
@@ -290,19 +343,59 @@ class ResilientLLM(UnifiedLLM):
     def get_model_info(self) -> Any:
         return self._clients[0].get_model_info()
 
+    async def aclose(self) -> None:
+        seen: set[int] = set()
+        for client in self._clients:
+            await _aclose_client_tree(client, seen)
+
+    def close(self) -> None:
+        seen: set[int] = set()
+        for client in self._clients:
+            _close_client_tree(client, seen)
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._clients[0], name)
 
 
-def _retry_after_seconds(exc: BaseException) -> float | None:
+def _lookup_retry_after(headers: Any) -> Any:
+    if isinstance(headers, Mapping):
+        direct = headers.get("retry-after")
+        if direct is not None:
+            return direct
+        direct = headers.get("Retry-After")
+        if direct is not None:
+            return direct
+        for key, value in headers.items():
+            if isinstance(key, str) and key.lower() == "retry-after":
+                return value
+        return None
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        return getter("retry-after") or getter("Retry-After")
+    return None
+
+
+def _retry_after_seconds(exc: BaseException, *, now: datetime | None = None) -> float | None:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None) or getattr(exc, "headers", None)
     if not headers:
         return None
-    raw = headers.get("retry-after") or headers.get("Retry-After")
+    raw = _lookup_retry_after(headers)
     if raw is None:
         return None
     try:
-        return max(float(raw), 0.0)
+        numeric = float(raw)
+        if math.isfinite(numeric):
+            return max(numeric, 0.0)
     except (TypeError, ValueError):
-        return None
+        pass
+    if isinstance(raw, str):
+        try:
+            parsed = email.utils.parsedate_to_datetime(raw.strip())
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        reference = now or datetime.now(UTC)
+        return max((parsed - reference).total_seconds(), 0.0)
+    return None

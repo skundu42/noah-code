@@ -167,6 +167,11 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             ("task", "status"),
             ("task", "wait"),
             ("task", "cancel"),
+            ("task", "diff"),
+            ("task", "apply"),
+            ("task", "cleanup"),
+            ("skills", "list_skills"),
+            ("skills", "activate"),
             ("processes", "input"),
             ("processes", "open_terminal"),
             ("processes", "terminal_run"),
@@ -207,6 +212,8 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
         ("plan", "exit_to_build"),
         ("memory", "save"),
         ("memory", "forget"),
+        ("task", "apply"),
+        ("task", "cleanup"),
     })
 
     @classmethod
@@ -271,6 +278,43 @@ class _PermissionSandboxedExecutor(SandboxedExecutor):
             # Even a picklable capability stays behind the broker. Variables and
             # scalar metadata cross as copies; tools cross only as proxies.
             return {"ok": True, "result": None, "proxy": True}
+        if kind == "call" and normalized == ("skills", "activate"):
+            args = msg.get("args") or ()
+            kwargs = msg.get("kwargs") or {}
+            raw_names = (
+                args[0]
+                if args
+                else kwargs.get("patterns")
+                if "patterns" in kwargs
+                else kwargs.get("names", ())
+            )
+            names = [raw_names] if isinstance(raw_names, str) else list(raw_names or ())
+            engine = getattr(self._agent, "_engine", None) or getattr(self._agent, "engine", None)
+            approvals = getattr(self._agent, "_approvals", None) or getattr(
+                self._agent, "approvals", None
+            )
+            try:
+                if engine is None or approvals is None:
+                    raise PermissionError("sandbox skill activation requires a permission broker")
+                for skill_name in names:
+                    decision = engine.decide("skill", str(skill_name), tool="skill")
+                    await approvals.require(decision)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            response = await super()._dispatch_tool_call(msg)
+            if response.get("ok"):
+                approved = getattr(self._agent, "_sandbox_approved_roots", None)
+                skills = getattr(self._agent, "skills", None)
+                if isinstance(approved, set) and skills is not None:
+                    for skill_name in names:
+                        attr = nooa_compat.skill_attribute(skills, str(skill_name))
+                        if attr:
+                            approved.add(attr)
+            return response
         response = await super()._dispatch_tool_call(msg)
         if kind == "call" and response.get("error_type") in {"TypeError", "ValueError"}:
             contracts = getattr(self._agent, "tools", None)
@@ -529,8 +573,9 @@ Every `self.ws.*` call is async: `await` it before accessing the result.
 - Delegate bounded units with `self.task.run`, independent units with
   `run_many`, and lead synthesis with `collaborate`.
   Use `start(name, prompt, isolate=True)` for background work in a retained
-  worktree, then `status`, `wait`, `cancel`, or `follow_up` with its task ID.
-  Shared-checkout background tasks must be read-only. Isolation starts at HEAD.
+  worktree, then `status`, `wait`, `cancel`, `follow_up`, `diff`, `apply`, or
+  `cleanup` with its task ID. Shared-checkout background tasks must be read-only.
+  Isolation starts at HEAD unless `include_dirty=True`.
 - `await self.task.team(objective, workflow="build")` analyzes, implements and
   reviews. Workflows `review`/`investigate` are read-only. Resolve reported
   blockers and validate; delegation alone is not completion.
@@ -776,16 +821,22 @@ class _PermissionCodeActStrategy(CodeActStrategy):
 
 
 class _LeanPermissionCodeActStrategy(_PermissionCodeActStrategy):
-    """Compact NOOA event rendering while retaining cross-turn history."""
+    """Compact NOOA event rendering while retaining cross-turn history and cache boundaries."""
 
     @property
     def name(self) -> str:
         return "NOAH_LEAN_CODEACT"
 
     async def execute(self, runtime: Any, call: Any) -> Any:
+        from noah_code import summarization as _summarization_mod
+
+        formatter_cls = getattr(
+            _summarization_mod, "CachedMarkdownBlockFormatter", MarkdownBlockFormatter
+        )
+        formatter: Any = formatter_cls()
         original = runtime.agent.render_config
         runtime.agent.render_config = original.model_copy(
-            update={"block_formatter": MarkdownBlockFormatter()}
+            update={"block_formatter": formatter}
         )
         try:
             return await super().execute(runtime, call)
@@ -835,6 +886,7 @@ class CodingAgent(InteractiveAgent):
     _observability_event_manager: Annotated[Any, hidden, nosnapshot]
     _observability_unsubs: Annotated[list[Any], hidden, nosnapshot]
     _sandbox_approved_roots: Annotated[set[str], hidden, nosnapshot]
+    _aux_predictors: Annotated[dict[str, Any], hidden, nosnapshot]
     _current_run_id: Annotated[str | None, hidden, nosnapshot] = None
     producers: Annotated[Any, hidden, nosnapshot]
     user_messages: Annotated[Any, hidden, nosnapshot]
@@ -1039,12 +1091,14 @@ class CodingAgent(InteractiveAgent):
             )
             summarizer._output_store = self.ws._output_store
             summarizer._agent_id = f"{self.agent_id}:summarize"
+            nooa_compat.rebind_summarizer_llms(self, self._lightweight_llm)
             self._observability_unsubs.extend(
                 _forward_observability_events(
                     summarizer.event_manager,
                     self._observability_event_manager,
                 )
             )
+        self._aux_predictors: dict[str, Any] = {}
 
         # Discover AGENTS.md / README hints without dumping trees.
         self._repo_instructions_value = self._repo_instructions()
@@ -1063,17 +1117,14 @@ class CodingAgent(InteractiveAgent):
 
         self._git_summary_value = self._git_summary()
         current = self._repo_instructions()
-        if current != self._repo_instructions_value:
-            self._repo_instructions_value = current
-            self.context["repo_instructions"] = Context(current, prefix=True)
+        self._repo_instructions_value = current
+        self.context["repo_instructions"] = Context(current, prefix=True)
         plan = self._active_plan()
-        if plan != getattr(self, "_active_plan_value", None):
-            self._active_plan_value = plan
-            self.context["active_plan"] = Context(plan, prefix=True)
+        self._active_plan_value = plan
+        self.context["active_plan"] = Context(plan, prefix=True)
         memory = self._project_memory()
-        if memory != getattr(self, "_project_memory_value", None):
-            self._project_memory_value = memory
-            self.context["project_memory"] = Context(memory, prefix=True)
+        self._project_memory_value = memory
+        self.context["project_memory"] = Context(memory, prefix=True)
 
     @hidden
     def inject_status_snapshot(self, *, force: bool = False) -> bool:
@@ -1133,6 +1184,7 @@ class CodingAgent(InteractiveAgent):
         self._llm = llm
         if lightweight_follows_main:
             self._lightweight_llm = llm
+            self._aux_predictors.clear()
             nooa_compat.rebind_summarizer_llms(self, llm)
         self.sync_model_limits()
 
@@ -1155,10 +1207,18 @@ class CodingAgent(InteractiveAgent):
     async def _run_auxiliary_predict(self, route: str, value: str) -> str:
         """Run one helper against fresh history and a stable session-local cache route."""
 
-        predictor = _AuxiliaryPredictor(
-            self._lightweight_llm,
-            cache_namespace=f"{self.agent_id}:aux:{route}",
-        )
+        predictors = getattr(self, "_aux_predictors", None)
+        if not isinstance(predictors, dict):
+            predictors = {}
+            self._aux_predictors = predictors
+        predictor = predictors.get(route)
+        if predictor is None or predictor._llm is not self._lightweight_llm:
+            predictor = _AuxiliaryPredictor(
+                self._lightweight_llm,
+                cache_namespace=f"{self.agent_id}:aux:{route}",
+            )
+            predictors[route] = predictor
+        predictor.event_manager.clear()
         unsubs = _forward_observability_events(
             predictor.event_manager,
             self._observability_event_manager,
@@ -1169,6 +1229,7 @@ class CodingAgent(InteractiveAgent):
         finally:
             for unsubscribe in unsubs:
                 unsubscribe()
+            predictor.event_manager.clear()
 
     @hidden
     async def name_session(self, user_message: str) -> str:
@@ -1293,7 +1354,7 @@ class CodingAgent(InteractiveAgent):
 
     @hidden
     async def close_tools(self) -> None:
-        """Close every owned shell, LSP server, and background process."""
+        """Close every owned shell, LSP server, MCP session, and background process."""
 
         task_tools = getattr(self, "task", None)
         try:
@@ -1305,7 +1366,11 @@ class CodingAgent(InteractiveAgent):
                     unsubscribe()
                 self._observability_unsubs.clear()
             finally:
-                await asyncio.gather(
-                    self.processes.close(), self.lsp.close(), self.ws.close(),
-                    return_exceptions=True,
-                )
+                coros: list[Any] = [self.processes.close(), self.lsp.close(), self.ws.close()]
+                with suppress(ImportError):
+                    from noah_code import mcp_setup
+
+                    close_mcp = getattr(mcp_setup, "close_mcp_servers", None)
+                    if callable(close_mcp):
+                        coros.append(close_mcp(self))
+                await asyncio.gather(*coros, return_exceptions=True)

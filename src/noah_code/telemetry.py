@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 
 _INSTRUMENTATION_NAME = "noah_code.agent"
 _AGENT_NAME = "noah-code"
+_MAX_PENDING_TELEMETRY = 256
+_MAX_TRACE_SESSIONS = 1024
 
 _CONTENT_ATTRIBUTES = frozenset(
     {
@@ -388,6 +390,7 @@ class AgentTelemetry:
                 "gen_ai.operation.name": "invoke_agent",
                 "gen_ai.agent.name": _AGENT_NAME,
                 "gen_ai.conversation.id": self.session_id,
+                "session.id": self.session_id,
                 "noah.agent.mode": mode,
                 "noah.agent.recovery": recovery,
             }
@@ -398,6 +401,10 @@ class AgentTelemetry:
                 kind=SpanKind.INTERNAL,
                 attributes=attrs,
             )
+            if self.session_id:
+                trace_id = _span_trace_id(span)
+                if trace_id:
+                    _register_trace_session(trace_id, self.session_id)
             token = context.attach(trace.set_span_in_context(span))
             observation = TurnObservation(span, token, time.perf_counter(), mode, recovery)
             self.event(
@@ -449,9 +456,23 @@ class AgentTelemetry:
 
                 context.detach(observation.context_token)
 
+    def _accept_event_session(self, event: Any) -> bool:
+        if not self.session_id:
+            return True
+        event_sid = str(
+            getattr(event, "session_id", "") or getattr(event, "conversation_id", "") or ""
+        )
+        return not event_sid or event_sid == self.session_id
+
     def llm_start(self, event: Any) -> None:
+        if not self._accept_event_session(event):
+            return
         key = self._event_key(event)
-        self._llm_started.setdefault(key, deque()).append(time.perf_counter())
+        if key not in self._llm_started:
+            while len(self._llm_started) >= _MAX_PENDING_TELEMETRY:
+                self._llm_started.pop(next(iter(self._llm_started)))
+            self._llm_started[key] = deque(maxlen=_MAX_PENDING_TELEMETRY)
+        self._llm_started[key].append(time.perf_counter())
         self.event(
             "gen_ai.client.inference.started",
             {
@@ -462,6 +483,8 @@ class AgentTelemetry:
         )
 
     def llm_end(self, event: Any) -> None:
+        if not self._accept_event_session(event):
+            return
         key = self._event_key(event)
         starts = self._llm_started.get(key)
         if not starts:
@@ -471,13 +494,19 @@ class AgentTelemetry:
             self._llm_started.pop(key, None)
         success = bool(getattr(event, "success", True))
         error_type = str(getattr(event, "exception_type", "") or "")
-        self._llm_finished.setdefault(key, deque()).append(
+        if key not in self._llm_finished:
+            while len(self._llm_finished) >= _MAX_PENDING_TELEMETRY:
+                self._llm_finished.pop(next(iter(self._llm_finished)))
+            self._llm_finished[key] = deque(maxlen=_MAX_PENDING_TELEMETRY)
+        self._llm_finished[key].append(
             (max(time.perf_counter() - started, 0.0), success, error_type)
         )
         if not success:
             self._record_llm_completion(key, self.model, 0, 0, 0, 0, 0.0)
 
     def llm_complete(self, event: Any) -> None:
+        if not self._accept_event_session(event):
+            return
         key = self._event_key(event)
         usage = getattr(event, "usage", None)
 
@@ -520,6 +549,9 @@ class AgentTelemetry:
 
     def tool_start(self, tool_name: str, call_id: str) -> None:
         if call_id:
+            self._tool_started.pop(call_id, None)
+            while len(self._tool_started) >= _MAX_PENDING_TELEMETRY:
+                self._tool_started.pop(next(iter(self._tool_started)))
             self._tool_started[call_id] = (time.perf_counter(), tool_name)
         self.event(
             "gen_ai.tool.execution.started",
@@ -573,7 +605,7 @@ class AgentTelemetry:
             from opentelemetry import trace
 
             span = trace.get_current_span()
-            if span.is_recording():
+            if span.is_recording() and _span_matches_session(span, self.session_id):
                 span.add_event(name, attributes=attrs)
         except Exception:
             pass
@@ -671,11 +703,78 @@ class AgentTelemetry:
 
 _ROUTER_LOCK = threading.Lock()
 _SESSION_EXPORTERS: dict[str, list[Any]] = {}
+_TRACE_SESSIONS: dict[int, str] = {}
 _ROUTER_EXPORTER: Any = None
 
 
+def _span_trace_id(span: Any) -> int:
+    ctx = getattr(span, "context", None)
+    if ctx is None:
+        get_ctx = getattr(span, "get_span_context", None)
+        if callable(get_ctx):
+            with contextlib.suppress(Exception):
+                ctx = get_ctx()
+    raw = getattr(ctx, "trace_id", 0) if ctx is not None else 0
+    return int(raw) if isinstance(raw, int) else 0
+
+
+def _register_trace_session(trace_id: int, session_id: str) -> None:
+    if not trace_id or not session_id:
+        return
+    with _ROUTER_LOCK:
+        _TRACE_SESSIONS.pop(trace_id, None)
+        while len(_TRACE_SESSIONS) >= _MAX_TRACE_SESSIONS:
+            _TRACE_SESSIONS.pop(next(iter(_TRACE_SESSIONS)))
+        _TRACE_SESSIONS[trace_id] = session_id
+
+
+def _resolve_span_session(
+    span: Any, trace_sessions: Mapping[int, str] | None = None
+) -> str:
+    trace_id = _span_trace_id(span)
+    if trace_id:
+        if trace_sessions is not None and trace_id in trace_sessions:
+            return trace_sessions[trace_id]
+        with _ROUTER_LOCK:
+            mapped = _TRACE_SESSIONS.get(trace_id)
+        if mapped:
+            return mapped
+    attrs = getattr(span, "attributes", None) or {}
+    conv_id = attrs.get("gen_ai.conversation.id")
+    if conv_id:
+        return str(conv_id)
+    agent_id = str(attrs.get("gen_ai.agent.id") or attrs.get("agent.id") or "")
+    if agent_id.startswith("noah:"):
+        candidate = agent_id.removeprefix("noah:").split(":", 1)[0]
+        if candidate:
+            return candidate
+    sid = attrs.get("session.id")
+    return str(sid) if sid else ""
+
+
+def _span_matches_session(span: Any, expected_session_id: str) -> bool:
+    if not expected_session_id:
+        return True
+    owner = _resolve_span_session(span)
+    return not owner or owner == expected_session_id
+
+
+class _SessionStampedSpan:
+    """Ensure routed spans carry their true session.id for OtlpJsonFileExporter."""
+
+    def __init__(self, span: Any, session_id: str) -> None:
+        self._span = span
+        base_attrs = dict(getattr(span, "attributes", None) or {})
+        base_attrs["session.id"] = session_id
+        base_attrs.setdefault("gen_ai.conversation.id", session_id)
+        self.attributes = base_attrs
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._span, name)
+
+
 class _SessionRoutingSpanExporter:
-    """Route spans by session.id so concurrent sessions keep separate JSONL sinks."""
+    """Route spans by verified session ownership so concurrent sessions never cross-contaminate."""
 
     synchronous = False
 
@@ -685,16 +784,22 @@ class _SessionRoutingSpanExporter:
         buckets: dict[str, list[Any]] = {}
         with _ROUTER_LOCK:
             snapshot = {sid: list(items) for sid, items in _SESSION_EXPORTERS.items()}
+            trace_sessions = dict(_TRACE_SESSIONS)
         if not snapshot:
             return SpanExportResult.SUCCESS
         fallback_sid = next(iter(snapshot)) if len(snapshot) == 1 else ""
         for span in spans:
-            attrs = getattr(span, "attributes", None) or {}
-            sid = str(attrs.get("session.id") or attrs.get("gen_ai.conversation.id") or "")
-            if sid not in snapshot:
+            sid = _resolve_span_session(span, trace_sessions)
+            if not sid:
                 sid = fallback_sid
-            if sid:
-                buckets.setdefault(sid, []).append(span)
+            if sid and sid in snapshot:
+                attrs = getattr(span, "attributes", None) or {}
+                routed = (
+                    span
+                    if attrs.get("session.id") == sid
+                    else _SessionStampedSpan(span, sid)
+                )
+                buckets.setdefault(sid, []).append(routed)
         result = SpanExportResult.SUCCESS
         for sid, group in buckets.items():
             for exporter in snapshot.get(sid, ()):
@@ -710,6 +815,7 @@ class _SessionRoutingSpanExporter:
         with _ROUTER_LOCK:
             all_exporters = [exp for items in _SESSION_EXPORTERS.values() for exp in items]
             _SESSION_EXPORTERS.clear()
+            _TRACE_SESSIONS.clear()
         for exporter in all_exporters:
             with contextlib.suppress(Exception):
                 exporter.shutdown()

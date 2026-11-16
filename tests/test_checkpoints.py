@@ -67,19 +67,37 @@ def test_checkpoint_contains_untracked_files(git_repo: Path) -> None:
 
 def test_restore_recovers_prior_state_and_keeps_head(git_repo: Path) -> None:
     manager = CheckpointManager(git_repo, "abcdef123456")
+    (git_repo / ".gitignore").write_text("*.ignored\n")
     (git_repo / "tracked.txt").write_text("version 1\n")
     _git(git_repo, "add", ".")
     _git(git_repo, "commit", "-q", "-m", "v1")
+    (git_repo / "untracked_before.txt").write_text("kept untracked\n")
     first = manager.capture("before edit")
     assert first is not None
 
     (git_repo / "tracked.txt").write_text("version 2\n")
+    (git_repo / "untracked_before.txt").write_text("modified and staged\n")
+    _git(git_repo, "add", "untracked_before.txt")
     (git_repo / "extra.txt").write_text("created later\n")
+    (git_repo / "keep.ignored").write_text("ignored build output\n")
+    (git_repo / ".env").write_text("SECRET=preserve\n")
     message = manager.restore(first["ref"])
     assert "HEAD unchanged" in message
     assert (git_repo / "tracked.txt").read_text() == "version 1\n"
-    # Files created after the checkpoint are intentionally left in place.
-    assert (git_repo / "extra.txt").exists()
+    assert (git_repo / "untracked_before.txt").read_text() == "kept untracked\n"
+    staged = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert "untracked_before.txt" not in staged
+    # Non-ignored, non-secret untracked files added after the checkpoint are removed.
+    assert not (git_repo / "extra.txt").exists()
+    # Ignored and secret files remain untouched.
+    assert (git_repo / "keep.ignored").read_text() == "ignored build output\n"
+    assert (git_repo / ".env").read_text() == "SECRET=preserve\n"
 
 
 def test_restore_rejects_unknown_ref(git_repo: Path) -> None:
@@ -210,7 +228,7 @@ def test_capture_batches_raw_hashing_and_updates_only_changed_index_entries(
     snapshot = manager.capture()
     assert snapshot is not None
     assert len(calls) <= 12
-    assert sum(args[0] == "hash-object" for args, _kwargs in calls) == 1
+    assert sum(args[0] == "hash-object" for args, _kwargs in calls) == 0
     assert not any(args[0] == "update-index" for args, _kwargs in calls)
     expected_tree = real_git("rev-parse", "HEAD^{tree}").stdout.decode().strip()
     assert snapshot["tree"] == expected_tree
@@ -222,12 +240,28 @@ def test_capture_batches_raw_hashing_and_updates_only_changed_index_entries(
     changed = manager.capture()
     assert changed is not None
     assert len(calls) <= 12
+    hash_inputs = [kwargs["input_bytes"] for args, kwargs in calls if args[0] == "hash-object"]
+    assert len(hash_inputs) == 1
+    assert b"file-0.txt" not in hash_inputs[0]
+    assert b"file-1.txt" in hash_inputs[0] and b"new.txt" in hash_inputs[0]
     updates = [kwargs["input_bytes"] for args, kwargs in calls if args[0] == "update-index"]
     assert len(updates) == 1
     assert len(updates[0].split(b"\0")) - 1 == 3
     assert _show(git_repo, changed["ref"], "file-1.txt").stdout == "changed\n"
     assert _show(git_repo, changed["ref"], "file-2.txt").returncode != 0
     assert _show(git_repo, changed["ref"], "new.txt").stdout == "new\n"
+
+    calls.clear()
+    (git_repo / "file-3.txt").write_text("third turn\n")
+    incremental = manager.capture()
+    assert incremental is not None
+    hash_inputs_3 = [kwargs["input_bytes"] for args, kwargs in calls if args[0] == "hash-object"]
+    assert len(hash_inputs_3) == 1
+    assert b"file-3.txt" in hash_inputs_3[0]
+    assert b"file-1.txt" not in hash_inputs_3[0] and b"new.txt" not in hash_inputs_3[0]
+    updates_3 = [kwargs["input_bytes"] for args, kwargs in calls if args[0] == "update-index"]
+    assert len(updates_3) == 1
+    assert len(updates_3[0].split(b"\0")) - 1 == 1
 
 
 def test_checkpoint_paths_are_literal_and_root_relative(git_repo: Path) -> None:
@@ -465,3 +499,32 @@ def test_git_failures_surface_as_checkpoint_error(tmp_path: Path) -> None:
     repo.rmdir()
     with pytest.raises(CheckpointError):
         manager.list()
+
+
+def test_skip_if_unchanged_large_untracked_exclusion_and_delete_all(git_repo: Path) -> None:
+    manager = CheckpointManager(
+        git_repo, "sess-clean", max_per_session=5, max_untracked_file_bytes=64
+    )
+    (git_repo / "small.txt").write_bytes(b"x" * 32)
+    (git_repo / "huge.bin").write_bytes(b"y" * 128)
+    other = CheckpointManager(git_repo, "sess-other")
+    other_snap = other.capture("other")
+    assert other_snap is not None
+
+    first = manager.capture("initial", skip_if_unchanged=True)
+    assert first is not None
+    assert _show(git_repo, first["ref"], "small.txt").returncode == 0
+    assert _show(git_repo, first["ref"], "huge.bin").returncode != 0
+
+    duplicate = manager.capture("duplicate", skip_if_unchanged=True)
+    assert duplicate == first
+    assert len(manager.list()) == 1
+
+    (git_repo / "small.txt").write_bytes(b"z" * 32)
+    second = manager.capture("updated", skip_if_unchanged=True)
+    assert second is not None and second["ref"] != first["ref"]
+    assert len(manager.list()) == 2
+
+    assert manager.delete_all() == 2
+    assert manager.list() == []
+    assert len(other.list()) == 1

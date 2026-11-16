@@ -318,3 +318,88 @@ def test_open_storage_permission_failure_releases_database_and_session_lock(
     # A leaked NOOA storage manager retains the exclusive session lock.
     with store.open_storage(meta.session_id) as storage:
         assert storage is not None
+
+
+def test_session_store_externalizes_journal_blobs_caches_list_and_cleans_on_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from noah_code import worktree as wt_mod
+    from noah_code.checkpoints import CheckpointManager
+    from noah_code.snapshots import SnapshotJournal
+    from noah_code.worktree import worktree_storage_root
+
+    repo = _init_repo(tmp_path / "repo")
+    store = SessionStore(tmp_path / "data" / "sessions")
+    ws = Workspace(root=repo)
+    meta = store.create(ws, model="m")
+
+    # 1) Content-addressed undo blobs in SessionStore.save_journal / load_journal
+    target = repo / "README.md"
+    journal = SnapshotJournal()
+    journal.begin_turn()
+    mut = journal.record_preimage(target)
+    target.write_text("updated\n")
+    journal.record_postimage(mut, target)
+    journal.end_turn()
+    store.save_journal(meta.session_id, journal.to_dict())
+
+    raw_sidecar = (store.session_dir / meta.session_id / "journal.json").read_text()
+    assert "pre_blob" in raw_sidecar and "pre_bytes_b64" not in raw_sidecar
+    blob_files = list(store.blob_dir(meta.session_id).iterdir())
+    assert len(blob_files) == 2
+    assert all((f.stat().st_mode & 0o777) == 0o600 for f in blob_files)
+
+    restored_journal = SnapshotJournal()
+    restored_journal.load_dict(store.load_journal(meta.session_id))
+    restored_journal.undo()
+    assert target.read_text() == "hello\n"
+
+    # 2) O(1) list_sessions family lookup + cached repo_id_for
+    for _ in range(5):
+        store.create(ws, model="m")
+    wt_mod.repo_id_for.cache_clear()
+    git_calls = 0
+    real_git = wt_mod._git
+
+    def count_git(cwd: Path, *args: str):
+        nonlocal git_calls
+        git_calls += 1
+        return real_git(cwd, *args)
+
+    monkeypatch.setattr(wt_mod, "_git", count_git)
+    listed = store.list_sessions(ws)
+    assert len(listed) == 6
+    assert git_calls <= 1  # Computed once and cached, never O(N) per session
+    monkeypatch.setattr(wt_mod, "_git", real_git)
+
+    # 3) SessionStore.delete cleans up checkpoint refs and retained isolated child worktrees
+    cp = CheckpointManager(repo, meta.session_id)
+    assert cp.capture("turn 1") is not None
+    assert len(cp.list()) == 1
+
+    wt_manager = WorktreeManager(repo, worktree_storage_root(store.session_dir))
+    child_id = "112233445566"
+    wt_info = wt_manager.create(f"task-{child_id}")
+    child_cp = CheckpointManager(wt_info.directory, child_id)
+    assert child_cp.capture("child turn") is not None
+
+    with store.open_runtime(meta.session_id) as runtime:
+        runtime.set_state(
+            "child_sessions",
+            {
+                child_id: {
+                    "id": child_id,
+                    "agent": "general",
+                    "directory": str(wt_info.directory),
+                    "isolated": True,
+                    "state": "completed",
+                    "result": "ok",
+                }
+            },
+        )
+
+    store.delete(meta.session_id)
+    assert cp.list() == []
+    assert CheckpointManager(repo, child_id).list() == []
+    assert wt_manager.list() == []
+    assert not wt_info.directory.exists()

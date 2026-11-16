@@ -38,6 +38,48 @@
         "config_merge.py"
       ],
       "expected_tests": 3
+    },
+    {
+      "id": "event-pipeline",
+      "fixture": "fixtures/event-pipeline",
+      "prompt": "Investigate and fix the NDJSON telemetry ingestion bugs in pkg/. Batch ingestion currently corrupts JSON string values containing '#', misnumbers rejected lines when blank or full-line '#' comment lines appear earlier, mishandles zero/negative vs boolean/non-finite numeric fields, fails to normalize tags into sorted unique stripped values, and double-counts or retains stale duplicate event_id records instead of keeping only the highest-timestamp record (breaking ties in favor of the later line) before aggregating per-actor totals and sorting events by (ts, event_id). Preserve public signatures, do not modify tests, and verify with python -m unittest discover -s tests -p acceptance.py.",
+      "acceptance": [
+        "{python}",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "acceptance.py"
+      ],
+      "implementation": [
+        "pkg/parser.py",
+        "pkg/validator.py",
+        "pkg/pipeline.py"
+      ],
+      "expected_tests": 6
+    },
+    {
+      "id": "build-graph",
+      "fixture": "fixtures/build-graph",
+      "prompt": "Fix the incremental build planner bugs across buildgraph/. Planning requested targets currently visits unrelated targets in the graph, misses self-dependency cycles, fails to break ready-target ties lexicographically, reuses stale downstream cached targets when an upstream dependency hash changes or a dependency is explicitly invalidated, and mutates cache state even when plan(..., commit=False) is called. Preserve public classes and method signatures, do not modify tests, and verify with python -m unittest discover -s tests -p acceptance.py.",
+      "acceptance": [
+        "{python}",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "acceptance.py"
+      ],
+      "implementation": [
+        "buildgraph/graph.py",
+        "buildgraph/cache.py",
+        "buildgraph/planner.py"
+      ],
+      "expected_tests": 6
     }
   ]
 }

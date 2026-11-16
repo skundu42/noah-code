@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 from nooa import Skill, hidden, spec
+from nooa.tools._bash_session import BashSession
 from nooa.tools.shell_tools import (
     FileWrite,
     Match,
@@ -28,9 +29,11 @@ from nooa.tools.shell_tools import (
     ShellTools,
     StreamDone,
     StreamEvent,
+    is_pure_search_command,
 )
 
 from noah_code.approvals import ApprovalBroker
+from noah_code.credentials import scrubbed_env_var_names
 from noah_code.permissions import (
     PermissionCategory,
     PermissionDecision,
@@ -49,6 +52,16 @@ if TYPE_CHECKING:
 # would shadow builtins.list in parameter annotations.
 InspectTargets = list[str]
 PatchChanges = list[dict[str, str | None]]
+_MAX_STREAM_CAPTURE_CHARS = 4_000_000
+
+
+def _capture_startup_umask() -> int:
+    umask = os.umask(0o077)
+    os.umask(umask)
+    return umask
+
+
+_STARTUP_UMASK = _capture_startup_umask()
 
 
 class WorkspaceMatch(Match):
@@ -259,6 +272,11 @@ class WorkspaceTools(Skill):
         # callers. Batched inspections can otherwise launch multiple shells
         # and orphan every process except the last one assigned to the session.
         self._shell_start_lock = asyncio.Lock()
+        self._base_shell_init_command: str | None = getattr(
+            getattr(shell, "session", None), "_init_command", None
+        )
+        self._scrubbed_shell_vars: set[str] = set()
+        self._scrubbed_shell_start_count = 0
         # Every operation on the persistent shell shares one transaction lock.
         # Pinned operations hold it across pin, command, and cwd restoration;
         # streamed commands hold it until their iterator finishes.
@@ -1016,45 +1034,126 @@ class WorkspaceTools(Skill):
         await self._approvals.require(decision)
         return await self._run_authorized(command, stdin=stdin, timeout=timeout)
 
+    def _can_stream_shell(self) -> bool:
+        if not hasattr(self._shell, "run_stream") or not callable(self._shell.run_stream):
+            return False
+        shell_dict = getattr(self._shell, "__dict__", {})
+        return not (
+            isinstance(self._shell, ShellTools)
+            and "run" in shell_dict
+            and "run_stream" not in shell_dict
+        )
+
     async def _run_authorized(
         self, command: str, *, stdin: str | None = None,
         timeout: float | None = None, before_run: Any = None,
     ) -> ShellResult:
         """Execute an approved command, optionally checking a host-owned precondition."""
-        if not self._engine.is_readonly_command(command):
+        mutating = not self._engine.is_readonly_command(command)
+        if mutating:
             await self.checkpoint_before_shell(command)
-            self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
             with contextlib.suppress(Exception):
                 self._on_shell_chunk("status", f"$ {command}\n")
-        mutating = not self._engine.is_readonly_command(command)
+        effective_timeout = timeout or self._default_timeout
+        streamed_live = False
         async with self._mutation_guard(mutating), self._file_op_lock:
             await self._ensure_shell_started()
             if before_run is not None:
                 await before_run()
-            check = await self._verification.begin(
-                command, source=self._verification_source, cwd=self._shell.session.cwd
+            session_cwd = getattr(
+                getattr(self._shell, "session", None), "cwd", self._workspace.root
             )
-            result = None
+            check = await self._verification.begin(
+                command, source=self._verification_source, cwd=session_cwd
+            )
+            result: ShellResult | None = None
+            returncode: int | None = None
             try:
-                result = await self._shell.run(
-                    command,
-                    stdin=stdin,
-                    timeout=timeout or self._default_timeout,
+                stream_iter = (
+                    self._shell.run_stream(command, timeout=effective_timeout)
+                    if stdin is None and self._can_stream_shell()
+                    else None
                 )
+                if stream_iter is not None and hasattr(stream_iter, "__aiter__"):
+                    streamed_live = True
+                    stdout_parts: list[str] = []
+                    stderr_parts: list[str] = []
+                    stdout_chars = 0
+                    stderr_chars = 0
+                    timed_out = False
+                    async for event in stream_iter:
+                        if isinstance(event, StreamDone) or getattr(event, "kind", "") == "done":
+                            returncode = int(event.returncode)
+                            timed_out = bool(getattr(event, "timed_out", False))
+                            continue
+                        kind = getattr(event, "kind", "stdout")
+                        text = getattr(event, "text", "")
+                        if kind == "stderr":
+                            if stderr_chars < _MAX_STREAM_CAPTURE_CHARS:
+                                piece = text[: _MAX_STREAM_CAPTURE_CHARS - stderr_chars]
+                                stderr_parts.append(piece)
+                                stderr_chars += len(piece)
+                        elif stdout_chars < _MAX_STREAM_CAPTURE_CHARS:
+                            piece = text[: _MAX_STREAM_CAPTURE_CHARS - stdout_chars]
+                            stdout_parts.append(piece)
+                            stdout_chars += len(piece)
+                        if self._on_shell_chunk is not None and text:
+                            with contextlib.suppress(Exception):
+                                self._on_shell_chunk(kind, text)
+                    if hasattr(self._shell, "session") and isinstance(
+                        getattr(self._shell.session, "cwd", None), Path
+                    ):
+                        self._shell.cwd = self._shell.session.cwd.resolve()
+                    stdout_text = "".join(stdout_parts).strip()
+                    stderr_text = "".join(stderr_parts).strip()
+                    matches = None
+                    if is_pure_search_command(command) and hasattr(
+                        self._shell, "_harvest_matches"
+                    ):
+                        matches = await self._shell._harvest_matches(command, stdout_text)
+                    if returncode is None:
+                        returncode = 0
+                    result = ShellResult(
+                        stdout=stdout_text,
+                        stderr=stderr_text,
+                        returncode=returncode,
+                        matches=matches,
+                        timed_out=timed_out,
+                        timeout_seconds=effective_timeout,
+                    )
+                else:
+                    result = await self._shell.run(
+                        command,
+                        stdin=stdin,
+                        timeout=effective_timeout,
+                    )
+                    returncode = result.returncode
             finally:
                 await self._verification.finish(
-                    check, result.returncode if result is not None else None
+                    check, result.returncode if result is not None else returncode
                 )
+                if hasattr(self._shell, "session") and isinstance(
+                    getattr(self._shell.session, "cwd", None), Path
+                ):
+                    self._shell.cwd = self._shell.session.cwd.resolve()
+                clean_verification = (
+                    check is not None
+                    and check.returncode is not None
+                    and check.start_revision is not None
+                    and check.end_revision == check.start_revision
+                )
+                if mutating and not clean_verification:
+                    self._journal.mark_shell_bypass()
+                    self._read_fingerprints.clear()
             self._absolutize_harvested_matches(result)
-            if mutating:
-                self._read_fingerprints.clear()
         if self._on_shell_chunk is not None:
             with contextlib.suppress(Exception):
-                if result.stdout:
-                    self._on_shell_chunk("stdout", result.stdout)
-                if result.stderr:
-                    self._on_shell_chunk("stderr", result.stderr)
+                if not streamed_live:
+                    if result.stdout:
+                        self._on_shell_chunk("stdout", result.stdout)
+                    if result.stderr:
+                        self._on_shell_chunk("stderr", result.stderr)
                 self._on_shell_chunk("status", f"[exit {result.returncode}]\n")
         return self._cap_shell_result(result)
 
@@ -1066,13 +1165,12 @@ class WorkspaceTools(Skill):
         """Stream command output; same permission rules as run()."""
         decision = self._shell_decision(command)
         await self._approvals.require(decision)
-        if not self._engine.is_readonly_command(command):
+        mutating = not self._engine.is_readonly_command(command)
+        if mutating:
             await self.checkpoint_before_shell(command)
-            self._journal.mark_shell_bypass()
         if self._on_shell_chunk is not None:
             with contextlib.suppress(Exception):
                 self._on_shell_chunk("status", f"$ {command}\n")
-        mutating = not self._engine.is_readonly_command(command)
         async with self._mutation_guard(mutating), self._file_op_lock:
             await self._ensure_shell_started()
             check = await self._verification.begin(
@@ -1096,7 +1194,14 @@ class WorkspaceTools(Skill):
                 # NOOA updates BashSession.cwd after a streamed command but
                 # currently leaves ShellTools.cwd stale.
                 self._shell.cwd = self._shell.session.cwd.resolve()
-                if mutating:
+                clean_verification = (
+                    check is not None
+                    and check.returncode is not None
+                    and check.start_revision is not None
+                    and check.end_revision == check.start_revision
+                )
+                if mutating and not clean_verification:
+                    self._journal.mark_shell_bypass()
                     self._read_fingerprints.clear()
 
     def _shell_decision(self, command: str, *, tool: str = "ws_run") -> PermissionDecision:
@@ -1192,9 +1297,41 @@ class WorkspaceTools(Skill):
         ))
 
     async def _ensure_shell_started(self) -> None:
-        """Single-flight NOOA's lazy persistent-shell startup."""
+        """Single-flight NOOA's lazy persistent-shell startup with scrubbed env."""
         async with self._shell_start_lock:
-            await self._shell.session.start()
+            session = self._shell.session
+            if isinstance(session, BashSession):
+                secret_vars = sorted(
+                    name
+                    for name in scrubbed_env_var_names()
+                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+                )
+                unset_cmd = f"unset -v {' '.join(secret_vars)}" if secret_vars else ""
+                base_init = self._base_shell_init_command
+                session._init_command = (
+                    f"{unset_cmd}\n{base_init}" if (unset_cmd and base_init) else (unset_cmd or base_init)
+                )
+                was_started = session._started
+                await session.start()
+                if not was_started:
+                    self._scrubbed_shell_start_count = session._start_count
+                    self._scrubbed_shell_vars = set(secret_vars)
+                else:
+                    missing = (
+                        set(secret_vars)
+                        if self._scrubbed_shell_start_count != session._start_count
+                        else (set(secret_vars) - self._scrubbed_shell_vars)
+                    )
+                    if missing:
+                        await session.run(
+                            f"unset -v {' '.join(sorted(missing))}", timeout=5.0
+                        )
+                        self._scrubbed_shell_start_count = session._start_count
+                        self._scrubbed_shell_vars.update(missing)
+                return
+            if hasattr(session, "env"):
+                session.env = {k: v for k, v in os.environ.items() if k not in scrubbed_env_var_names()}
+            await session.start()
 
     @contextlib.asynccontextmanager
     async def _pinned_shell_cwd(self):
@@ -1488,10 +1625,17 @@ class WorkspaceTools(Skill):
 
     @staticmethod
     def _default_file_mode() -> int:
-        """0666 minus the process umask, like a normal ``open(..., "w")`` create."""
+        """0666 minus the process umask, without calling ``os.umask`` at runtime."""
 
-        umask = os.umask(0)
-        os.umask(umask)
+        umask = _STARTUP_UMASK
+        try:
+            with open("/proc/self/status", encoding="ascii", errors="replace") as status_file:
+                for line in status_file:
+                    if line.startswith("Umask:"):
+                        umask = int(line.split(":", 1)[1].strip(), 8)
+                        break
+        except (OSError, ValueError):
+            pass
         return 0o666 & ~umask
 
     @staticmethod

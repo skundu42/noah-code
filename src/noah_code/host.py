@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import re
-import shlex
+import time
 from collections.abc import Coroutine
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -28,6 +29,7 @@ from noah_code.config import (
 from noah_code.custom_commands import CustomCommand, discover_custom_commands
 from noah_code.event_bridge import install_event_bridge
 from noah_code.events import HostEvent, HostEventKind
+from noah_code.host_commands import HostCommandsMixin, _command_output
 from noah_code.redaction import safe_error_message
 from noah_code.sessions import SessionEventRecord, SessionMeta, SessionStore
 from noah_code.steer import (
@@ -47,6 +49,29 @@ from noah_code.workspace import Workspace, open_workspace
 if TYPE_CHECKING:
     from noah_code.agent import CodingAgent
     from noah_code.runtime_state import RunRecord, RuntimeStateStore, WorkspaceLease
+
+__all__ = [
+    "AgentHost",
+    "HostResult",
+    "REASONING_EFFORTS",
+    "SAFE_SLASH_WHILE_BUSY",
+    "THEME_NAMES",
+    "_command_output",
+    "_friendly_agent_error",
+    "_handle_with_overflow_recovery",
+    "_is_context_overflow",
+    "_load_agent_runtime",
+    "_stop_text",
+    "config_text",
+    "get_theme",
+    "help_text",
+    "parse_slash",
+    "save_user_animations",
+    "save_user_default_model",
+    "save_user_reasoning_effort",
+    "save_user_theme",
+    "user_default_model",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -160,16 +185,6 @@ def _stop_text(kind: Any, explanation: str) -> str:
     return f"{label} · {detail}" if detail else label
 
 
-def _command_output(text: str) -> HostEvent:
-    """Return exact, preformatted command output for every UI frontend."""
-
-    return HostEvent(
-        HostEventKind.MESSAGE,
-        text,
-        meta={"format": "plain", "source": "command"},
-    )
-
-
 def _deterministic_title(text: str) -> str:
     """Create a useful title without spending an additional model call."""
 
@@ -209,6 +224,22 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+async def _aclose_llm_chain(llm: Any) -> None:
+    """Best-effort close of wrapped LLM transports (httpx pools, Codex RPC)."""
+
+    seen: set[int] = set()
+    current = llm
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        aclose = getattr(current, "aclose", None)
+        if callable(aclose):
+            with contextlib.suppress(Exception):
+                result = aclose()
+                if inspect.isawaitable(result):
+                    await result
+        current = getattr(current, "_inner", None)
+
+
 @dataclass
 class HostResult:
     exit_code: int
@@ -229,7 +260,7 @@ class _BackgroundTaskOrigin:
     workspace_root: Path
 
 
-class AgentHost:
+class AgentHost(HostCommandsMixin):
     """Owns session lifecycle and the InteractiveAgent dispatcher loop."""
 
     def __init__(
@@ -257,6 +288,7 @@ class AgentHost:
         self._storage: Any = None
         self._runtime: RuntimeStateStore | None = None
         self._workspace_lease: WorkspaceLease | None = None
+        self._lease_shared = False
         self.meta = session_meta
         self._exit_requested = False
         self._title_task: asyncio.Task[Any] | None = None
@@ -270,6 +302,8 @@ class AgentHost:
         self._trace_info = "session jsonl"
         self._telemetry = AgentTelemetry()
         self._active_turn: asyncio.Task[Any] | None = None
+        self._session_lock = asyncio.Lock()
+        self._last_live_state_sync = 0.0
         self._event_unsubs: list[Any] = []
         self._custom_commands: dict[str, CustomCommand] = {}
         self._last_turn_shell_bypass = False
@@ -286,6 +320,7 @@ class AgentHost:
         self._pending_attach_paths: list[Path] = []
         self._active_context_paths: set[Path] = set()
         self._pending_worktree_name = ""
+        self._last_agent_message = ""
         self.on_session_changed: Any = None  # optional UI callback
 
     @property
@@ -294,8 +329,10 @@ class AgentHost:
             raise RuntimeError("host not started")
         return self._agent
 
-    def _setup_tracing(self, session_id: str) -> None:
-        self._telemetry.shutdown(self.config.tracing.export_timeout_millis)
+    async def _setup_tracing_async(self, session_id: str) -> None:
+        await asyncio.to_thread(
+            self._telemetry.shutdown, self.config.tracing.export_timeout_millis
+        )
         path = (
             Path(self.config.tracing.jsonl_dir).expanduser()
             if self.config.tracing.jsonl_dir
@@ -306,7 +343,8 @@ class AgentHost:
         if path is not None:
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
         model = self.meta.model if self.meta is not None else self.config.model
-        self._telemetry = setup_agent_telemetry(
+        self._telemetry = await asyncio.to_thread(
+            setup_agent_telemetry,
             self.config.tracing,
             session_id=session_id,
             model=model,
@@ -314,29 +352,69 @@ class AgentHost:
         )
         self._trace_info = self._telemetry.info
 
+    def _acquire_lease_sync(self, session_id: str, *, shared: bool) -> WorkspaceLease:
+        acquire: Any = self.store.acquire_workspace_lease
+        try:
+            return acquire(session_id, self.workspace, shared=shared)
+        except TypeError:
+            return acquire(session_id, self.workspace)
+
+    async def _ensure_mode_lease(self, target_mode: str) -> None:
+        """Upgrade a shared plan-mode lease before entering mutating build mode."""
+
+        if (
+            target_mode != "build"
+            or not self.config.reliability.workspace_lease
+            or self._workspace_lease is None
+            or not self._lease_shared
+            or self.meta is None
+        ):
+            return
+        previous = self._workspace_lease
+        previous.close()
+        self._workspace_lease = None
+        try:
+            self._workspace_lease = await asyncio.to_thread(
+                self._acquire_lease_sync, self.meta.session_id, shared=False
+            )
+            self._lease_shared = False
+        except Exception:
+            with contextlib.suppress(Exception):
+                self._workspace_lease = await asyncio.to_thread(
+                    self._acquire_lease_sync, self.meta.session_id, shared=True
+                )
+                self._lease_shared = True
+            raise
+
     async def start(self) -> SessionMeta:
         from noah_code.worktree import infer_worktree_name, repo_id_for, worktree_storage_root
 
         loaded_meta_updated_at = self.meta.updated_at if self.meta is not None else None
         if self.meta is None:
-            self.meta = self.store.create(
+            repo_id = await asyncio.to_thread(repo_id_for, self.workspace.root)
+            wt_name = self._pending_worktree_name or await asyncio.to_thread(
+                infer_worktree_name,
+                self.workspace.root,
+                worktree_storage_root(self.config.session_dir),
+            )
+            self.meta = await asyncio.to_thread(
+                self.store.create,
                 self.workspace,
                 model=self.config.model,
                 mode=self.config.mode,
                 reasoning_effort=self.config.reasoning_effort,
-                repo_id=repo_id_for(self.workspace.root),
-                worktree_name=self._pending_worktree_name
-                or infer_worktree_name(
-                    self.workspace.root, worktree_storage_root(self.config.session_dir)
-                ),
+                repo_id=repo_id,
+                worktree_name=wt_name,
             )
             self._pending_worktree_name = ""
         else:
             self.store.verify_workspace(self.meta, self.workspace)
-            inferred = infer_worktree_name(
-                self.workspace.root, worktree_storage_root(self.config.session_dir)
+            inferred = await asyncio.to_thread(
+                infer_worktree_name,
+                self.workspace.root,
+                worktree_storage_root(self.config.session_dir),
             )
-            repo = repo_id_for(self.workspace.root)
+            repo = await asyncio.to_thread(repo_id_for, self.workspace.root)
             dirty = False
             if repo and not self.meta.repo_id:
                 self.meta.repo_id = repo
@@ -345,19 +423,23 @@ class AgentHost:
                 self.meta.worktree_name = inferred
                 dirty = True
             if dirty:
-                self.store.save_meta(self.meta)
+                await asyncio.to_thread(self.store.save_meta, self.meta)
 
         if self.config.reliability.workspace_lease and self._workspace_lease is None:
+            shared = self.meta.mode == "plan" and not self.config.yolo
             self._workspace_lease = await asyncio.to_thread(
-                self.store.acquire_workspace_lease,
+                self._acquire_lease_sync,
                 self.meta.session_id,
-                self.workspace,
+                shared=shared,
             )
+            self._lease_shared = shared
         try:
             return await self._start_with_lease(loaded_meta_updated_at)
         except BaseException:
             self._teardown_event_bridge()
             if self._agent is not None:
+                with contextlib.suppress(Exception):
+                    await _aclose_llm_chain(self._agent._llm)
                 with contextlib.suppress(Exception):
                     await self._agent.close_tools()
                 self._agent = None
@@ -366,10 +448,25 @@ class AgentHost:
                     self._storage.close()
                 self._storage = None
             with contextlib.suppress(Exception):
-                self._telemetry.shutdown()
-            self._runtime = None
+                await asyncio.to_thread(self._telemetry.shutdown)
+            self._close_runtime()
             self._release_workspace_lease()
             raise
+
+    def _close_runtime(self) -> None:
+        runtime, self._runtime = self._runtime, None
+        if runtime is not None:
+            close_fn = getattr(runtime, "close", None)
+            if callable(close_fn):
+                with contextlib.suppress(Exception):
+                    close_fn()
+
+    def _session_blob_dir(self) -> Path | None:
+        if self.meta is None:
+            return None
+        with contextlib.suppress(Exception):
+            return self.store._session_path(self.meta.session_id) / "blobs"
+        return None
 
     async def _start_with_lease(self, loaded_meta_updated_at: float | None) -> SessionMeta:
         assert self.meta is not None
@@ -403,14 +500,12 @@ class AgentHost:
                     loaded_meta_updated_at is not None
                     and loaded_meta_updated_at > recovered_meta.updated_at
                 ):
-                    # CLI overrides and idle model switches may be newer than
-                    # the last completed turn's checkpoint.
                     recovered_meta.mode = self.meta.mode
                     recovered_meta.model = self.meta.model
                     recovered_meta.reasoning_effort = self.meta.reasoning_effort
-                # The runtime checkpoint is written as one generation and is the
-                # authoritative host-state view when JSON sidecars lag a crash.
                 self.meta = recovered_meta
+            if self.meta.mode == "build":
+                await self._ensure_mode_lease("build")
             recovered_files = await asyncio.to_thread(self._runtime.recover_file_operations)
             recovered_jobs = await asyncio.to_thread(
                 self._runtime.recover_orphan_jobs,
@@ -492,7 +587,6 @@ class AgentHost:
         llm = wrap_conversational_replies(llm)
         lightweight_llm = wrap_conversational_replies(lightweight_llm)
 
-        # Budget enforcement also observes prompt-prefix stability for usage reporting.
         llm, self._budget_guard = wrap_with_budget(
             llm, self.config.budget, prefix_observer=self._usage
         )
@@ -505,16 +599,18 @@ class AgentHost:
             self._budget_guard.load_state(budget_state)
         self._budget_guard.pause()
         if isinstance(llm, SharedBudgetLLM):
-            # Both routes draw from one guard so caps span the whole session.
             lightweight_llm = SharedBudgetLLM(
                 lightweight_llm, self._budget_guard, prefix_observer=self._usage
             )
         elif isinstance(llm, _PrefixObserverOnly):
             lightweight_llm = _PrefixObserverOnly(lightweight_llm, self._usage)
 
-        self._setup_tracing(self.meta.session_id)
-        self._storage = self.store.open_storage(self.meta.session_id)
-
+        meta = self.meta
+        assert meta is not None
+        await self._setup_tracing_async(meta.session_id)
+        # SQLiteStorageManager binds its sqlite3 connection to the creating thread,
+        # so open_storage and CodingAgent initialization must stay on the event-loop thread.
+        self._storage = self.store.open_storage(meta.session_id)
         agent = agent_class(
             self.workspace,
             self.config,
@@ -524,28 +620,34 @@ class AgentHost:
             runtime=self._runtime,
             budget_guard=self._budget_guard,
             usage_tracker=self._usage,
-            cache_namespace=f"noah:{self.meta.session_id}",
+            cache_namespace=f"noah:{meta.session_id}",
         )
-        # Legacy NOOA snapshots stored an empty list for these live agents.
-        # Keep the fresh instances, subscriptions and session artifact store.
         summarizers = nooa_compat.summarizers(agent)
         restored = self._storage.restore_latest_snapshot(agent)
         agent._summarizers = summarizers
+        blob_dir = self._session_blob_dir()
+        journal_obj: Any = agent.journal
+        if blob_dir is not None and hasattr(journal_obj, "_blob_dir"):
+            journal_obj._blob_dir = blob_dir
         if restored:
-            # Re-bind host-owned nosnapshot infrastructure after restore.
-            agent._engine.load_session_rules(self.meta.permission_rules)
+            agent.refresh_context_sources()
+            agent._engine.load_session_rules(meta.permission_rules)
             journal_data = checkpoint.get("journal")
             if not isinstance(journal_data, dict):
                 journal_data = await asyncio.to_thread(
-                    self.store.load_journal, self.meta.session_id
+                    self.store.load_journal, meta.session_id
                 )
-            agent.journal.load_dict(journal_data or self.meta.journal)
-            todos = checkpoint.get("todos", self.meta.todos)
+            try:
+                journal_obj.load_dict(journal_data or meta.journal, blob_dir=blob_dir)
+            except TypeError:
+                journal_obj.load_dict(journal_data or meta.journal)
+            todos = checkpoint.get("todos", meta.todos)
             if isinstance(todos, dict) and todos:
                 agent.todos.from_dict(todos)
-        agent.set_mode(self.meta.mode)
-        agent.v.mode = self.meta.mode
-        agent.v.model = _clean_control_chars(self.meta.model)
+        mode_lit: Literal["build", "plan"] = "plan" if meta.mode == "plan" else "build"
+        agent.set_mode(mode_lit)
+        agent.v.mode = mode_lit
+        agent.v.model = _clean_control_chars(meta.model)
 
         agent._approvals.set_handler(self.ui.ask_approval)
         agent.ask.set_handler(self.ui.ask_questions)
@@ -575,7 +677,8 @@ class AgentHost:
             agent._approvals.set_guard(_pre_tool_guard)
 
         session_id = self.meta.session_id
-        self._checkpoints = CheckpointManager(
+        self._checkpoints = await asyncio.to_thread(
+            CheckpointManager,
             self.workspace.root,
             session_id,
             max_per_session=self.config.checkpoints.max_per_session,
@@ -596,12 +699,14 @@ class AgentHost:
             self._telemetry,
         )
 
-        self._custom_commands = discover_custom_commands(self.workspace.root)
+        self._custom_commands = await asyncio.to_thread(
+            discover_custom_commands, self.workspace.root
+        )
 
         self._agent = agent
 
         assert self._runtime is not None
-        queue_state = self._runtime.get_state("input_queue", {})
+        queue_state = await asyncio.to_thread(self._runtime.get_state, "input_queue", {})
         self.queue_paused = bool(queue_state.get("paused", False))
         self._pending_attach_paths = [Path(path) for path in queue_state.get("attachments", [])]
         pending = await asyncio.to_thread(self._runtime.pending_inbox)
@@ -618,8 +723,6 @@ class AgentHost:
         self._mcp_attached = set()
         self._mcp_errors = {}
 
-        # Connect configured MCP servers so their tools are on the agent at
-        # the first turn. Workspace catalogs stay untrusted until `/mcp connect`.
         if not self.config.efficiency.lazy_mcp:
             try:
                 from noah_code.mcp_setup import install_mcp
@@ -677,7 +780,9 @@ class AgentHost:
         except Exception as exc:
             failures = [safe_error_message(exc)]
         for failure in failures:
-            self.ui.render(HostEvent(HostEventKind.STATUS, f"{event} hook: {safe_error_message(failure)}"))
+            self.ui.render(
+                HostEvent(HostEventKind.STATUS, f"{event} hook: {safe_error_message(failure)}")
+            )
 
     def _emit_with_hooks(self, event: HostEvent) -> None:
         """Render an event; schedule post-tool hooks for tool completions."""
@@ -696,9 +801,13 @@ class AgentHost:
                     "run_id": self._current_run_id,
                 },
             )
-            self._runtime.set_state("live:usage", self.usage_snapshot().to_dict())
-            if self._budget_guard is not None:
-                self._runtime.set_state("live:budget", self._budget_guard.status())
+            now = time.monotonic()
+            terminal_event = event.kind in {HostEventKind.ERROR, HostEventKind.STOP}
+            if terminal_event or now - self._last_live_state_sync >= 0.5:
+                self._last_live_state_sync = now
+                self._runtime.set_state("live:usage", self.usage_snapshot().to_dict())
+                if self._budget_guard is not None:
+                    self._runtime.set_state("live:budget", self._budget_guard.status())
         hooks = getattr(self, "_hooks", None)
         if (
             hooks is not None
@@ -725,7 +834,9 @@ class AgentHost:
             logger.debug("post-tool hook crashed", exc_info=True)
             return
         for failure in failures:
-            self.ui.render(HostEvent(HostEventKind.STATUS, f"hook warning: {safe_error_message(failure)}"))
+            self.ui.render(
+                HostEvent(HostEventKind.STATUS, f"hook warning: {safe_error_message(failure)}")
+            )
 
     async def _flush_post_hooks(self, *, cancel: bool = False) -> None:
         tasks, self._post_hook_tasks = self._post_hook_tasks, []
@@ -741,18 +852,29 @@ class AgentHost:
             return
         guard.sync_cost_usd(self.usage_snapshot().cost_usd)
 
-    async def _capture_checkpoint(self, label: str) -> None:
+    async def _capture_checkpoint(self, label: str, *, skip_if_unchanged: bool = False) -> None:
+        if getattr(self, "_skip_unchanged_checkpoint", False):
+            skip_if_unchanged = True
+            self._skip_unchanged_checkpoint = False
         manager = self._checkpoints
         if manager is None or not self.config.checkpoints.enabled:
             return
+        previous_ref = self.last_checkpoint.get("ref") if isinstance(self.last_checkpoint, dict) else None
         try:
-            snapshot = await asyncio.to_thread(manager.capture, label)
+            try:
+                snapshot = await asyncio.to_thread(
+                    manager.capture, label, skip_if_unchanged=skip_if_unchanged
+                )
+            except TypeError:
+                snapshot = await asyncio.to_thread(manager.capture, label)
         except Exception as exc:  # noqa: BLE001 - checkpoints are best-effort
             logger.debug("checkpoint capture failed", exc_info=True)
             self.ui.render(HostEvent(HostEventKind.STATUS, f"checkpoint failed: {exc}"))
             return
         if snapshot is not None:
             self.last_checkpoint = snapshot
+            if skip_if_unchanged and previous_ref and snapshot.get("ref") == previous_ref:
+                return
             self.ui.render(
                 HostEvent(
                     HostEventKind.STATUS,
@@ -810,14 +932,15 @@ class AgentHost:
             self._wake_event.set()
 
     def _on_subagent_lifecycle(self, activity: dict[str, Any]) -> None:
-        """Expose delegated work as structured UI events and console-readable text."""
+        """Expose delegated work as structured UI events and wake WAIT turns."""
 
         state = str(activity.get("state", "running"))
         agent = str(activity.get("agent", "agent"))
         prompt = " ".join(str(activity.get("prompt", "")).split())[:80]
         duration = float(activity.get("duration", 0.0) or 0.0)
+        terminal = state in {"completed", "needs_input", "failed", "cancelled"}
         detail = f" · {prompt}" if prompt else ""
-        elapsed = f" · {duration:.1f}s" if state in {"completed", "needs_input", "failed", "cancelled"} else ""
+        elapsed = f" · {duration:.1f}s" if terminal else ""
         self.ui.render(
             HostEvent(
                 HostEventKind.STATUS,
@@ -825,74 +948,108 @@ class AgentHost:
                 meta={"kind": "subagent", **activity},
             )
         )
+        if terminal:
+            self._wake_event.set()
 
     def _on_agent_message(self, text: str, **_kwargs: Any) -> None:
         self._last_agent_message = str(text)
         self.ui.render(HostEvent(HostEventKind.MESSAGE, text))
 
     def _on_model_stream(self, event: Any) -> None:
-        self.ui.render(HostEvent(
-            HostEventKind.MODEL_STREAM, event.text,
-            meta={"phase": event.kind, "call_id": event.call_id, "model": event.model,
-                  "attempt": event.attempt, "error_type": event.error_type},
-        ))
+        self.ui.render(
+            HostEvent(
+                HostEventKind.MODEL_STREAM,
+                event.text,
+                meta={
+                    "phase": event.kind,
+                    "call_id": event.call_id,
+                    "model": event.model,
+                    "attempt": event.attempt,
+                    "error_type": event.error_type,
+                },
+            )
+        )
 
-    def _persist_state(self) -> dict:
-        """Serialize agent-owned state for persistence. Thread-safe; touches no SQLite."""
+    def _snapshot_meta_from_agent(self) -> SessionMeta | None:
+        """Synchronize meta fields on the owning thread and return an isolated copy."""
 
         if self._agent is None or self.meta is None:
-            return {}
+            return None
         self.meta.mode = self._agent.mode
         self.meta.model = getattr(self._agent.v, "model", self.meta.model) or self.meta.model
         self.meta.permission_rules = self._agent.engine.snapshot_session_rules()
-        # Undo blobs live in a pruned sidecar so meta.json stays small and
-        # cheap to rewrite on every turn end.
         self.meta.journal = {}
         self.meta.todos = _json_safe(self._agent.todos.to_dict())
         with contextlib.suppress(Exception):
             title = getattr(self._agent.v, "title", None)
             if title:
                 self.meta.title = str(title)
-        return self._agent.journal.to_dict()
+        return replace(
+            self.meta,
+            permission_rules=list(self.meta.permission_rules),
+            todos=dict(self.meta.todos),
+            journal={},
+        )
 
-    def _write_persist_files(self, journal_data: dict) -> None:
-        """Write meta.json and the undo sidecar. File I/O only."""
+    def _serialize_journal_data(self) -> dict:
+        if self._agent is None:
+            return {}
+        blob_dir = self._session_blob_dir()
+        journal_obj: Any = self._agent.journal
+        try:
+            return journal_obj.to_dict(blob_dir=blob_dir)
+        except TypeError:
+            return journal_obj.to_dict()
 
-        if self.meta is None:
+    def _persist_state(self) -> dict:
+        """Serialize agent-owned state for persistence."""
+
+        if self._agent is None or self.meta is None:
+            return {}
+        self._snapshot_meta_from_agent()
+        return self._serialize_journal_data()
+
+    def _write_persist_files(
+        self, journal_data: dict, meta_snapshot: SessionMeta | None = None
+    ) -> None:
+        """Write meta.json and the undo sidecar. File/SQLite I/O only."""
+
+        target_meta = meta_snapshot or self.meta
+        if target_meta is None:
             return
         if self._runtime is not None:
             usage = self.usage_snapshot()
             budget = self._budget_guard.status() if self._budget_guard is not None else {}
             self._runtime.save_checkpoint(
                 {
-                    "meta": json.loads(self.meta.to_json()),
+                    "meta": json.loads(target_meta.to_json()),
                     "journal": journal_data,
-                    "todos": self.meta.todos,
+                    "todos": target_meta.todos,
                     "usage": usage.to_dict(),
                     "budget": budget,
                 }
             )
-        self.store.save_journal(self.meta.session_id, journal_data)
-        self.store.save_meta(self.meta)
+        self.store.save_journal(target_meta.session_id, journal_data)
+        self.store.save_meta(target_meta)
+        if self.meta is not None and self.meta is not target_meta:
+            self.meta.updated_at = target_meta.updated_at
 
     def _persist(self) -> None:
         if self._agent is None or self.meta is None or self._storage is None:
             return
-        journal_data = self._persist_state()
-        self._write_persist_files(journal_data)
+        meta_snapshot = self._snapshot_meta_from_agent()
+        journal_data = self._serialize_journal_data()
+        self._write_persist_files(journal_data, meta_snapshot)
         self._storage.save_snapshot(self._agent)
 
     async def _persist_async(self) -> None:
-        """Serialize and write session files off the UI event loop.
-
-        NOOA's SQLiteStorageManager is thread-affine, so the snapshot write
-        itself must stay on the event-loop thread.
-        """
+        """Serialize and write session files off the UI event loop."""
 
         if self._agent is None or self.meta is None or self._storage is None:
             return
-        journal_data = await asyncio.to_thread(self._persist_state)
-        await asyncio.to_thread(self._write_persist_files, journal_data)
+        meta_snapshot = self._snapshot_meta_from_agent()
+        journal_data = await asyncio.to_thread(self._serialize_journal_data)
+        await asyncio.to_thread(self._write_persist_files, journal_data, meta_snapshot)
         if self._agent is not None and self._storage is not None:
             self._storage.save_snapshot(self._agent)
 
@@ -904,14 +1061,14 @@ class AgentHost:
             if self._agent is not None:
                 await self._run_lifecycle("session_end")
         finally:
-            # Also cover cancellation/failure before the normal drain above.
-            # Each step suppresses fresh cancellation so one delivery cannot
-            # skip the rest: that would leak storage, LSP servers, telemetry,
-            # and most importantly the workspace lease.
             with contextlib.suppress(asyncio.CancelledError):
                 await self._cancel_background_tasks()
             self._teardown_event_bridge()
             if self._agent is not None:
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await _aclose_llm_chain(self._agent._llm)
+                    if self._agent._lightweight_llm is not self._agent._llm:
+                        await _aclose_llm_chain(self._agent._lightweight_llm)
                 with contextlib.suppress(Exception, asyncio.CancelledError):
                     await self._agent.close_tools()
             if self._storage is not None:
@@ -928,11 +1085,12 @@ class AgentHost:
                 await asyncio.to_thread(self._telemetry.shutdown)
             self._agent = None
             self._hooks = None
-            self._runtime = None
+            self._close_runtime()
             self._release_workspace_lease()
 
     def _release_workspace_lease(self) -> None:
         lease, self._workspace_lease = self._workspace_lease, None
+        self._lease_shared = False
         if lease is not None:
             lease.close()
 
@@ -960,48 +1118,6 @@ class AgentHost:
 
     def usage_snapshot(self) -> UsageSnapshot:
         return self._usage.snapshot()
-
-    def work_snapshot(self) -> dict[str, list[dict[str, Any]]]:
-        """Return presentation-safe live/recent agent and process work."""
-
-        if self._agent is None:
-            return {"agents": [], "jobs": []}
-        agents: list[dict[str, Any]] = []
-        task = getattr(self.agent, "task", None)
-        if task is not None:
-            with contextlib.suppress(Exception):
-                agents = task.snapshot(limit=20)
-        jobs: list[dict[str, Any]] = []
-        with contextlib.suppress(Exception):
-            jobs = self.agent.processes.snapshot(limit=20)
-        return {"agents": agents, "jobs": jobs}
-
-    def work_status_text(self) -> str:
-        snapshot = self.work_snapshot()
-        agents = snapshot["agents"]
-        jobs = snapshot["jobs"]
-        lines = ["Work ledger", "", "Agents"]
-        if not agents:
-            lines.append("  No delegated work yet. Start /team build OBJECTIVE or choose a team with F9.")
-            lines.append("  Noah can also use task.run_many or task.collaborate for custom assignments.")
-        for item in agents:
-            mode = "read" if item.get("readonly") else "write"
-            lines.append(
-                f"  {item['id']}  [{item['state']:<9}] {item['agent']} · {mode} · "
-                f"{float(item.get('duration', 0.0)):.1f}s"
-            )
-            if item.get("prompt"):
-                lines.append(f"    {str(item['prompt'])[:100]}")
-        lines.extend(["", "Terminals and jobs"])
-        if not jobs:
-            lines.append("  No sessions. Noah can use processes.open_terminal or processes.start.")
-        for item in jobs:
-            kind = "terminal" if item.get("kind") == "terminal" else "job"
-            lines.append(
-                f"  {item['id']}  [{item['state']:<9}] {kind} · {item['name']} · "
-                f"{float(item.get('elapsed', 0.0)):.1f}s"
-            )
-        return "\n".join(lines)
 
     async def diff_review(self) -> Any:
         """List Git changes without waiting for individual patches or language servers."""
@@ -1032,49 +1148,94 @@ class AgentHost:
         """Revert an explicitly confirmed review item as its own journal turn."""
 
         self._require_review_idle()
-        self._active_turn = asyncio.current_task()
-        self.ui.set_busy(True)
-        self.agent.journal.begin_turn()
-        try:
-            result = await self.agent.git.revert(path, scope, expected_revision=expected_revision)
-        finally:
-            self.agent.journal.end_turn()
+        async with self._session_lock:
+            self._active_turn = asyncio.current_task()
+            self.ui.set_busy(True)
+            self.agent.journal.begin_turn()
             try:
-                await self._persist_async()
+                result = await self.agent.git.revert(
+                    path, scope, expected_revision=expected_revision
+                )
             finally:
-                self._active_turn = None
-                self.ui.set_busy(False)
-        return result
+                self.agent.journal.end_turn()
+                try:
+                    await self._persist_async()
+                finally:
+                    self._active_turn = None
+                    self.ui.set_busy(False)
+            return result
 
-    def _undo_last_turn_state(self) -> str:
-        """Undo the latest reversible checkpoint without touching session storage."""
+    def _undo_last_turn_state(self, *, use_checkpoint: bool = False) -> str:
+        """Undo the latest reversible turn or explicitly restore the latest Git checkpoint."""
+
+        if use_checkpoint:
+            manager = self._checkpoints
+            if manager is None:
+                raise RuntimeError("no Git checkpoint manager available for this session")
+            entries = manager.list()
+            if not entries:
+                raise RuntimeError("no Git checkpoints recorded for this session")
+            target = entries[-2] if len(entries) >= 2 else entries[-1]
+            manager.restore(target["ref"])
+            self._last_turn_shell_bypass = False
+            return f"restored Git checkpoint {target['ref']} ({target['commit'][:12]})"
 
         turn = self.agent.journal.latest_turn()
         if turn:
             self.agent.journal.capture_post_bytes_before_undo(turn)
-        undone = self.agent.journal.undo()
+        try:
+            undone = self.agent.journal.undo()
+        except RuntimeError as exc:
+            if (
+                "shell mutations outside the file journal" in str(exc)
+                and self._checkpoints is not None
+                and self._checkpoints.list()
+            ):
+                raise RuntimeError(
+                    f"{exc}; run '/undo --checkpoint' to restore the pre-command Git checkpoint"
+                ) from exc
+            raise
         return f"undid turn {undone.turn_id[:8]} ({len(undone.mutations)} files)"
 
-    async def undo_last_turn_async(self) -> str:
+    async def undo_last_turn_async(self, *, use_checkpoint: bool = False) -> str:
         self._require_review_idle()
-        self._active_turn = asyncio.current_task()
-        self.ui.set_busy(True)
-        undo_task = asyncio.create_task(asyncio.to_thread(self._undo_last_turn_state))
-        try:
+        async with self._session_lock:
+            self._active_turn = asyncio.current_task()
+            self.ui.set_busy(True)
+            undo_task = asyncio.create_task(
+                asyncio.to_thread(self._undo_last_turn_state, use_checkpoint=use_checkpoint)
+            )
             try:
-                status = await asyncio.shield(undo_task)
-            except asyncio.CancelledError:
-                # Cancellation cannot stop a filesystem worker. Keep the busy
-                # guard until it completes and persist its actual result.
-                await undo_task
+                try:
+                    status = await asyncio.shield(undo_task)
+                except asyncio.CancelledError:
+                    await undo_task
+                    await self._persist_async()
+                    raise
                 await self._persist_async()
-                raise
-            # SQLite persistence remains on its owning event-loop thread.
-            await self._persist_async()
-            return status
-        finally:
-            self._active_turn = None
-            self.ui.set_busy(False)
+                return status
+            finally:
+                self._active_turn = None
+                self.ui.set_busy(False)
+
+    async def redo_last_turn_async(self) -> str:
+        self._require_review_idle()
+        async with self._session_lock:
+            self._active_turn = asyncio.current_task()
+            self.ui.set_busy(True)
+            redo_task = asyncio.create_task(asyncio.to_thread(self.agent.journal.redo))
+            try:
+                try:
+                    redone = await asyncio.shield(redo_task)
+                except asyncio.CancelledError:
+                    await redo_task
+                    await self._persist_async()
+                    raise
+                await self._persist_async()
+                return f"redid turn {redone.turn_id[:8]} ({len(redone.mutations)} files)"
+            finally:
+                self._active_turn = None
+                self.ui.set_busy(False)
 
     def _require_idle_turn(self) -> None:
         """Refuse session switches while a turn is still running."""
@@ -1091,302 +1252,72 @@ class AgentHost:
     ) -> SessionMeta:
         """Persist current session and open a fresh one in-process."""
         self._require_idle_turn()
-        validated_workspace = (
-            open_workspace(workspace.root) if workspace is not None else None
-        )
-        self._clear_steer_state()
-        self._active_context_paths.clear()
-        await self._cancel_background_tasks()
-        await self._persist_async()
-        if self._agent is not None:
-            await self._run_lifecycle("session_end")
-        if validated_workspace is not None:
-            self.workspace = validated_workspace
-        self._pending_worktree_name = worktree_name
-        self._teardown_event_bridge()
-        if self._agent is not None:
-            with contextlib.suppress(Exception):
-                await self._agent.close_tools()
-        if self._storage is not None:
-            self._storage.close()
-            self._storage = None
-        self._agent = None
-        self._runtime = None
-        self._release_workspace_lease()
-        self._usage = UsageTracker()
-        self.meta = None
-        self._exit_requested = False
-        return await self.start()
+        async with self._session_lock:
+            self._require_idle_turn()
+            validated_workspace = (
+                open_workspace(workspace.root) if workspace is not None else None
+            )
+            self._clear_steer_state()
+            self._active_context_paths.clear()
+            await self._cancel_background_tasks()
+            await self._persist_async()
+            if self._agent is not None:
+                await self._run_lifecycle("session_end")
+            if validated_workspace is not None:
+                self.workspace = validated_workspace
+            self._pending_worktree_name = worktree_name
+            self._teardown_event_bridge()
+            if self._agent is not None:
+                with contextlib.suppress(Exception):
+                    await _aclose_llm_chain(self._agent._llm)
+                with contextlib.suppress(Exception):
+                    await self._agent.close_tools()
+            if self._storage is not None:
+                self._storage.close()
+                self._storage = None
+            self._agent = None
+            self._close_runtime()
+            self._release_workspace_lease()
+            self._usage = UsageTracker()
+            self.meta = None
+            self._exit_requested = False
+            return await self.start()
 
     async def switch_session(self, session_id: str) -> SessionMeta:
         """Persist current session and resume another."""
         self._require_idle_turn()
-        # Validate the target before tearing anything down so a failed resume
-        # leaves the current session fully intact.
-        meta = self.store.load_meta(session_id)
-        rebound = self.store.workspace_for_resume(meta, self.workspace)
-        self._clear_steer_state()
-        self._active_context_paths.clear()
-        await self._cancel_background_tasks()
-        await self._persist_async()
-        if self._agent is not None:
-            await self._run_lifecycle("session_end")
-        self._teardown_event_bridge()
-        if self._agent is not None:
-            with contextlib.suppress(Exception):
-                await self._agent.close_tools()
-        if self._storage is not None:
-            self._storage.close()
-            self._storage = None
-        self._agent = None
-        self._runtime = None
-        self._release_workspace_lease()
-        self._usage = UsageTracker()
-        self.workspace = rebound
-        self.meta = meta
-        self._exit_requested = False
-        return await self.start()
+        async with self._session_lock:
+            self._require_idle_turn()
+            meta = await asyncio.to_thread(self.store.load_meta, session_id)
+            rebound = await asyncio.to_thread(
+                self.store.workspace_for_resume, meta, self.workspace
+            )
+            self._clear_steer_state()
+            self._active_context_paths.clear()
+            await self._cancel_background_tasks()
+            await self._persist_async()
+            if self._agent is not None:
+                await self._run_lifecycle("session_end")
+            self._teardown_event_bridge()
+            if self._agent is not None:
+                with contextlib.suppress(Exception):
+                    await _aclose_llm_chain(self._agent._llm)
+                with contextlib.suppress(Exception):
+                    await self._agent.close_tools()
+            if self._storage is not None:
+                self._storage.close()
+                self._storage = None
+            self._agent = None
+            self._close_runtime()
+            self._release_workspace_lease()
+            self._usage = UsageTracker()
+            self.workspace = rebound
+            self.meta = meta
+            self._exit_requested = False
+            return await self.start()
 
     def list_session_metas(self) -> list[SessionMeta]:
         return self.store.list_sessions(self.workspace)
-
-    def worktree_manager(self) -> Any:
-        from noah_code.worktree import WorktreeManager, worktree_storage_root
-
-        return WorktreeManager(self.workspace.root, worktree_storage_root(self.config.session_dir))
-
-    async def create_worktree_session(self, name: str | None = None) -> SessionMeta:
-        """Create a linked worktree and start a new session there."""
-
-        self._require_idle_turn()
-        info = await asyncio.to_thread(self.worktree_manager().create, name)
-        try:
-            meta = await self.start_new_session(
-                Workspace(root=info.directory), worktree_name=info.name
-            )
-            await self._run_lifecycle("worktree_created", name=info.name, directory=str(info.directory))
-            return meta
-        except Exception:
-            with contextlib.suppress(Exception):
-                self.worktree_manager().remove(info.name)
-            raise
-
-    def remove_worktree(self, name: str) -> Any:
-        from noah_code.worktree import WorktreeError
-
-        manager = self.worktree_manager()
-        matches = [item for item in manager.list() if item.name == name or str(item.directory) == name]
-        if matches and matches[0].directory.resolve() == self.workspace.root.resolve():
-            raise WorktreeError("switch away from this worktree before removing it")
-        return manager.remove(name)
-
-    async def _handle_worktree(self, args: str) -> Literal["handled"]:
-        from noah_code.worktree import WorktreeError
-
-        parts = shlex.split(args) if args.strip() else []
-        action = parts[0] if parts else "create"
-        rest = parts[1:]
-        if action == "create":
-            name = rest[0] if rest else None
-            try:
-                meta = await self.create_worktree_session(name)
-            except Exception as exc:  # noqa: BLE001
-                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-                return "handled"
-            self.ui.render(
-                HostEvent(
-                    HostEventKind.STATUS,
-                    f"worktree {meta.worktree_name} · session {meta.session_id} · "
-                    f"{meta.workspace_path}",
-                )
-            )
-            return "handled"
-        if action == "list":
-            try:
-                rows = self.worktree_manager().list()
-            except WorktreeError as exc:
-                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-                return "handled"
-            text = (
-                "\n".join(f"{item.name}  {item.branch}  {item.directory}" for item in rows)
-                or "(none)"
-            )
-            self.ui.render(_command_output(text))
-            return "handled"
-        if action == "remove":
-            if not rest:
-                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /worktree remove NAME"))
-                return "handled"
-            try:
-                info = self.remove_worktree(rest[0])
-            except WorktreeError as exc:
-                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-                return "handled"
-            self.ui.render(HostEvent(HostEventKind.STATUS, f"removed worktree {info.name}"))
-            return "handled"
-        self.ui.render(
-            HostEvent(
-                HostEventKind.ERROR,
-                "usage: /worktree [create [NAME]|list|remove NAME]",
-            )
-        )
-        return "handled"
-
-    def github_manager(self) -> Any:
-        from noah_code.github import GithubManager
-
-        return GithubManager(self.workspace.root)
-
-    async def create_pull_request(
-        self,
-        title: str | None = None,
-        body: str = "",
-        base: str | None = None,
-    ) -> Any:
-        self._require_idle_turn()
-        return await asyncio.to_thread(self.github_manager().create, title, body, base)
-
-    async def push_pull_request_branch(self) -> str:
-        self._require_idle_turn()
-        return await asyncio.to_thread(self.github_manager().push)
-
-    async def checkout_pull_request(self, number: int) -> str:
-        self._require_idle_turn()
-        return await asyncio.to_thread(self.github_manager().checkout, number)
-
-    async def _handle_pr(self, args: str) -> Literal["handled"]:
-        from noah_code.github import GithubError
-
-        parts = shlex.split(args) if args.strip() else []
-        if not parts:
-            action, rest = "list", []
-        elif parts[0].isdigit():
-            action, rest = "view", parts[:1]
-        else:
-            action, rest = parts[0], parts[1:]
-        try:
-            if action == "list":
-                rows = await asyncio.to_thread(self.github_manager().list)
-                text = "\n".join(item.format_row() for item in rows) or "(none)"
-                self.ui.render(_command_output(text))
-                return "handled"
-            if action == "view":
-                number = int(rest[0]) if rest else None
-                text = await asyncio.to_thread(self.github_manager().view, number)
-                self.ui.render(_command_output(text or "(none)"))
-                return "handled"
-            if action == "create":
-                title = " ".join(rest) or None
-                info = await self.create_pull_request(title)
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.STATUS,
-                        f"created #{info.number}  {info.title}  {info.url}",
-                    )
-                )
-                return "handled"
-            if action == "push":
-                text = await self.push_pull_request_branch()
-                self.ui.render(HostEvent(HostEventKind.STATUS, text))
-                return "handled"
-            if action == "checkout":
-                if not rest or not rest[0].isdigit():
-                    self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /pr checkout N"))
-                    return "handled"
-                branch = await self.checkout_pull_request(int(rest[0]))
-                self.ui.render(
-                    HostEvent(HostEventKind.STATUS, f"checked out #{rest[0]} as {branch}")
-                )
-                return "handled"
-            if action == "comment":
-                if len(rest) < 2 or not rest[0].isdigit():
-                    self.ui.render(
-                        HostEvent(HostEventKind.ERROR, "usage: /pr comment N TEXT")
-                    )
-                    return "handled"
-                text = await asyncio.to_thread(
-                    self.github_manager().comment, int(rest[0]), " ".join(rest[1:])
-                )
-                self.ui.render(HostEvent(HostEventKind.STATUS, text))
-                return "handled"
-        except (GithubError, RuntimeError, OSError, ValueError) as exc:
-            self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-            return "handled"
-        self.ui.render(
-            HostEvent(
-                HostEventKind.ERROR,
-                "usage: /pr [list|view [N]|create [TITLE]|push|checkout N|comment N TEXT]",
-            )
-        )
-        return "handled"
-
-    async def _handle_plan(self, args: str) -> Literal["handled"]:
-        from noah_code.project_notes import PlanStore
-
-        store = PlanStore(self.workspace.root)
-        verb = args.strip().split(None, 1)[0].lower() if args.strip() else "show"
-        if verb in {"show", "read"}:
-            self.ui.render(_command_output(store.read().strip() or "(no active plan)"))
-            return "handled"
-        if verb == "clear":
-            store.clear()
-            if self._agent is not None:
-                self.agent.refresh_context_sources()
-            self.ui.render(HostEvent(HostEventKind.STATUS, "plan cleared"))
-            self.ui.set_status(self.status_prompt())
-            return "handled"
-        self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /plan [clear]"))
-        return "handled"
-
-    async def _handle_memory(self, args: str) -> Literal["handled"]:
-        from noah_code.project_notes import MemoryStore, parse_memory_facts
-
-        store = MemoryStore(self.workspace.root)
-        parts = args.split(None, 1)
-        verb = parts[0].lower() if parts and parts[0] else "show"
-        rest = parts[1].strip() if len(parts) > 1 else ""
-        if verb in {"show", "list", "read"}:
-            self.ui.render(_command_output(store.read().strip() or "(no project memory yet)"))
-            return "handled"
-        if verb == "save":
-            facts = parse_memory_facts(f"- {rest}" if rest else "")
-            if not facts:
-                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /memory save FACT"))
-                return "handled"
-            added = store.merge(facts)
-            if self._agent is not None:
-                self.agent.refresh_context_sources()
-            self.ui.render(
-                HostEvent(
-                    HostEventKind.STATUS,
-                    f"remembered {added[0]}" if added else "already remembered",
-                )
-            )
-            return "handled"
-        if verb == "forget":
-            if not rest:
-                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /memory forget TEXT"))
-                return "handled"
-            forgotten = store.forget(rest)
-            if self._agent is not None:
-                self.agent.refresh_context_sources()
-            self.ui.render(
-                HostEvent(
-                    HostEventKind.STATUS,
-                    f"forgot {rest}" if forgotten else "no matching memory",
-                )
-            )
-            return "handled"
-        if verb == "clear":
-            store.clear()
-            if self._agent is not None:
-                self.agent.refresh_context_sources()
-            self.ui.render(HostEvent(HostEventKind.STATUS, "memory cleared"))
-            return "handled"
-        self.ui.render(
-            HostEvent(HostEventKind.ERROR, "usage: /memory [save FACT|forget TEXT|clear]")
-        )
-        return "handled"
 
     def list_skill_infos(self) -> list[Any]:
         """Return display metadata for all loaded and document skills."""
@@ -1430,13 +1361,13 @@ class AgentHost:
 
     async def configure_permission_mode(self, mode: str) -> str:
         """Save the onboarding choice before creating the agent or its permission engine."""
-        from noah_code.config import save_user_permission_mode
+        from noah_code import config as _config_mod
         from noah_code.permission_modes import permission_mode_flags
 
         if self._agent is not None:
             raise RuntimeError("Choose permissions before starting a session")
         flags = permission_mode_flags(mode)
-        path = await asyncio.to_thread(save_user_permission_mode, mode)
+        path = await asyncio.to_thread(_config_mod.save_user_permission_mode, mode)
         self.config.auto_approve = flags["auto_approve"]
         self.config.yolo = flags["yolo"]
         return f"Permission mode set to {mode}; default saved in {path}"
@@ -1499,10 +1430,10 @@ class AgentHost:
         elif self.meta is not None:
             self.meta.model = selected_model
             self.meta.reasoning_effort = selected_effort
-            self.store.save_meta(self.meta)
-        default_path = save_user_default_model(selected_model)
+            await asyncio.to_thread(self.store.save_meta, self.meta)
+        default_path = await asyncio.to_thread(save_user_default_model, selected_model)
         if reasoning_effort is not None:
-            save_user_reasoning_effort(selected_effort)
+            await asyncio.to_thread(save_user_reasoning_effort, selected_effort)
         self.config.model = selected_model
         self.config.reasoning_effort = selected_effort
         suffix = f"; alias saved in {config_path}" if config_path else ""
@@ -1519,7 +1450,8 @@ class AgentHost:
             return f"MCP server {name} is already connected"
         from noah_code.mcp_setup import attach_mcp_server, load_mcp_servers, mcp_source_is_trusted
 
-        servers, sources = load_mcp_servers(
+        servers, sources = await asyncio.to_thread(
+            load_mcp_servers,
             self.workspace.root,
             self.config,
             extra_servers=self._client_mcp_servers or None,
@@ -1540,6 +1472,8 @@ class AgentHost:
 
     async def add_mcp_server(self, kind: str, name: str, target: str) -> str:
         """Persist and connect a simple STDIO or Streamable HTTP server."""
+
+        import shlex
 
         from noah_code.mcp_setup import save_user_mcp_server
 
@@ -1611,11 +1545,30 @@ class AgentHost:
 
     def _save_input_queue(self) -> None:
         if self._runtime is not None:
-            self._runtime.set_state("input_queue", {
-                "paused": self.queue_paused,
-                "attachments": [str(path) for path in self._pending_attach_paths],
-                "order": [item.sequence for item in self.steer_queue.items()],
-            })
+            self._runtime.set_state(
+                "input_queue",
+                {
+                    "paused": self.queue_paused,
+                    "attachments": [str(path) for path in self._pending_attach_paths],
+                    "order": [item.sequence for item in self.steer_queue.items()],
+                },
+            )
+
+    def attach_context_path(self, raw_path: str | Path) -> Path:
+        """Validate and queue a file or temporary clipboard image for the next prompt."""
+
+        from noah_code.composer import validate_attachment
+
+        path = validate_attachment(
+            str(raw_path),
+            self.workspace.root,
+            engine=getattr(self._agent, "engine", None),
+            max_file_bytes=self.config.max_file_bytes,
+        )
+        if path not in self._pending_attach_paths:
+            self._pending_attach_paths.append(path)
+            self._save_input_queue()
+        return path
 
     def discard_queued_input(self) -> None:
         """Explicitly discard waiting prompts and pending attachments."""
@@ -1640,84 +1593,6 @@ class AgentHost:
         """Return attachment paths already delivered in the active session."""
 
         return tuple(sorted(self._active_context_paths))
-
-    def context_snapshot(self) -> list[dict[str, str]]:
-        """Return a display-safe inventory of context sources for the UI."""
-
-        from noah_code.project_notes import MEMORY_RELATIVE, PLAN_RELATIVE, MemoryStore, PlanStore
-
-        rows: list[dict[str, str]] = []
-        root = self.workspace.root
-        for relative in ("AGENTS.md", "CLAUDE.md", ".noah-code/instructions.md"):
-            path = root / relative
-            if path.is_file():
-                rows.append(
-                    {
-                        "kind": "instruction",
-                        "label": relative,
-                        "detail": f"Repository instructions · {path}",
-                    }
-                )
-        if PlanStore(root).exists():
-            rows.append(
-                {
-                    "kind": "plan",
-                    "label": PLAN_RELATIVE,
-                    "detail": "Pinned project plan included at each turn boundary",
-                }
-            )
-        if MemoryStore(root).exists():
-            rows.append(
-                {
-                    "kind": "memory",
-                    "label": MEMORY_RELATIVE,
-                    "detail": "Durable project conventions included in model context",
-                }
-            )
-        for path in self.active_context_paths():
-            rows.append(
-                {
-                    "kind": "attachment",
-                    "label": path.name,
-                    "detail": f"Attached in this session · {path}",
-                }
-            )
-        for path in self.pending_attach_paths():
-            rows.append(
-                {
-                    "kind": "pending",
-                    "label": path.name,
-                    "detail": f"Waiting for the next prompt · {path}",
-                }
-            )
-        if self._agent is not None:
-            with contextlib.suppress(Exception):
-                for info in self.list_skill_infos():
-                    if info.active:
-                        rows.append(
-                            {
-                                "kind": "skill",
-                                "label": info.name,
-                                "detail": f"Active skill · {info.source}",
-                            }
-                        )
-        for name in sorted(self._mcp_attached):
-            rows.append(
-                {
-                    "kind": "mcp",
-                    "label": name,
-                    "detail": "Connected MCP server tools available to Noah",
-                }
-            )
-        return rows
-
-    def context_status_text(self) -> str:
-        rows = self.context_snapshot()
-        if not rows:
-            return "Context sources\n  Workspace defaults only"
-        lines = ["Context sources"]
-        lines.extend(f"  {row['kind']:<11} {row['label']}\n    {row['detail']}" for row in rows)
-        return "\n".join(lines)
 
     def remove_pending_attach(self, index: int) -> Path | None:
         if index < 0 or index >= len(self._pending_attach_paths):
@@ -1762,11 +1637,12 @@ class AgentHost:
         items = self.steer_queue.items()
         sequence = (
             self._runtime.enqueue_inbox(
-                text, paths or None,
+                text,
+                paths or None,
                 input_state={
                     "paused": self.queue_paused,
                     "attachments": [],
-                    "order": [item.sequence for item in items[-(STEER_QUEUE_CAP - 1):]],
+                    "order": [item.sequence for item in items[-(STEER_QUEUE_CAP - 1) :]],
                 },
                 discard_sequence=items[0].sequence if len(items) >= STEER_QUEUE_CAP else None,
             )
@@ -1786,120 +1662,42 @@ class AgentHost:
         self.ui.set_status(self.status_prompt())
         return dropped_item is not None
 
-    async def handle_line(self, line: str) -> Literal["continue", "exit", "handled"]:
-        slash = parse_slash(line)
-        if slash:
-            if slash[0] == "team":
-                return await self._handle_team(slash[1])
-            return await self._handle_slash(slash[0], slash[1])
-        result = await self.submit_prompt(line)
-        return "continue" if result is not None else "handled"
-
     async def submit_prompt(self, text: str) -> HostResult | None:
-        """Submit text without interpreting commands that change session identity.
-
-        Network and editor clients own their session lifecycle. Keep their prompts
-        on the ordinary turn path, including explicit skills and waiting-user runs.
-        """
+        """Submit text without interpreting commands that change session identity."""
         self._require_idle_turn()
-        line = text
-        self.ui.set_busy(True)
-        self._active_turn = asyncio.current_task()
-        try:
-            skill_prompt = await self._activate_explicit_skill(line)
-            if skill_prompt is None:
-                return HostResult(
-                    1,
-                    "skill activation failed",
-                    self.meta.session_id if self.meta else None,
-                    "failed",
+        async with self._session_lock:
+            self._require_idle_turn()
+            line = text
+            self.ui.set_busy(True)
+            self._active_turn = asyncio.current_task()
+            try:
+                skill_prompt = await self._activate_explicit_skill(line)
+                if skill_prompt is None:
+                    return HostResult(
+                        1,
+                        "skill activation failed",
+                        self.meta.session_id if self.meta else None,
+                        "failed",
+                    )
+                line = skill_prompt
+                continuable = (
+                    await asyncio.to_thread(self._runtime.latest_incomplete_run)
+                    if self._runtime is not None
+                    else None
                 )
-            line = skill_prompt
-            continuable = (
-                self._runtime.latest_incomplete_run() if self._runtime is not None else None
-            )
-            run_id = continuable.run_id if continuable and continuable.state == "waiting_user" else None
-            attach_paths = self.take_pending_attaches()
-            if run_id is None:
-                return await self._run_user_turn(line, attach_paths=attach_paths)
-            return await self._run_user_turn(line, run_id=run_id, attach_paths=attach_paths)
-        finally:
-            self._active_turn = None
-            self.ui.set_busy(False)
-            self.ui.set_status(self.status_prompt())
-
-    def team_status_text(self) -> str:
-        """Describe coordinated workflows without starting model work."""
-
-        from noah_code.teams import team_workflows
-
-        lines = ["Agent teams", ""]
-        for workflow in team_workflows():
-            mode = "read-only" if workflow.readonly else "build mode required"
-            phases = " → ".join(phase.title for phase in workflow.phases)
-            lines.extend(
-                [
-                    f"  /team {workflow.name} OBJECTIVE · {mode}",
-                    f"    {workflow.description}",
-                    f"    {phases}",
-                ]
-            )
-        lines.extend(
-            [
-                "",
-                "Example: /team review Find regressions in the current changes",
-                "Track progress with /work or F4. Teams share this session's budget and approvals.",
-            ]
-        )
-        return "\n".join(lines)
-
-    def prepare_team_prompt(self, args: str) -> str:
-        """Validate a team request and route it through the normal agent lifecycle."""
-
-        from noah_code.teams import get_team_workflow
-
-        parts = args.strip().split(maxsplit=1)
-        if not parts:
-            raise ValueError("usage: /team <build|review|investigate> OBJECTIVE")
-        workflow = get_team_workflow(parts[0].lower())
-        if len(parts) < 2 or not parts[1].strip():
-            raise ValueError(f"Add an objective: /team {workflow.name} OBJECTIVE")
-        if not workflow.readonly and self.agent.mode != "build":
-            raise ValueError(
-                "The build team requires build mode. Use /mode build first, "
-                "or choose /team review or /team investigate for read-only work."
-            )
-        objective = parts[1].strip()
-        access_instruction = (
-            "This is a read-only request: do not modify files or switch to build mode. "
-            if workflow.readonly else ""
-        )
-        return (
-            f"Run the {workflow.title} team workflow for the objective below. "
-            f"Call await self.task.team(objective, workflow={workflow.name!r}) with that "
-            "objective, then inspect the returned reports and provide one consolidated answer "
-            "with observed validation and any unresolved blockers. Respect the active mode, "
-            "repository instructions, and existing user changes. "
-            f"{access_instruction}\n\n"
-            f"Objective:\n{objective}"
-        )
-
-    async def _handle_team(self, args: str) -> Literal["continue", "exit", "handled"]:
-        if not args.strip():
-            self.ui.render(_command_output(self.team_status_text()))
-            return "handled"
-        try:
-            prompt = self.prepare_team_prompt(args)
-        except ValueError as exc:
-            self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-            return "handled"
-        another_turn_running = self._turn_running() and self._active_turn is not asyncio.current_task()
-        if another_turn_running or self.queue_paused:
-            self.enqueue_steer(prompt)
-            state = "paused" if self.queue_paused else "queued"
-            self.ui.render(HostEvent(HostEventKind.STATUS, f"team {state} · /work to track progress"))
-            return "handled"
-        return await self.handle_line(prompt)
+                run_id = (
+                    continuable.run_id
+                    if continuable and continuable.state == "waiting_user"
+                    else None
+                )
+                attach_paths = self.take_pending_attaches()
+                if run_id is None:
+                    return await self._run_user_turn(line, attach_paths=attach_paths)
+                return await self._run_user_turn(line, run_id=run_id, attach_paths=attach_paths)
+            finally:
+                self._active_turn = None
+                self.ui.set_busy(False)
+                self.ui.set_status(self.status_prompt())
 
     async def _activate_explicit_skill(self, line: str) -> str | None:
         """Resolve ``$name task``, approve it, and expose its instructions."""
@@ -1933,617 +1731,6 @@ class AgentHost:
         if attr and isinstance(approved, set):
             approved.add(attr)
         return f"Use the ${info.name} skill instructions for this task:\n\n{task.strip()}"
-
-    def _handle_slash_while_busy(
-        self, name: str, args: str
-    ) -> Literal["continue", "exit", "handled"] | None:
-        """Allow read-only slash commands during a turn; block mutating ones."""
-
-        if not self._turn_running() or name in SAFE_SLASH_WHILE_BUSY:
-            return None
-        if name in {"exit", "quit"}:
-            return None
-        if name == "attach":
-            from noah_code.composer import validate_attachment
-
-            raw = args.strip().strip("\"'")
-            if not raw:
-                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /attach PATH"))
-                return "handled"
-            try:
-                path = validate_attachment(
-                    raw,
-                    self.workspace.root,
-                    engine=self.agent.engine,
-                    max_file_bytes=self.config.max_file_bytes,
-                )
-            except (PermissionError, ValueError) as exc:
-                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-                return "handled"
-            self._pending_attach_paths.append(path)
-            self._save_input_queue()
-            self.ui.render(HostEvent(HostEventKind.STATUS, f"attach queued · {path}"))
-            return "handled"
-        self.ui.render(
-            HostEvent(HostEventKind.STATUS, f"/{name} is blocked while a turn is running")
-        )
-        return "handled"
-
-    async def _handle_slash(self, name: str, args: str) -> Literal["continue", "exit", "handled"]:
-        busy = self._handle_slash_while_busy(name, args)
-        if busy is not None:
-            return busy
-        agent = self.agent
-        if name == "help":
-            self.ui.render(_command_output(help_text(self._custom_commands)))
-            return "handled"
-        if name == "config":
-            try:
-                text = config_text(self.config, args)
-            except KeyError:
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.ERROR,
-                        f"unknown configuration path {args.strip()!r}; use /config to list all",
-                    )
-                )
-            else:
-                self.ui.render(_command_output(text))
-            return "handled"
-        if name == "theme":
-            requested = args.strip().lower()
-            if not requested:
-                choices = ", ".join(THEME_NAMES)
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.STATUS,
-                        f"theme={self.config.ui.theme} available={choices}",
-                    )
-                )
-                return "handled"
-            try:
-                selected = get_theme(requested).name
-            except ValueError as exc:
-                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-                return "handled"
-            path = save_user_theme(selected)
-            self.config.ui.theme = selected
-            self.ui.render(
-                HostEvent(
-                    HostEventKind.STATUS,
-                    f"theme set to {selected} in {path}",
-                    meta={"kind": "theme", "theme": selected},
-                )
-            )
-            return "handled"
-        if name == "animations":
-            requested = args.strip().lower()
-            if not requested:
-                state = "on" if self.config.ui.animations else "off"
-                self.ui.render(HostEvent(HostEventKind.STATUS, f"animations={state}"))
-                return "handled"
-            if requested not in {"on", "off"}:
-                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /animations [on|off]"))
-                return "handled"
-            enabled = requested == "on"
-            path = save_user_animations(enabled)
-            self.config.ui.animations = enabled
-            self.ui.render(
-                HostEvent(
-                    HostEventKind.STATUS,
-                    f"animations set to {requested} · saved in {path}",
-                    meta={"kind": "animations", "enabled": enabled},
-                )
-            )
-            return "handled"
-        if name in self._custom_commands:
-            return await self._run_custom_command(name, args)
-        if name == "exit" or name == "quit":
-            self.cancel_active_turn()
-            self._exit_requested = True
-            return "exit"
-        if name == "new":
-            meta = await self.start_new_session()
-            self.ui.render(
-                HostEvent(HostEventKind.STATUS, f"started new session {meta.session_id}")
-            )
-            return "handled"
-        if name == "worktree":
-            return await self._handle_worktree(args)
-        if name == "pr":
-            return await self._handle_pr(args)
-        if name == "plan":
-            return await self._handle_plan(args)
-        if name == "memory":
-            return await self._handle_memory(args)
-        if name == "skills":
-            skills = getattr(agent, "skills", None)
-            if skills is None:
-                self.ui.render(HostEvent(HostEventKind.STATUS, "no skills registry"))
-            else:
-                try:
-                    if args.strip().lower().startswith("add "):
-                        source = args.strip()[4:].strip()
-                        info = await asyncio.to_thread(self.add_skill_from_path, source)
-                        text = f"Added ${info.name}\n{info.description}\n{info.source}"
-                    elif args.strip():
-                        text = "usage: /skills [add PATH]"
-                    else:
-                        from noah_code.skills_setup import format_skills
-
-                        text = format_skills(skills)
-                except Exception as exc:  # noqa: BLE001
-                    text = f"skills error: {exc}"
-                self.ui.render(_command_output(text if text else "(empty)"))
-            return "handled"
-        if name == "mcp":
-            try:
-                parts = shlex.split(args)
-                if not parts:
-                    rows = self.list_mcp_infos()
-                    text = "MCP servers"
-                    if rows:
-                        for row in rows:
-                            state = "connected" if row.name in self._mcp_attached else "available"
-                            text += (
-                                f"\n\n  {row.name}  [{state}]\n"
-                                f"    {row.transport} · {row.target}\n    {row.source}"
-                            )
-                    else:
-                        text += "\n\n  None configured"
-                    text += "\n\nAdd with: /mcp add stdio NAME COMMAND…\n          /mcp add http NAME URL"
-                elif parts[0] == "connect" and len(parts) == 2:
-                    text = await self.connect_mcp_server(parts[1])
-                elif parts[:2] == ["add", "stdio"] and len(parts) >= 4:
-                    text = await self.add_mcp_server("stdio", parts[2], shlex.join(parts[3:]))
-                elif parts[:2] == ["add", "http"] and len(parts) == 4:
-                    text = await self.add_mcp_server("http", parts[2], parts[3])
-                else:
-                    text = (
-                        "usage: /mcp [connect NAME | add stdio NAME COMMAND… | add http NAME URL]"
-                    )
-                self.ui.render(_command_output(text))
-            except Exception as exc:  # noqa: BLE001
-                self.ui.render(HostEvent(HostEventKind.ERROR, f"MCP error: {exc}"))
-            return "handled"
-        if name == "mode":
-            mode = args.strip().lower()
-            if not mode:
-                self.ui.render(HostEvent(HostEventKind.STATUS, f"mode={agent.mode}"))
-                return "handled"
-            if mode not in {"build", "plan"}:
-                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /mode [build|plan]"))
-                return "handled"
-            agent.set_mode(mode)
-            if self.meta:
-                self.meta.mode = mode
-                self.store.save_meta(self.meta)
-            self.ui.render(HostEvent(HostEventKind.STATUS, f"mode set to {mode}"))
-            self.ui.set_status(self.status_prompt())
-            return "handled"
-        if name == "model":
-            requested = args.strip()
-            if not requested:
-                default_model = user_default_model() or "(not configured)"
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.STATUS,
-                        f"model={self.meta.model if self.meta else self.config.model} "
-                        f"global_default={default_model}",
-                    )
-                )
-                return "handled"
-            if requested == "--global" or requested.startswith("--global "):
-                global_model = requested.removeprefix("--global").strip()
-                if not global_model:
-                    self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /model --global MODEL"))
-                    return "handled"
-                await self._switch_model(global_model)
-                path = save_user_default_model(global_model)
-                self.config.model = global_model
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.STATUS,
-                        f"global default model set to {global_model} in {path}",
-                    )
-                )
-                return "handled"
-            await self._switch_model(requested)
-            return "handled"
-        if name == "reasoning":
-            requested = args.strip().lower()
-            make_global = requested == "--global" or requested.startswith("--global ")
-            if make_global:
-                requested = requested.removeprefix("--global").strip()
-            if not requested:
-                effort = self.meta.reasoning_effort if self.meta else self.config.reasoning_effort
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.STATUS,
-                        f"reasoning_effort={effort} (default lets the provider/model decide)",
-                    )
-                )
-                return "handled"
-            if requested not in REASONING_EFFORTS:
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.ERROR,
-                        "usage: /reasoning [--global] [default|none|minimal|low|medium|high|xhigh]",
-                    )
-                )
-                return "handled"
-            model = self.meta.model if self.meta else self.config.model
-            await self._switch_model(model, reasoning_effort=requested)
-            if make_global:
-                path = save_user_reasoning_effort(requested)
-                self.config.reasoning_effort = requested
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.STATUS,
-                        f"global reasoning effort set to {requested} in {path}",
-                    )
-                )
-            return "handled"
-        if name == "providers":
-            try:
-                parts = shlex.split(args)
-                if not parts:
-                    from noah_code.providers import format_providers
-
-                    text = format_providers(self.meta.model if self.meta else self.config.model)
-                elif parts[0] == "use" and len(parts) == 3:
-                    text = await self.configure_provider(parts[1], parts[2])
-                else:
-                    text = "usage: /providers [use PROVIDER MODEL]"
-                self.ui.render(_command_output(text))
-            except Exception as exc:  # noqa: BLE001
-                self.ui.render(HostEvent(HostEventKind.ERROR, f"provider error: {exc}"))
-            return "handled"
-        if name == "session":
-            current = self.meta
-            if current is None:
-                self.ui.render(_command_output("(no active session)"))
-                return "handled"
-            self.ui.render(
-                _command_output(
-                    f"id={current.session_id}\ntitle={current.title}\n"
-                    f"mode={agent.mode}\nmodel={current.model}\n"
-                    f"reasoning_effort={current.reasoning_effort}\n"
-                    f"workspace={current.workspace_path}"
-                    + (f"\nworktree={current.worktree_name}" if current.worktree_name else "")
-                )
-            )
-            return "handled"
-        if name == "sessions":
-            if args.strip():
-                sid = args.strip().split()[0]
-                try:
-                    await self.switch_session(sid)
-                    self.ui.render(HostEvent(HostEventKind.STATUS, f"switched to session {sid}"))
-                except Exception as exc:  # noqa: BLE001
-                    self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-                return "handled"
-            rows = self.store.list_sessions(self.workspace)
-            text = (
-                "\n".join(
-                    f"{s.session_id}  {s.mode:5}  {s.title}"
-                    + (f"  {s.worktree_name}" if s.worktree_name else "")
-                    + ("  ← current" if self.meta and s.session_id == self.meta.session_id else "")
-                    for s in rows
-                )
-                or "(none)"
-            )
-            text += "\n\nSwitch with: /sessions SESSION_ID"
-            self.ui.render(_command_output(text))
-            return "handled"
-        if name == "todos":
-            self.ui.render(_command_output(agent.todos.status() or "(no todos)"))
-            return "handled"
-        if name == "agents":
-            listing = (
-                agent.task.list() if getattr(agent, "task", None) is not None else "(no agents)"
-            )
-            self.ui.render(_command_output(listing))
-            return "handled"
-        if name == "tasks":
-            parts = args.strip().split(maxsplit=2)
-            tasks = getattr(agent, "task", None)
-            try:
-                if tasks is None:
-                    text = "(no child tasks)"
-                elif not parts or len(parts) == 1:
-                    text = tasks.status(parts[0] if parts else "")
-                elif parts[0] == "cancel" and len(parts) == 2:
-                    text = await tasks.cancel(parts[1])
-                elif parts[0] == "follow" and len(parts) == 3:
-                    if self._turn_running():
-                        raise RuntimeError("wait for the current turn before following up with a child")
-                    self._active_turn = asyncio.current_task()
-                    self.ui.set_busy(True)
-                    agent.journal.begin_turn()
-                    try:
-                        text = await tasks.follow_up(parts[1], parts[2])
-                    finally:
-                        agent.journal.end_turn()
-                        try:
-                            await self._persist_async()
-                        finally:
-                            self._active_turn = None
-                            self.ui.set_busy(False)
-                else:
-                    text = "usage: /tasks [ID | cancel ID | follow ID PROMPT]"
-                self.ui.render(_command_output(text))
-            except Exception as exc:
-                self.ui.render(HostEvent(HostEventKind.ERROR, safe_error_message(exc)))
-            return "handled"
-        if name == "work":
-            self.ui.render(_command_output(self.work_status_text()))
-            return "handled"
-        if name == "queue":
-            if args.strip() == "discard":
-                self.discard_queued_input()
-            elif args.strip() == "resume":
-                self.resume_queued_input()
-                if not self._turn_running() and self.steer_queue.items():
-                    self.ui.set_busy(True)
-                    self._active_turn = asyncio.current_task()
-                    try:
-                        await self._run_user_turn(self.steer_queue.items()[0].text, queued=True)
-                    finally:
-                        self._active_turn = None
-                        self.ui.set_busy(False)
-                        self.ui.set_status(self.status_prompt())
-                    return "continue"
-            queued = self.steer_queue.items()
-            attached = self.pending_attach_paths()
-            state = "paused" if self.queue_paused else "waiting"
-            lines = [f"Queued prompts: {len(queued)} · {state}", f"Pending attachments: {len(attached)}"]
-            for index, item in enumerate(queued, start=1):
-                preview = " ".join(item.text.split())[:80]
-                suffix = f" · {len(item.attach_paths)} file(s)" if item.attach_paths else ""
-                lines.append(f"  {index}. {preview}{suffix}")
-            for index, path in enumerate(attached, start=1):
-                lines.append(f"  A{index}. {path}")
-            self.ui.render(_command_output("\n".join(lines)))
-            return "handled"
-        if name == "terminals":
-            self.ui.render(_command_output(await agent.processes.terminal_status()))
-            return "handled"
-        if name == "attach":
-            from noah_code.composer import validate_attachment
-
-            raw = args.strip().strip("\"'")
-            if not raw:
-                self.ui.render(HostEvent(HostEventKind.ERROR, "usage: /attach PATH"))
-                return "handled"
-            try:
-                path = validate_attachment(
-                    raw,
-                    self.workspace.root,
-                    engine=self.agent.engine,
-                    max_file_bytes=self.config.max_file_bytes,
-                )
-            except (PermissionError, ValueError) as exc:
-                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-                return "handled"
-            self.ui.set_busy(True)
-            self._active_turn = asyncio.current_task()
-            try:
-                await self._run_user_turn("Please inspect the attached file.", attach_paths=[path])
-            finally:
-                self._active_turn = None
-                self.ui.set_busy(False)
-                self.ui.set_status(self.status_prompt())
-            return "continue"
-        if name == "status":
-            reversible = agent.journal.last_turn_reversible() if agent.journal.can_undo() else True
-            warn = ""
-            if agent.journal.can_undo() and not reversible:
-                warn = " last_turn=NOT_FULLY_REVERSIBLE(shell)"
-            elif self._last_turn_shell_bypass:
-                warn = " last_turn=shell_bypass"
-            self.ui.render(
-                HostEvent(
-                    HostEventKind.STATUS,
-                    f"mode={agent.mode} model={self.meta.model if self.meta else '?'} "
-                    f"reasoning={self.meta.reasoning_effort if self.meta else '?'} "
-                    f"session={self.meta.session_id if self.meta else '?'} "
-                    f"title={self.meta.title if self.meta else '?'} "
-                    f"undo={'yes' if agent.journal.can_undo() else 'no'} "
-                    f"reversible={reversible}{warn}",
-                )
-            )
-            return "handled"
-        if name == "context":
-            self.ui.render(_command_output(self.context_status_text()))
-            return "handled"
-        if name == "timeline":
-            self.ui.render(
-                HostEvent(
-                    HostEventKind.STATUS,
-                    "Open the task timeline with F2 in the TUI",
-                )
-            )
-            return "handled"
-        if name == "health":
-            health = self._runtime.health() if self._runtime is not None else {}
-            rows = ["Durable runtime health"]
-            rows.extend(f"  {key}  {value}" for key, value in health.items())
-            self.ui.render(_command_output("\n".join(rows)))
-            return "handled"
-        if name == "tokens":
-            self.ui.render(_command_output(self.usage_snapshot().format()))
-            evicted = nooa_compat.evicted_output_chars(self.agent)
-            if evicted:
-                self.ui.render(
-                    _command_output(f"  compaction savings {evicted:,} chars (pointer eviction)")
-                )
-            return "handled"
-        if name == "efficiency":
-            profile = args.strip().lower()
-            if not profile:
-                profile = self.config.efficiency.profile
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.STATUS,
-                        f"efficiency={profile} strategy={self.config.efficiency.strategy}",
-                    )
-                )
-                return "handled"
-            try:
-                agent.set_efficiency_profile(profile)
-            except ValueError as exc:
-                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-            else:
-                self.config.efficiency.profile = profile  # type: ignore[assignment]
-                self.ui.render(HostEvent(HostEventKind.STATUS, f"efficiency set to {profile}"))
-            return "handled"
-        if name == "diff":
-            try:
-                review = await self.diff_review()
-                if review.files:
-                    lines = [
-                        f"Changes · {len(review.files)} views · select a file to load its patch"
-                    ]
-                    lines.extend(
-                        f"  {item.scope[0].upper()} {item.path} · {item.status}"
-                        for item in review.files
-                    )
-                    text = "\n".join(lines)
-                else:
-                    text = "No staged or unstaged changes"
-            except Exception as exc:  # noqa: BLE001
-                self.ui.render(HostEvent(HostEventKind.ERROR, f"diff failed: {exc}"))
-                return "handled"
-            self.ui.render(HostEvent(HostEventKind.DIFF_REVIEW, text, meta={"review": review}))
-            return "handled"
-        if name == "undo":
-            try:
-                self.ui.render(HostEvent(HostEventKind.STATUS, await self.undo_last_turn_async()))
-            except Exception as exc:  # noqa: BLE001
-                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-            return "handled"
-        if name == "redo":
-            try:
-                redone = await asyncio.to_thread(agent.journal.redo)
-                await self._persist_async()
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.STATUS,
-                        f"redid turn {redone.turn_id[:8]} ({len(redone.mutations)} files)",
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.ui.render(HostEvent(HostEventKind.ERROR, str(exc)))
-            return "handled"
-        if name == "trace":
-            self.ui.render(HostEvent(HostEventKind.STATUS, f"trace: {self._trace_info}"))
-            return "handled"
-        if name == "checkpoints":
-            manager = getattr(self, "_checkpoints", None)
-            if manager is None:
-                self.ui.render(_command_output("(no checkpoint manager for this session)"))
-                return "handled"
-            entries = await asyncio.to_thread(manager.list)
-            if not entries:
-                enabled = self.config.checkpoints.enabled
-                hint = "" if enabled else "\nEnable with [checkpoints] enabled=true"
-                self.ui.render(_command_output(f"(no checkpoints yet){hint}"))
-                return "handled"
-            rows = [
-                f"{entry['ref']}\t{entry['commit'][:12]}"
-                + (f" {entry['label']}" if entry["label"] else "")
-                for entry in entries
-            ]
-            text = "\n".join(rows) + "\n\nRestore with: noah checkpoints restore REF"
-            self.ui.render(_command_output(text))
-            return "handled"
-        if name == "compact":
-            try:
-                compacted = await agent.compact_history()
-            except Exception as exc:  # noqa: BLE001
-                self.ui.render(HostEvent(HostEventKind.ERROR, f"compact failed: {exc}"))
-                return "handled"
-            status = "history compacted" if compacted else "nothing eligible to compact"
-            self.ui.render(HostEvent(HostEventKind.STATUS, status))
-            return "handled"
-        if name == "continue":
-            latest = self.store.latest_for_workspace(self.workspace)
-            if latest is None:
-                self.ui.render(
-                    HostEvent(HostEventKind.ERROR, "no prior session for this workspace")
-                )
-                return "handled"
-            if self.meta and latest.session_id == self.meta.session_id:
-                self.ui.render(HostEvent(HostEventKind.STATUS, "already on the latest session"))
-                return "handled"
-            await self.switch_session(latest.session_id)
-            self.ui.render(
-                HostEvent(HostEventKind.STATUS, f"continued session {latest.session_id}")
-            )
-            return "handled"
-        self.ui.render(HostEvent(HostEventKind.ERROR, f"unknown command /{name} - try /help"))
-        return "handled"
-
-    async def _run_custom_command(
-        self, name: str, args: str
-    ) -> Literal["continue", "exit", "handled"]:
-        cmd = self._custom_commands[name]
-        rendered = cmd.render(args)
-        if not rendered:
-            self.ui.render(
-                HostEvent(HostEventKind.ERROR, f"custom command /{name} produced empty body")
-            )
-            return "handled"
-        prior_mode = self.agent.mode
-        prior_model = self.meta.model if self.meta else self.config.model
-        project_source = cmd.source.startswith("project:")
-        target_mode: Literal["build", "plan"] | None = None
-        if cmd.mode in {"build", "plan"}:
-            if project_source and cmd.mode == "build" and prior_mode == "plan":
-                self.ui.render(
-                    HostEvent(
-                        HostEventKind.STATUS,
-                        f"project command /{name} cannot leave plan mode; staying in plan",
-                    )
-                )
-            else:
-                target_mode = cmd.mode  # type: ignore[assignment]
-        target_model = None if project_source else cmd.model
-        mode_changed = False
-        model_changed = False
-        if target_mode is not None and target_mode != prior_mode:
-            self.agent.set_mode(target_mode)
-            mode_changed = True
-            if self.meta:
-                self.meta.mode = target_mode
-                self.store.save_meta(self.meta)
-        if target_model and target_model != prior_model:
-            try:
-                await self._switch_model(target_model)
-                model_changed = True
-            except Exception as exc:  # noqa: BLE001
-                self.ui.render(HostEvent(HostEventKind.ERROR, f"model switch failed: {exc}"))
-        self.ui.render(HostEvent(HostEventKind.STATUS, f"running /{name} ({cmd.source})"))
-        self.ui.set_busy(True)
-        self._active_turn = asyncio.current_task()
-        try:
-            await self._run_user_turn(rendered)
-        finally:
-            if mode_changed and self._agent is not None:
-                with contextlib.suppress(Exception):
-                    self.agent.set_mode(prior_mode)
-                if self.meta:
-                    self.meta.mode = prior_mode
-                    with contextlib.suppress(Exception):
-                        self.store.save_meta(self.meta)
-            if model_changed and self._agent is not None:
-                with contextlib.suppress(Exception):
-                    await self._switch_model(prior_model)
-            self._active_turn = None
-            self.ui.set_busy(False)
-            self.ui.set_status(self.status_prompt())
-        return "continue"
 
     def _record_retry(self, payload: dict[str, Any]) -> None:
         """Emit retry telemetry to the runtime when it exists."""
@@ -2632,16 +1819,19 @@ class AgentHost:
         llm = self._apply_runtime_llm_wrappers(
             self._wrap_resilient(llm, self.config.reliability.retries, fallback_clients)
         )
+        previous_llm = self.agent._llm
         self.agent.set_main_llm(
             llm,
             lightweight_follows_main=not bool(self.config.lightweight_model),
         )
+        if previous_llm is not llm:
+            await _aclose_llm_chain(previous_llm)
         self._telemetry.model = model
         if self.meta:
             self.meta.model = model
             self.meta.reasoning_effort = effort
             self.agent.v.model = _clean_control_chars(model)
-            self.store.save_meta(self.meta)
+            await asyncio.to_thread(self.store.save_meta, self.meta)
         self.ui.render(
             HostEvent(HostEventKind.STATUS, f"model set to {model} · reasoning={effort}")
         )
@@ -2671,7 +1861,7 @@ class AgentHost:
         nooa_compat.queue_user_message(agent, expanded.text)
 
     def _apply_next_steer(self, agent: Any) -> bool:
-        """Pop until one follow-up is queued. Returns False when the queue is empty."""
+        """Synchronously pop and apply the next non-interactive follow-up item."""
 
         if self.queue_paused:
             return False
@@ -2710,7 +1900,9 @@ class AgentHost:
                     HostEvent(HostEventKind.STATUS, "steer dropped · skill activation failed")
                 )
                 continue
-            expanded = self._expand_user_text(skill_prompt, list(item.attach_paths))
+            expanded = await asyncio.to_thread(
+                self._expand_user_text, skill_prompt, list(item.attach_paths)
+            )
             check_item = SteerItem(skill_prompt, item.attach_paths, item.sequence)
             if expansion_failed(check_item, expanded):
                 if self._runtime is not None and item.sequence is not None:
@@ -2725,15 +1917,22 @@ class AgentHost:
             self.ui.set_status(self.status_prompt())
             return True
 
-    async def _wait_for_wake(self, agent: Any, *, latched: bool = False) -> bool:
-        """Bounded poll for a background-job terminal wake.
+    @staticmethod
+    def _agent_has_running_background_work(agent: Any) -> bool:
+        if agent.processes.has_running():
+            return True
+        task_tools = getattr(agent, "task", None)
+        if task_tools is not None:
+            has_running = getattr(task_tools, "has_running", None)
+            if callable(has_running):
+                return bool(has_running())
+            jobs = getattr(task_tools, "_jobs", None)
+            if isinstance(jobs, dict):
+                return any(not job.done() for job in jobs.values())
+        return False
 
-        Wake events are consumed here so a completed job cannot spuriously
-        wake a later WAIT. ``latched`` preserves an event that arrived before
-        the caller's initial ``clear()`` when no jobs remain. Returns False
-        when nothing is running and no wake ever arrived, so the caller fails
-        the run instead of hanging the turn until Ctrl-C.
-        """
+    async def _wait_for_wake(self, agent: Any, *, latched: bool = False) -> bool:
+        """Bounded poll for a background-job or background-subagent terminal wake."""
 
         while True:
             timeout = self._wake_timeout_seconds
@@ -2742,7 +1941,7 @@ class AgentHost:
                 remaining = self._budget_guard.remaining_seconds()
                 if remaining is not None:
                     timeout = min(timeout, remaining)
-            if not agent.processes.has_running():
+            if not self._agent_has_running_background_work(agent):
                 if latched or self._wake_event.is_set():
                     self._wake_event.clear()
                     return True
@@ -2782,18 +1981,16 @@ class AgentHost:
                     f"{self.config.reliability.session_max_bytes:,} bytes); "
                     "archive or delete old sessions before continuing"
                 )
-        # git status + instruction-file reads are subprocess/file work; keep
-        # them off the UI event loop. Do this before recording the run: a
-        # failure here has not delivered the request or performed effects and
-        # therefore must not create a phantom interrupted run.
         await asyncio.to_thread(agent.refresh_context_sources)
         agent.inject_status_snapshot()
         background_origin = self._background_task_origin(agent)
         if runtime is not None:
             if run_id is None:
-                run_id = runtime.begin_run(text)
+                run_id = await asyncio.to_thread(runtime.begin_run, text)
             else:
-                runtime.transition_run(run_id, "recovering" if recovery else "running")
+                await asyncio.to_thread(
+                    runtime.transition_run, run_id, "recovering" if recovery else "running"
+                )
         self._current_run_id = run_id
         agent._current_run_id = run_id
         turn_observation = self._telemetry.start_turn(
@@ -2807,7 +2004,7 @@ class AgentHost:
         run_state: Any = "running"
         telemetry_error_type = ""
         turn_result = HostResult(
-            exit_code=0, session_id=self.meta.session_id if self.meta else None, run_id=run_id,
+            exit_code=0, session_id=self.meta.session_id if self.meta else None, run_id=run_id
         )
         self._budget_guard.resume()
         try:
@@ -2828,7 +2025,8 @@ class AgentHost:
                     explanation = "No waiting prompt could be expanded"
                     return turn_result
             else:
-                self._deliver_expanded(agent, self._expand_user_text(text, attach_paths))
+                expanded = await asyncio.to_thread(self._expand_user_text, text, attach_paths)
+                self._deliver_expanded(agent, expanded)
 
             if not recovery and self.meta and self.meta.title == "untitled":
                 if self.config.efficiency.deterministic_titles:
@@ -2842,6 +2040,8 @@ class AgentHost:
                     notification: dict[str, list] = {}
                     for name, item in wins:
                         notification.setdefault(name, []).append(item)
+                    if agent.mode == "build" and self._lease_shared:
+                        await self._ensure_mode_lease("build")
                     from noah_code.model_streaming import model_stream
 
                     self._last_agent_message = ""
@@ -2868,7 +2068,8 @@ class AgentHost:
                         exit_code = 0
                         run_state = "waiting_user"
                         if runtime is not None and run_id is not None:
-                            runtime.transition_run(
+                            await asyncio.to_thread(
+                                runtime.transition_run,
                                 run_id,
                                 "waiting_user",
                                 wake_kind="user",
@@ -2877,14 +2078,12 @@ class AgentHost:
                     elif stop_kind == "WAIT":
                         if await self._apply_next_steer_async(agent):
                             continue
-                        # Snapshot before clearing: a terminal emit that
-                        # fired between the agent returning WAIT and this
-                        # branch is a normal wake, not a spurious failure.
                         latched = self._wake_event.is_set()
                         self._wake_event.clear()
                         run_state = "waiting_process"
                         if runtime is not None and run_id is not None:
-                            runtime.transition_run(
+                            await asyncio.to_thread(
+                                runtime.transition_run,
                                 run_id,
                                 "waiting_process",
                                 wake_kind="process",
@@ -2896,20 +2095,22 @@ class AgentHost:
                             run_state = "failed"
                             explanation = (
                                 "Agent returned WAIT without a running background job; "
-                                "start one with self.processes.start() or finish with DONE."
+                                "start one with self.processes.start() or self.task.start(), "
+                                "or finish with DONE."
                             )
                             self.ui.render(HostEvent(HostEventKind.ERROR, explanation))
                             break
                         run_state = "running"
                         if runtime is not None and run_id is not None:
-                            runtime.transition_run(run_id, "running")
+                            await asyncio.to_thread(runtime.transition_run, run_id, "running")
                         if await self._apply_next_steer_async(agent):
                             continue
                         agent.inject_status_snapshot(force=True)
                         nooa_compat.queue_system_message(
                             agent,
-                            "A background process changed state. Inspect self.processes.status() "
-                            "and consume any relevant logs, then continue the task.",
+                            "Background work changed state. Inspect self.processes.status() "
+                            "or self.task.status() and consume any relevant logs/results, "
+                            "then continue the task.",
                         )
                         continue
                     elif stop_kind == "DONE":
@@ -2946,7 +2147,7 @@ class AgentHost:
                 if await self._apply_next_steer_async(agent):
                     run_state = "running"
                     if runtime is not None and run_id is not None:
-                        runtime.transition_run(run_id, "running")
+                        await asyncio.to_thread(runtime.transition_run, run_id, "running")
                     continue
                 if run_state != "waiting_user" and exit_code != 0:
                     run_state = "failed"
@@ -2962,25 +2163,31 @@ class AgentHost:
                         HostEvent(
                             HostEventKind.STATUS,
                             "warning: this turn ran mutating shell commands; "
-                            "file-journal undo may be incomplete",
+                            "file-journal undo may be incomplete (use /undo --checkpoint)",
                         )
                     )
                 if exit_code == 130:
-                    # Keep cancellation propagation reliable even if storage is
-                    # already unavailable during process teardown.
                     with contextlib.suppress(Exception):
                         self._persist()
                 else:
                     await self._persist_async()
                     label = " ".join(text.split())[:80] or "turn"
-                    await self._capture_checkpoint(label)
+                    turn_mutated = bool(latest and (latest.mutations or latest.shell_may_bypass))
+                    self._skip_unchanged_checkpoint = (
+                        not turn_mutated and self.last_checkpoint is not None
+                    )
+                    try:
+                        await self._capture_checkpoint(label)
+                    finally:
+                        self._skip_unchanged_checkpoint = False
                     if exit_code == 0 and run_state == "completed":
                         self._track_background_task(
                             self._maybe_remember(text, background_origin),
                             name="noah-memory",
                         )
                 if runtime is not None and run_id is not None:
-                    runtime.transition_run(
+                    await asyncio.to_thread(
+                        runtime.transition_run,
                         run_id,
                         run_state,
                         wake_kind="user" if run_state == "waiting_user" else "",
@@ -3011,9 +2218,13 @@ class AgentHost:
                 turn_result.exit_code = exit_code or (1 if outcome == "failed" else 0)
                 turn_result.explanation = explanation
                 turn_result.status = (
-                    "needs_input" if outcome == "waiting_user" else
-                    "completed" if outcome == "completed" else
-                    "cancelled" if outcome == "cancelled" else "failed"
+                    "needs_input"
+                    if outcome == "waiting_user"
+                    else "completed"
+                    if outcome == "completed"
+                    else "cancelled"
+                    if outcome == "cancelled"
+                    else "failed"
                 )
                 turn_result.usage = self.usage_snapshot().to_dict()
                 self.last_result = turn_result
@@ -3059,8 +2270,6 @@ class AgentHost:
         return task
 
     def _start_title_task(self, text: str, origin: _BackgroundTaskOrigin) -> None:
-        # Only the first turn should name an untitled session. Serializing title
-        # generation avoids a later turn racing and overwriting the first title.
         if self._title_task is not None and not self._title_task.done():
             return
         task = self._track_background_task(
@@ -3103,7 +2312,7 @@ class AgentHost:
         if not self._origin_is_current(origin):
             return
         title = (title or "").strip().strip('"')[:60]
-        self._set_session_title(title)
+        await asyncio.to_thread(self._set_session_title, title)
 
     @staticmethod
     def _can_distill_memories(agent: Any) -> bool:
@@ -3137,17 +2346,19 @@ class AgentHost:
         except Exception:  # noqa: BLE001 - never fail the main task
             logger.debug("memory distillation failed", exc_info=True)
             return
-        # This check must precede absorb_memories(), which writes project notes.
         if not self._origin_is_current(origin):
             return
         try:
-            added = origin.agent.absorb_memories(raw or "")
+            added = await asyncio.to_thread(origin.agent.absorb_memories, raw or "")
         except Exception:  # noqa: BLE001 - never fail the main task
             logger.debug("memory absorption failed", exc_info=True)
             return
         if not added:
             return
-        origin.agent.refresh_context_sources()
+        # Defer context refresh if another turn is already running so we never
+        # mutate the system prompt prefix mid-generation.
+        if not self._turn_running() and self._origin_is_current(origin):
+            await asyncio.to_thread(origin.agent.refresh_context_sources)
         self.ui.render(
             HostEvent(
                 HostEventKind.STATUS,
@@ -3159,7 +2370,6 @@ class AgentHost:
         selected = _clean_control_chars(title).strip('"')[:60]
         if selected and self.meta:
             self.meta.title = selected
-            self.agent.v.title = selected
             self.store.save_meta(self.meta)
 
     async def resume_interrupted_run(self) -> HostResult | None:
@@ -3179,18 +2389,19 @@ class AgentHost:
                 f"resuming interrupted run {record.run_id[:8]} · previous state={record.state}",
             )
         )
-        self.ui.set_busy(True)
-        self._active_turn = asyncio.current_task()
-        try:
-            return await self._run_user_turn(
-                record.user_text,
-                run_id=record.run_id,
-                recovery=True,
-            )
-        finally:
-            self._active_turn = None
-            self.ui.set_busy(False)
-            self.ui.set_status(self.status_prompt())
+        async with self._session_lock:
+            self.ui.set_busy(True)
+            self._active_turn = asyncio.current_task()
+            try:
+                return await self._run_user_turn(
+                    record.user_text,
+                    run_id=record.run_id,
+                    recovery=True,
+                )
+            finally:
+                self._active_turn = None
+                self.ui.set_busy(False)
+                self.ui.set_status(self.status_prompt())
 
     async def run_interactive(self) -> int:
         """Line-oriented console loop."""
@@ -3235,7 +2446,10 @@ class AgentHost:
             await self.close()
 
     async def run_tui(
-        self, *, onboarding_required: bool = False, permission_setup_required: bool = False,
+        self,
+        *,
+        onboarding_required: bool = False,
+        permission_setup_required: bool = False,
     ) -> int:
         """Full-screen Textual UI. App owns input; host owns turns."""
         try:
@@ -3246,7 +2460,9 @@ class AgentHost:
         ui = TextualUI()
         self.ui = ui
         app = NoahCodeApp(
-            self, ui, onboarding_required=onboarding_required,
+            self,
+            ui,
+            onboarding_required=onboarding_required,
             permission_setup_required=permission_setup_required,
         )
         try:
@@ -3277,15 +2493,27 @@ class AgentHost:
                 self.agent.approvals.set_handler(_reject)
 
             await self.resume_interrupted_run()
-            continuable = self._runtime.latest_incomplete_run() if self._runtime else None
-            run_id = continuable.run_id if continuable and continuable.state == "waiting_user" else None
-            result = await self._run_user_turn(prompt, run_id=run_id)
+            continuable = (
+                await asyncio.to_thread(self._runtime.latest_incomplete_run)
+                if self._runtime
+                else None
+            )
+            run_id = (
+                continuable.run_id
+                if continuable and continuable.state == "waiting_user"
+                else None
+            )
+            async with self._session_lock:
+                self._active_turn = asyncio.current_task()
+                try:
+                    result = await self._run_user_turn(prompt, run_id=run_id)
+                finally:
+                    self._active_turn = None
             return result
         finally:
             try:
                 await self.close()
             finally:
-                # Teardown may terminate a check that was still running at DONE.
                 if self.last_result is not None and ledger is not None:
                     with contextlib.suppress(Exception):
                         self.last_result.checks = await ledger.snapshot(since=0.0)

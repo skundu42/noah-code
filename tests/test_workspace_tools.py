@@ -1112,3 +1112,153 @@ async def test_grep_anchor_after_cd_edits_file_under_new_cwd(tmp_path: Path) -> 
         assert (tmp_path / "app.py").read_text() == "alpha = 999\n"
     finally:
         await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_shell_scrubs_provider_and_server_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from noah_code import credentials
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(credentials, "_HYDRATED_ENV_VARS", set())
+    credentials.store_provider_api_key("openai", "openai-secret")
+    monkeypatch.setenv("NOAH_CODE_SERVER_TOKEN", "server-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
+    monkeypatch.setenv("ORDINARY_VAR", "ordinary-value")
+
+    ws = _make_ws(tmp_path, auto=False)
+    try:
+        res = await ws.run(
+            "printf '%s|%s|%s|%s' "
+            "\"${NOAH_CODE_SERVER_TOKEN:-}\" "
+            "\"${OPENAI_API_KEY:-}\" "
+            "\"${ANTHROPIC_API_KEY:-}\" "
+            "\"${ORDINARY_VAR:-}\""
+        )
+        assert res.stdout.strip() == "|||ordinary-value"
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_default_file_mode_never_calls_os_umask_at_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = _make_ws(tmp_path, auto=True)
+    monkeypatch.setattr(
+        os,
+        "umask",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("os.umask called at runtime")),
+    )
+    try:
+        await ws.write_file("safe_create.py", "x = 1\n")
+        await ws.apply_patch([{"path": "patched_create.py", "old": None, "new": "y = 2\n"}])
+        assert (tmp_path / "safe_create.py").is_file()
+        assert (tmp_path / "patched_create.py").is_file()
+    finally:
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_run_streams_chunks_live_before_command_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nooa.tools.shell_tools import ShellResult, StreamDone, StreamEvent
+
+    ws = _make_ws(tmp_path, auto=False)
+    first_chunk_seen = asyncio.Event()
+    allow_finish = asyncio.Event()
+    chunks: list[tuple[str, str]] = []
+
+    def on_chunk(kind: str, text: str) -> None:
+        chunks.append((kind, text))
+        if kind == "stdout" and "phase-one" in text:
+            first_chunk_seen.set()
+
+    ws.set_shell_chunk_handler(on_chunk)
+    try:
+        # 1. Verify real ShellTools command streams stdout, stderr, and exit status.
+        real_res = await ws.run("sh -c 'echo live-out; echo live-err 1>&2'")
+        assert real_res.stdout == "live-out"
+        assert real_res.stderr == "live-err"
+        assert ("stdout", "live-out\n") in chunks or any(
+            k == "stdout" and "live-out" in t for k, t in chunks
+        )
+        assert any(k == "stderr" and "live-err" in t for k, t in chunks)
+
+        # 2. Verify chunks are forwarded immediately before StreamDone arrives.
+        chunks.clear()
+
+        async def gated_stream(_command: str, *, timeout: float | None = None):
+            _ = timeout
+            yield StreamEvent(kind="stdout", text="phase-one\n")
+            await asyncio.wait_for(allow_finish.wait(), timeout=2.0)
+            yield StreamEvent(kind="stderr", text="warn-two\n")
+            yield StreamDone(kind="done", returncode=0, timed_out=False)
+
+        monkeypatch.setattr(ws._shell, "run_stream", gated_stream)
+        run_task = asyncio.create_task(ws.run("echo gated"))
+        await asyncio.wait_for(first_chunk_seen.wait(), timeout=2.0)
+        assert not run_task.done()
+        allow_finish.set()
+        streamed_res = await run_task
+        assert streamed_res.stdout == "phase-one"
+        assert streamed_res.stderr == "warn-two"
+        assert streamed_res.returncode == 0
+
+        # 3. Verify stdin!=None falls back cleanly to shell.run.
+        fallback_calls: list[tuple[str, str | None]] = []
+
+        async def fake_run(cmd: str, *, stdin: str | None = None, timeout: float | None = None):
+            _ = timeout
+            fallback_calls.append((cmd, stdin))
+            return ShellResult(stdout="from-stdin", stderr="", returncode=0)
+
+        monkeypatch.setattr(ws._shell, "run", fake_run)
+        stdin_res = await ws.run("cat", stdin="payload")
+        assert stdin_res.stdout == "from-stdin"
+        assert fallback_calls == [("cat", "payload")]
+    finally:
+        allow_finish.set()
+        await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_clean_verification_command_preserves_undo_and_read_anchors(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    other = tmp_path / "other.py"
+    target.write_text("value = 1\n")
+    other.write_text("keep = 1\n")
+    check_script = tmp_path / "pytest"
+    check_script.write_text("#!/bin/sh\nmkdir -p .pytest_cache\ntouch .pytest_cache/state\nexit 0\n")
+    check_script.chmod(0o700)
+
+    ws = _make_ws(tmp_path, auto=False)
+    try:
+        anchor = await ws.read("other.py")
+        await ws.edit("app.py", "value = 1", "value = 2")
+        res = await ws.run(shlex.quote(str(check_script)))
+        assert res.returncode == 0
+        assert ws._journal._current is not None
+        assert ws._journal._current.shell_may_bypass is False
+        assert str(other.resolve()) in ws._read_fingerprints
+        await ws.replace(anchor, "keep = 2\n")
+
+        ws._journal.end_turn()
+        assert ws._journal.last_turn_reversible() is True
+        ws._journal.undo()
+        assert target.read_text() == "value = 1\n"
+        assert other.read_text() == "keep = 1\n"
+
+        # A verification command that actually mutates workspace files DOES mark bypass.
+        ws._journal.begin_turn()
+        await ws.edit("app.py", "value = 1", "value = 3")
+        mutating_pytest = tmp_path / "pytest"
+        mutating_pytest.write_text("#!/bin/sh\necho side-effect > mutated.txt\nexit 0\n")
+        mutating_pytest.chmod(0o700)
+        await ws.run(shlex.quote(str(mutating_pytest)))
+        assert ws._journal._current is not None
+        assert ws._journal._current.shell_may_bypass is True
+    finally:
+        await ws.close()

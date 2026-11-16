@@ -20,6 +20,7 @@ from noah_code.config import load_config
 from noah_code.host import AgentHost
 from noah_code.summarization import (
     EVICT_FLOOR_CHARS,
+    UNSPILLED_EVICT_FLOOR_CHARS,
     CodingSessionSummarizer,
     evict_spilled_outputs,
 )
@@ -185,6 +186,33 @@ def test_stub_mentions_recall_command() -> None:
     text = _stub("tool", "a" * 20, 54321)
     assert "a" * 20 in text
     assert "read_output" in text
+
+
+def test_evict_spills_oversized_unspilled_python_outputs_when_opted_in(
+    output_store: ToolOutputStore,
+) -> None:
+    manager = EventManager()
+    big_unspilled = "unspilled line of test output\n" * 350
+    assert len(big_unspilled) > UNSPILLED_EVICT_FLOOR_CHARS
+    manager.add(_python_output(big_unspilled))
+    manager.add(Feedback(content="y" * (UNSPILLED_EVICT_FLOOR_CHARS + 500)))
+
+    # Default call still requires a spill marker.
+    assert evict_spilled_outputs(manager, "1", "2", output_store) == 0
+
+    saved = evict_spilled_outputs(
+        manager,
+        "1",
+        "2",
+        output_store,
+        store_unspilled_over_chars=UNSPILLED_EVICT_FLOOR_CHARS,
+    )
+    assert saved > 0
+    stub = manager.get("1").stdout
+    assert len(stub) < 300
+    assert _recalled(stub, output_store) == big_unspilled
+    # Non-PythonOutput events without a spill marker remain untouched for prose summarization.
+    assert len(manager.get("2").content) > UNSPILLED_EVICT_FLOOR_CHARS
 
 
 @pytest.mark.asyncio

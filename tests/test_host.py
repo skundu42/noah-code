@@ -2349,3 +2349,84 @@ def test_context_snapshot_reports_instructions_notes_and_attachments(tmp_path: P
     assert ("plan", ".noah-code/plan.md") in labels
     assert ("memory", ".noah-code/memory.md") in labels
     assert ("attachment", "trace.log") in labels
+
+
+@pytest.mark.asyncio
+async def test_wait_for_wake_wakes_on_subagent_lifecycle(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(workspace.root, cli_overrides={"session_dir": str(tmp_path / "sessions")})
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    try:
+        running = {"active": True}
+        fake_agent = SimpleNamespace(
+            processes=SimpleNamespace(has_running=lambda: False),
+            task=SimpleNamespace(has_running=lambda: running["active"]),
+        )
+        wait_task = asyncio.create_task(host._wait_for_wake(fake_agent))
+        await asyncio.sleep(0.02)
+        assert not wait_task.done()
+        running["active"] = False
+        host._on_subagent_lifecycle(
+            {"agent": "explore", "state": "completed", "prompt": "finished refactor", "duration": 0.2}
+        )
+        woke = await asyncio.wait_for(wait_task, timeout=2.0)
+        assert woke is True
+    finally:
+        await host.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_checkpoint_restores_after_shell_bypass(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    config = load_config(
+        repo,
+        cli_overrides={"session_dir": str(tmp_path / "sessions"), "auto_approve": True},
+    )
+    host = AgentHost(Workspace(root=repo), config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+    try:
+        assert host._checkpoints is not None
+        snap_ref = host._checkpoints.capture(label="turn-start")
+        assert snap_ref is not None
+        host.agent.journal.begin_turn()
+        (repo / "README.md").write_text("mutated by shell\n")
+        host.agent.journal.mark_shell_bypass()
+        host.agent.journal.end_turn()
+
+        blocked = await host.handle_line("/undo")
+        assert blocked == "handled"
+        assert "--checkpoint" in host.ui.render.call_args.args[0].text
+        assert (repo / "README.md").read_text() == "mutated by shell\n"
+
+        restored = await host.handle_line("/undo --checkpoint")
+        assert restored == "handled"
+        assert (repo / "README.md").read_text() == "hello\n"
+    finally:
+        await host.close()
+
+
+@pytest.mark.asyncio
+async def test_attach_context_path_and_session_lock_guard(tmp_path: Path) -> None:
+    workspace = Workspace(root=tmp_path.resolve())
+    config = load_config(workspace.root, cli_overrides={"session_dir": str(tmp_path / "sessions")})
+    host = AgentHost(workspace, config, llm=FakeLLMClient())
+    await host.start()
+    host.ui.render = MagicMock()
+    try:
+        img = tmp_path / "clip.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n")
+        resolved = host.attach_context_path(img)
+        assert resolved == img.resolve()
+        assert "clip.png" in [p.name for p in host.pending_attach_paths()]
+
+        await host._session_lock.acquire()
+        try:
+            action = await host.handle_line("/compact")
+            assert action == "handled"
+            assert "blocked" in host.ui.render.call_args.args[0].text
+        finally:
+            host._session_lock.release()
+    finally:
+        await host.close()

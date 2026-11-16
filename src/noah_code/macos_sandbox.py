@@ -8,10 +8,15 @@ import ctypes.util
 import json
 import os
 import resource
+import sys
+import tempfile
 import unicodedata
 from collections.abc import Iterable
 from multiprocessing.connection import Connection
+from pathlib import Path
 from typing import Any
+
+from noah_code.credentials import auth_file_path
 
 
 class MacOSSandboxUnavailable(RuntimeError):
@@ -84,6 +89,128 @@ def build_macos_profile(read_paths: Iterable[str]) -> str:
 (allow mach-lookup)
 (allow ipc-posix-shm)
 (allow signal (target self))
+"""
+
+
+def _expand_path_variants(path: str | Path, *, require_exists: bool = False) -> set[str]:
+    raw = os.fspath(path)
+    if not raw:
+        return set()
+    absolute = os.path.abspath(os.path.expanduser(raw))
+    resolved = os.path.realpath(absolute)
+    if require_exists and not os.path.exists(resolved):
+        return set()
+    variants: set[str] = set()
+    for candidate in (absolute, resolved):
+        variants.update(
+            {
+                candidate,
+                unicodedata.normalize("NFC", candidate),
+                unicodedata.normalize("NFD", candidate),
+            }
+        )
+    return variants
+
+
+def build_macos_workspace_command_profile(workspace_root: Path | str) -> str:
+    """Build a Seatbelt profile for workspace shell commands.
+
+    Allows reading system/runtime paths and reading/writing ``workspace_root``
+    and ``/tmp``, while explicitly denying access to ``~/.ssh``, ``~/.aws``,
+    ``~/.gnupg``, and Noah's ``auth.json``.
+    """
+
+    write_roots: set[str] = set()
+    write_roots.update(_expand_path_variants(workspace_root, require_exists=False))
+    for tmp_candidate in ("/tmp", "/private/tmp"):
+        write_roots.update(_expand_path_variants(tmp_candidate, require_exists=False))
+    write_roots.update(_expand_path_variants(tempfile.gettempdir(), require_exists=True))
+
+    read_roots: set[str] = set(write_roots)
+    for core_system in (
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/System",
+        "/Library",
+        "/etc",
+        "/private/etc",
+        "/private/var/db/dyld",
+        "/dev",
+    ):
+        read_roots.update(_expand_path_variants(core_system, require_exists=False))
+    for optional_runtime in (
+        "/opt",
+        "/usr/local",
+        "/private/var/select",
+        sys.prefix,
+        sys.base_prefix,
+        os.path.dirname(sys.executable),
+    ):
+        read_roots.update(_expand_path_variants(optional_runtime, require_exists=True))
+
+    home = Path.home()
+    denied_subpaths: set[str] = set()
+    for secret_dir in (home / ".ssh", home / ".aws", home / ".gnupg"):
+        denied_subpaths.update(_expand_path_variants(secret_dir, require_exists=False))
+
+    denied_literals: set[str] = set()
+    for secret_file in (
+        auth_file_path(),
+        home / ".local" / "share" / "noah-code" / "auth.json",
+    ):
+        denied_literals.update(_expand_path_variants(secret_file, require_exists=False))
+
+    ancestors: set[str] = {"/"}
+    for root in (*read_roots, *denied_subpaths, *denied_literals):
+        parent = os.path.dirname(root)
+        while parent and parent not in ancestors:
+            ancestors.add(parent)
+            next_parent = os.path.dirname(parent)
+            if next_parent == parent:
+                break
+            parent = next_parent
+    ancestors.difference_update(denied_subpaths)
+    ancestors.difference_update(denied_literals)
+
+    metadata_rules = "\n".join(f"    (literal {_profile_path(path)})" for path in sorted(ancestors))
+    read_rules = "\n".join(f"    (subpath {_profile_path(path)})" for path in sorted(read_roots))
+    write_rules = "\n".join(f"    (subpath {_profile_path(path)})" for path in sorted(write_roots))
+    deny_rules = "\n".join(
+        [
+            *(f"    (subpath {_profile_path(path)})" for path in sorted(denied_subpaths)),
+            *(f"    (literal {_profile_path(path)})" for path in sorted(denied_literals)),
+        ]
+    )
+    return f"""(version 1)
+(deny default)
+(allow process-exec)
+(allow process-fork)
+(allow sysctl-read)
+(allow mach-lookup)
+(allow ipc-posix-shm)
+(allow signal (target self))
+(allow file-read-metadata
+{metadata_rules}
+{read_rules}
+    (literal \"/dev/null\"))
+(allow file-read*
+{read_rules}
+    (literal \"/dev/null\")
+    (literal \"/dev/zero\")
+    (literal \"/dev/random\")
+    (literal \"/dev/urandom\"))
+(allow file-write*
+{write_rules}
+    (literal \"/dev/null\")
+    (literal \"/dev/zero\"))
+(allow file-ioctl
+    (literal \"/dev/null\")
+    (literal \"/dev/tty\"))
+(deny file-read*
+{deny_rules})
+(deny file-write*
+{deny_rules})
 """
 
 

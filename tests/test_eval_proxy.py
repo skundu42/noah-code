@@ -110,3 +110,76 @@ def test_accepts_null_tools_and_preserves_tail_usage_over_2mb():
     record: dict[str, object] = {}
     proxy_two._capture_usage(bytes(buf), record)
     assert record["usage"] == {"cost": 0.0042, "completion_tokens": 9}
+
+
+def test_large_multi_file_body_cap_and_cli_override():
+    assert _module._MAX_BODY == 4_000_000
+    proxy = EvalProxy("selected/model", "test-secret", 1e-8, 2e-8, budget_usd=4.0)
+    large_text = "x" * 600_000  # > old 256 KB limit, < 4 MB
+    _, record = proxy.reserve(
+        {"model": "selected/model", "messages": [{"role": "user", "content": large_text}]}
+    )
+    assert record["reserved_usd"] > 0
+
+    tight = EvalProxy(
+        "selected/model",
+        "test-secret",
+        1e-8,
+        2e-8,
+        max_body_bytes=4_096,
+    )
+    with pytest.raises(ValueError, match="size limit"):
+        tight.reserve(
+            {"model": "selected/model", "messages": [{"role": "user", "content": "x" * 5_000}]}
+        )
+
+    parsed = _module.build_arg_parser().parse_args(
+        [
+            "--model",
+            "selected/model",
+            "--input-price-per-token",
+            "0.000001",
+            "--output-price-per-token",
+            "0.000002",
+            "--max-body-bytes",
+            "2000000",
+        ]
+    )
+    assert parsed.max_body_bytes == 2_000_000
+
+
+def test_reconciles_unused_reservation_on_http_200_and_keeps_worst_case_on_failures():
+    proxy = EvalProxy("selected/model", "test-secret", 1e-6, 2e-6, budget_usd=0.08)
+    proxy.begin_run("noah", budget_usd=0.06, max_requests=4)
+
+    _, first = proxy.reserve(payload())
+    initial = first["reserved_usd"]
+    assert initial > 0.03
+
+    # Without reconciliation, a second request would exceed the $0.06 per-run budget.
+    with pytest.raises(ValueError, match="per-run"):
+        proxy.reserve(payload())
+
+    # HTTP 200 with verified usage + cost refunds unused conservative delta.
+    first["usage"] = {"prompt_tokens": 500, "completion_tokens": 100, "cost": 0.001}
+    with proxy._lock:
+        proxy._reconcile_reservation(first, http_status=200)
+    assert first["reserved_usd"] == pytest.approx(0.001)
+    assert first["refunded_usd"] == pytest.approx(initial - 0.001)
+    assert proxy.summary()["reserved_usd"] == pytest.approx(0.001)
+
+    # Now subsequent multi-turn requests in the same run succeed cleanly.
+    _, second = proxy.reserve(payload())
+    second_initial = second["reserved_usd"]
+
+    # Non-200 or unknown-cost responses must retain 100% of worst-case reservation.
+    second["usage"] = {"prompt_tokens": 100, "completion_tokens": 10, "cost": 0.0002}
+    with proxy._lock:
+        proxy._reconcile_reservation(second, http_status=500)
+    assert second["reserved_usd"] == pytest.approx(second_initial)
+
+    second["usage"] = {"prompt_tokens": 100, "completion_tokens": 10}
+    with proxy._lock:
+        proxy._reconcile_reservation(second, http_status=200)
+    assert second["reserved_usd"] == pytest.approx(second_initial)
+    assert proxy.summary()["reserved_usd"] == pytest.approx(0.001 + second_initial)

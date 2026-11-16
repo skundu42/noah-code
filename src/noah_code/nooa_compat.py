@@ -17,6 +17,7 @@ from typing import Any
 
 _stream_install_lock = threading.Lock()
 _stream_observer_installed = False
+_responses_stream_observer_installed = False
 _cell_indent_installed = False
 
 
@@ -109,6 +110,59 @@ def install_completion_stream_observer(observer: Callable[[Any], Any]) -> None:
         _stream_observer_installed = True
 
 
+class _LiteLLMResponsesProxy:
+    """Forward module lookups to ``litellm`` while collecting Responses streams."""
+
+    def __init__(
+        self,
+        module: Any,
+        sync_collector: Callable[[Any], Any],
+        async_collector: Callable[[Any], Any],
+    ) -> None:
+        object.__setattr__(self, "_module", module)
+        object.__setattr__(self, "_sync_collector", sync_collector)
+        object.__setattr__(self, "_async_collector", async_collector)
+
+    def responses(self, *args: Any, **kwargs: Any) -> Any:
+        raw = self._module.responses(*args, **kwargs)
+        return self._sync_collector(raw)
+
+    async def aresponses(self, *args: Any, **kwargs: Any) -> Any:
+        raw = await self._module.aresponses(*args, **kwargs)
+        return await self._async_collector(raw)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_module"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_module"), name, value)
+
+
+def install_responses_stream_observer(
+    sync_collector: Callable[[Any], Any],
+    async_collector: Callable[[Any], Any],
+) -> None:
+    """Observe NOOA's ResponsesClient streams while preserving its response parser."""
+
+    global _responses_stream_observer_installed
+    with _stream_install_lock:
+        if _responses_stream_observer_installed:
+            return
+        if version("nooa") != "0.0.12":
+            raise RuntimeError("model streaming requires the audited nooa==0.0.12 collectors")
+        import litellm as real_litellm
+        from nooa.unifiedllm import unifiedllm
+
+        if not inspect.iscoroutinefunction(async_collector):
+            raise RuntimeError("Responses async stream collector must be a coroutine function")
+        unifiedllm.litellm = _LiteLLMResponsesProxy(
+            real_litellm,
+            sync_collector,
+            async_collector,
+        )
+        _responses_stream_observer_installed = True
+
+
 def queue_user_message(agent: Any, text: str) -> None:
     """InteractiveAgent consumes prompts through a private in-process queue."""
 
@@ -157,7 +211,10 @@ def rebind_summarizer_llms(agent: Any, llm: Any) -> None:
     """Route every summarizer's model calls to the new client when applicable."""
 
     for summarizer in summarizers(agent):
-        if hasattr(summarizer, "_llm"):
+        set_llm = getattr(summarizer, "set_llm", None)
+        if callable(set_llm):
+            set_llm(llm)
+        elif hasattr(summarizer, "_llm"):
             summarizer._llm = llm
 
 
@@ -191,6 +248,12 @@ def init_llm_wrapper(wrapper: Any, delegate: Any) -> None:
     object.__setattr__(wrapper, "reasoning_level", getattr(delegate, "reasoning_level", None))
     object.__setattr__(wrapper, "structured_output_mode", getattr(delegate, "structured_output_mode", None))
     object.__setattr__(wrapper, "media_inputs", getattr(delegate, "media_inputs", ()))
+    object.__setattr__(wrapper, "_context_window", getattr(delegate, "_context_window", None))
+    object.__setattr__(
+        wrapper,
+        "_registry_context_route",
+        getattr(delegate, "_registry_context_route", None),
+    )
     object.__setattr__(wrapper, "config", dict(getattr(delegate, "config", None) or {}))
     object.__setattr__(wrapper, "_registry_config", getattr(delegate, "_registry_config", None))
     object.__setattr__(wrapper, "cache_breakpoint", getattr(delegate, "cache_breakpoint", None))

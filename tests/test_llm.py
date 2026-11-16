@@ -7,7 +7,13 @@ import pytest
 
 from noah_code.budget import wrap_with_budget
 from noah_code.config import BudgetConfig, RetryConfig
-from noah_code.llm import ResilientLLM, get_llm_client, reasoning_overrides
+from noah_code.llm import (
+    ResilientLLM,
+    _retry_after_seconds,
+    get_llm_client,
+    is_transient_llm_error,
+    reasoning_overrides,
+)
 
 
 def test_reasoning_overrides_omits_provider_default() -> None:
@@ -176,3 +182,75 @@ def test_retried_call_counts_cost_once_for_the_successful_attempt() -> None:
     assert client.calls == 2  # one transient failure, then the successful attempt
     assert response.usage["cost_usd"] == 0.42
     assert guard.status()["cost_usd"] == 0.42  # not 0.84: the retry is not double-counted
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        TypeError("acall() got an unexpected keyword argument 'timeout'"),
+        ValueError("request timeout must be positive"),
+        KeyError("rate limit"),
+        AttributeError("object has no attribute 'timeout'"),
+    ],
+)
+def test_local_programming_errors_are_not_classified_as_transient(exc: BaseException) -> None:
+    assert is_transient_llm_error(exc) is False
+
+
+def test_http_status_code_on_value_error_is_still_honored() -> None:
+    class StatusValueError(ValueError):
+        status_code = 429
+
+    assert is_transient_llm_error(StatusValueError("rate limited")) is True
+
+
+def test_retry_after_supports_numeric_and_rfc7231_http_date_and_caps_at_request_timeout() -> None:
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+
+    now = datetime(2026, 11, 16, 12, 0, 0, tzinfo=UTC)
+    future_header = format_datetime(now + timedelta(seconds=2), usegmt=True)
+
+    date_exc = RuntimeError("429 Too Many Requests")
+    date_exc.response = SimpleNamespace(status_code=429, headers={"Retry-After": future_header})  # type: ignore[attr-defined]
+    parsed = _retry_after_seconds(date_exc, now=now)
+    assert parsed == 2.0
+
+    num_exc = RuntimeError("429 Too Many Requests")
+    num_exc.response = SimpleNamespace(status_code=429, headers={"retry-after": "1.25"})  # type: ignore[attr-defined]
+    resilient = ResilientLLM(
+        _SequenceClient(SimpleNamespace(content="ok")),
+        RetryConfig(
+            max_attempts=3,
+            base_delay_seconds=0.05,
+            max_delay_seconds=0.1,
+            jitter_ratio=0,
+            request_timeout_seconds=2.0,
+        ),
+    )
+    # Explicit Retry-After (1.25s) exceeds max_delay_seconds (0.1s) and is honored up to request_timeout_seconds (2.0s)
+    assert resilient._delay(1, num_exc) == 1.25
+
+    huge_exc = RuntimeError("429 Too Many Requests")
+    huge_exc.response = SimpleNamespace(status_code=429, headers={"Retry-After": "999"})  # type: ignore[attr-defined]
+    assert resilient._delay(1, huge_exc) == 2.0
+
+
+@pytest.mark.asyncio
+async def test_resilient_llm_aclose_closes_primary_and_fallbacks() -> None:
+    closed: list[str] = []
+
+    class ClosableClient:
+        def __init__(self, name: str) -> None:
+            self.model = name
+
+        async def aclose(self) -> None:
+            closed.append(self.model)
+
+    resilient = ResilientLLM(
+        ClosableClient("primary"),
+        _retry_config(),
+        fallbacks=[ClosableClient("fallback-1"), ClosableClient("fallback-2")],
+    )
+    await resilient.aclose()
+    assert closed == ["primary", "fallback-1", "fallback-2"]

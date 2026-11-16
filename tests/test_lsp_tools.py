@@ -260,3 +260,202 @@ async def test_close_reaps_server_that_ignores_shutdown(tmp_path: Path) -> None:
 
     assert client.process.returncode is not None
     assert int(counter.read_text()) == 1
+
+
+async def test_lsp_client_scrubs_provider_and_server_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from noah_code import credentials
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(credentials, "_HYDRATED_ENV_VARS", set())
+    credentials.store_provider_api_key("openai", "lsp-openai-secret")
+    monkeypatch.setenv("NOAH_CODE_SERVER_TOKEN", "lsp-server-secret")
+    monkeypatch.setenv("NORMAL_LSP_FLAG", "ok")
+
+    env_dump = tmp_path / "lsp-env.json"
+    probe_server = tmp_path / "probe_lsp.py"
+    probe_server.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        f"Path({str(env_dump)!r}).write_text(json.dumps({{\n"
+        "    'openai': os.environ.get('OPENAI_API_KEY'),\n"
+        "    'server': os.environ.get('NOAH_CODE_SERVER_TOKEN'),\n"
+        "    'normal': os.environ.get('NORMAL_LSP_FLAG'),\n"
+        "}))\n" + _FAKE_SERVER
+    )
+    counter = tmp_path / "count"
+    counter.write_text("0")
+    client = _LSPClient(
+        tmp_path,
+        (sys.executable, str(probe_server), str(counter)),
+        timeout=5.0,
+    )
+    try:
+        import json
+
+        await client.start()
+        captured = json.loads(env_dump.read_text())
+        assert captured == {"openai": None, "server": None, "normal": "ok"}
+    finally:
+        await client.close()
+
+
+def test_repository_map_extracts_multilanguage_declarations(tmp_path: Path) -> None:
+    (tmp_path / "service.py").write_text(
+        "class Engine(Base):\n"
+        "    def run(self, count: int, fast: bool = False) -> str:\n"
+        "        return 'ok'\n\n"
+        "def top_helper(x: int) -> int:\n"
+        "    return x\n"
+    )
+    (tmp_path / "lib.rs").write_text(
+        "pub mod wire;\n"
+        "pub(crate) struct Packet {}\n"
+        "pub(super) enum Mode { Fast }\n"
+        "pub(in crate::wire) unsafe trait Transport {}\n"
+        "pub type Alias = u32;\n"
+        "pub async unsafe fn send_packet() {}\n"
+        "default const fn size_hint() -> usize { 0 }\n"
+    )
+    (tmp_path / "server.go").write_text(
+        "package main\n"
+        "type Server struct {}\n"
+        "type Handler interface { Serve() }\n"
+        "func NewServer() *Server { return nil }\n"
+        "func (s *Server) Start() error { return nil }\n"
+        "func (Server) Health() bool { return true }\n"
+    )
+    (tmp_path / "app.ts").write_text(
+        "export interface Config { url: string }\n"
+        "export type ID = string;\n"
+        "export enum Role { Admin }\n"
+        "export const createApp = (cfg: Config): void => {};\n"
+        "export default function boot() {}\n"
+        "export class Store {\n"
+        "  async load(id: ID) {\n"
+        "    return id;\n"
+        "  }\n"
+        "}\n"
+    )
+    (tmp_path / "Worker.java").write_text(
+        "public class Worker {\n"
+        "    public List<String> processBatch(int limit) {\n"
+        "        return null;\n"
+        "    }\n"
+        "}\n"
+    )
+    (tmp_path / "engine.cpp").write_text(
+        "struct Context {};\n"
+        "static inline int compute_hash(const char *buf) {\n"
+        "    if (buf) {\n"
+        "        return 1;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n"
+        "bool Context::reset() const {\n"
+        "    return true;\n"
+        "}\n"
+    )
+    (tmp_path / "billing.rb").write_text(
+        "module Billing\n"
+        "  class Invoice\n"
+        "    def paid?\n"
+        "      true\n"
+        "    end\n"
+        "  end\n"
+        "end\n"
+    )
+
+    repo = RepositoryMap(tmp_path)
+    py_syms = {(s.kind, s.name): s.detail for s in repo.symbols_for(tmp_path / "service.py")}
+    assert ("class", "Engine") in py_syms
+    assert ("method", "Engine.run") in py_syms
+    assert "count: int" in py_syms[("method", "Engine.run")]
+    assert ("function", "top_helper") in py_syms
+
+    rs_syms = {(s.kind, s.name) for s in repo.symbols_for(tmp_path / "lib.rs")}
+    assert {
+        ("module", "wire"),
+        ("struct", "Packet"),
+        ("enum", "Mode"),
+        ("trait", "Transport"),
+        ("type", "Alias"),
+        ("function", "send_packet"),
+        ("function", "size_hint"),
+    } <= rs_syms
+
+    go_syms = {(s.kind, s.name) for s in repo.symbols_for(tmp_path / "server.go")}
+    assert {
+        ("struct", "Server"),
+        ("interface", "Handler"),
+        ("function", "NewServer"),
+        ("method", "Server.Start"),
+        ("method", "Server.Health"),
+    } <= go_syms
+
+    ts_syms = {(s.kind, s.name) for s in repo.symbols_for(tmp_path / "app.ts")}
+    assert {
+        ("interface", "Config"),
+        ("type", "ID"),
+        ("enum", "Role"),
+        ("function", "createApp"),
+        ("function", "boot"),
+        ("class", "Store"),
+        ("method", "Store.load"),
+    } <= ts_syms
+
+    java_syms = {(s.kind, s.name) for s in repo.symbols_for(tmp_path / "Worker.java")}
+    assert {("class", "Worker"), ("method", "Worker.processBatch")} <= java_syms
+
+    cpp_syms = {(s.kind, s.name) for s in repo.symbols_for(tmp_path / "engine.cpp")}
+    assert {
+        ("struct", "Context"),
+        ("function", "compute_hash"),
+        ("method", "Context.reset"),
+    } <= cpp_syms
+
+    rb_syms = {(s.kind, s.name) for s in repo.symbols_for(tmp_path / "billing.rb")}
+    assert {
+        ("module", "Billing"),
+        ("class", "Billing.Invoice"),
+        ("method", "Billing.Invoice.paid?"),
+    } <= rb_syms
+
+
+def test_repository_map_ranks_central_late_alphabet_symbols_above_unreferenced_noise(
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    # Alphabetically first file has many unreferenced helper functions.
+    (src / "a_noise.py").write_text(
+        "\n".join(f"def unused_helper_{i}():\n    return {i}\n" for i in range(40))
+    )
+    # Alphabetically last file defines core symbols referenced across multiple modules.
+    (src / "z_core.py").write_text(
+        "class ZCoreCoordinator:\n"
+        "    def dispatch(self, item: str) -> bool:\n"
+        "        return True\n\n"
+        "def build_coordinator() -> ZCoreCoordinator:\n"
+        "    return ZCoreCoordinator()\n"
+    )
+    for idx in range(4):
+        (src / f"m_consumer_{idx}.py").write_text(
+            "from z_core import ZCoreCoordinator, build_coordinator\n"
+            f"def use_{idx}():\n"
+            "    coord = build_coordinator()\n"
+            "    return coord.dispatch('x')\n"
+        )
+
+    repo = RepositoryMap(tmp_path)
+    ranked = repo.build(limit=8)
+    names = [sym.name for sym in ranked]
+    assert "ZCoreCoordinator" in names
+    assert "build_coordinator" in names
+
+    z_syms = [sym for sym in ranked if sym.path.endswith("z_core.py")]
+    assert [s.line for s in z_syms] == sorted(s.line for s in z_syms)
+
+    queried = repo.build("build_coordinator", limit=5)
+    assert queried[0].name == "build_coordinator"

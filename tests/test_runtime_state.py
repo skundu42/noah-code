@@ -177,7 +177,7 @@ def test_runtime_event_log_is_bounded(tmp_path: Path) -> None:
     assert '"index":7' in rows[-1][0]
 
 
-def test_runtime_connections_close_after_commit_and_rollback(
+def test_runtime_persistent_connection_rollback_close_and_lazy_reopen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     opened: list[sqlite3.Connection] = []
@@ -195,10 +195,23 @@ def test_runtime_connections_close_after_commit_and_rollback(
         connection.execute("UPDATE state SET value='\"discarded\"'")
         raise RuntimeError("abort transaction")
     assert store.get_state("committed") == "kept"
-    assert len(opened) == 4
-    for connection in opened:
-        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
-            connection.execute("SELECT 1")
+    assert len(opened) == 1
+    sync_mode = opened[0].execute("PRAGMA synchronous").fetchone()[0]
+    assert sync_mode == 1  # NORMAL
+
+    store.close()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        opened[0].execute("SELECT 1")
+
+    # Lazy reopen after close() keeps existing callers working seamlessly.
+    assert store.get_state("committed") == "kept"
+    assert len(opened) == 2
+    with store:
+        store.set_state("committed", "updated")
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        opened[1].execute("SELECT 1")
+    assert store.get_state("committed") == "updated"
+    store.close()
 
 
 def test_workspace_lease_prevents_concurrent_checkout_owners(tmp_path: Path) -> None:
@@ -214,3 +227,39 @@ def test_workspace_lease_prevents_concurrent_checkout_owners(tmp_path: Path) -> 
 
     second = WorkspaceLease.acquire(lease_root, workspace, "session-b")
     second.close()
+
+
+def test_workspace_lease_canonicalizes_git_subdirectories_and_supports_shared_locks(
+    tmp_path: Path,
+) -> None:
+    import subprocess
+
+    lease_root = tmp_path / "leases"
+    repo = tmp_path / "repo"
+    subdir = repo / "packages" / "core"
+    subdir.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+    root_lease = WorkspaceLease.acquire(lease_root, repo, "session-root")
+    try:
+        with pytest.raises(WorkspaceAlreadyActiveError, match="session session-root"):
+            WorkspaceLease.acquire(lease_root, subdir, "session-sub")
+        with pytest.raises(WorkspaceAlreadyActiveError):
+            WorkspaceLease.acquire(lease_root, subdir, "session-reader", shared=True)
+    finally:
+        root_lease.close()
+
+    # Shared read-only leases coexist across root and subdir without clobbering owner payload.
+    owner_before = lease_root / root_lease.path.name
+    payload_before = owner_before.read_text()
+    sh1 = WorkspaceLease.acquire(lease_root, repo, "reader-1", shared=True)
+    sh2 = WorkspaceLease.acquire(lease_root, subdir, "reader-2", shared=True)
+    try:
+        assert sh1.path == sh2.path == root_lease.path
+        assert sh1.shared is True
+        assert owner_before.read_text() == payload_before
+        with pytest.raises(WorkspaceAlreadyActiveError):
+            WorkspaceLease.acquire(lease_root, subdir, "writer", shared=False)
+    finally:
+        sh1.close()
+        sh2.close()

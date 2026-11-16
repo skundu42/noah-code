@@ -1,24 +1,30 @@
 """Loopback-only, conservatively metered OpenRouter relay for live evaluations.
 
-Each request reserves its worst-case token cost before dispatch. Reservations
-are never refunded, including retries and disconnected clients. Provider routing
-enforces the same price ceilings. Only text chat/function tools are accepted;
-paid server tools, media, fallback models and alternate routes are rejected.
+Each request reserves its worst-case token cost before dispatch. Failed,
+interrupted, or unknown-cost requests retain their full worst-case reservation.
+Completed HTTP 200 responses with valid usage and known provider cost reconcile
+their unused conservative delta while enforcing metered token floors. Provider
+routing enforces the same price ceilings. Only text chat/function tools are
+accepted; paid server tools, media, fallback models and alternate routes are
+rejected.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
+import os
 import secrets
 import threading
+import time
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import httpx
 
-_MAX_BODY = 256_000
+_MAX_BODY = 4_000_000
 _FIELDS = frozenset(
     {
         "model",
@@ -55,6 +61,7 @@ class EvalProxy:
         *,
         budget_usd: float = 4,
         max_output_tokens: int = 4096,
+        max_body_bytes: int = _MAX_BODY,
         provider: str | None = None,
     ) -> None:
         prices = (input_price_per_token, output_price_per_token, budget_usd)
@@ -67,6 +74,9 @@ class EvalProxy:
             or not isinstance(max_output_tokens, int)
             or isinstance(max_output_tokens, bool)
             or not 1 <= max_output_tokens <= 8192
+            or not isinstance(max_body_bytes, int)
+            or isinstance(max_body_bytes, bool)
+            or not 1_024 <= max_body_bytes <= 16_000_000
         ):
             raise ValueError("invalid evaluation model, key, budget, or output cap")
         self.model = model
@@ -78,8 +88,10 @@ class EvalProxy:
         self._budget = Decimal(str(budget_usd))
         self._reserved = Decimal(0)
         self.max_output_tokens = max_output_tokens
+        self.max_body_bytes = max_body_bytes
         self._lock = threading.Lock()
         self._requests: list[dict[str, Any]] = []
+        self._record_reservations: dict[int, Decimal] = {}
         self._run: dict[str, Any] | None = None
         self._server: ThreadingHTTPServer | None = None
         self.base_url = ""
@@ -88,7 +100,7 @@ class EvalProxy:
         """Allocate the same request and spend limits to each sequential agent run."""
         if not math.isfinite(budget_usd) or not 0 < budget_usd <= float(self._budget):
             raise ValueError("invalid per-run budget")
-        if not label or not 1 <= max_requests <= 24:
+        if not label or not 1 <= max_requests <= 48:
             raise ValueError("invalid run label or request limit")
         with self._lock:
             self._run = {
@@ -156,7 +168,7 @@ class EvalProxy:
         # Serialized UTF-8 bytes overcount text tokens. Extra per-message/tool
         # allowance covers provider-added role/schema framing and reasoning fields.
         size = len(json.dumps(request, ensure_ascii=False).encode())
-        if size > _MAX_BODY:
+        if size > self.max_body_bytes:
             raise ValueError("request exceeds evaluation size limit")
         ceiling = (
             2 * size
@@ -179,8 +191,9 @@ class EvalProxy:
                 self._run["reserved"] += reservation
             elif len(self._requests) >= 24:
                 raise ValueError("evaluation request limit reached")
+            index = len(self._requests)
             record: dict[str, Any] = {
-                "index": len(self._requests),
+                "index": index,
                 "run": self._run["label"] if self._run else "",
                 "reserved_usd": float(reservation),
                 "input_token_ceiling": ceiling,
@@ -189,8 +202,63 @@ class EvalProxy:
                 "status": "reserved",
             }
             self._requests.append(record)
+            self._record_reservations[index] = reservation
             self._reserved += reservation
         return request, record
+
+    def _reconcile_reservation(self, record: dict[str, Any], *, http_status: int) -> None:
+        """Refund unused conservative margin only on HTTP 200 with verified cost."""
+        if http_status != 200:
+            return
+        usage = record.get("usage")
+        if not isinstance(usage, dict):
+            return
+        raw_cost = usage.get("cost")
+        if (
+            isinstance(raw_cost, bool)
+            or not isinstance(raw_cost, (int, float))
+            or not math.isfinite(float(raw_cost))
+            or float(raw_cost) < 0
+        ):
+            return
+        index = record.get("index")
+        if not isinstance(index, int) or index not in self._record_reservations:
+            return
+        initial = self._record_reservations[index]
+        settled = Decimal(str(raw_cost))
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        if (
+            isinstance(prompt_tokens, int)
+            and not isinstance(prompt_tokens, bool)
+            and prompt_tokens >= 0
+            and isinstance(completion_tokens, int)
+            and not isinstance(completion_tokens, bool)
+            and completion_tokens >= 0
+        ):
+            token_floor = (
+                Decimal(prompt_tokens) * self._input_price
+                + Decimal(completion_tokens) * self._output_price
+            )
+            settled = max(settled, token_floor)
+        if settled < initial:
+            refund = initial - settled
+            self._reserved = max(Decimal(0), self._reserved - refund)
+            if self._run is not None and self._run["label"] == record.get("run"):
+                self._run["reserved"] = max(Decimal(0), self._run["reserved"] - refund)
+            self._record_reservations[index] = settled
+            record["initial_reserved_usd"] = float(initial)
+            record["reserved_usd"] = float(settled)
+            record["refunded_usd"] = float(refund)
+        elif settled > initial:
+            extra = settled - initial
+            self._reserved += extra
+            if self._run is not None and self._run["label"] == record.get("run"):
+                self._run["reserved"] += extra
+            self._record_reservations[index] = settled
+            record["initial_reserved_usd"] = float(initial)
+            record["reserved_usd"] = float(settled)
+            record["refunded_usd"] = 0.0
 
     def summary(self) -> dict[str, Any]:
         with self._lock:
@@ -206,6 +274,7 @@ class EvalProxy:
                 "output_price_per_token": float(self._output_price),
                 "budget_usd": float(self._budget),
                 "reserved_usd": float(self._reserved),
+                "max_body_bytes": self.max_body_bytes,
                 "requests": rows,
                 "reported_cost_usd": sum(costs) if complete else None,
                 "cost_complete": complete,
@@ -244,8 +313,11 @@ class EvalProxy:
                     return
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
-                    if self.headers.get("Transfer-Encoding") or not 0 < size <= _MAX_BODY:
+                    if self.headers.get("Transfer-Encoding") or size <= 0:
                         raise ValueError("invalid request size")
+                    if size > owner.max_body_bytes:
+                        self.error(413, "request exceeds evaluation size limit")
+                        return
                     payload = json.loads(self.rfile.read(size))
                     if not isinstance(payload, dict):
                         raise ValueError("invalid request")
@@ -268,7 +340,8 @@ class EvalProxy:
                             record["http_status"] = response.status_code
                         self.send_response(response.status_code)
                         self.send_header(
-                            "Content-Type", response.headers.get("Content-Type", "application/json")
+                            "Content-Type",
+                            response.headers.get("Content-Type", "application/json"),
                         )
                         self.send_header("Connection", "close")
                         self.end_headers()
@@ -286,6 +359,9 @@ class EvalProxy:
                                 buffer.extend(chunk)
                         with owner._lock:
                             owner._capture_usage(bytes(buffer), record)
+                            owner._reconcile_reservation(
+                                record, http_status=response.status_code
+                            )
                             record["status"] = "finished"
                 except (OSError, httpx.HTTPError):
                     with owner._lock:
@@ -320,3 +396,42 @@ class EvalProxy:
             self._server.shutdown()
             self._server.server_close()
             self._thread.join(timeout=2)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--input-price-per-token", type=float, required=True)
+    parser.add_argument("--output-price-per-token", type=float, required=True)
+    parser.add_argument("--budget-usd", type=float, default=4.0)
+    parser.add_argument("--max-output-tokens", type=int, default=4096)
+    parser.add_argument("--max-body-bytes", type=int, default=_MAX_BODY)
+    parser.add_argument("--provider", default=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        raise SystemExit("OPENROUTER_API_KEY is required")
+    with EvalProxy(
+        args.model,
+        api_key,
+        args.input_price_per_token,
+        args.output_price_per_token,
+        budget_usd=args.budget_usd,
+        max_output_tokens=args.max_output_tokens,
+        max_body_bytes=args.max_body_bytes,
+        provider=args.provider,
+    ) as proxy:
+        print(json.dumps({"base_url": proxy.base_url, "max_body_bytes": proxy.max_body_bytes}))
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from collections import deque
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from nooa import Skill, hidden, spec
 
+from noah_code.credentials import scrubbed_subprocess_env
 from noah_code.permissions import PermissionCategory
 from noah_code.tools.workspace_tools import WorkspaceTools
 from noah_code.verification import CheckRecord
@@ -61,6 +63,7 @@ class BackgroundJob:
     command_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_event: asyncio.Event = field(default_factory=asyncio.Event)
     check: CheckRecord | None = None
+    _log_io_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def elapsed(self) -> float:
@@ -282,6 +285,7 @@ class ProcessTools(Skill):
                 process = await asyncio.create_subprocess_exec(
                     *argv,
                     cwd=self._ws._workspace.root,
+                    env=scrubbed_subprocess_env(),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=(
@@ -625,13 +629,13 @@ class ProcessTools(Skill):
             if not chunk:
                 tail = decoder.decode(b"", final=True)
                 if tail:
-                    self._append(job, stream_name, tail)
+                    await self._append_async(job, stream_name, tail)
                 return
             text = decoder.decode(chunk)
             if text:
-                self._append(job, stream_name, text)
+                await self._append_async(job, stream_name, text)
 
-    def _append(self, job: BackgroundJob, stream: str, text: str) -> None:
+    def _record_event(self, job: BackgroundJob, stream: str, text: str) -> str | None:
         retained = text
         if len(retained) > self._max_buffer:
             notice = "… earlier output truncated …\n"
@@ -645,29 +649,52 @@ class ProcessTools(Skill):
         while job.events and job.event_chars > self._max_buffer:
             removed = job.events.popleft()
             job.event_chars -= len(removed.text)
-        if job.log_path is not None:
-            payload = json.dumps(
-                {
-                    "sequence": event.sequence,
-                    "stream": stream,
-                    "text": text,
-                    "timestamp": time.time(),
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+        if job.log_path is None:
+            return None
+        return json.dumps(
+            {
+                "sequence": event.sequence,
+                "stream": stream,
+                "text": text,
+                "timestamp": time.time(),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _write_durable_log(self, job: BackgroundJob, payload: str) -> None:
+        with job._log_io_lock:
+            path = job.log_path
+            if path is None:
+                return
+            with path.open("a", encoding="utf-8") as output:
+                output.write(payload + "\n")
+                output.flush()
+            self._cap_durable_log(job)
+
+    def _disable_durable_log(self, job: BackgroundJob, exc: OSError) -> None:
+        # Keep draining the pipe when durable storage fails; otherwise
+        # a full stdout pipe can deadlock the owned child process.
+        job.log_path = None
+        message = f"[noah] durable process logging disabled: {exc}"
+        self._record_event(job, "stderr", message)
+        self._emit(job, message)
+
+    async def _append_async(self, job: BackgroundJob, stream: str, text: str) -> None:
+        payload = self._record_event(job, stream, text)
+        if payload is not None:
             try:
-                with job.log_path.open("a", encoding="utf-8") as output:
-                    output.write(payload + "\n")
-                    output.flush()
-                self._cap_durable_log(job)
+                await asyncio.to_thread(self._write_durable_log, job, payload)
             except OSError as exc:
-                # Keep draining the pipe when durable storage fails; otherwise
-                # a full stdout pipe can deadlock the owned child process.
-                job.log_path = None
-                message = f"[noah] durable process logging disabled: {exc}"
-                self._append(job, "stderr", message)
-                self._emit(job, message)
+                self._disable_durable_log(job, exc)
+
+    def _append(self, job: BackgroundJob, stream: str, text: str) -> None:
+        payload = self._record_event(job, stream, text)
+        if payload is not None:
+            try:
+                self._write_durable_log(job, payload)
+            except OSError as exc:
+                self._disable_durable_log(job, exc)
 
     def _cap_durable_log(self, job: BackgroundJob) -> None:
         """Rotate an oversized JSONL log, keeping whole recent lines.
@@ -769,31 +796,42 @@ class ProcessTools(Skill):
         except asyncio.CancelledError:
             pass
 
-    async def _terminate(self, job: BackgroundJob) -> None:
-        await self._close_stdin(job)
-        if job.process.returncode is not None:
+    @staticmethod
+    def _signal_process_tree(process: asyncio.subprocess.Process, sig: signal.Signals) -> None:
+        if process.returncode is not None:
             return
         with contextlib.suppress(ProcessLookupError):
             if os.name != "nt":
                 try:
-                    os.killpg(job.process.pid, signal.SIGTERM)
+                    pgid = os.getpgid(process.pid)
+                    if pgid > 0 and pgid != os.getpgrp():
+                        os.killpg(pgid, sig)
+                    elif sig == signal.SIGKILL:
+                        process.kill()
+                    else:
+                        process.terminate()
                 except PermissionError:
                     # Some macOS runners deny process-group signals even for
-                    # an owned child. Terminate the direct child instead.
-                    job.process.terminate()
+                    # an owned child. Signal the direct child instead.
+                    if sig == signal.SIGKILL:
+                        process.kill()
+                    else:
+                        process.terminate()
+            elif sig == signal.SIGKILL:
+                process.kill()
             else:
-                job.process.terminate()
+                process.terminate()
+
+    async def _terminate(self, job: BackgroundJob) -> None:
+        await self._close_stdin(job)
+        if job.process.returncode is not None:
+            return
+        self._signal_process_tree(job.process, signal.SIGTERM)
         try:
             await asyncio.wait_for(job.process.wait(), timeout=self._stop_grace)
         except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                if os.name != "nt":
-                    try:
-                        os.killpg(job.process.pid, signal.SIGKILL)
-                    except PermissionError:
-                        job.process.kill()
-                else:
-                    job.process.kill()
+            if job.process.returncode is None:
+                self._signal_process_tree(job.process, signal.SIGKILL)
             await job.process.wait()
 
     @staticmethod

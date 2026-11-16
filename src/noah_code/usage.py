@@ -87,6 +87,14 @@ class UsageSnapshot:
         }
 
 
+def _is_cache_boundary(message: Any) -> bool:
+    if getattr(message, "nooa_cache_boundary", False) is True:
+        return True
+    if isinstance(message, dict) and message.get("nooa_cache_boundary") is True:
+        return True
+    return type(message).__name__ == "CacheBoundary"
+
+
 class UsageTracker:
     def __init__(self) -> None:
         self._lock = Lock()
@@ -157,6 +165,14 @@ class UsageTracker:
         """
 
         try:
+            items = list(messages)
+            boundary_index = next(
+                (index for index, item in enumerate(items) if _is_cache_boundary(item)),
+                None,
+            )
+            if boundary_index is not None:
+                items = items[:boundary_index]
+            items = [item for item in items if not _is_cache_boundary(item)]
             normalized = (
                 message
                 if isinstance(message, dict)
@@ -165,7 +181,7 @@ class UsageTracker:
                     for key in ("role", "content", "name", "tool_calls", "tool_call_id")
                     if getattr(message, key, None) is not None
                 }
-                for message in messages
+                for message in items
             )
             serialized = "\n\x1e\n".join(
                 json.dumps(

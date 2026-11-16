@@ -296,10 +296,11 @@ async def test_cancelled_undo_keeps_busy_guard_until_filesystem_work_finishes() 
     release = threading.Event()
     host = AgentHost.__new__(AgentHost)
     host._active_turn = None
+    host._session_lock = asyncio.Lock()
     host.ui = MagicMock()
     host._persist_async = AsyncMock()
 
-    def undo() -> str:
+    def undo(**_kwargs: object) -> str:
         started.set()
         assert release.wait(timeout=3)
         return "undid turn"
@@ -487,3 +488,48 @@ async def test_prompt_during_receipt_is_resumed_without_taking_new_draft(tmp_pat
         assert composer.text == "new unsent draft"
         assert host._pending_attach_paths == [tmp_path / "new-attachment.py"]
         assert host.steer_queue.items() == []
+
+
+@pytest.mark.asyncio
+async def test_diff_hunk_navigation_tracks_wrapped_visual_line_offsets(tmp_path: Path) -> None:
+    host = _fake_host(tmp_path)
+    host.agent.lsp.document_symbols = AsyncMock(return_value="")
+    host.diff_diagnostics = AsyncMock()
+    long_line = "+" + ("verylongidentifier_" * 12)
+    patch_text = "\n".join(
+        [
+            "--- a/wrapped.py",
+            "+++ b/wrapped.py",
+            "@@ -1,2 +1,2 @@",
+            long_line,
+            long_line,
+            "@@ -20,1 +20,1 @@",
+            "-before_second_hunk",
+            "+after_second_hunk",
+            *[f" context_{idx}" for idx in range(30)],
+        ]
+    )
+    item = DiffFile("wrapped.py", "unstaged", "modified", patch=patch_text, loaded=True)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test(size=(80, 24)) as pilot:
+        screen = DiffReviewScreen(host, DiffReview([item]))
+        await app.push_screen(screen)
+        await pilot.pause()
+        patch_log = screen.query_one("#diff-patch")
+        patch_log.wrap = True
+        screen._show_item(item)
+        await pilot.pause()
+
+        # Find the actual rendered visual row of the second hunk header in RichLog.lines.
+        second_hunk_row = next(
+            idx
+            for idx, strip in enumerate(patch_log.lines)
+            if "@@ -20,1 +20,1 @@" in strip.text
+        )
+        assert second_hunk_row > 5  # Wrapped lines pushed hunk 2 past logical index 5
+
+        screen.action_next_hunk()
+        screen.action_next_hunk()
+        await pilot.pause()
+        assert screen._hunks[1] == second_hunk_row
+        assert int(patch_log.scroll_y) == second_hunk_row

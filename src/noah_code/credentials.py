@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,8 @@ from noah_code.providers import PROVIDER_PRESETS, provider_preset
 AUTH_FILE_NAME = "auth.json"
 AUTH_FILE_MODE = 0o600
 AUTH_DIR_MODE = 0o700
+SERVER_TOKEN_ENV_VAR = "NOAH_CODE_SERVER_TOKEN"
+_HYDRATED_ENV_VARS: set[str] = set()
 
 
 class CredentialStoreError(RuntimeError):
@@ -153,6 +156,7 @@ def store_provider_api_key(provider: str, api_key: str) -> CredentialStoreResult
         raise ValueError("API key must be a non-empty single-line value")
 
     os.environ[env_var] = value
+    _HYDRATED_ENV_VARS.add(env_var)
     path = auth_file_path()
     persisted = False
     try:
@@ -186,8 +190,30 @@ def load_provider_api_key(provider: str) -> bool:
     if value:
         # Stored credentials take precedence, matching OpenCode's auth behavior.
         os.environ[env_var] = value
+        _HYDRATED_ENV_VARS.add(env_var)
         return True
     return bool(os.environ.get(env_var))
+
+
+def scrubbed_env_var_names() -> frozenset[str]:
+    """Return environment variable names holding server or provider credentials."""
+
+    names: set[str] = {SERVER_TOKEN_ENV_VAR, *_HYDRATED_ENV_VARS}
+    for preset in PROVIDER_PRESETS:
+        if preset.api_key_env:
+            names.add(preset.api_key_env)
+        for group in preset.credential_groups:
+            names.update(group)
+    return frozenset(names)
+
+
+def scrubbed_subprocess_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return a copy of ``base_env`` (or ``os.environ``) with secrets removed."""
+
+    env = dict(os.environ if base_env is None else base_env)
+    for name in scrubbed_env_var_names():
+        env.pop(name, None)
+    return env
 
 
 def provider_key_for_model(model: str) -> str | None:

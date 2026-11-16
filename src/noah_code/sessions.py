@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from noah_code.snapshots import JOURNAL_MAX_TURNS
+from noah_code.snapshots import JournalData, externalize_journal_dict
 from noah_code.workspace import Workspace
 from noah_code.worktree import family_id, infer_worktree_name, repo_id_for, worktree_storage_root
 
@@ -99,6 +99,9 @@ class SessionStore:
     def _journal_path(self, session_id: str) -> Path:
         return self._session_path(session_id) / "journal.json"
 
+    def blob_dir(self, session_id: str) -> Path:
+        return self._session_path(session_id) / "blobs"
+
     def _db_path(self, session_id: str) -> Path:
         return self._session_path(session_id) / "session.db"
 
@@ -124,9 +127,9 @@ class SessionStore:
         return total
 
     def acquire_workspace_lease(
-        self, session_id: str, workspace: Workspace
+        self, session_id: str, workspace: Workspace, *, shared: bool = False
     ) -> WorkspaceLease:
-        """Exclusively claim a checkout while this process may mutate it."""
+        """Claim a checkout (exclusively by default, or shared for read-only sessions)."""
 
         from noah_code.runtime_state import WorkspaceLease
 
@@ -134,6 +137,7 @@ class SessionStore:
             self.session_dir / ".leases",
             workspace.root,
             session_id,
+            shared=shared,
         )
 
     def create(
@@ -171,12 +175,9 @@ class SessionStore:
         self._atomic_write_json(self._meta_path(meta.session_id), meta.to_json())
 
     def save_journal(self, session_id: str, data: dict) -> None:
-        """Persist the undo journal sidecar with bounded retention."""
+        """Persist the undo journal sidecar with content-addressed blobs and bounded retention."""
 
-        pruned = {
-            "turns": list(data.get("turns", []))[-JOURNAL_MAX_TURNS:],
-            "redo": list(data.get("redo", []))[-JOURNAL_MAX_TURNS:],
-        }
+        pruned = externalize_journal_dict(data, self.blob_dir(session_id))
         self._atomic_write_json(
             self._journal_path(session_id), json.dumps(pruned, indent=1)
         )
@@ -185,17 +186,18 @@ class SessionStore:
         """Load the undo sidecar; fall back to legacy embedded meta journals."""
 
         path = self._journal_path(session_id)
+        blobs = self.blob_dir(session_id)
         if path.is_file():
             try:
                 data = json.loads(path.read_text())
             except (json.JSONDecodeError, OSError):
                 return {}
-            return data if isinstance(data, dict) else {}
+            return JournalData(data, blob_dir=blobs) if isinstance(data, dict) else {}
         try:
             legacy = self.load_meta(session_id).journal
         except SessionError:
             return {}
-        return legacy or {}
+        return JournalData(legacy, blob_dir=blobs) if isinstance(legacy, dict) and legacy else {}
 
     @staticmethod
     def _atomic_write_json(path: Path, payload: str) -> None:
@@ -259,6 +261,7 @@ class SessionStore:
 
     def list_sessions(self, workspace: Workspace | None = None) -> list[SessionMeta]:
         items: list[SessionMeta] = []
+        target_family = family_id(workspace.root, workspace.identity) if workspace else ""
 
         def mtime(child: Path) -> float:
             try:
@@ -283,7 +286,7 @@ class SessionStore:
                 or re.fullmatch(r"[0-9a-f]{12}", meta.session_id) is None
             ):
                 continue
-            if workspace and meta.family_id() != family_id(workspace.root, workspace.identity):
+            if workspace and meta.family_id() != target_family:
                 continue
             items.append(meta)
         return items
@@ -300,10 +303,51 @@ class SessionStore:
         path = self._session_path(session_id)
         if not path.exists():
             raise SessionError(f"session not found: {session_id}")
+        workspace_path = ""
+        with contextlib.suppress(Exception):
+            workspace_path = self.load_meta(session_id).workspace_path
+        child_sessions: dict[str, Any] = {}
+        runtime_db = path / "runtime.db"
+        if runtime_db.is_file():
+            with contextlib.suppress(Exception):
+                uri = f"{runtime_db.resolve().as_uri()}?mode=ro"
+                with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
+                    row = conn.execute(
+                        "SELECT value FROM state WHERE key = 'child_sessions'"
+                    ).fetchone()
+                    if row and row[0]:
+                        parsed = json.loads(str(row[0]))
+                        if isinstance(parsed, dict):
+                            child_sessions = parsed
         try:
             delete_sqlite_database(self._db_path(session_id))
         except Exception as exc:
             raise SessionError(f"cannot delete active session {session_id}: {exc}") from exc
+
+        from noah_code.checkpoints import CheckpointManager
+        from noah_code.worktree import WorktreeManager
+
+        if workspace_path:
+            ws_dir = Path(workspace_path)
+            with contextlib.suppress(Exception):
+                CheckpointManager(ws_dir, session_id).delete_all()
+            storage_root = worktree_storage_root(self.session_dir)
+            for child_id, record in child_sessions.items():
+                if not isinstance(record, dict):
+                    continue
+                with contextlib.suppress(Exception):
+                    CheckpointManager(ws_dir, str(child_id)).delete_all()
+                if record.get("isolated") and not record.get("worktree_cleaned"):
+                    removed = False
+                    with contextlib.suppress(Exception):
+                        WorktreeManager(ws_dir, storage_root).remove(f"task-{child_id}")
+                        removed = True
+                    if not removed:
+                        child_dir = record.get("directory")
+                        if isinstance(child_dir, str) and child_dir:
+                            resolved_child = Path(child_dir).resolve()
+                            if resolved_child.is_relative_to(storage_root.resolve()):
+                                shutil.rmtree(resolved_child, ignore_errors=True)
         shutil.rmtree(path)
 
     def verify_workspace(self, meta: SessionMeta, workspace: Workspace) -> None:

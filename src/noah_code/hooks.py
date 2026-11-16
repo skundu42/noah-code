@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from noah_code.config import HooksConfig, HookSpec
+from noah_code.credentials import _HYDRATED_ENV_VARS, SERVER_TOKEN_ENV_VAR
 
 LIFECYCLE_EVENTS = frozenset(
     {"session_start", "session_end", "turn_start", "turn_end", "worktree_created"}
@@ -91,6 +92,8 @@ class HookRunner:
         payload: str = "",
     ) -> tuple[int, str]:
         env = os.environ.copy()
+        for secret_var in (SERVER_TOKEN_ENV_VAR, *_HYDRATED_ENV_VARS):
+            env.pop(secret_var, None)
         env.update(
             NOAH_HOOK_PHASE=phase,
             NOAH_HOOK_TOOL=tool,

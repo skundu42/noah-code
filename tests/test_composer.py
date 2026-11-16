@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
+
+import pytest
 
 from noah_code.composer import (
     IMAGE_TYPES,
@@ -11,6 +14,7 @@ from noah_code.composer import (
     expand_turn,
     mention_suggestions,
     mention_text,
+    validate_attachment,
 )
 
 PNG_BYTES = (
@@ -208,3 +212,60 @@ def test_suggestions_prioritize_path_matches_before_basename_matches(tmp_path: P
 
     assert mention_suggestions(tmp_path, "@src/main", limit=1) == ["src/main.py"]
     assert mention_suggestions(tmp_path, "@src/main", limit=0) == []
+
+
+def test_clipboard_temp_png_allowed_while_arbitrary_external_files_stay_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_temp = tmp_path / "sys-temp"
+    fake_temp.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_temp))
+
+    valid_clip = fake_temp / "noah-clipboard-shot1.png"
+    valid_clip.write_bytes(PNG_BYTES)
+    os.chmod(valid_clip, 0o600)
+
+    resolved = validate_attachment(valid_clip, workspace)
+    assert resolved == valid_clip.resolve()
+
+    turn = expand_turn(f"Inspect {mention_text(str(valid_clip))}", workspace)
+    assert len(turn.images) == 1
+    assert turn.paths == [valid_clip.resolve()]
+    assert "noah-clipboard-shot1.png" in turn.text
+
+    # Arbitrary external image in temp without prefix must be rejected.
+    unprefixed = fake_temp / "screenshot.png"
+    unprefixed.write_bytes(PNG_BYTES)
+    os.chmod(unprefixed, 0o600)
+    assert expand_turn(f"Inspect {mention_text(str(unprefixed))}", workspace).images == []
+
+    # Permissive file mode (0644) must be rejected.
+    world_readable = fake_temp / "noah-clipboard-open.png"
+    world_readable.write_bytes(PNG_BYTES)
+    os.chmod(world_readable, 0o644)
+    assert expand_turn(f"Inspect {mention_text(str(world_readable))}", workspace).images == []
+    with pytest.raises(ValueError, match="outside workspace"):
+        validate_attachment(world_readable, workspace)
+
+    # Non-image file with clipboard prefix must be rejected.
+    text_clip = fake_temp / "noah-clipboard-secret.txt"
+    text_clip.write_text("do not inline")
+    os.chmod(text_clip, 0o600)
+    turn_txt = expand_turn(f"Read {mention_text(str(text_clip))}", workspace)
+    assert "do not inline" not in turn_txt.text
+    assert turn_txt.paths == []
+
+    # Symlink with clipboard prefix must be rejected.
+    outside_target = tmp_path / "outside.png"
+    outside_target.write_bytes(PNG_BYTES)
+    os.chmod(outside_target, 0o600)
+    symlink_clip = fake_temp / "noah-clipboard-link.png"
+    symlink_clip.symlink_to(outside_target)
+    assert expand_turn(f"Inspect {mention_text(str(symlink_clip))}", workspace).images == []
+
+    # Wrong owner UID must be rejected.
+    if hasattr(os, "getuid"):
+        monkeypatch.setattr(os, "getuid", lambda: valid_clip.stat().st_uid + 1)
+        assert expand_turn(f"Inspect {mention_text(str(valid_clip))}", workspace).images == []

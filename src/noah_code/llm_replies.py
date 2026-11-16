@@ -11,6 +11,8 @@ from nooa.unifiedllm.unifiedllm import UnifiedLLM
 
 from noah_code import nooa_compat
 
+_RECOVERY_HEADER = "[Noah host recovery notice; not model output]"
+
 
 def _codeact_session(tools: Any) -> bool:
     return any(getattr(tool, "name", "") == "execute_python" for tool in tools or [])
@@ -54,11 +56,44 @@ def recover_empty_truncated_response(response: Any) -> Any:
     ):
         return response
     notice = (
-        "[Noah host recovery notice; not model output]\n"
+        f"{_RECOVERY_HEADER}\n"
         "The previous response reached its output limit without any answer or tool call. "
         "Continue the same task with shorter reasoning and one concrete execute_python "
         "action within the unchanged output limit. The task is not complete.\n"
         f"Original response: finish_reason=length; content={json.dumps(content)}; tool_calls=[]"
+    )
+    reasoning_parts = _reasoning_parts(response)
+    return LLMResponse(
+        raw_response=getattr(response, "raw_response", None),
+        parts=(*reasoning_parts, AssistantText(text=notice)),
+        replay_scope=getattr(response, "replay_scope", None),
+        finish_reason="length",
+        usage=getattr(response, "usage", None),
+        model_name=getattr(response, "model_name", "") or "",
+        generation_id=getattr(response, "generation_id", "") or "",
+    )
+
+
+def recover_truncated_prose_response(response: Any) -> Any:
+    """Preserve partial truncated prose and append an explicit max-tokens notice."""
+
+    content = getattr(response, "content", None)
+    if (
+        getattr(response, "finish_reason", None) != "length"
+        or getattr(response, "tool_calls", None)
+        or not isinstance(content, str)
+        or not content.strip()
+        or _RECOVERY_HEADER in content
+    ):
+        return response
+    notice = (
+        f"{content.rstrip()}\n\n"
+        f"{_RECOVERY_HEADER}\n"
+        "The previous response hit its output token limit (finish_reason=length) "
+        "without completing a tool call. "
+        "Do not repeat the partial text above; continue concisely with one concrete "
+        "execute_python action (or self.message(...) and return_result(...) if ready "
+        "to finish) within the unchanged output limit. The task is not complete."
     )
     reasoning_parts = _reasoning_parts(response)
     return LLMResponse(
@@ -113,6 +148,22 @@ class ConversationalReplyLLM(UnifiedLLM):
         self._inner = inner
         nooa_compat.init_llm_wrapper(self, inner)
 
+    @property
+    def model(self) -> Any:
+        return getattr(self._inner, "model", None)
+
+    @property
+    def context_window(self) -> Any:
+        return getattr(self._inner, "context_window", None)
+
+    def get_context_limits(
+        self, overrides: dict[str, Any] | None = None, *, fallback_reserve: int = 0
+    ) -> Any:
+        get_limits = getattr(self._inner, "get_context_limits", None)
+        if callable(get_limits):
+            return get_limits(overrides, fallback_reserve=fallback_reserve)
+        return super().get_context_limits(overrides, fallback_reserve=fallback_reserve)
+
     def _coerce(self, response: Any, tools: Any) -> Any:
         if not _codeact_session(tools) or nooa_compat.in_summary_fork():
             return response
@@ -121,6 +172,7 @@ class ConversationalReplyLLM(UnifiedLLM):
             and not getattr(response, "tool_calls", None)
         )
         response = recover_empty_truncated_response(response)
+        response = recover_truncated_prose_response(response)
         if truncated_without_tools:
             return (
                 response.model_copy(update={"finish_reason": "stop"})
@@ -144,6 +196,20 @@ class ConversationalReplyLLM(UnifiedLLM):
 
     def get_model_info(self) -> Any:
         return self._inner.get_model_info()
+
+    async def aclose(self) -> None:
+        aclose = getattr(self._inner, "aclose", None)
+        if callable(aclose):
+            await aclose()
+        else:
+            await super().aclose()
+
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if callable(close):
+            close()
+        else:
+            super().close()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)

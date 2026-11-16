@@ -30,6 +30,31 @@ DEFAULT_MODEL = "openrouter/z-ai/glm-5.3-flash"
 OPENCODE_VERSION = "2.0.18"
 _SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|AUTH", re.IGNORECASE)
 _MAX_LOG_BYTES = 256_000
+_SAFE_SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+_VALID_RUNNERS = frozenset({"unittest", "pytest", "command"})
+_ROOT_STDLIB_SHADOWS = frozenset(
+    {
+        "unittest",
+        "unittest.py",
+        "sitecustomize",
+        "sitecustomize.py",
+        "usercustomize",
+        "usercustomize.py",
+        "json",
+        "json.py",
+        "io",
+        "io.py",
+        "sys",
+        "sys.py",
+        "os",
+        "os.py",
+        "pathlib",
+        "pathlib.py",
+        "pytest",
+        "pytest.py",
+        "conftest.py",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -40,6 +65,7 @@ class Task:
     acceptance: tuple[str, ...]
     implementation: tuple[str, ...]
     expected_tests: int
+    runner: str = "unittest"
 
 
 @dataclass
@@ -51,6 +77,28 @@ class ProcessResult:
     stdout: str
     stderr: str
     output_truncated: bool
+
+
+def _validate_implementation_path(raw: Any, fixture: Path) -> str:
+    if not isinstance(raw, str) or not raw or raw != raw.strip():
+        raise ValueError("Implementation paths must be nonempty relative strings")
+    if "\\" in raw or raw.startswith("/") or Path(raw).is_absolute():
+        raise ValueError(f"Implementation path must be relative Posix style: {raw}")
+    parts = raw.split("/")
+    if not all(parts) or any(part in {".", ".."} for part in parts):
+        raise ValueError(f"Implementation path must not contain empty or parent segments: {raw}")
+    if any(not _SAFE_SEGMENT.fullmatch(part) for part in parts):
+        raise ValueError(f"Implementation path contains invalid segment: {raw}")
+    if parts[0] == "tests":
+        raise ValueError(f"Implementation path must not target frozen tests/: {raw}")
+    if parts[0] in _ROOT_STDLIB_SHADOWS:
+        raise ValueError(f"Implementation path must not shadow stdlib or test runner at root: {raw}")
+    current = fixture
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"Implementation path must not traverse symlinks: {raw}")
+    return "/".join(parts)
 
 
 def load_tasks(manifest: Path) -> list[Task]:
@@ -74,23 +122,35 @@ def load_tasks(manifest: Path) -> list[Task]:
         prompt = item["prompt"]
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("Task prompt must be nonempty")
-        implementation = item["implementation"]
+        runner = item.get("runner", "unittest")
+        if not isinstance(runner, str) or runner not in _VALID_RUNNERS:
+            raise ValueError(f"Task runner must be one of {sorted(_VALID_RUNNERS)}")
+        implementation_raw = item["implementation"]
+        if not isinstance(implementation_raw, list) or not implementation_raw:
+            raise ValueError("Implementation must list one or more relative file paths")
+        implementation = tuple(
+            _validate_implementation_path(name, fixture) for name in implementation_raw
+        )
+        if len(set(implementation)) != len(implementation):
+            raise ValueError("Implementation paths must be unique")
+        default_expected = 1 if runner == "command" and "expected_tests" not in item else None
+        expected_tests = item.get("expected_tests", default_expected)
         if (
-            not isinstance(implementation, list)
-            or not implementation
-            or any(
-                not isinstance(name, str)
-                or not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]*\.py", name)
-                or name in {"unittest.py", "sitecustomize.py", "json.py"}
-                for name in implementation
-            )
+            not isinstance(expected_tests, int)
+            or isinstance(expected_tests, bool)
+            or not 1 <= expected_tests <= 100
         ):
-            raise ValueError("Implementation must list simple Python module filenames")
-        expected_tests = item["expected_tests"]
-        if not isinstance(expected_tests, int) or not 1 <= expected_tests <= 100:
             raise ValueError("Expected test count must be between 1 and 100")
         tasks.append(
-            Task(task_id, fixture, prompt, tuple(command), tuple(implementation), expected_tests)
+            Task(
+                task_id,
+                fixture,
+                prompt,
+                tuple(command),
+                implementation,
+                expected_tests,
+                runner=runner,
+            )
         )
         seen.add(task_id)
     if not tasks:
@@ -254,7 +314,15 @@ def create_fixture_repo(task: Task, output: Path) -> tuple[Path, str]:
 
 
 def write_run_config(
-    run_dir: Path, base_url: str, model: str, seconds: float, output_tokens: int
+    run_dir: Path,
+    base_url: str,
+    model: str,
+    seconds: float,
+    output_tokens: int,
+    *,
+    enable_subagents: bool = False,
+    enable_skills: bool = False,
+    enable_retries: bool = False,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     # JSON is valid YAML and avoids adding a YAML dependency to the harness.
@@ -274,17 +342,29 @@ def write_run_config(
             }
         )
     )
+    skills_toml = '["*"]' if enable_skills else "[]"
+    retry_attempts = 3 if enable_retries else 1
+    task_rule = (
+        ""
+        if enable_subagents
+        else '[[permission_rules]]\ncategory = "task"\npattern = "*"\naction = "deny"\n'
+    )
     (run_dir / "noah.toml").write_text(
         f'model = "eval-fixture"\nlightweight_model = "eval-fixture"\nmax_iterations = 12\n'
-        "enabled_skills = []\n"
+        f"enabled_skills = {skills_toml}\n"
         '[efficiency]\ndeterministic_titles = true\nmemory_distillation = "off"\nlazy_mcp = true\ncontext_token_budget = 32000\n'
         f"[budget]\nmax_seconds = {seconds}\nmax_tokens = 100000\n"
-        "[reliability.retries]\nmax_attempts = 1\nrequest_timeout_seconds = 60\n"
+        f"[reliability.retries]\nmax_attempts = {retry_attempts}\nrequest_timeout_seconds = 60\n"
         "[updates]\nauto_install = false\n"
         '[[permission_rules]]\ncategory = "*"\npattern = "*"\naction = "allow"\n'
         '[[permission_rules]]\ncategory = "websearch"\npattern = "*"\naction = "deny"\n'
         '[[permission_rules]]\ncategory = "webfetch"\npattern = "*"\naction = "deny"\n'
-        '[[permission_rules]]\ncategory = "task"\npattern = "*"\naction = "deny"\n'
+        f"{task_rule}"
+    )
+    denied_opencode = ("websearch", "webfetch") if enable_subagents else (
+        "websearch",
+        "webfetch",
+        "subagent",
     )
     config = {
         "model": "eval/fixture",
@@ -314,7 +394,7 @@ def write_run_config(
             {"action": "*", "resource": "*", "effect": "allow"},
             *[
                 {"action": action, "resource": "*", "effect": "deny"}
-                for action in ("websearch", "webfetch", "subagent")
+                for action in denied_opencode
             ],
         ],
     }
@@ -384,36 +464,50 @@ def fixture_digest(task: Task) -> str:
     return tree_digest(task.fixture)
 
 
-async def score_worktree(
-    task: Task,
-    worktree: Path,
-    state: Path,
-    snapshot: dict[Path, bytes],
-    python: str,
-    env: dict[str, str],
-    secrets: tuple[str, ...],
-) -> ProcessResult:
-    """Score only allowed implementations with frozen tests and trusted stdlib."""
+def _snapshot_non_test_files(root: Path) -> dict[Path, bytes]:
+    if not root.is_dir():
+        return {}
+    files: dict[Path, bytes] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            continue
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root)
+        if ".git" in rel.parts or "__pycache__" in rel.parts or path.suffix == ".pyc":
+            continue
+        if rel.parts and rel.parts[0] == "tests":
+            continue
+        files[rel] = path.read_bytes()
+    return files
 
-    scoring = state / "scoring"
-    scoring.mkdir(parents=True, exist_ok=False)
-    for name in task.implementation:
-        source = worktree / name
-        if not source.is_file() or source.is_symlink() or source.stat().st_size > 256_000:
-            return ProcessResult(
-                [], 1, False, 0, "", f"Missing regular implementation: {name}", False
-            )
-        (scoring / name).write_bytes(source.read_bytes())
-    for relative, data in snapshot.items():
-        target = scoring / "tests" / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-    bootstrap = """
+
+def _read_safe_implementation(worktree: Path, rel_name: str) -> bytes | None:
+    parts = rel_name.split("/")
+    current = worktree
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            return None
+    if not current.is_file():
+        return None
+    try:
+        if current.stat().st_size > 256_000:
+            return None
+        return current.read_bytes()
+    except OSError:
+        return None
+
+
+_UNITTEST_BOOTSTRAP = """
 import io, json, pathlib, sys, unittest
 root, expected = sys.argv[1], int(sys.argv[2])
 started_path, report_path, pattern = pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4]), sys.argv[5]
 started_path.write_text("1")
 sys.path.insert(0, root)
+src_dir = pathlib.Path(root) / "src"
+if src_dir.is_dir() and not (src_dir / "__init__.py").exists():
+    sys.path.insert(1, str(src_dir))
 report = {"passed": False, "tests_discovered": 0, "tests_run": 0, "expected_tests": expected}
 real_stdout = sys.stdout
 captured = io.StringIO()
@@ -437,30 +531,187 @@ report_path.write_text(payload)
 print(payload)
 sys.exit(0 if report["passed"] else 1)
 """
-    pattern = "acceptance.py"
-    if "-p" in task.acceptance:
-        idx = task.acceptance.index("-p")
-        if idx + 1 < len(task.acceptance):
-            pattern = task.acceptance[idx + 1]
+
+_PYTEST_BOOTSTRAP = """
+import io, json, pathlib, sys
+import pytest
+root, expected = sys.argv[1], int(sys.argv[2])
+started_path, report_path = pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4])
+extra_args = sys.argv[5:]
+started_path.write_text("1")
+sys.path.insert(0, root)
+src_dir = pathlib.Path(root) / "src"
+if src_dir.is_dir() and not (src_dir / "__init__.py").exists():
+    sys.path.insert(1, str(src_dir))
+report = {"passed": False, "tests_discovered": 0, "tests_run": 0, "expected_tests": expected}
+class _Collector:
+    def __init__(self):
+        self.collected = 0
+        self.passed = 0
+        self.failed = 0
+        self.errors = 0
+        self.skipped = 0
+        self.failures = []
+    def pytest_collection_modifyitems(self, items):
+        self.collected = len(items)
+    def pytest_runtest_logreport(self, report):
+        if report.when == "call":
+            if report.passed:
+                self.passed += 1
+            elif report.failed:
+                self.failed += 1
+                self.failures.append((report.nodeid, str(report.longrepr)))
+            elif report.skipped:
+                self.skipped += 1
+        elif report.failed:
+            self.errors += 1
+            self.failures.append((report.nodeid, str(report.longrepr)))
+        elif report.skipped and report.when == "setup":
+            self.skipped += 1
+collector = _Collector()
+real_stdout = sys.stdout
+captured = io.StringIO()
+try:
+    sys.stdout = captured
+    targets = extra_args or [str(pathlib.Path(root) / "tests")]
+    code = int(pytest.main(["-q", "-p", "no:cacheprovider", *targets], plugins=[collector]))
+    tests_run = collector.passed + collector.failed + collector.errors
+    ok = (
+        code == 0
+        and collector.collected == expected
+        and tests_run == expected
+        and collector.passed == expected
+        and collector.skipped == 0
+    )
+    report.update(
+        passed=ok,
+        tests_discovered=collector.collected,
+        tests_run=tests_run,
+        failures=collector.failures,
+        errors=[],
+        skipped=collector.skipped,
+    )
+except BaseException as error:
+    report["load_error"] = type(error).__name__ + ": " + str(error)
+finally:
+    sys.stdout = real_stdout
+payload = json.dumps(report, default=str)
+report_path.write_text(payload)
+print(payload)
+sys.exit(0 if report["passed"] else 1)
+"""
+
+
+async def score_worktree(
+    task: Task,
+    worktree: Path,
+    state: Path,
+    snapshot: dict[Path, bytes],
+    python: str,
+    env: dict[str, str],
+    secrets: tuple[str, ...],
+    *,
+    baseline_files: dict[Path, bytes] | None = None,
+) -> ProcessResult:
+    """Score only allowed implementations with frozen baseline/tests and isolated runner."""
+
+    scoring = state / "scoring"
+    scoring.mkdir(parents=True, exist_ok=False)
+    base = baseline_files if baseline_files is not None else _snapshot_non_test_files(task.fixture)
+    allowed_set = set(task.implementation)
+    for rel_path, content in base.items():
+        if rel_path.as_posix() in allowed_set:
+            continue
+        target = scoring / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    for name in task.implementation:
+        payload = _read_safe_implementation(worktree, name)
+        if payload is None:
+            return ProcessResult(
+                [], 1, False, 0, "", f"Missing regular implementation: {name}", False
+            )
+        target = scoring / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    for relative, data in snapshot.items():
+        target = scoring / "tests" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
     started_path = state / "acceptance.started"
     report_path = state / "acceptance-report.json"
-    result = await run_process(
-        [
-            python,
-            "-I",
-            "-c",
-            bootstrap,
-            str(scoring),
-            str(task.expected_tests),
-            str(started_path),
-            str(report_path),
-            pattern,
-        ],
-        cwd=scoring,
-        env=env,
-        seconds=30,
-        secrets=secrets,
-    )
+
+    if task.runner == "command":
+        scoring_env = {k: v for k, v in env.items() if k != "PYTHONPATH"}
+        argv = [python if token == "{python}" else token for token in task.acceptance]
+        started_path.write_text("1")
+        result = await run_process(
+            argv,
+            cwd=scoring,
+            env=scoring_env,
+            seconds=30,
+            secrets=secrets,
+        )
+        passed = result.exit_code == 0 and not result.timed_out
+        report_payload = json.dumps(
+            {
+                "passed": passed,
+                "tests_discovered": task.expected_tests,
+                "tests_run": task.expected_tests if passed else 0,
+                "expected_tests": task.expected_tests,
+                "command_stdout": result.stdout,
+                "command_stderr": result.stderr,
+            }
+        )
+        report_path.write_text(report_payload)
+        result.stdout = report_payload
+        return result
+
+    if task.runner == "pytest":
+        scoring_env = {k: v for k, v in env.items() if k != "PYTHONPATH"}
+        result = await run_process(
+            [
+                python,
+                "-s",
+                "-E",
+                "-P",
+                "-c",
+                _PYTEST_BOOTSTRAP,
+                str(scoring),
+                str(task.expected_tests),
+                str(started_path),
+                str(report_path),
+            ],
+            cwd=scoring,
+            env=scoring_env,
+            seconds=30,
+            secrets=secrets,
+        )
+    else:
+        pattern = "acceptance.py"
+        if "-p" in task.acceptance:
+            idx = task.acceptance.index("-p")
+            if idx + 1 < len(task.acceptance):
+                pattern = task.acceptance[idx + 1]
+        result = await run_process(
+            [
+                python,
+                "-I",
+                "-c",
+                _UNITTEST_BOOTSTRAP,
+                str(scoring),
+                str(task.expected_tests),
+                str(started_path),
+                str(report_path),
+                pattern,
+            ],
+            cwd=scoring,
+            env=env,
+            seconds=30,
+            secrets=secrets,
+        )
+
     if report_path.is_file():
         result.stdout = report_path.read_text()
     elif started_path.is_file():
@@ -497,6 +748,9 @@ async def evaluate(
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
     os.chmod(output, 0o700)
+    enable_subagents = bool(getattr(args, "enable_subagents", False))
+    enable_skills = bool(getattr(args, "enable_skills", False))
+    enable_retries = bool(getattr(args, "enable_retries", False))
     result: dict[str, Any] = {
         "schema_version": 1,
         "model": args.model,
@@ -506,23 +760,35 @@ async def evaluate(
         "noah_source_tree_sha256": tree_digest(ROOT / "src" / "noah_code"),
         "max_seconds_per_run": args.seconds,
         "output_tokens": args.output_tokens,
+        "options": {
+            "enable_subagents": enable_subagents,
+            "enable_skills": enable_skills,
+            "enable_retries": enable_retries,
+        },
         "tasks": [],
     }
     # Freeze every baseline and acceptance file before either agent can execute.
     prepared = {task.id: create_fixture_repo(task, output) for task in tasks}
     fixture_hashes = {task.id: fixture_digest(task) for task in tasks}
+    baseline_snapshots = {
+        task.id: _snapshot_non_test_files(prepared[task.id][0]) for task in tasks
+    }
     acceptance_snapshots = {
         task.id: {
             path.relative_to(prepared[task.id][0] / "tests"): path.read_bytes()
             for path in (prepared[task.id][0] / "tests").rglob("*")
             if path.is_file()
         }
+        if (prepared[task.id][0] / "tests").is_dir()
+        else {}
         for task in tasks
     }
+    max_requests = 24 if (enable_subagents or enable_retries) else 12
     for task in tasks:
         repo, ref = prepared[task.id]
         task_result: dict[str, Any] = {
             "id": task.id,
+            "runner": task.runner,
             "base_ref": ref,
             "fixture_sha256": fixture_hashes[task.id],
             "prompt": task.prompt,
@@ -537,6 +803,7 @@ async def evaluate(
             args.python,
             baseline_env,
             secrets,
+            baseline_files=baseline_snapshots[task.id],
         )
         task_result["baseline_acceptance"] = asdict(baseline_check)
         if baseline_check.exit_code == 0:
@@ -551,12 +818,15 @@ async def evaluate(
                 args.model.removeprefix("openrouter/"),
                 args.seconds,
                 args.output_tokens,
+                enable_subagents=enable_subagents,
+                enable_skills=enable_skills,
+                enable_retries=enable_retries,
             )
             env = child_environment(state, proxy_key=proxy.client_key)
             proxy.begin_run(
                 f"{task.id}/{agent}",
                 budget_usd=args.budget_usd / (2 * len(tasks)),
-                max_requests=12,
+                max_requests=max_requests,
             )
             before = proxy.summary()
             started = await run_process(
@@ -580,6 +850,7 @@ async def evaluate(
                 args.python,
                 env,
                 secrets,
+                baseline_files=baseline_snapshots[task.id],
             )
             fixture_unchanged = fixture_digest(task) == fixture_hashes[task.id]
             run = {
@@ -669,14 +940,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seconds", type=float, default=150)
     parser.add_argument("--output-tokens", type=int, default=4096)
     parser.add_argument("--budget-usd", type=float, default=4.0)
+    parser.add_argument("--max-body-bytes", type=int, default=4_000_000)
+    parser.add_argument("--enable-subagents", action="store_true")
+    parser.add_argument("--enable-skills", action="store_true")
+    parser.add_argument("--enable-retries", action="store_true")
     parser.add_argument("--live", action="store_true")
     args = parser.parse_args(argv)
     if (
         not 0 < args.seconds <= 600
         or not 1 <= args.output_tokens <= 8192
         or not 0 < args.budget_usd <= 4
+        or not 1_024 <= args.max_body_bytes <= 16_000_000
     ):
-        parser.error("Bounds: 0–600 seconds, 1–8192 output tokens and at most $4 reserved spend")
+        parser.error(
+            "Bounds: 0–600 seconds, 1–8192 output tokens, 1024–16000000 max body bytes, "
+            "and at most $4 reserved spend"
+        )
     if not args.model.startswith("openrouter/"):
         parser.error("Live comparisons currently require an explicit OpenRouter model route")
     tasks = load_tasks(args.manifest.resolve())
@@ -693,9 +972,16 @@ def main(argv: list[str] | None = None) -> int:
                     "model": args.model,
                     "required_opencode_version": OPENCODE_VERSION,
                     "max_reserved_usd": args.budget_usd,
+                    "max_body_bytes": args.max_body_bytes,
+                    "options": {
+                        "enable_subagents": args.enable_subagents,
+                        "enable_skills": args.enable_skills,
+                        "enable_retries": args.enable_retries,
+                    },
                     "tasks": [
                         {
                             "id": task.id,
+                            "runner": task.runner,
                             "fixture_sha256": fixture_digest(task),
                             "prompt": task.prompt,
                             "acceptance": task.acceptance,
@@ -739,6 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
         output_price_per_token=output_rate,
         budget_usd=args.budget_usd,
         max_output_tokens=args.output_tokens,
+        max_body_bytes=args.max_body_bytes,
         provider=provider,
     ) as proxy:
         result = asyncio.run(evaluate(tasks, args, proxy, secrets))

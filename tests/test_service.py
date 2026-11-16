@@ -501,3 +501,56 @@ asyncio.run(run_stdio(make_service(Path(sys.argv[1]))))
             process.kill()
         with contextlib.suppress(Exception):
             await process.wait()
+
+
+async def test_service_restrict_workspace_and_acp_streaming_without_replay_gap_crash(
+    tmp_path: Path,
+) -> None:
+    allowed_root = tmp_path / "allowed"
+    outside_root = tmp_path / "outside"
+    allowed_root.mkdir()
+    outside_root.mkdir()
+    restricted = make_service(allowed_root, restrict_workspace=True)
+    try:
+        with pytest.raises(ServiceError) as exc_info:
+            await restricted.open_session(cwd=str(outside_root))
+        assert exc_info.value.status == 403
+    finally:
+        await restricted.close()
+
+    service = make_service(allowed_root)
+    acp = ACPConnection(service)
+    sent: list[dict[str, Any]] = []
+
+    async def capture_send(payload: dict[str, Any]) -> None:
+        sent.append(payload)
+
+    acp.send = capture_send  # type: ignore[method-assign]
+    try:
+        await acp.handle("initialize", {"protocolVersion": 1})
+        created = await acp.handle("session/new", {"cwd": str(allowed_root), "mcpServers": []})
+        assert created is not None
+        sid = created["sessionId"]
+        await acp._event(
+            sid,
+            {
+                "kind": "model_stream",
+                "text": "thinking step ",
+                "meta": {"phase": "reasoning", "call_id": "call-1"},
+            },
+        )
+        # Subsequent committed reasoning for the same call is deduplicated:
+        await acp._event(sid, {"kind": "reasoning", "text": "thinking step "})
+        # Mid-turn replay_gap emits a non-fatal note instead of raising RPCError(-32603):
+        await acp._event(sid, {"kind": "replay_gap", "oldest_sequence": 50})
+        updates = [item["params"]["update"] for item in sent if "params" in item]
+        thoughts = [u for u in updates if u.get("sessionUpdate") == "agent_thought_chunk"]
+        assert len(thoughts) == 1
+        assert thoughts[0]["content"]["text"] == "thinking step "
+        assert any(
+            u.get("sessionUpdate") == "agent_message_chunk"
+            and "skipped" in u.get("content", {}).get("text", "")
+            for u in updates
+        )
+    finally:
+        await service.close()

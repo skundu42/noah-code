@@ -3431,3 +3431,157 @@ async def test_trailing_space_closes_mention_suggestions_and_fuzzy_picker_and_co
         await pilot.pause()
         assert app.clipboard == patch_text
         assert "Copied patch for app.py" in str(app.screen.query_one("#diff-status").render())
+
+
+def test_read_os_clipboard_image_macos_linux_and_pytest_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from noah_code.ui import clipboard as clipboard_mod
+
+    png_payload = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    monkeypatch.delenv("NOAH_TEST_OS_CLIPBOARD", raising=False)
+    assert textual_app_module.read_os_clipboard_image(tmp_path) is None
+
+    monkeypatch.setenv("NOAH_TEST_OS_CLIPBOARD", "1")
+    monkeypatch.setattr(textual_app_module.sys, "platform", "darwin")
+
+    # 1. macOS pngpaste fast path + 0600 mode + PNG header check.
+    monkeypatch.setattr(
+        textual_app_module.subprocess,
+        "run",
+        lambda cmd, **_kw: subprocess.CompletedProcess(cmd, 0, stdout=png_payload),
+    )
+    saved = textual_app_module.read_os_clipboard_image(tmp_path)
+    assert saved is not None and saved.is_file()
+    assert saved.name.startswith("noah-clipboard-") and saved.suffix == ".png"
+    assert saved.read_bytes() == png_payload
+    assert (saved.stat().st_mode & 0o777) == 0o600
+
+    # 2. macOS osascript fallback when pngpaste is absent; rejects non-PNG data.
+    def fake_osascript(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[bytes]:
+        if cmd[0] == "pngpaste":
+            raise FileNotFoundError("pngpaste")
+        Path(cmd[-1]).write_bytes(png_payload)
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"")
+
+    monkeypatch.setattr(textual_app_module.subprocess, "run", fake_osascript)
+    saved_osa = textual_app_module.read_os_clipboard_image(tmp_path)
+    assert saved_osa is not None and saved_osa.read_bytes() == png_payload
+
+    def fake_bad_osascript(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[bytes]:
+        if cmd[0] == "pngpaste":
+            raise FileNotFoundError("pngpaste")
+        Path(cmd[-1]).write_bytes(b"NOT-A-PNG")
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"")
+
+    monkeypatch.setattr(textual_app_module.subprocess, "run", fake_bad_osascript)
+    assert textual_app_module.read_os_clipboard_image(tmp_path) is None
+
+    # 3. Linux wl-paste fallback to xclip with PNG magic verification.
+    monkeypatch.setattr(textual_app_module.sys, "platform", "linux")
+    monkeypatch.setattr(textual_app_module, "_running_in_wsl", lambda: False)
+    seen_cmds: list[list[str]] = []
+
+    def fake_linux(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[bytes]:
+        seen_cmds.append(list(cmd))
+        if cmd[0] == "wl-paste":
+            return subprocess.CompletedProcess(cmd, 1, stdout=b"")
+        return subprocess.CompletedProcess(cmd, 0, stdout=png_payload)
+
+    monkeypatch.setattr(textual_app_module.subprocess, "run", fake_linux)
+    saved_linux = textual_app_module.read_os_clipboard_image(tmp_path)
+    assert saved_linux is not None and saved_linux.read_bytes() == png_payload
+    assert seen_cmds[0][0] == "wl-paste" and seen_cmds[1][0] == "xclip"
+
+    # 4. WSL prepends powershell.exe image export.
+    wsl_cmds = clipboard_mod._clipboard_image_read_commands(running_in_wsl=lambda: True)
+    assert wsl_cmds[0][0] == "powershell.exe"
+
+
+@pytest.mark.asyncio
+async def test_ctrl_v_attaches_binary_clipboard_image_when_text_clipboard_is_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clip_png = tmp_path / "noah-clipboard-demo.png"
+    clip_png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    monkeypatch.setattr(textual_app_module, "read_os_clipboard", lambda: "")
+    monkeypatch.setattr(textual_app_module, "read_os_clipboard_image", lambda: clip_png)
+
+    host = _fake_host(tmp_path)
+    app = NoahCodeApp(host, TextualUI())
+    async with app.run_test() as pilot:
+        composer = app.query_one("#composer")
+        composer.focus()
+        await pilot.press("ctrl+v")
+        await pilot.pause()
+        host.attach_context_path.assert_called_once_with(str(clip_png))
+        notice = _rendered_text(app.query_one("#notice-banner").content)
+        assert "Attached clipboard image" in notice
+
+
+@pytest.mark.asyncio
+async def test_recount_transcript_rows_uses_lru_cache_and_debounces_resize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = _fake_host(tmp_path)
+    ui = TextualUI()
+    app = NoahCodeApp(host, ui)
+    async with app.run_test(size=(100, 32)) as pilot:
+        for idx in range(6):
+            app._append_entry(
+                textual_app_module.TranscriptEntry("NOAH", f"### Heading {idx}\nBody line {idx}", True)
+            )
+        await pilot.pause()
+
+        # First recount populates the LRU cache after initial deferred layout.
+        assert app._recount_transcript_rows() is True
+        assert len(app._row_count_cache) == 6
+
+        # Live post-layout append also populates the cache directly.
+        app._append_entry(
+            textual_app_module.TranscriptEntry("NOAH", "### Heading 6\nBody line 6", True)
+        )
+        await pilot.pause()
+        assert len(app._row_count_cache) == 7
+
+        render_calls = 0
+        real_render = textual_app_module._role_renderable
+
+        def counting_render(*args: object, **kwargs: object):
+            nonlocal render_calls
+            render_calls += 1
+            return real_render(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(textual_app_module, "_role_renderable", counting_render)
+        app._transcript_line_counts.clear()
+        assert app._recount_transcript_rows() is True
+        assert render_calls == 0  # O(1) cache hit for every unchanged entry!
+
+        # Rapid resize bursts coalesce via _resize_timer instead of synchronous rerender per event.
+        rerenders = 0
+        real_rerender = app._rerender_transcript
+
+        def counting_rerender() -> None:
+            nonlocal rerenders
+            rerenders += 1
+            real_rerender()
+
+        monkeypatch.setattr(app, "_rerender_transcript", counting_rerender)
+        app._apply_layout(104, 32)
+        app._apply_layout(108, 32)
+        app._apply_layout(112, 32)
+        assert app._resize_timer is not None
+        assert rerenders == 0
+
+
+def test_extracted_ui_modules_reexport_cleanly() -> None:
+    from noah_code.ui import clipboard, diff_screen, modals
+
+    assert textual_app_module.ApprovalModal is modals.ApprovalModal
+    assert textual_app_module.FilteredPicker is modals.FilteredPicker
+    assert textual_app_module.DiffReviewScreen is diff_screen.DiffReviewScreen
+    assert callable(clipboard.read_os_clipboard_image)

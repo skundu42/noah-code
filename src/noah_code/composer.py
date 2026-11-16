@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import os
 import re
+import stat
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from noah_code.permissions import is_secret_path
+
+CLIPBOARD_IMAGE_PREFIX = "noah-clipboard-"
 
 IMAGE_TYPES = {
     ".png": "image/png",
@@ -200,13 +204,40 @@ def expand_turn(
     return ExpandedTurn(text=f"{text.rstrip()}\n\n{notice}", images=images, paths=paths)
 
 
+def _is_clipboard_temp_image(candidate: Path, resolved: Path) -> bool:
+    """Allow only 0600 current-user clipboard image tempfiles in system temp."""
+
+    if not candidate.is_absolute() or ".." in candidate.parts:
+        return False
+    if candidate.name != resolved.name or not resolved.name.startswith(CLIPBOARD_IMAGE_PREFIX):
+        return False
+    if resolved.suffix.lower() not in IMAGE_TYPES:
+        return False
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        if resolved.parent != temp_root or candidate.parent.resolve() != temp_root:
+            return False
+        leaf_stat = candidate.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(leaf_stat.st_mode):
+        return False
+    if os.name != "nt" and (leaf_stat.st_mode & 0o777) != 0o600:
+        return False
+    return not (hasattr(os, "getuid") and leaf_stat.st_uid != os.getuid())
+
+
 def _resolve(root: Path, raw: str) -> Path | None:
     candidate = Path(raw).expanduser()
     try:
         path = (candidate if candidate.is_absolute() else root / candidate).resolve()
-        path.relative_to(root)
     except (OSError, RuntimeError, ValueError):
         return None
+    try:
+        path.relative_to(root)
+    except ValueError:
+        if not _is_clipboard_temp_image(candidate, path):
+            return None
     if not path.is_file() or is_secret_path(candidate) or is_secret_path(path):
         return None
     return path

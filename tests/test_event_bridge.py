@@ -195,3 +195,24 @@ def test_reasoning_events_forward_to_ui() -> None:
 
     manager.handlers["Reasoning"](SimpleNamespace(content="   "))
     assert len(emitted) == 1
+
+
+def test_code_activity_supports_worktree_task_verbs_and_ignores_multiline_strings() -> None:
+    assert _describe_code_activity('await self.task.diff("wt-1")') == "Task diff"
+    assert _describe_code_activity('await self.task.apply("wt-1")') == "Task apply"
+    assert _describe_code_activity('await self.task.cleanup("wt-1")') == "Task cleanup"
+
+    code_with_docstring_example = (
+        'await self.ws.write("docs/guide.md", """\n'
+        'Example:\n'
+        'await self.ws.run("rm -rf /")\n'
+        'await self.git.commit("fake")\n'
+        '""")'
+    )
+    label = _describe_code_activity(code_with_docstring_example)
+    assert label == "Write docs/guide.md"
+    assert "Bash" not in label
+    assert "Git" not in label
+
+    huge_code = 'await self.ws.read("src/main.py")\n' + ("# padding\n" * 4000)
+    assert _describe_code_activity(huge_code) == "Read src/main.py"

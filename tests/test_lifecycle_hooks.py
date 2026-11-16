@@ -126,3 +126,42 @@ def test_lifecycle_commands_are_loaded_only_from_user_configuration(tmp_path: Pa
     monkeypatch.setattr("noah_code.config._user_config_path", lambda: user_config)
     loaded = load_config(project)
     assert loaded.hooks.lifecycle == [HookSpec(match="turn_end", command="trusted")]
+
+
+@pytest.mark.asyncio
+async def test_hooks_scrub_server_token_and_hydrated_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from noah_code import credentials
+
+    data_home = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    monkeypatch.setattr(credentials, "_HYDRATED_ENV_VARS", set())
+    credentials.store_provider_api_key("openai", "hydrated-openai-secret")
+    monkeypatch.setenv("NOAH_CODE_SERVER_TOKEN", "internal-server-token")
+    monkeypatch.setenv("USER_EXPORTED_FLAG", "visible-to-hook")
+
+    out_path = tmp_path / "hook-env.json"
+    dump_cmd = (
+        f"{shlex.quote(sys.executable)} -c "
+        + shlex.quote(
+            "import json, os, pathlib; "
+            f"pathlib.Path({str(out_path)!r}).write_text(json.dumps({{"
+            "'server': os.environ.get('NOAH_CODE_SERVER_TOKEN'), "
+            "'openai': os.environ.get('OPENAI_API_KEY'), "
+            "'user': os.environ.get('USER_EXPORTED_FLAG')"
+            "}))"
+        )
+    )
+    runner = HookRunner(
+        HooksConfig(pre_tool=[HookSpec(match="*", command=dump_cmd)]),
+        cwd=tmp_path,
+    )
+    outcome = await runner.run_pre(tool="ws_run", category="bash", target="pwd")
+    assert outcome.allowed
+    observed = json.loads(out_path.read_text())
+    assert observed == {
+        "server": None,
+        "openai": None,
+        "user": "visible-to-hook",
+    }

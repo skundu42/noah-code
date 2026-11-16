@@ -35,6 +35,15 @@ _IGNORED_DIRS = frozenset(
         "node_modules",
         "dist",
         "build",
+        "target",
+        ".next",
+        ".nuxt",
+        ".turbo",
+        ".gradle",
+        ".nox",
+        "htmlcov",
+        "test-results",
+        "playwright-report",
         "__pycache__",
         ".tox",
         ".mypy_cache",
@@ -44,9 +53,74 @@ _IGNORED_DIRS = frozenset(
     }
 )
 
+_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+_STANDALONE_CHECKS = frozenset(
+    {
+        "pytest",
+        "unittest",
+        "mypy",
+        "pyright",
+        "tsc",
+        "jest",
+        "vitest",
+        "tox",
+        "nox",
+        "eslint",
+    }
+)
+_SUBCOMMAND_RUNNERS = frozenset({"npm", "pnpm", "yarn", "bun", "cargo", "go", "make"})
+_CHECK_SUBCOMMANDS = frozenset(
+    {"test", "check", "lint", "build", "typecheck", "clippy", "vet"}
+)
+_NARROW_FILTER_FLAGS = frozenset(
+    {
+        "-k",
+        "-m",
+        "--lf",
+        "--last-failed",
+        "--sw",
+        "--stepwise",
+        "-t",
+        "--testNamePattern",
+        "--testPathPattern",
+        "--grep",
+        "-g",
+        "--filter",
+    }
+)
+_NON_NARROWING_VALUE_FLAGS = frozenset(
+    {
+        "-c",
+        "--config",
+        "--config-file",
+        "-n",
+        "--numprocesses",
+        "--maxfail",
+        "--tb",
+        "--cov",
+        "--cov-report",
+        "--cov-config",
+        "--color",
+        "--durations",
+        "-o",
+        "--override-ini",
+        "--rootdir",
+        "--basetemp",
+        "--import-mode",
+        "--junitxml",
+        "--log-cli-level",
+    }
+)
+_SUITE_WIDE_TARGETS = frozenset(
+    {"", ".", "./", "...", "./...", "tests", "./tests", "test", "./test", "src", "./src"}
+)
 
-def check_label(command: str) -> str | None:
-    """Recognize a single check command whose exit status can be attributed safely."""
+
+def _is_ignored_artifact_name(name: str) -> bool:
+    return name in {".coverage", "coverage.xml"} or name.startswith(".coverage.")
+
+
+def _unwrap_check_tokens(command: str) -> list[str] | None:
     if any(char in command for char in "\n\r`$"):
         return None
     try:
@@ -57,7 +131,12 @@ def check_label(command: str) -> str | None:
         return None
     if not tokens or any(set(token) <= set(";|&<>()") for token in tokens):
         return None
-    if Path(tokens[0]).name == "uv" and tokens[1:2] == ["run"]:
+    while tokens and _ENV_ASSIGNMENT_RE.fullmatch(tokens[0]):
+        tokens.pop(0)
+    if not tokens:
+        return None
+    runner = Path(tokens[0]).name
+    if runner == "uv" and tokens[1:2] == ["run"]:
         tokens = tokens[2:]
         while tokens and tokens[0] in {
             "--no-sync",
@@ -67,6 +146,18 @@ def check_label(command: str) -> str | None:
             "-q",
             "--quiet",
         }:
+            tokens.pop(0)
+    elif runner in {"poetry", "pdm", "hatch"} and tokens[1:2] == ["run"]:
+        tokens = tokens[2:]
+        while tokens and tokens[0] in {"-q", "--quiet"}:
+            tokens.pop(0)
+    elif runner == "npx":
+        tokens = tokens[1:]
+        while tokens and tokens[0] in {"--no-install", "--no", "-q", "--quiet", "-y", "--yes"}:
+            tokens.pop(0)
+    elif runner == "bunx":
+        tokens = tokens[1:]
+        while tokens and tokens[0] in {"--bun", "--no-install", "-q", "--quiet", "-y", "--yes"}:
             tokens.pop(0)
     if tokens and re.fullmatch(r"python(?:3(?:\.\d+)?)?", Path(tokens[0]).name):
         tokens = tokens[1:]
@@ -90,26 +181,132 @@ def check_label(command: str) -> str | None:
         for token in tokens
     ):
         return None
+    return tokens
+
+
+def check_label(command: str) -> str | None:
+    """Recognize a single check command whose exit status can be attributed safely."""
+    tokens = _unwrap_check_tokens(command)
+    if not tokens:
+        return None
     executable = Path(tokens[0]).name
-    if executable in {"pytest", "unittest", "mypy", "pyright", "tsc", "jest", "vitest"}:
+    if executable in _STANDALONE_CHECKS:
         return executable
-    if executable == "ruff" and tokens[1:2] == ["check"]:
-        return "ruff"
-    if executable in {"npm", "pnpm", "yarn", "cargo", "go", "make"}:
+    if executable == "ruff":
+        if tokens[1:2] == ["check"]:
+            return "ruff"
+        if tokens[1:2] == ["format"] and "--check" in tokens[2:]:
+            return "ruff format"
+        return None
+    if executable == "biome" and len(tokens) >= 2 and tokens[1] in {"check", "lint", "ci"}:
+        return f"biome {tokens[1]}"
+    if executable == "golangci-lint" and tokens[1:2] == ["run"]:
+        return "golangci-lint"
+    if executable in {"gradle", "gradlew"}:
+        for arg in tokens[1:]:
+            if arg.startswith("-"):
+                continue
+            task = arg.rsplit(":", 1)[-1]
+            if task in {"test", "check"}:
+                return f"gradle {task}"
+            return None
+        return None
+    if executable == "deno":
+        if tokens[1:2] == ["test"]:
+            return "deno test"
+        return None
+    if executable in _SUBCOMMAND_RUNNERS:
         arguments = tokens[1:]
         if arguments[:1] == ["run"]:
             arguments = arguments[1:]
-        if arguments and arguments[0] in {
-            "test",
-            "check",
-            "lint",
-            "build",
-            "typecheck",
-            "clippy",
-            "vet",
-        }:
+        if arguments and arguments[0] in _CHECK_SUBCOMMANDS:
             return f"{executable} {arguments[0]}"
     return None
+
+
+def _is_suite_wide_check(command: str) -> bool:
+    """Return True when a check command covers the suite rather than a narrow filter/path."""
+    tokens = _unwrap_check_tokens(command)
+    if not tokens:
+        return False
+    executable = Path(tokens[0]).name
+    args = list(tokens[1:])
+    _strip_first = {
+        "ruff": {"check", "format"},
+        "biome": {"check", "lint", "ci"},
+        "golangci-lint": {"run"},
+        "deno": {"test"},
+        "vitest": {"run"},
+    }
+    if executable in _strip_first and args and args[0] in _strip_first[executable]:
+        args = args[1:]
+    elif executable in {"gradle", "gradlew"}:
+        rest: list[str] = []
+        consumed_task = False
+        for arg in args:
+            if not consumed_task and not arg.startswith("-"):
+                if ":" in arg:
+                    return False
+                consumed_task = True
+                continue
+            rest.append(arg)
+        args = rest
+    elif executable in _SUBCOMMAND_RUNNERS:
+        if args[:1] == ["run"]:
+            args = args[1:]
+        if args and args[0] in _CHECK_SUBCOMMANDS:
+            args = args[1:]
+    elif executable == "unittest" and args[:1] == ["discover"]:
+        idx = 1
+        while idx < len(args):
+            tok = args[idx]
+            flag = tok.split("=", 1)[0]
+            if flag == "-k":
+                return False
+            if flag in {"-s", "--start-directory"}:
+                val = tok.split("=", 1)[1] if "=" in tok else (args[idx + 1] if idx + 1 < len(args) else "")
+                if val.rstrip("/") not in _SUITE_WIDE_TARGETS:
+                    return False
+                idx += 1 if "=" in tok else 2
+                continue
+            if flag in {"-p", "--pattern"}:
+                val = tok.split("=", 1)[1] if "=" in tok else (args[idx + 1] if idx + 1 < len(args) else "")
+                if "*" not in val and "?" not in val:
+                    return False
+                idx += 1 if "=" in tok else 2
+                continue
+            if flag in {"-t", "--top-level-directory"}:
+                idx += 1 if "=" in tok else 2
+                continue
+            if not tok.startswith("-") and tok.rstrip("/") not in _SUITE_WIDE_TARGETS:
+                return False
+            idx += 1
+        return True
+
+    idx = 0
+    while idx < len(args):
+        tok = args[idx]
+        if tok == "--":
+            idx += 1
+            while idx < len(args):
+                pos = args[idx]
+                if "::" in pos or pos.rstrip("/") not in _SUITE_WIDE_TARGETS:
+                    return False
+                idx += 1
+            break
+        flag = tok.split("=", 1)[0]
+        if flag in _NARROW_FILTER_FLAGS:
+            return False
+        if flag in _NON_NARROWING_VALUE_FLAGS and "=" not in tok:
+            idx += 2
+            continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        if "::" in tok or tok.rstrip("/") not in _SUITE_WIDE_TARGETS:
+            return False
+        idx += 1
+    return True
 
 
 @dataclass
@@ -200,10 +397,13 @@ class CheckLedger:
                     relative = os.fsdecode(listed_row[2:])
                     # -t distinguishes untracked outputs (?) from index entries.
                     # Always include tracked files, even under generated dirs.
-                    if listed_row[:1] == b"?" and any(
-                        part in _IGNORED_DIRS for part in Path(relative).parts[:-1]
-                    ):
-                        continue
+                    if listed_row[:1] == b"?":
+                        rel_path = Path(relative)
+                        if (
+                            any(part in _IGNORED_DIRS for part in rel_path.parts[:-1])
+                            or _is_ignored_artifact_name(rel_path.name)
+                        ):
+                            continue
                     paths.add(relative)
             else:
                 paths = set()
@@ -222,7 +422,11 @@ class CheckLedger:
                         if (folder / name).is_symlink():
                             files.append(name)
                             dirs.remove(name)
-                    paths.update(str((folder / name).relative_to(self.root)) for name in files)
+                    paths.update(
+                        str((folder / name).relative_to(self.root))
+                        for name in files
+                        if not _is_ignored_artifact_name(name)
+                    )
             digest = hashlib.sha256()
             for relative in sorted(paths):
                 path = self.root / relative
@@ -351,13 +555,34 @@ class CheckLedger:
     async def completion_blockers(self, since: float = 0) -> list[dict[str, Any]]:
         """Latest observed check per command/cwd since an epoch timestamp.
 
-        A successful rerun supersedes that command's previous failure. Missing
-        checks create no blocker; failed, stale, incomplete, unknown, and active
-        checks do. Sources share evidence when checking the same command/cwd.
+        A successful rerun supersedes that command's previous failure, and a
+        subsequent suite-wide pass (or a pass after a CLI/collection error)
+        for the same ``(label, cwd)`` clears earlier narrow or mistyped checks.
+        Missing checks create no blocker; failed, stale, incomplete, unknown,
+        and active checks do.
         """
         latest: dict[tuple[str, str | None], dict[str, Any]] = {}
         for row in await self.snapshot(since=since):
-            latest[(row["command"], row["cwd"])] = row
+            key = (row["command"], row["cwd"])
+            latest[key] = row
+            if row["state"] == "passed":
+                suite_wide = _is_suite_wide_check(row["command"])
+                superseded = [
+                    prev_key
+                    for prev_key, prev_row in latest.items()
+                    if prev_key != key
+                    and prev_row["label"] == row["label"]
+                    and prev_row["cwd"] == row["cwd"]
+                    and (
+                        (suite_wide and prev_row["state"] in {"failed", "stale", "incomplete"})
+                        or (
+                            prev_row["state"] in {"failed", "stale"}
+                            and prev_row.get("returncode") in {2, 4, 5}
+                        )
+                    )
+                ]
+                for prev_key in superseded:
+                    del latest[prev_key]
         return [row for row in latest.values() if row["state"] != "passed"]
 
 

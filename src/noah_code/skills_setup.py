@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 import shutil
 import uuid
@@ -11,6 +12,12 @@ from typing import Any
 
 from noah_code import nooa_compat
 from noah_code.config import NoahCodeConfig
+
+_UNSUPPORTED_SKILL_PREFIXES = ("nemo.",)
+
+
+def _is_unsupported_builtin_skill(registry_name: str) -> bool:
+    return registry_name.startswith(_UNSUPPORTED_SKILL_PREFIXES)
 
 
 @dataclass(frozen=True)
@@ -23,6 +30,16 @@ class SkillInfo:
     source: str
     active: bool
     document_skill: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "registry_name": self.registry_name,
+            "name": self.name,
+            "description": self.description,
+            "source": self.source,
+            "active": self.active,
+            "document_skill": self.document_skill,
+        }
 
 
 def _default_user_home() -> Path:
@@ -263,24 +280,203 @@ def _discover_workspace_text_skills(registry: Any, roots: list[Path]) -> None:
                 continue
 
 
-def install_skills(agent: Any, workspace: Path, config: NoahCodeConfig) -> str:
+def _build_noah_skill_registry(agent: Any) -> Any:
+    from nooa.skill_registry import SkillRegistry
+
+    class NoahSkillRegistry(SkillRegistry):
+        """SkillRegistry keeping unactivated skills hidden and filtering built-in nemo.* tools."""
+
+        def register(
+            self,
+            name: str,
+            skill_or_cls: Any = None,
+            /,
+            **kwargs: Any,
+        ) -> None:
+            if _is_unsupported_builtin_skill(name):
+                raise ValueError(f"Built-in skill {name!r} is not supported in Noah Code")
+            super().register(name, skill_or_cls, **kwargs)
+            if name not in self._activated:
+                self._hide_skill(name)
+
+        def load(self, patterns: list[str]) -> None:
+            normalized = [patterns] if isinstance(patterns, str) else list(patterns)
+            allowed_candidates = {
+                name for name in self._discovered if not _is_unsupported_builtin_skill(name)
+            }
+            matched = self._match(normalized, allowed_candidates)
+            if not matched:
+                blocked = self._match(normalized, set(self._discovered) - allowed_candidates)
+                if blocked:
+                    raise ValueError(
+                        f"NOOA built-in skills ({', '.join(sorted(blocked))}) are not supported "
+                        "in Noah Code; use self.ws, self.git, self.todos, and self.web instead."
+                    )
+                return
+            super().load(sorted(matched))
+            for name in self._loaded - self._activated:
+                self._hide_skill(name)
+
+        def activate(self, patterns: list[str] | str) -> list[str]:
+            normalized = [patterns] if isinstance(patterns, str) else list(patterns)
+            if not normalized:
+                return self.activated()
+            resolved: list[str] = []
+            for pattern in normalized:
+                if (
+                    pattern not in self._discovered
+                    and pattern not in self._loaded
+                    and not any(ch in pattern for ch in "*?[")
+                    and f"cmd.{pattern}" in self._discovered
+                ):
+                    resolved.append(f"cmd.{pattern}")
+                else:
+                    resolved.append(pattern)
+
+            allowed_discovered = {
+                name for name in self._discovered if not _is_unsupported_builtin_skill(name)
+            }
+            allowed_loaded = {
+                name for name in self._loaded if not _is_unsupported_builtin_skill(name)
+            }
+            matched_any = self._match(resolved, allowed_discovered | allowed_loaded)
+            if not matched_any:
+                blocked = self._match(
+                    resolved,
+                    (set(self._discovered) | set(self._loaded))
+                    - (allowed_discovered | allowed_loaded),
+                )
+                if blocked:
+                    raise ValueError(
+                        f"NOOA built-in skills ({', '.join(sorted(blocked))}) are not supported "
+                        "in Noah Code; use self.ws, self.git, self.todos, and self.web instead."
+                    )
+                return self.activated()
+
+            super().activate(sorted(matched_any))
+            for name in self._loaded - self._activated:
+                self._hide_skill(name)
+            approved = getattr(self._agent, "_sandbox_approved_roots", None)
+            if isinstance(approved, set):
+                for name in self._activated:
+                    attr = self._attr_map.get(name)
+                    if attr:
+                        approved.add(attr)
+            return self.activated()
+
+        def list_skills(self) -> list[dict[str, Any]]:
+            """Return picklable metadata for Noah-compatible skills."""
+
+            return [
+                info.to_dict()
+                for info in list_skills(self)
+                if not _is_unsupported_builtin_skill(info.registry_name)
+            ]
+
+        def status(self) -> str:
+            """Render the `# Skills` context block without unsupported `nemo.*` builtins."""
+
+            lines: list[str] = []
+
+            active_tools: list[tuple[str, str, str]] = []
+            for name in sorted(self._activated):
+                if _is_unsupported_builtin_skill(name):
+                    continue
+                attr = self._attr_map.get(name, "")
+                skill = getattr(self._agent, attr, None) if attr else None
+                if skill is None:
+                    continue
+                desc = str(getattr(skill, "description", "") or "").strip()
+                if not desc:
+                    doc_str = type(skill).__doc__ or ""
+                    desc = doc_str.strip().split("\n")[0]
+                active_tools.append((name, attr, desc[:65]))
+
+            if active_tools:
+                lines.append(
+                    "Active Skills (use via self.<attr>, docs via doc(self.<attr>)):"
+                )
+                for _name, attr, desc in active_tools:
+                    lines.append(f"  self.{attr:18s} {desc}")
+
+            available: list[tuple[str, str]] = []
+            for name in sorted(set(self._discovered.keys()) - self._activated):
+                if _is_unsupported_builtin_skill(name):
+                    continue
+                attr = self._attr_map.get(name, "")
+                skill = getattr(self._agent, attr, None) if attr else None
+                one_liner = ""
+                if skill is not None:
+                    one_liner = str(getattr(skill, "description", "") or "").strip()
+                    if not one_liner:
+                        doc_str = type(skill).__doc__ or ""
+                        one_liner = doc_str.strip().split("\n")[0]
+                else:
+                    entry = self._discovered.get(name)
+                    if entry and entry.entry_point:
+                        try:
+                            cls = entry.entry_point.load()
+                            doc_str = cls.__doc__ or ""
+                            one_liner = doc_str.strip().split("\n")[0]
+                        except Exception:  # noqa: BLE001
+                            one_liner = ""
+                available.append((name, one_liner[:65]))
+
+            if available:
+                if active_tools:
+                    lines.append("")
+                lines.append(
+                    "Available Skills (inspect with self.skills.list_skills(), "
+                    "activate with self.skills.activate(['name'])):"
+                )
+                for name, desc in available[:24]:
+                    lines.append(f"  {name:28s} {desc}")
+                if len(available) > 24:
+                    lines.append(
+                        f"  ... ({len(available) - 24} more; call self.skills.list_skills())"
+                    )
+
+            return "\n".join(lines)
+
+    return NoahSkillRegistry(agent)
+
+
+def install_skills(
+    agent: Any,
+    workspace: Path,
+    config: NoahCodeConfig,
+    *,
+    home: Path | None = None,
+) -> str:
     """Attach SkillRegistry, discover compatible roots, and activate config patterns."""
     try:
-        from nooa.skill_registry import SkillRegistry
+        from nooa.agentdoc import spec
     except ImportError:
         return "SkillRegistry unavailable"
 
-    registry = SkillRegistry(agent)
+    try:
+        registry = _build_noah_skill_registry(agent)
+    except ImportError:
+        return "SkillRegistry unavailable"
+
     agent.skills = registry
+    if getattr(agent, "skills", None) is not None:
+        with contextlib.suppress(Exception):
+            spec(agent, "skills", hidden=True)
+
     # Untrusted repository directories can only supply Markdown TextSkills; Python
     # skills and entry-point packages are loaded exclusively from user-owned roots.
-    workspace_roots = [d for d in _workspace_skill_dirs(workspace) if d.is_dir() and not d.is_symlink()]
+    workspace_roots = [
+        d for d in _workspace_skill_dirs(workspace) if d.is_dir() and not d.is_symlink()
+    ]
     if workspace_roots:
         _discover_workspace_text_skills(registry, workspace_roots)
-    user_roots = [d for d in _user_skill_dirs() if d.is_dir()]
+    user_roots = [d for d in _user_skill_dirs(home=home) if d.is_dir()]
     if user_roots:
         registry.discover_skills_dirs(user_roots)
-    found = list(registry.discovered())
+    found = [
+        name for name in registry.discovered() if not _is_unsupported_builtin_skill(name)
+    ]
 
     # Activation is opt-in from trusted user configuration. Repository config is
     # not allowed to set enabled_skills (see config._USER_ONLY_CONFIG_KEYS).

@@ -354,3 +354,54 @@ def test_rollback_cleans_leftover_directory(tmp_path: Path, monkeypatch) -> None
         manager.create("crumbs")
     # _rollback rmtree'd the leftover directory.
     assert not (storage / repo_id_for(repo) / "crumbs").exists()
+
+
+def test_unnamed_create_falls_back_to_hex_suffix_on_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    storage = tmp_path / "worktree"
+    manager = WorktreeManager(repo, storage)
+    occupied = storage / repo_id_for(repo)
+    (occupied / "calm-river").mkdir(parents=True)
+    monkeypatch.setattr(worktree, "_random_name", lambda: "calm-river")
+
+    created = manager.create(None)
+    assert created.name.startswith("calm-river-")
+    assert len(created.name.removeprefix("calm-river-")) == 4
+    assert created.directory.is_dir()
+
+
+def test_create_include_dirty_overlays_uncommitted_changes_and_skips_secrets_and_huge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text("*.ignored\n")
+    (repo / "remove_me.txt").write_text("gone soon\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "setup")
+
+    (repo / "README.md").write_text("dirty edit\n")
+    (repo / "remove_me.txt").unlink()
+    (repo / "untracked.py").write_text("x = 1\n")
+    (repo / "link.py").symlink_to("untracked.py")
+    (repo / ".env").write_text("SECRET=123\n")
+    (repo / "build.ignored").write_text("ignored\n")
+    monkeypatch.setattr(worktree, "_MAX_UNTRACKED_OVERLAY_BYTES", 32)
+    (repo / "large.bin").write_bytes(b"z" * 64)
+
+    manager = WorktreeManager(repo, tmp_path / "worktree")
+    clean = manager.create("clean-wt", include_dirty=False)
+    dirty = manager.create("dirty-wt", include_dirty=True)
+
+    assert (clean.directory / "README.md").read_text() == "hello\n"
+    assert (clean.directory / "remove_me.txt").exists()
+    assert not (clean.directory / "untracked.py").exists()
+
+    assert (dirty.directory / "README.md").read_text() == "dirty edit\n"
+    assert not (dirty.directory / "remove_me.txt").exists()
+    assert (dirty.directory / "untracked.py").read_text() == "x = 1\n"
+    assert (dirty.directory / "link.py").is_symlink()
+    assert not (dirty.directory / ".env").exists()
+    assert not (dirty.directory / "build.ignored").exists()
+    assert not (dirty.directory / "large.bin").exists()

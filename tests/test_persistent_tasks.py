@@ -507,3 +507,48 @@ async def test_database_setup_failure_closes_storage_and_releases_lease(
         WorktreeManager(root, worktree_storage_root(parent._config.session_dir)).remove(
             f"task-{started['id']}",
         )
+
+
+@pytest.mark.asyncio
+async def test_isolated_task_include_dirty_diff_apply_and_cleanup(tmp_path: Path) -> None:
+    root = _repo(tmp_path / "repo")
+    (root / "source.txt").write_text("dirty parent seed\n")
+    parent = _parent(
+        root,
+        tmp_path / "data",
+        _model(
+            'content = (await self.ws.read("source.txt")).text\n'
+            'assert "dirty parent seed" in content\n'
+            'await self.ws.write_file("source.txt", content + "child line\\n")\n'
+            'return_result(Done(explanation="applied dirty + child"))'
+        ),
+    )
+    tasks = TaskTools(parent.ws._workspace, parent.engine, parent.approvals, parent=parent)
+    try:
+        started = json.loads(
+            await tasks.start("general", "extend dirty file", isolate=True, include_dirty=True)
+        )
+        task_id = started["id"]
+        status = json.loads(await tasks.wait(task_id, timeout=10))
+        assert status["state"] == "completed", status
+
+        diff_out = await tasks.diff(task_id)
+        assert "source.txt" in diff_out
+        assert "child line" in diff_out
+
+        parent.journal.begin_turn()
+        applied = await tasks.apply(task_id)
+        parent.journal.end_turn()
+        assert "source.txt" in applied
+        assert (root / "source.txt").read_text() == "dirty parent seed\nchild line\n"
+
+        # Undo via parent journal restores exact pre-apply parent contents!
+        parent.journal.undo()
+        assert (root / "source.txt").read_text() == "dirty parent seed\n"
+
+        cleaned = await tasks.cleanup(task_id)
+        assert "cleaned" in cleaned.lower() or "removed" in cleaned.lower()
+        assert not Path(status["directory"]).exists()
+    finally:
+        await tasks.close()
+        await parent.close_tools()

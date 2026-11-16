@@ -854,3 +854,110 @@ def test_narrow_text_filter_forms_remain_readonly() -> None:
         assert build.is_readonly_command(command), command
         assert build.decide("bash", command).action == "allow", command
         assert plan.decide("bash", command).action == "allow", command
+
+
+def test_subshell_and_brace_grouping_bypasses_are_denied() -> None:
+    interactive = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=False)
+    auto = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+
+    for cmd in ("(env)", "(printenv)", "((env))", "{ env; }", "{ printenv; }"):
+        assert interactive.decide("bash", cmd).action == "deny", cmd
+        assert auto.decide("bash", cmd).action == "deny", cmd
+
+    for cmd in (
+        "(python3 -c 'import os; print(os.environ)')",
+        "{ set; }",
+        "{ export -p; }",
+        "(deno eval 'console.log(Deno.env.toObject())')",
+        "(bun -e 'console.log(Bun.env)')",
+    ):
+        decision = auto.decide("bash", cmd)
+        assert decision.action == "deny", cmd
+        assert "environment dump" in decision.reason
+
+    for cmd in (
+        "(bash -c 'cat .env')",
+        "FOO=1 (python3 -c 'print(1)')",
+        "{ python3 -c 'print(1)'; }",
+    ):
+        decision = auto.decide("bash", cmd)
+        assert decision.action == "deny", cmd
+        assert "interpreter" in decision.reason
+
+    for cmd in ("(cat .env)", "{ cat .env; }", "(head id_rsa)"):
+        decision = interactive.decide("bash", cmd)
+        assert decision.action == "deny", cmd
+        assert "secret" in decision.reason
+
+
+def test_unquoted_subshells_and_groups_are_compound_while_quoted_parens_are_not() -> None:
+    from noah_code.permissions import _is_compound
+
+    engine = PermissionEngine(DEFAULT_PERMISSION_RULES)
+    for compound_cmd in ("(pwd)", "(ls)", "{ pwd; }", "{ pwd }", "FOO=1 (pwd)"):
+        assert _is_compound(compound_cmd) is True, compound_cmd
+        assert engine.is_readonly_command(compound_cmd) is False, compound_cmd
+        assert engine.is_uncertain_shell(compound_cmd) is True, compound_cmd
+
+    assert _is_compound('python -c "print(1)"') is False
+    assert _is_compound("python -c 'print(1)'") is False
+    assert _is_compound('rg "foo(bar)" src') is False
+    assert engine.is_readonly_command('rg "foo(bar)" src') is True
+    assert engine.is_uncertain_shell('rg "foo(bar)" src') is False
+
+
+def test_modern_interpreters_and_safe_unittest_under_auto() -> None:
+    auto = PermissionEngine(DEFAULT_PERMISSION_RULES, auto_approve=True)
+    plan = PermissionEngine(DEFAULT_PERMISSION_RULES, mode="plan", auto_approve=True)
+
+    for cmd in (
+        "bun run script.ts",
+        "bun -e '1 + 1'",
+        "deno run script.ts",
+        "deno eval '1 + 1'",
+        "tsx script.ts",
+        "ts-node script.ts",
+        "lua script.lua",
+        "luajit -e 'print(1)'",
+    ):
+        decision = auto.decide("bash", cmd)
+        assert decision.action == "deny", cmd
+        assert "interpreter" in decision.reason
+
+    for env_cmd in (
+        "deno eval 'console.log(Deno.env.toObject())'",
+        "bun -e 'console.log(Bun.env)'",
+        "tsx -e 'console.log(process.env)'",
+        "ts-node -e 'console.log(process.env)'",
+    ):
+        decision = auto.decide("bash", env_cmd)
+        assert decision.action == "deny", env_cmd
+        assert "environment dump" in decision.reason
+
+    for inert in ("bun --version", "deno --version", "lua -v"):
+        assert auto.decide("bash", inert).action == "allow", inert
+
+    for safe_unittest in (
+        "python -m unittest",
+        "python3 -m unittest discover -s tests -p 'test_*.py'",
+        ".venv/bin/python3.13 -B -I -q -m unittest discover",
+        "uv run python -m unittest discover",
+        "uv run --offline --locked python3 -B -m unittest tests.test_mod",
+    ):
+        assert auto.decide("bash", safe_unittest).action == "allow", safe_unittest
+        assert plan.decide("bash", safe_unittest).action == "deny", safe_unittest
+
+    for unsafe_py in (
+        "python -c 'print(1)'",
+        "python -c 'print(1)' -m unittest",
+        "python -W error -m unittest",
+        "python -X dev -m unittest",
+        "python script.py",
+        "python -m scripts.read_secrets",
+        "python -m unittest.mock",
+        "uv run -m scripts.read_secrets",
+        "uv run --with evil python -m unittest",
+    ):
+        decision = auto.decide("bash", unsafe_py)
+        assert decision.action == "deny", unsafe_py
+        assert "interpreter" in decision.reason

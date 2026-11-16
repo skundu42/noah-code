@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import random
 import shutil
+import stat
 import subprocess
+import uuid
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+
+from noah_code.permissions import is_secret_path
 
 _STRIPPED_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY")
 _GIT_TIMEOUT = 30
+_MAX_UNTRACKED_OVERLAY_BYTES = 20_000_000
 
 ADJECTIVES = (
     "brave",
@@ -94,6 +101,29 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
         )
 
 
+def _git_bytes(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    env = os.environ.copy()
+    for name in _STRIPPED_GIT_ENV:
+        env.pop(name, None)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=_GIT_TIMEOUT,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise WorktreeError(f"git {args[0] if args else ''} failed: {exc}") from exc
+
+
+def _split_nul(data: bytes) -> list[str]:
+    return [os.fsdecode(part) for part in data.split(b"\0") if part]
+
+
 def _git_message(result: subprocess.CompletedProcess[str]) -> str:
     return (result.stderr or result.stdout or "git command failed").strip()
 
@@ -111,13 +141,24 @@ def git_common_dir(cwd: Path) -> Path | None:
     return path.resolve()
 
 
-def repo_id_for(cwd: Path) -> str:
-    """Stable id shared by every linked worktree of the same repository."""
-
-    common = git_common_dir(cwd)
+@lru_cache(maxsize=256)
+def _repo_id_cached(resolved: Path, has_dot_git: bool) -> str:
+    _ = has_dot_git
+    common = git_common_dir(resolved)
     if common is None:
         return ""
     return hashlib.sha256(str(common).encode()).hexdigest()[:16]
+
+
+def repo_id_for(cwd: Path) -> str:
+    """Stable id shared by every linked worktree of the same repository."""
+
+    resolved = cwd.resolve()
+    return _repo_id_cached(resolved, (resolved / ".git").exists())
+
+
+repo_id_for.cache_clear = _repo_id_cached.cache_clear  # type: ignore[attr-defined]
+repo_id_for.cache_info = _repo_id_cached.cache_info  # type: ignore[attr-defined]
 
 
 def primary_checkout(cwd: Path) -> Path:
@@ -162,7 +203,7 @@ class WorktreeManager:
         self.checkout = checkout.resolve()
         self.storage_root = storage_root.expanduser().resolve()
 
-    def create(self, name: str | None = None) -> WorktreeInfo:
+    def create(self, name: str | None = None, *, include_dirty: bool = False) -> WorktreeInfo:
         if git_common_dir(self.checkout) is None:
             raise WorktreeError("worktrees need a git repo")
         repo = repo_id_for(self.checkout)
@@ -184,7 +225,98 @@ class WorktreeManager:
         if populated.returncode != 0:
             self._rollback(info)
             raise WorktreeError(_git_message(populated))
+        if include_dirty:
+            try:
+                self._overlay_dirty(info.directory)
+            except Exception as exc:
+                self._rollback(info)
+                if isinstance(exc, WorktreeError):
+                    raise
+                raise WorktreeError(f"failed to overlay dirty worktree state: {exc}") from exc
         return info
+
+    def _overlay_dirty(self, target_dir: Path) -> None:
+        top_res = _git_bytes(self.checkout, "rev-parse", "--show-toplevel")
+        if top_res.returncode != 0:
+            raise WorktreeError("cannot determine source worktree root")
+        source_top = Path(os.fsdecode(top_res.stdout.strip())).resolve()
+        target_root = target_dir.resolve()
+
+        unstaged = _git_bytes(
+            source_top, "ls-files", "-m", "-d", "-z", "--full-name", "--", ":/"
+        )
+        has_head = _git(source_top, "rev-parse", "--verify", "--quiet", "HEAD").returncode == 0
+        staged = (
+            _git_bytes(source_top, "diff-index", "--cached", "--name-only", "-z", "HEAD")
+            if has_head
+            else _git_bytes(source_top, "ls-files", "-z", "--full-name", "--", ":/")
+        )
+        untracked = _git_bytes(
+            source_top, "ls-files", "-o", "--exclude-standard", "-z", "--full-name", "--", ":/"
+        )
+        for res in (unstaged, staged, untracked):
+            if res.returncode != 0:
+                raise WorktreeError("failed to inspect uncommitted files")
+
+        untracked_set = set(_split_nul(untracked.stdout))
+        dirty_paths = sorted(
+            set(_split_nul(unstaged.stdout)) | set(_split_nul(staged.stdout)) | untracked_set
+        )
+
+        def _remove_target(path: Path) -> None:
+            if not os.path.lexists(path):
+                return
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+
+        def _ensure_parent_dirs(rel_parts: tuple[str, ...]) -> Path:
+            cur = target_root
+            for part in rel_parts[:-1]:
+                cur = cur / part
+                if os.path.lexists(cur):
+                    if cur.is_symlink() or not cur.is_dir():
+                        cur.unlink()
+                        cur.mkdir(mode=0o755)
+                else:
+                    cur.mkdir(mode=0o755)
+            return cur / rel_parts[-1]
+
+        for rel in dirty_paths:
+            if is_secret_path(rel):
+                continue
+            rel_path = Path(rel)
+            if rel_path.is_absolute() or ".." in rel_path.parts or not rel_path.parts:
+                continue
+            src = source_top / rel_path
+            dst = target_root / rel_path
+            try:
+                src_info = src.lstat()
+            except (FileNotFoundError, NotADirectoryError):
+                _remove_target(dst)
+                parent = dst.parent
+                while parent != target_root and parent.is_relative_to(target_root):
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
+                    parent = parent.parent
+                continue
+
+            if stat.S_ISLNK(src_info.st_mode):
+                link_target = os.readlink(src)
+                _remove_target(dst)
+                safe_dst = _ensure_parent_dirs(rel_path.parts)
+                os.symlink(link_target, safe_dst)
+            elif stat.S_ISREG(src_info.st_mode):
+                if rel in untracked_set and src_info.st_size > _MAX_UNTRACKED_OVERLAY_BYTES:
+                    continue
+                _remove_target(dst)
+                safe_dst = _ensure_parent_dirs(rel_path.parts)
+                shutil.copy2(src, safe_dst)
+            elif os.path.lexists(dst) and (not dst.is_dir() or dst.is_symlink()):
+                dst.unlink()
 
     def list(self) -> list[WorktreeInfo]:
         if git_common_dir(self.checkout) is None:
@@ -244,12 +376,19 @@ class WorktreeManager:
             _git(self.checkout, "branch", "-D", info.branch)
         if directory.exists():
             shutil.rmtree(directory, ignore_errors=True)
+        with contextlib.suppress(Exception):
+            repo_id_for.cache_clear()  # type: ignore[attr-defined]
         return info
 
     def _candidate(self, root: Path, name: str | None) -> WorktreeInfo:
-        base = _slug(name) if name else ""
+        explicit = bool(name and "".join(ch for ch in name if ch.isalnum()))
+        base = _slug(name) if explicit and name is not None else ""
         for attempt in range(MAX_NAME_ATTEMPTS):
-            chosen = base if base and attempt == 0 else (f"{base}-{_random_name()}" if base else _random_name())
+            chosen = (
+                base
+                if base and attempt == 0
+                else (f"{base}-{_random_name()}" if base else _random_name())
+            )
             branch = f"noah/{chosen}"
             directory = root / chosen
             if directory.exists():
@@ -258,6 +397,19 @@ class WorktreeManager:
             if exists.returncode == 0:
                 continue
             return WorktreeInfo(name=chosen, branch=branch, directory=directory)
+        if not explicit:
+            for _ in range(MAX_NAME_ATTEMPTS):
+                chosen = f"{_random_name()}-{uuid.uuid4().hex[:4]}"
+                branch = f"noah/{chosen}"
+                directory = root / chosen
+                if directory.exists():
+                    continue
+                exists = _git(
+                    self.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"
+                )
+                if exists.returncode == 0:
+                    continue
+                return WorktreeInfo(name=chosen, branch=branch, directory=directory)
         raise WorktreeError("failed to generate a unique worktree name")
 
     def _owned(self, directory: Path, branch: str) -> WorktreeInfo | None:

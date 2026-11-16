@@ -6,7 +6,9 @@ import asyncio
 import builtins
 import contextlib
 import json
+import os
 import re
+import subprocess
 import time
 import uuid
 from collections import deque
@@ -15,12 +17,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from nooa import Skill
+from nooa import Skill, hidden
 
 from noah_code import nooa_compat
 from noah_code.agents import AgentSpec, discover_agents
 from noah_code.approvals import ApprovalBroker
-from noah_code.permissions import PermissionCategory, PermissionEngine
+from noah_code.permissions import PermissionCategory, PermissionEngine, is_secret_path
 from noah_code.teams import TeamPhase, TeamRole, TeamWorkflow, get_team_workflow
 from noah_code.workspace import Workspace
 
@@ -35,6 +37,47 @@ TaskRunner = Callable[[AgentSpec, str], Awaitable[str | TaskResult]]
 
 _DISTILL_INPUT_LIMIT = 24_000
 _TEAM_REPORT_LIMIT = 4000
+_TASK_DIFF_LIMIT = 16_000
+_STRIPPED_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY")
+
+
+class _DynamicSemaphore:
+    """Async context manager enforcing a live concurrency limit across callers."""
+
+    def __init__(self, limit_fn: Callable[[], int]) -> None:
+        self._limit_fn = limit_fn
+        self._active = 0
+        self._waiters: deque[asyncio.Future[None]] = deque()
+
+    def _wake_next(self) -> None:
+        limit = max(1, self._limit_fn())
+        while self._active < limit and self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                self._active += 1
+                waiter.set_result(None)
+
+    async def __aenter__(self) -> _DynamicSemaphore:
+        self._wake_next()
+        if self._active < max(1, self._limit_fn()) and not self._waiters:
+            self._active += 1
+            return self
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        try:
+            await waiter
+        except BaseException:
+            try:
+                self._waiters.remove(waiter)
+            except ValueError:
+                self._active -= 1
+                self._wake_next()
+            raise
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        self._active -= 1
+        self._wake_next()
 
 
 def _truncate_result(text: str, max_chars: int) -> str:
@@ -122,8 +165,8 @@ class TaskTools(Skill):
         self._jobs: dict[str, asyncio.Task[str]] = {}
         self._start_lock = asyncio.Lock()
         self._closed = False
-        self._slots = asyncio.Semaphore(self._max_concurrent())
-        self._bg_slots = asyncio.Semaphore(self._max_concurrent())
+        self._slots = _DynamicSemaphore(self._max_concurrent)
+        self._bg_slots = self._slots
         self._runtime = getattr(parent, "_runtime", None)
         self._records: dict[str, dict[str, Any]] = (
             self._runtime.get_state("child_sessions", {}) if self._runtime is not None else {}
@@ -142,18 +185,39 @@ class TaskTools(Skill):
             raise ValueError(f"unknown child session: {task_id}")
         return self._records[task_id]
 
-    async def start(self, name: str, prompt: str, isolate: bool = False) -> str:
+    @hidden
+    def has_running(self) -> bool:
+        """Return True while any background child job is active."""
+        return any(not job.done() for job in self._jobs.values())
+
+    async def start(
+        self,
+        name: str,
+        prompt: str,
+        isolate: bool = False,
+        include_dirty: bool = False,
+    ) -> str:
         """Start a background child; writable children require an isolated worktree.
 
-        Returns a session ID for status, wait, cancel, and follow_up. Worktrees
-        start from committed HEAD and are retained for review after completion.
+        Returns a session ID for status, wait, cancel, follow_up, diff, apply,
+        and cleanup. Worktrees start from committed HEAD unless include_dirty=True
+        and are retained for review after completion.
         """
         async with self._start_lock:
             if self._closed:
                 raise RuntimeError("child session runner is closed")
-            return await self._start_child(name, prompt, isolate)
+            return await self._start_child(name, prompt, isolate, include_dirty=include_dirty)
 
-    async def _start_child(self, name: str, prompt: str, isolate: bool) -> str:
+    async def _start_child(
+        self,
+        name: str,
+        prompt: str,
+        isolate: bool,
+        *,
+        include_dirty: bool = False,
+    ) -> str:
+        if include_dirty and not isolate:
+            raise ValueError("include_dirty requires isolate=True")
         spec = self._resolve(name)
         await self._authorize(spec, prompt.strip())
         if not spec.readonly and not isolate:
@@ -167,7 +231,9 @@ class TaskTools(Skill):
         rel_subdir = _git_workdir_offset(directory) if isolate else None
         manager = None
         info = None
-        warnings: list[str] = []
+        base_commit = ""
+        dirty_base: dict[str, str | None] = {}
+        warnings: builtins.list[str] = []
         if isolate:
             if self._engine.mode == "plan":
                 raise PermissionError("plan mode cannot create worktrees")
@@ -177,7 +243,16 @@ class TaskTools(Skill):
             manager = WorktreeManager(
                 directory, worktree_storage_root(self._parent._config.session_dir)
             )
-            creating = asyncio.create_task(asyncio.to_thread(manager.create, f"task-{task_id}"))
+            if include_dirty:
+                creating = asyncio.create_task(
+                    asyncio.to_thread(
+                        lambda: manager.create(f"task-{task_id}", include_dirty=True)
+                    )
+                )
+            else:
+                creating = asyncio.create_task(
+                    asyncio.to_thread(manager.create, f"task-{task_id}")
+                )
             try:
                 # Cancelling to_thread does not stop Git. Keep ownership until
                 # creation finishes so cancellation cannot orphan a worktree.
@@ -187,6 +262,9 @@ class TaskTools(Skill):
                     info = await creating
                     await asyncio.to_thread(manager.remove, info.name)
                 raise
+            base_commit, dirty_base = await asyncio.to_thread(
+                _inspect_isolated_baseline, info.directory, include_dirty
+            )
             directory = info.directory
             if rel_subdir is not None:
                 candidate = (info.directory / rel_subdir).resolve()
@@ -202,14 +280,26 @@ class TaskTools(Skill):
                 ).run_lifecycle("worktree_created", {
                     "child_id": task_id, "directory": str(directory), "agent": spec.name,
                 })
-            self._records[task_id] = {
-                "id": task_id, "agent": spec.name, "directory": str(directory),
-                "isolated": isolate, "state": "queued", "result": "",
+            record_data: dict[str, Any] = {
+                "id": task_id,
+                "agent": spec.name,
+                "directory": str(directory),
+                "isolated": isolate,
+                "state": "queued",
+                "result": "",
             }
+            if isolate:
+                if base_commit:
+                    record_data["base_commit"] = base_commit
+                if include_dirty:
+                    record_data["include_dirty"] = True
+                    if dirty_base:
+                        record_data["dirty_base"] = dirty_base
+            self._records[task_id] = record_data
             if warnings:
                 self._records[task_id]["warnings"] = warnings
             self._save_records()
-            self._launch(task_id, spec, prompt.strip())
+            self._launch(task_id, spec, prompt.strip(), semaphore=self._slots)
         except BaseException:
             self._records.pop(task_id, None)
             with contextlib.suppress(Exception):
@@ -220,7 +310,14 @@ class TaskTools(Skill):
             raise
         return json.dumps(self._records[task_id])
 
-    def _launch(self, task_id: str, spec: AgentSpec, prompt: str) -> None:
+    def _launch(
+        self,
+        task_id: str,
+        spec: AgentSpec,
+        prompt: str,
+        *,
+        semaphore: Any = None,
+    ) -> None:
         runner = self._runner or _default_runner(self._parent)
         if runner is None:
             raise RuntimeError("subagent runner is not configured")
@@ -229,7 +326,7 @@ class TaskTools(Skill):
                 spec,
                 prompt,
                 runner,
-                semaphore=self._bg_slots,
+                semaphore=self._slots if semaphore is None else semaphore,
                 task_id=task_id,
             ),
             name=f"noah-child-{task_id}",
@@ -261,7 +358,10 @@ class TaskTools(Skill):
             raise RuntimeError("concurrent child session limit reached")
         record["state"] = "queued"
         self._save_records()
-        self._launch(task_id, spec, prompt.strip())
+        # Foreground follow_up runs inline with the caller's turn and must not
+        # deadlock waiting on background start slots.
+        slot = self._slots if background else contextlib.nullcontext()
+        self._launch(task_id, spec, prompt.strip(), semaphore=slot)
 
     def status(self, task_id: str = "") -> str:
         """Read saved child state, workspace, and bounded last result."""
@@ -288,6 +388,91 @@ class TaskTools(Skill):
             self._save_records()
         return self.status(task_id)
 
+    async def diff(self, task_id: str) -> str:
+        """Return bounded git status and unified diff for an isolated child worktree."""
+        record = self._record(task_id)
+        if not record.get("isolated"):
+            raise ValueError(f"child session {task_id} is not isolated")
+        if record.get("worktree_cleaned"):
+            raise ValueError(f"worktree for child session {task_id} has been cleaned up")
+        directory = Path(record["directory"])
+        if not directory.is_dir():
+            raise ValueError(f"child workspace missing: {directory}")
+        base_ref = str(record.get("base_commit") or "HEAD")
+        raw = await asyncio.to_thread(_collect_isolated_diff, directory, base_ref)
+        return _truncate_result(raw, _TASK_DIFF_LIMIT)
+
+    async def apply(self, task_id: str) -> str:
+        """Atomically apply a finished isolated child's edits into the parent workspace."""
+        if self._engine.mode == "plan":
+            raise PermissionError("plan mode cannot apply child changes")
+        record = self._record(task_id)
+        if not record.get("isolated"):
+            raise ValueError(f"child session {task_id} is not isolated")
+        job = self._jobs.get(task_id)
+        if (job is not None and not job.done()) or record.get("state") in {"queued", "running"}:
+            raise RuntimeError("child is running; wait or cancel before applying changes")
+        if record.get("worktree_cleaned"):
+            raise ValueError(f"worktree for child session {task_id} has been cleaned up")
+        child_dir = Path(record["directory"])
+        if not child_dir.is_dir():
+            raise ValueError(f"child workspace missing: {child_dir}")
+        parent_ws = getattr(self._parent, "ws", None)
+        if parent_ws is None:
+            raise RuntimeError("parent workspace tools are not available")
+        base_ref = str(record.get("base_commit") or "HEAD")
+        dirty_base = record.get("dirty_base")
+        dirty_map = dirty_base if isinstance(dirty_base, dict) else {}
+        changes = await asyncio.to_thread(
+            _collect_isolated_patch_changes,
+            child_dir,
+            self._workspace.root,
+            base_ref,
+            dirty_map,
+        )
+        if not changes:
+            return f"No changes to apply from child session {task_id}"
+        report = str(await parent_ws.apply_patch(changes))
+        record["applied"] = True
+        self._save_records()
+        return report
+
+    async def cleanup(self, task_id: str) -> str:
+        """Remove a finished isolated child's retained linked worktree."""
+        if self._engine.mode == "plan":
+            raise PermissionError("plan mode cannot remove worktrees")
+        record = self._record(task_id)
+        if not record.get("isolated"):
+            raise ValueError(f"child session {task_id} is not isolated")
+        job = self._jobs.get(task_id)
+        if (job is not None and not job.done()) or record.get("state") in {"queued", "running"}:
+            raise RuntimeError("child is running; wait or cancel before cleaning up worktree")
+        from noah_code.checkpoints import CheckpointManager
+        from noah_code.worktree import WorktreeError, WorktreeManager, worktree_storage_root
+
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(
+                CheckpointManager(self._workspace.root, task_id).delete_all
+            )
+        if record.get("worktree_cleaned"):
+            return f"worktree for child {task_id} is already cleaned up"
+        assert self._parent is not None
+        manager = WorktreeManager(
+            self._workspace.root,
+            worktree_storage_root(self._parent._config.session_dir),
+        )
+        target_name = f"task-{task_id}"
+        try:
+            await asyncio.to_thread(manager.remove, target_name)
+        except WorktreeError:
+            known = await asyncio.to_thread(manager.list)
+            if any(item.name == target_name for item in known) or Path(record["directory"]).exists():
+                raise
+        record["worktree_cleaned"] = True
+        self._save_records()
+        return f"cleaned up worktree for child {task_id}"
+
+    @hidden
     async def close(self) -> None:
         """Drain children before parent tools and storage are closed."""
         async with self._start_lock:
@@ -448,13 +633,11 @@ class TaskTools(Skill):
         runner: TaskRunner,
         team_id: str,
     ) -> builtins.list[_TeamReport]:
-        semaphore = asyncio.Semaphore(self._max_concurrent())
-
         async def _one(spec: AgentSpec, role: TeamRole) -> _TeamReport:
             prompt = _team_prompt(workflow, phase, role, objective, reports)
             try:
                 result = await self._execute_result(
-                    spec, prompt, runner, semaphore=semaphore,
+                    spec, prompt, runner, semaphore=self._slots,
                     team_id=team_id, workflow=workflow.name, phase=phase.name,
                     display_prompt=objective,
                 )
@@ -500,11 +683,9 @@ class TaskTools(Skill):
         if runner is None:
             raise RuntimeError("subagent runner is not configured")
 
-        semaphore = asyncio.Semaphore(self._max_concurrent())
-
         async def _one(spec: AgentSpec, prompt: str) -> str:
             try:
-                return await self._execute(spec, prompt, runner, semaphore=semaphore)
+                return await self._execute(spec, prompt, runner, semaphore=self._slots)
             except Exception as exc:  # noqa: BLE001 - one failure must not sink the batch
                 return f"error: {type(exc).__name__}: {exc}"
 
@@ -528,7 +709,7 @@ class TaskTools(Skill):
         prompt: str,
         runner: TaskRunner,
         *,
-        semaphore: asyncio.Semaphore | None = None,
+        semaphore: Any = None,
         task_id: str | None = None,
     ) -> str:
         result = await self._execute_result(spec, prompt, runner, semaphore=semaphore, task_id=task_id)
@@ -540,7 +721,7 @@ class TaskTools(Skill):
         prompt: str,
         runner: TaskRunner,
         *,
-        semaphore: asyncio.Semaphore | None = None,
+        semaphore: Any = None,
         team_id: str | None = None,
         workflow: str | None = None,
         phase: str | None = None,
@@ -713,24 +894,159 @@ def _default_runner(parent: Any | None) -> TaskRunner | None:
     return _run
 
 
-def _git_workdir_offset(root: Path) -> Path | None:
-    import subprocess
+def _git_bytes(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    env = os.environ.copy()
+    for name in _STRIPPED_GIT_ENV:
+        env.pop(name, None)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
 
+
+def _split_nul(data: bytes) -> list[str]:
+    return [os.fsdecode(part) for part in data.split(b"\0") if part]
+
+
+def _git_toplevel(cwd: Path) -> Path | None:
     try:
-        top_res = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=root,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        res = _git_bytes(cwd, "rev-parse", "--show-toplevel")
     except (OSError, subprocess.SubprocessError):
         return None
-    if top_res.returncode != 0:
+    if res.returncode != 0 or not res.stdout.strip():
         return None
-    top = Path(top_res.stdout.strip()).resolve()
+    return Path(os.fsdecode(res.stdout.strip())).resolve()
+
+
+def _inspect_isolated_baseline(
+    worktree_dir: Path, include_dirty: bool
+) -> tuple[str, dict[str, str | None]]:
+    try:
+        head_res = _git_bytes(worktree_dir, "rev-parse", "--verify", "HEAD")
+    except (OSError, subprocess.SubprocessError):
+        return "", {}
+    if head_res.returncode != 0:
+        return "", {}
+    base_commit = head_res.stdout.decode("utf-8", errors="replace").strip()
+    if not include_dirty or not base_commit:
+        return base_commit, {}
+    dirty_base: dict[str, str | None] = {}
+    diff_res = _git_bytes(worktree_dir, "diff-index", "--name-only", "-z", base_commit)
+    untracked_res = _git_bytes(
+        worktree_dir, "ls-files", "-o", "--exclude-standard", "-z", "--full-name", "--", ":/"
+    )
+    if diff_res.returncode != 0 or untracked_res.returncode != 0:
+        return base_commit, {}
+    candidates = sorted(set(_split_nul(diff_res.stdout)) | set(_split_nul(untracked_res.stdout)))
+    for rel in candidates:
+        if is_secret_path(rel):
+            continue
+        target = worktree_dir / rel
+        if os.path.lexists(target) and not target.is_symlink() and target.is_file():
+            hashed = _git_bytes(
+                worktree_dir, "hash-object", "-w", "--no-filters", "--", str(target)
+            )
+            if hashed.returncode == 0:
+                dirty_base[rel] = hashed.stdout.decode("utf-8", errors="replace").strip()
+        elif not os.path.lexists(target):
+            dirty_base[rel] = None
+    return base_commit, dirty_base
+
+
+def _collect_isolated_diff(directory: Path, base_ref: str) -> str:
+    status_res = _git_bytes(directory, "status", "--short", "--untracked-files=all")
+    diff_res = _git_bytes(directory, "diff", base_ref)
+    status_text = status_res.stdout.decode("utf-8", errors="replace").rstrip()
+    diff_text = diff_res.stdout.decode("utf-8", errors="replace").rstrip()
+    parts: list[str] = []
+    if status_text:
+        parts.append(f"Status:\n{status_text}")
+    if diff_text:
+        parts.append(diff_text)
+    return "\n\n".join(parts) if parts else "(no changes)"
+
+
+def _collect_isolated_patch_changes(
+    child_dir: Path,
+    parent_ws_root: Path,
+    base_ref: str,
+    dirty_base: dict[str, Any],
+) -> list[dict[str, str | None]]:
+    child_top = _git_toplevel(child_dir) or child_dir.resolve()
+    parent_top = _git_toplevel(parent_ws_root) or parent_ws_root.resolve()
+    resolved_parent_ws = parent_ws_root.resolve()
+
+    diff_res = _git_bytes(child_top, "diff-index", "--name-only", "-z", base_ref)
+    untracked_res = _git_bytes(
+        child_top, "ls-files", "-o", "--exclude-standard", "-z", "--full-name", "--", ":/"
+    )
+    if diff_res.returncode != 0 or untracked_res.returncode != 0:
+        raise RuntimeError("cannot inspect isolated worktree changes")
+    candidates = sorted(
+        set(_split_nul(diff_res.stdout))
+        | set(_split_nul(untracked_res.stdout))
+        | set(dirty_base.keys())
+    )
+
+    changes: list[dict[str, str | None]] = []
+    for rel in candidates:
+        if is_secret_path(rel):
+            continue
+        if rel in dirty_base:
+            blob_sha = dirty_base[rel]
+            if blob_sha is None:
+                start_text = None
+            else:
+                blob_res = _git_bytes(child_top, "cat-file", "blob", str(blob_sha))
+                if blob_res.returncode != 0:
+                    raise RuntimeError(f"missing base blob for {rel}")
+                if b"\0" in blob_res.stdout:
+                    raise ValueError(f"binary file cannot be applied via patch: {rel}")
+                start_text = blob_res.stdout.decode("utf-8")
+        else:
+            exists_res = _git_bytes(child_top, "cat-file", "-e", f"{base_ref}:{rel}")
+            if exists_res.returncode == 0:
+                show_res = _git_bytes(child_top, "show", f"{base_ref}:{rel}")
+                if show_res.returncode != 0:
+                    raise RuntimeError(f"cannot read base file {rel}")
+                if b"\0" in show_res.stdout:
+                    raise ValueError(f"binary file cannot be applied via patch: {rel}")
+                start_text = show_res.stdout.decode("utf-8")
+            else:
+                start_text = None
+
+        child_file = child_top / rel
+        if os.path.lexists(child_file):
+            if child_file.is_symlink() or not child_file.is_file():
+                raise ValueError(f"non-regular file cannot be applied: {rel}")
+            raw = child_file.read_bytes()
+            if b"\0" in raw:
+                raise ValueError(f"binary file cannot be applied via patch: {rel}")
+            end_text: str | None = raw.decode("utf-8")
+        else:
+            end_text = None
+
+        if end_text == start_text:
+            continue
+
+        target_in_parent = (parent_top / rel).resolve()
+        if not target_in_parent.is_relative_to(resolved_parent_ws):
+            raise PermissionError(f"child modified file outside parent workspace: {rel}")
+        ws_rel = target_in_parent.relative_to(resolved_parent_ws).as_posix()
+        changes.append({"path": ws_rel, "old": start_text, "new": end_text})
+    return changes
+
+
+def _git_workdir_offset(root: Path) -> Path | None:
+    top = _git_toplevel(root)
+    if top is None:
+        return None
     resolved_root = root.resolve()
     if resolved_root == top or not resolved_root.is_relative_to(top):
         return None
@@ -800,13 +1116,23 @@ async def _run_subagent(
 
     runtime = getattr(parent, "_runtime", None)
     child_runtime = runtime
+    owns_child_runtime = False
     storage: Any = InMemoryStorageManager()
     lease = None
     child_workspace = Workspace(directory) if directory is not None else parent.ws._workspace
     if not child_workspace.root.is_dir():
         raise ValueError(f"child workspace missing: {child_workspace.root}")
+    child_blob_dir = (
+        runtime.session_path / "children" / task_id / "blobs"
+        if isolated and task_id is not None and runtime is not None
+        else None
+    )
     journal = (
-        SnapshotJournal(blob_limit=config.undo_blob_limit, root=child_workspace.root)
+        SnapshotJournal(
+            blob_limit=config.undo_blob_limit,
+            root=child_workspace.root,
+            blob_dir=child_blob_dir,
+        )
         if isolated
         else parent.journal
     )
@@ -821,11 +1147,18 @@ async def _run_subagent(
             )
         try:
             if isolated:
-                journal.load_dict(runtime.get_state(f"child:{task_id}:journal", {}))
+                journal.load_dict(
+                    runtime.get_state(f"child:{task_id}:journal", {}),
+                    blob_dir=child_blob_dir,
+                )
             storage = SQLiteStorageManager(child_path / "session.db")
             (child_path / "session.db").chmod(0o600)
             child_runtime = RuntimeStateStore(child_path)
+            owns_child_runtime = True
         except BaseException:
+            if owns_child_runtime and child_runtime is not None:
+                with contextlib.suppress(Exception):
+                    child_runtime.close()
             close_storage = getattr(storage, "close", None)
             if callable(close_storage):
                 with contextlib.suppress(Exception):
@@ -836,9 +1169,13 @@ async def _run_subagent(
     messages: list[str] = []
     child = None
     child_engine = _child_engine(parent.engine, spec.mode)
+    parent_approvals = getattr(parent, "approvals", None)
     child_approvals = ApprovalBroker(
-        child_engine, handler=getattr(parent.approvals, "_handler", None)
+        child_engine, handler=getattr(parent_approvals, "_handler", None)
     )
+    if parent_approvals is not None and hasattr(parent_approvals, "_ui_lock"):
+        child_approvals._ui_lock = parent_approvals._ui_lock  # noqa: SLF001
+    checkpoints = None
     try:
         child = CodingAgent(
             child_workspace,
@@ -866,6 +1203,12 @@ async def _run_subagent(
             nested=True,
             nested_prompt=spec.prompt,
         )
+        parent_ask = getattr(parent, "ask", None)
+        ask_handler = getattr(parent_ask, "_handler", None)
+        if ask_handler is not None:
+            child.ask.set_handler(ask_handler)
+        if parent_ask is not None and hasattr(parent_ask, "_ui_lock"):
+            child.ask._ui_lock = parent_ask._ui_lock  # noqa: SLF001
         if task_id is not None and runtime is not None:
             summarizers = nooa_compat.summarizers(child)
             storage.restore_latest_snapshot(child)
@@ -955,9 +1298,18 @@ async def _run_subagent(
                         storage.save_snapshot(child)
                     if isolated:
                         journal.end_turn()
-                        runtime.set_state(f"child:{task_id}:journal", journal.to_dict())
+                        runtime.set_state(
+                            f"child:{task_id}:journal",
+                            journal.to_dict(blob_dir=child_blob_dir),
+                        )
+                        if checkpoints is not None:
+                            with contextlib.suppress(Exception):
+                                await asyncio.to_thread(checkpoints.delete_all)
                 finally:
                     try:
+                        if owns_child_runtime and child_runtime is not None:
+                            with contextlib.suppress(Exception):
+                                child_runtime.close()
                         storage.close()
                     finally:
                         if lease is not None:

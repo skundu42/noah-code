@@ -186,3 +186,38 @@ async def test_revision_unavailability_is_explicit_and_unknown_checks_block(tmp_
     record = await ledger.begin("python -m unittest")
     await ledger.finish(record, 0)
     assert (await ledger.completion_blockers())[0]["state"] == "unknown"
+
+
+async def test_suite_wide_or_post_typo_pass_supersedes_same_label_cwd_only(tmp_path: Path):
+    source = tmp_path / "mod.py"
+    source.write_text("x = 1\n")
+    ledger = CheckLedger(tmp_path)
+
+    # 1. Mistyped file (pytest exit code 4) superseded by targeted passing run of same label/cwd.
+    typo = await ledger.begin("pytest tests/typo.py", cwd=tmp_path)
+    await ledger.finish(typo, 4)
+    targeted_pass = await ledger.begin("pytest tests/test_real.py", cwd=tmp_path)
+    await ledger.finish(targeted_pass, 0)
+    assert await ledger.completion_blockers() == []
+
+    # 2. Genuine failure on test_a is NOT cleared by a narrow pass on test_b,
+    #    until a suite-wide pytest run passes!
+    fail_a = await ledger.begin("pytest tests/test_a.py", cwd=tmp_path)
+    await ledger.finish(fail_a, 1)
+    pass_b = await ledger.begin("pytest tests/test_b.py", cwd=tmp_path)
+    await ledger.finish(pass_b, 0)
+    blockers = await ledger.completion_blockers()
+    assert [b["command"] for b in blockers] == ["pytest tests/test_a.py"]
+
+    # Edit source (making earlier runs stale) and run suite-wide pytest + ruff failure.
+    source.write_text("x = 2\n")
+    lint_fail = await ledger.begin("ruff check .", cwd=tmp_path)
+    await ledger.finish(lint_fail, 1)
+    suite_pass = await ledger.begin("pytest -q", cwd=tmp_path)
+    await ledger.finish(suite_pass, 0)
+
+    # pytest blockers are cleared, while distinct tool label "ruff" still blocks!
+    remaining = await ledger.completion_blockers()
+    assert [(b["label"], b["command"], b["state"]) for b in remaining] == [
+        ("ruff", "ruff check .", "failed")
+    ]

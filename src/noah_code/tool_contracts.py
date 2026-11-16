@@ -136,6 +136,21 @@ _DETAILS = {
         "Run checks again when edits make earlier evidence stale.",
         ("print(await self.ws.checks())",),
     ),
+    "task.diff": _Details(
+        "str: status and unified diff of an isolated child task's worktree.",
+        "Pass the 12-char task_id returned by self.task.start(..., isolate=True).",
+        ('print(await self.task.diff(task_id))',),
+    ),
+    "task.apply": _Details(
+        "str: atomic patch report after applying an isolated child's edits to the parent workspace.",
+        "Requires the isolated child to be finished (not running) and non-conflicting.",
+        ('print(await self.task.apply(task_id))',),
+    ),
+    "task.cleanup": _Details(
+        "str: confirmation after removing a finished isolated child's retained worktree.",
+        "Call after reviewing or applying the isolated child's edits.",
+        ('print(await self.task.cleanup(task_id))',),
+    ),
     "message": _Details(
         "None: sends user-facing text.",
         "Synchronous: call without await.",

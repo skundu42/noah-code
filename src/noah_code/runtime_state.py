@@ -5,9 +5,9 @@ host-level state which must survive independently of a model turn: run state,
 file-operation intents, background-process metadata, user inbox items,
 interactions, usage checkpoints, and an operational event log.
 
-Every method opens a short-lived SQLite connection.  That makes the store safe
-to call from the event loop and from ``asyncio.to_thread`` workers without
-sharing thread-affine connection objects.
+Every store maintains a persistent SQLite WAL connection guarded by a
+re-entrant lock so eventloop and ``asyncio.to_thread`` callers share one
+durable WAL session without per-call checkpoint/teardown thrashing.
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ import os
 import signal
 import sqlite3
 import stat
+import subprocess
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -68,39 +70,77 @@ class InboxRecord:
     attach_paths: tuple[str, ...]
 
 
-class WorkspaceLease:
-    """Kernel-released exclusive lock for one canonical checkout path."""
+_STRIPPED_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY")
 
-    def __init__(self, path: Path, descriptor: int) -> None:
+
+def _canonical_lease_workspace(workspace: Path) -> Path:
+    resolved = workspace.expanduser().resolve()
+    if not resolved.is_dir():
+        return resolved
+    env = os.environ.copy()
+    for name in _STRIPPED_GIT_ENV:
+        env.pop(name, None)
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=resolved,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return resolved
+    if probe.returncode == 0 and probe.stdout.strip():
+        return Path(probe.stdout.strip()).resolve()
+    return resolved
+
+
+class WorkspaceLease:
+    """Kernel-released shared or exclusive lock for one canonical checkout path."""
+
+    def __init__(self, path: Path, descriptor: int, *, shared: bool = False) -> None:
         self.path = path
         self._descriptor = descriptor
+        self.shared = shared
 
     @classmethod
-    def acquire(cls, lease_root: Path, workspace: Path, session_id: str) -> WorkspaceLease:
+    def acquire(
+        cls,
+        lease_root: Path,
+        workspace: Path,
+        session_id: str,
+        *,
+        shared: bool = False,
+    ) -> WorkspaceLease:
         import fcntl
 
-        canonical = workspace.expanduser().resolve()
+        canonical = _canonical_lease_workspace(workspace)
         digest = hashlib.sha256(str(canonical).encode()).hexdigest()[:24]
         lease_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         lease_root.chmod(0o700)
         path = lease_root / f"workspace-{digest}.lock"
         descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        lock_mode = (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            payload = json.dumps(
-                {
-                    "pid": os.getpid(),
-                    "session_id": session_id,
-                    "workspace": str(canonical),
-                    "acquired_at": time.time(),
-                },
-                separators=(",", ":"),
-            ).encode()
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            os.ftruncate(descriptor, 0)
-            os.write(descriptor, payload)
-            os.fsync(descriptor)
-            return cls(path, descriptor)
+            fcntl.flock(descriptor, lock_mode)
+            if not shared:
+                payload = json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "session_id": session_id,
+                        "workspace": str(canonical),
+                        "acquired_at": time.time(),
+                    },
+                    separators=(",", ":"),
+                ).encode()
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                os.ftruncate(descriptor, 0)
+                os.write(descriptor, payload)
+                os.fsync(descriptor)
+            return cls(path, descriptor, shared=shared)
         except OSError as exc:
             owner = _read_lease_owner(path)
             with contextlib.suppress(OSError):
@@ -164,19 +204,54 @@ class RuntimeStateStore:
         self.artifact_dir.mkdir(exist_ok=True, mode=0o700)
         self.process_log_dir.mkdir(exist_ok=True, mode=0o700)
         self._max_events = max_events
+        self._lock = threading.RLock()
+        self._conn: sqlite3.Connection | None = None
         self._initialize()
+
+    def _ensure_connection(self) -> sqlite3.Connection:
+        if self._conn is None:
+            connection = sqlite3.connect(
+                self.path,
+                timeout=5.0,
+                check_same_thread=False,
+            )
+            try:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA busy_timeout=5000")
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA synchronous=NORMAL")
+                connection.execute("PRAGMA foreign_keys=ON")
+            except BaseException:
+                connection.close()
+                raise
+            self._conn = connection
+        return self._conn
 
     @contextlib.contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        # SQLite's own context manager finishes the transaction but leaves the
-        # connection open. Close on success, rollback, and setup failure alike.
-        with contextlib.closing(sqlite3.connect(self.path, timeout=5.0)) as connection, connection:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA busy_timeout=5000")
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=FULL")
-            connection.execute("PRAGMA foreign_keys=ON")
-            yield connection
+        with self._lock:
+            connection = self._ensure_connection()
+            with connection:
+                yield connection
+
+    def close(self) -> None:
+        """Close the persistent SQLite connection cleanly; lazily reopens if used again."""
+
+        with self._lock:
+            conn, self._conn = self._conn, None
+            if conn is not None:
+                with contextlib.suppress(sqlite3.Error):
+                    conn.close()
+
+    def __enter__(self) -> RuntimeStateStore:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.close()
 
     def _initialize(self) -> None:
         schema = """
@@ -749,17 +824,15 @@ class RuntimeStateStore:
     def event(self, kind: str, payload: dict[str, Any]) -> None:
         serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "INSERT INTO runtime_events(kind, payload, created_at) VALUES (?, ?, ?)",
                 (kind, serialized, time.time()),
             )
-            count = connection.execute("SELECT COUNT(*) FROM runtime_events").fetchone()[0]
-            overflow = int(count) - self._max_events
-            if overflow > 0:
+            seq = cursor.lastrowid
+            if seq is not None and seq > self._max_events:
                 connection.execute(
-                    "DELETE FROM runtime_events WHERE sequence IN "
-                    "(SELECT sequence FROM runtime_events ORDER BY sequence LIMIT ?)",
-                    (overflow,),
+                    "DELETE FROM runtime_events WHERE sequence <= ?",
+                    (seq - self._max_events,),
                 )
 
     def health(self) -> dict[str, Any]:
