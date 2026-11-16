@@ -567,97 +567,107 @@ class SessionStore:
         except SessionError:
             return ""
 
+        orig_dir_ns: tuple[int, int] | None = None
+        with contextlib.suppress(OSError):
+            dir_stat = session_path.stat()
+            orig_dir_ns = (dir_stat.st_atime_ns, dir_stat.st_mtime_ns)
+
         snippet = ""
-        db_path = session_path / "session.db"
-        if db_path.is_file():
-            has_wal = (session_path / "session.db-wal").exists()
-            uri = (
-                f"{db_path.resolve().as_uri()}?mode=ro"
-                if has_wal
-                else f"{db_path.resolve().as_uri()}?mode=ro&immutable=1"
-            )
-            query = (
-                "SELECT event_type, data FROM events "
-                "WHERE event_type IN ("
-                "'Task', 'QueueOutput', 'Notification', 'PythonOutput', "
-                "'AgentMessage', 'Message', 'AssistantEvent', 'TextOnlyReply'"
-                ") AND json_valid(data) AND json_type(data) = 'object' "
-                "ORDER BY insertion_order DESC LIMIT 50"
-            )
-            try:
-                with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
-                    rows = conn.execute(query).fetchall()
-            except sqlite3.Error:
-                rows = []
-
-            user_candidate = ""
-            assistant_candidate = ""
-            for raw_type, raw_data in rows:
+        try:
+            db_path = session_path / "session.db"
+            if db_path.is_file():
+                has_wal = (session_path / "session.db-wal").exists()
+                uri = (
+                    f"{db_path.resolve().as_uri()}?mode=ro"
+                    if has_wal
+                    else f"{db_path.resolve().as_uri()}?mode=ro&immutable=1"
+                )
+                query = (
+                    "SELECT event_type, data FROM events "
+                    "WHERE event_type IN ("
+                    "'Task', 'QueueOutput', 'Notification', 'PythonOutput', "
+                    "'AgentMessage', 'Message', 'AssistantEvent', 'TextOnlyReply'"
+                    ") AND json_valid(data) AND json_type(data) = 'object' "
+                    "ORDER BY insertion_order DESC LIMIT 50"
+                )
                 try:
-                    payload = json.loads(raw_data)
-                except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
-                    continue
-                if not isinstance(payload, dict):
-                    continue
-                etype = str(raw_type)
-                if not user_candidate:
-                    if etype == "Task":
-                        prompt = str(payload.get("prompt", "") or "").strip()
-                        if prompt and not prompt.startswith("## Task: handle"):
-                            user_candidate = prompt
-                    elif etype == "QueueOutput" and "user_messages" in str(
-                        payload.get("source", "")
-                    ):
-                        val = payload.get("value") or payload.get("value_preview") or ""
-                        if isinstance(val, str) and val.strip():
-                            user_candidate = val.strip()
-                    elif etype == "Notification" and "user" in str(
-                        payload.get("source", "")
-                    ).lower():
-                        desc = str(payload.get("description", "") or "").strip()
-                        if desc:
-                            user_candidate = desc
-                    elif etype == "PythonOutput":
-                        meta = payload.get("metadata")
-                        if isinstance(meta, dict) and meta.get("prefill_type") == "inspect_inputs":
-                            extracted = _extract_prefill_user_message(
-                                str(payload.get("stdout", "") or "")
-                            )
-                            if extracted:
-                                user_candidate = extracted
-                if not assistant_candidate and etype in {
-                    "AgentMessage",
-                    "Message",
-                    "AssistantEvent",
-                    "TextOnlyReply",
-                }:
-                    content = str(payload.get("content", "") or "").strip()
-                    if content:
-                        assistant_candidate = content
-                if user_candidate:
-                    break
-            snippet = user_candidate or assistant_candidate
+                    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
+                        rows = conn.execute(query).fetchall()
+                except sqlite3.Error:
+                    rows = []
 
-        runtime_db = session_path / "runtime.db"
-        if runtime_db.is_file():
-            rt_has_wal = (session_path / "runtime.db-wal").exists()
-            rt_uri = (
-                f"{runtime_db.resolve().as_uri()}?mode=ro"
-                if rt_has_wal
-                else f"{runtime_db.resolve().as_uri()}?mode=ro&immutable=1"
-            )
-            try:
-                with contextlib.closing(sqlite3.connect(rt_uri, uri=True, timeout=1.0)) as rt_conn:
-                    row = rt_conn.execute(
-                        "SELECT user_text FROM runs WHERE trim(user_text) != '' "
-                        "ORDER BY updated_at DESC LIMIT 1"
-                    ).fetchone()
-                    if row and row[0]:
-                        rt_text = str(row[0]).strip()
-                        if rt_text:
-                            snippet = rt_text
-            except sqlite3.Error:
-                pass
+                user_candidate = ""
+                assistant_candidate = ""
+                for raw_type, raw_data in rows:
+                    try:
+                        payload = json.loads(raw_data)
+                    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    etype = str(raw_type)
+                    if not user_candidate:
+                        if etype == "Task":
+                            prompt = str(payload.get("prompt", "") or "").strip()
+                            if prompt and not prompt.startswith("## Task: handle"):
+                                user_candidate = prompt
+                        elif etype == "QueueOutput" and "user_messages" in str(
+                            payload.get("source", "")
+                        ):
+                            val = payload.get("value") or payload.get("value_preview") or ""
+                            if isinstance(val, str) and val.strip():
+                                user_candidate = val.strip()
+                        elif etype == "Notification" and "user" in str(
+                            payload.get("source", "")
+                        ).lower():
+                            desc = str(payload.get("description", "") or "").strip()
+                            if desc:
+                                user_candidate = desc
+                        elif etype == "PythonOutput":
+                            meta = payload.get("metadata")
+                            if isinstance(meta, dict) and meta.get("prefill_type") == "inspect_inputs":
+                                extracted = _extract_prefill_user_message(
+                                    str(payload.get("stdout", "") or "")
+                                )
+                                if extracted:
+                                    user_candidate = extracted
+                    if not assistant_candidate and etype in {
+                        "AgentMessage",
+                        "Message",
+                        "AssistantEvent",
+                        "TextOnlyReply",
+                    }:
+                        content = str(payload.get("content", "") or "").strip()
+                        if content:
+                            assistant_candidate = content
+                    if user_candidate:
+                        break
+                snippet = user_candidate or assistant_candidate
+
+            runtime_db = session_path / "runtime.db"
+            if runtime_db.is_file():
+                rt_has_wal = (session_path / "runtime.db-wal").exists()
+                rt_uri = (
+                    f"{runtime_db.resolve().as_uri()}?mode=ro"
+                    if rt_has_wal
+                    else f"{runtime_db.resolve().as_uri()}?mode=ro&immutable=1"
+                )
+                try:
+                    with contextlib.closing(sqlite3.connect(rt_uri, uri=True, timeout=1.0)) as rt_conn:
+                        row = rt_conn.execute(
+                            "SELECT user_text FROM runs WHERE trim(user_text) != '' "
+                            "ORDER BY updated_at DESC LIMIT 1"
+                        ).fetchone()
+                        if row and row[0]:
+                            rt_text = str(row[0]).strip()
+                            if rt_text:
+                                snippet = rt_text
+                except sqlite3.Error:
+                    pass
+        finally:
+            if orig_dir_ns is not None:
+                with contextlib.suppress(OSError):
+                    os.utime(session_path, ns=orig_dir_ns)
 
         return _format_preview_snippet(snippet, max_chars=max_chars)
 
